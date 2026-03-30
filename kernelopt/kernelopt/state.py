@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 
 @dataclass
@@ -52,10 +53,18 @@ class PipelineConfig:
     ncu_extra_args: list[str] = field(default_factory=list)
     kernel_args: list[str] = field(default_factory=list)  # args passed to kernel program
 
-    # LLM options
+    # LLM options (defaults, used when per-agent options are not set)
     model: str = "Qwen/Qwen3-32B"
     api_key: str | None = None
     base_url: str = "http://localhost:8000/v1"
+
+    # Per-agent model/URL overrides (for dual-model / --local mode)
+    planner_model: str | None = None
+    planner_base_url: str | None = None
+    summarizer_model: str | None = None
+    summarizer_base_url: str | None = None
+    executor_model: str | None = None
+    executor_base_url: str | None = None
 
     # Paths
     output_dir: str = "pipeline_output"
@@ -99,3 +108,41 @@ class PipelineState:
 
     # History
     iteration_results: list[IterationResult] = field(default_factory=list)
+
+
+class GraphState(TypedDict, total=False):
+    """LangGraph-compatible state for the optimization pipeline."""
+
+    # Immutable config
+    config: PipelineConfig
+    kernel_path: str
+    kernel_source: str
+    kernel_basename: str
+    kernel_id: int
+    framework: str
+    output_dir: str
+    ext: str
+
+    # Baseline
+    baseline_profiling_context: dict
+    baseline_csv: str
+    baseline_ncu_rep: str
+    baseline_latency_ns: float
+
+    # Current best
+    best_kernel: str
+    best_latency_ns: float
+    best_ncu_rep: str
+    current_profiling_context: dict
+
+    # Per-iteration
+    iteration: int
+    no_improvement_streak: int
+    plans: list[tuple[str, dict]]
+    candidates: list[PlanCandidate]
+
+    # Memory
+    optimization_memory: list[dict]
+
+    # History
+    iteration_results: list[IterationResult]

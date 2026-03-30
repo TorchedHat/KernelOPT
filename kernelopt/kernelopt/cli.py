@@ -63,11 +63,40 @@ def run(
         None, "--api-key", help="API key (not needed for local vLLM)"
     ),
     model: str = typer.Option(
-        "Qwen/Qwen3-32B", help="Model name"
+        "Qwen/Qwen3-32B", help="Default model name (used when per-agent models not set)"
     ),
     base_url: str = typer.Option(
         "http://localhost:8000/v1", "--base-url",
-        help="vLLM/OpenAI-compatible API base URL"
+        help="Default vLLM/OpenAI-compatible API base URL"
+    ),
+    local: bool = typer.Option(
+        False, "--local",
+        help="Use dual local vLLM servers (planner+summarizer on 8001, executor on 8000)"
+    ),
+    planner_model: Optional[str] = typer.Option(
+        None, "--planner-model", help="Model for planner agent"
+    ),
+    planner_url: Optional[str] = typer.Option(
+        None, "--planner-url", help="Base URL for planner agent"
+    ),
+    summarizer_model: Optional[str] = typer.Option(
+        None, "--summarizer-model", help="Model for summarizer agent"
+    ),
+    summarizer_url: Optional[str] = typer.Option(
+        None, "--summarizer-url", help="Base URL for summarizer agent"
+    ),
+    executor_model: Optional[str] = typer.Option(
+        None, "--executor-model", help="Model for executor agent"
+    ),
+    executor_url: Optional[str] = typer.Option(
+        None, "--executor-url", help="Base URL for executor agent"
+    ),
+    torchserve: bool = typer.Option(
+        False, "--torchserve",
+        help="Use TorchServe backend with LangGraph pipeline (auto-starts servers)"
+    ),
+    gpu: int = typer.Option(
+        2, "--gpu", help="GPU device ID for TorchServe models"
     ),
     verbose: bool = typer.Option(False, help="Verbose output"),
 ):
@@ -80,7 +109,6 @@ def run(
     Example:
         kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
     """
-    from kernelopt.graph import run_pipeline
     from kernelopt.memory import load_memory
     from kernelopt.state import PipelineConfig, PipelineState
 
@@ -88,8 +116,24 @@ def run(
         console.print(f"[red]Error:[/] kernel file not found: {kernel_path}")
         raise typer.Exit(1)
 
-    # Derive a short basename for file naming
     kernel_basename = kernel_path.stem
+
+    # --torchserve sets defaults for TorchServe + LangGraph on a single GPU
+    if torchserve:
+        planner_model = planner_model or "Qwen/Qwen3-30B-A3B"
+        planner_url = planner_url or "http://localhost:8000/v1"
+        summarizer_model = summarizer_model or "Qwen/Qwen3-30B-A3B"
+        summarizer_url = summarizer_url or "http://localhost:8000/v1"
+        executor_model = executor_model or "Qwen/Qwen3-Coder-Next-FP8"
+        executor_url = executor_url or "http://localhost:8000/v1"
+    # --local sets defaults for dual vLLM servers
+    elif local:
+        planner_model = planner_model or "Qwen/Qwen3-30B-A3B"
+        planner_url = planner_url or "http://localhost:8001/v1"
+        summarizer_model = summarizer_model or "Qwen/Qwen3-30B-A3B"
+        summarizer_url = summarizer_url or "http://localhost:8001/v1"
+        executor_model = executor_model or "Qwen/Qwen3-Coder-Next-FP8"
+        executor_url = executor_url or "http://localhost:8000/v1"
 
     cfg = PipelineConfig(
         T=iterations,
@@ -103,6 +147,12 @@ def run(
         model=model,
         api_key=api_key,
         base_url=base_url,
+        planner_model=planner_model,
+        planner_base_url=planner_url,
+        summarizer_model=summarizer_model,
+        summarizer_base_url=summarizer_url,
+        executor_model=executor_model,
+        executor_base_url=executor_url,
         output_dir=str(output_dir),
         kernel_path=str(kernel_path),
         baseline_csv=str(csv) if csv else None,
@@ -125,8 +175,23 @@ def run(
         f"  T={iterations} iterations, N={plans} plans/iter, "
         f"K={attempts} attempts/plan, TopK={top_k}"
     )
+    if torchserve:
+        console.print(f"  Backend: [cyan]TorchServe + LangGraph[/] on GPU {gpu}")
 
-    final = run_pipeline(state)
+    if torchserve:
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
+        from kernelopt.serving.manager import TorchServeManager
+
+        with TorchServeManager(
+            gpu_id=gpu,
+            planner_model=planner_model or "Qwen/Qwen3-30B-A3B",
+            executor_model=executor_model or "Qwen/Qwen3-Coder-Next-FP8",
+        ) as ts:
+            ts.wait_ready()
+            final = run_langgraph_pipeline(state)
+    else:
+        from kernelopt.graph import run_pipeline
+        final = run_pipeline(state)
 
     baseline_lat = final.baseline_profiling_context.get(
         "sections", {}
@@ -136,7 +201,7 @@ def run(
 
     console.print(
         f"\n[bold]Done.[/] "
-        f"Baseline: {baseline_lat} ns → "
+        f"Baseline: {baseline_lat} ns -> "
         f"Best: [green]{final.best_latency_ns:.0f} ns[/]\n"
         f"Results in [cyan]{output_dir}/[/]"
     )

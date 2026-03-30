@@ -170,8 +170,8 @@ def _run_iteration(
                 kernel_source=current_kernel,
                 optimization_memory=state.optimization_memory,
                 api_key=cfg.api_key,
-                model=cfg.model,
-                base_url=cfg.base_url,
+                model=cfg.planner_model or cfg.model,
+                base_url=cfg.planner_base_url or cfg.base_url,
                 plan_index=i,
                 total_plans=cfg.N,
                 previous_directions=previous_directions,
@@ -203,8 +203,8 @@ def _run_iteration(
                     optimization_plan=plan,
                     framework=state.framework,
                     api_key=cfg.api_key,
-                    model=cfg.model,
-                    base_url=cfg.base_url,
+                    model=cfg.executor_model or cfg.model,
+                    base_url=cfg.executor_base_url or cfg.base_url,
                     attempt=attempt,
                 )
             except Exception as e:
@@ -328,8 +328,8 @@ def _run_iteration(
                 existing_memory=state.optimization_memory,
                 execution_result=c.execution_result,
                 api_key=cfg.api_key,
-                model=cfg.model,
-                base_url=cfg.base_url,
+                model=cfg.summarizer_model or cfg.model,
+                base_url=cfg.summarizer_base_url or cfg.base_url,
             )
             experience_items.append(item)
             memory_updates.append(mem_update)
