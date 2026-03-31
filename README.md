@@ -1,102 +1,91 @@
-# kernelopt
+# KernelOpt
 
-Multi-agent GPU kernel optimizer powered by LangGraph and NVIDIA Nsight Compute (NCU). Automatically profiles, plans, rewrites, and re-profiles GPU kernels in a closed loop to find faster implementations.
+Multi-agent GPU kernel optimizer powered by **Claude on Vertex AI**, **LangGraph**, and **NVIDIA Nsight Compute**. Automatically profiles, plans, rewrites, and re-profiles GPU kernels in a closed loop to find faster implementations.
 
 ## How It Works
 
 ```
-                    +---> Planner (x N) ---> Executor (x N) ---+
-                    |                                          |
-Kernel --> Profiler-+                                          +--> Profiler --> Summarizer --> Select Best
-                    |                                          |
-                    +<---- loop (T iterations) <---------------+
+                    +---> Planner (Claude) x N ---> Executor (Claude) x N ---+
+                    |                                                        |
+Kernel --> Profiler-+                                                        +--> Profiler --> Summarizer (Claude) --> Select Best
+                    |                                                        |
+                    +<---- loop (T iterations) <-----------------------------+
 ```
 
 Each iteration:
 
 1. **Profiler** runs NCU on the kernel, parses the CSV into a structured `profiling_context` (metrics, rules, launch config)
-2. **Planner** reads profiling data + optimization memory, generates N diverse optimization plans ranked by NCU rule speedup potential
-3. **Executor** applies each plan to produce optimized kernel code, verified by a correctness gate
-4. **Profiler** re-profiles valid candidates with NCU
-5. **Summarizer** compares before/after profiling, extracts reusable experience items into memory
-6. **Select Best** picks the fastest candidate for the next iteration
+2. **Planner** (Claude) reads profiling data + optimization memory, generates N diverse optimization plans ranked by NCU rule speedup potential
+3. **Executor** (Claude) applies each plan to produce optimized kernel code
+4. **Correctness** (Claude) generates CPU reference implementation and validates GPU kernel outputs
+5. **Profiler** re-profiles valid candidates with NCU
+6. **Summarizer** (Claude) compares before/after profiling, extracts reusable experience items into memory
+7. **Select Best** picks the fastest candidate for the next iteration
 
 The pipeline stops after T iterations, 2 consecutive no-improvement iterations, or when all NCU optimization opportunities are exhausted.
 
 ## Supported Frameworks
 
-- **Triton** -- tile sizes, num_warps, num_stages, `tl.math.*` substitutions
-- **CUDA** -- shared memory tiling, vectorized loads, `__launch_bounds__`, instruction fusion
-- **Helion** -- tile hierarchy, memory access ordering
+- **Triton** — tile sizes, num_warps, num_stages, `tl.math.*` substitutions
+- **CUDA** — shared memory tiling, vectorized loads, `__launch_bounds__`, instruction fusion
+- **Helion** — tile hierarchy, memory access ordering
 
 Framework is auto-detected from the NCU kernel name.
 
 ## Installation
 
 ```bash
-git clone https://gitlab.com/Sanskaaar1/kernel-profiling-tool.git
-cd kernel-profiling-tool/kernelopt
-
-# Core install
+cd /workspaces/pytorch-devcontainers/TOOL/kernelopt
 pip install -e .
-
-# With TorchServe backend (batch inference on H200)
-pip install -e ".[torchserve]"
-
-# With local vLLM backend
-pip install -e ".[local]"
 ```
 
 **Requirements:**
 - Python >= 3.10
 - NVIDIA GPU with CUDA
 - [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute) (`ncu` on PATH)
-- An LLM backend (TorchServe, vLLM, or any OpenAI-compatible API)
+- Vertex AI authentication (gcloud)
+- Environment variable: `ANTHROPIC_VERTEX_PROJECT_ID`
 
 ## Quick Start
 
-### Run the full pipeline
-
 ```bash
-# Using TorchServe (auto-starts servers, auto-shuts down)
-kernelopt run my_kernel.py --torchserve --gpu 2 -T 4 -N 4
+# Quick example run
+./run_example.sh
 
-# Using a local vLLM server (must be running separately)
-kernelopt run my_kernel.py --local -T 4 -N 4
-
-# Using any OpenAI-compatible endpoint
-kernelopt run my_kernel.py --base-url http://localhost:8000/v1 --model Qwen/Qwen3-30B-A3B
+# Or manually:
+kernelopt run test/softmaxtri.py \
+  --csv pipeline_output/baseline.csv \
+  -T 4 -N 4 \
+  -o results \
+  --kernel-name softmax_triton_forward_kernel \
+  --kernel-args '--profile-only'
 ```
 
-### Direct inference (no server)
+See [QUICKSTART.md](QUICKSTART.md) for complete guide.
+
+## Basic Commands
 
 ```bash
-# Uses transformers directly on GPU -- slower but no server setup needed
-CUDA_VISIBLE_DEVICES=2 python test/run_pipeline.py -T 4 -N 4 --kernel test/softmaxtri.py
-```
+# Profile a kernel
+kernelopt profile test/softmaxtri.py \
+  --kernel-name 'softmax_kernel' \
+  --kernel-args '--profile-only' \
+  -o baseline
 
-### Profile only
+# View profiling results
+kernelopt show baseline.csv
 
-```bash
-kernelopt profile my_kernel.py --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
-```
+# Generate optimization plans (uses Claude)
+kernelopt plan baseline.csv test/softmaxtri.py -N 4
 
-### Inspect a profile
+# Run full optimization pipeline
+kernelopt run test/softmaxtri.py \
+  --csv baseline.csv \
+  -T 4 -N 4 \
+  -o results
 
-```bash
-kernelopt show output.csv
-```
-
-### Generate plans without executing
-
-```bash
-kernelopt plan output.csv my_kernel.py -N 4
-```
-
-### List kernels in a CSV
-
-```bash
-kernelopt kernels output.csv
+# List kernels in a CSV
+kernelopt kernels baseline.csv
 ```
 
 ## CLI Reference
@@ -116,9 +105,9 @@ kernelopt kernels output.csv
 | `--memory` | | Load existing optimization_memory.json |
 | `--kernel-name` | | Regex for NCU `--kernel-name` |
 | `--kernel-args` | | Extra args for the kernel program |
-| `--torchserve` | false | Use TorchServe + LangGraph backend |
-| `--local` | false | Use dual vLLM servers |
-| `--gpu` | 2 | GPU device for TorchServe models |
+| `--model` | claude-sonnet-4@20250514 | Claude model to use |
+| `--project-id` | $ANTHROPIC_VERTEX_PROJECT_ID | Vertex AI project ID |
+| `--region` | us-east5 | Vertex AI region |
 | `--planner-model` | | Override model for planner agent |
 | `--executor-model` | | Override model for executor agent |
 | `--summarizer-model` | | Override model for summarizer agent |
@@ -129,26 +118,21 @@ kernelopt kernels output.csv
 kernelopt/
   cli.py                  # Typer CLI entry point
   langgraph_pipeline.py   # LangGraph StateGraph (7 nodes + conditional loop)
-  graph.py                # Legacy linear pipeline (still works)
+  graph.py                # Legacy linear pipeline
   state.py                # PipelineState, PipelineConfig, GraphState
-  llm.py                  # LLM factory (ChatOpenAI wrapper)
+  llm.py                  # LLM factory (Claude Vertex AI wrapper)
   memory.py               # Bounded experience queue (FIFO, ExpN=8)
   schemas.py              # Pydantic models for all data contracts
   agents/
     profiler.py           # NCU runner + CSV parser + profiling_context builder
-    planner.py            # LLM agent: profiling data -> optimization plan
-    executor.py           # LLM agent: plan + kernel -> optimized kernel
-    summarizer.py         # LLM agent: before/after -> experience item
+    planner.py            # Claude agent: profiling data -> optimization plan
+    executor.py           # Claude agent: plan + kernel -> optimized kernel
+    correctness.py        # Claude agent: generate CPU reference + validate
+    summarizer.py         # Claude agent: before/after -> experience item
   functions/
     csv_parser.py         # NCU sections-based CSV parser
-    correctness.py        # Subprocess correctness checker (.py and .cu)
+    correctness.py        # Correctness wrapper (agentic + subprocess modes)
     selector.py           # Best candidate selector
-  serving/
-    manager.py            # TorchServeManager context manager (start/stop)
-    gateway.py            # FastAPI proxy: OpenAI format <-> TorchServe
-    qwen3_handler.py      # TorchServe handler for Qwen3-30B-A3B (BF16)
-    qwen3_coder_handler.py # TorchServe handler for Qwen3-Coder-Next (FP8)
-    config.properties     # TorchServe server config
 ```
 
 ### LangGraph Pipeline
@@ -163,28 +147,20 @@ profile_baseline -> generate_plans -> execute_plans -> profile_candidates
                      END
 ```
 
-- **generate_plans** and **summarize_results** use `ThreadPoolExecutor` for concurrent LLM calls (enables TorchServe batch inference)
+- **generate_plans** and **summarize_results** use `ThreadPoolExecutor` for concurrent Claude API calls
 - **execute_plans** and **profile_candidates** run sequentially (GPU-bound)
 
 ### Model Configuration
 
 | Agent | Default Model | Purpose |
 |-------|--------------|---------|
-| Planner | Qwen/Qwen3-30B-A3B | Analyze profiling data, generate optimization hypotheses |
-| Summarizer | Qwen/Qwen3-30B-A3B | Extract reusable experience from results |
-| Executor | Qwen/Qwen3-Coder-Next-FP8 | Rewrite kernel code per plan |
+| Profiler | (rule-based) | Parse NCU CSV into structured profiling context |
+| Planner | claude-sonnet-4@20250514 | Analyze profiling data, generate optimization hypotheses |
+| Executor | claude-sonnet-4@20250514 | Rewrite kernel code per plan |
+| Correctness | claude-sonnet-4@20250514 | Generate CPU reference and validate GPU outputs |
+| Summarizer | claude-sonnet-4@20250514 | Extract reusable experience from results |
 
-### TorchServe Backend
-
-When `--torchserve` is used, the CLI automatically:
-1. Packages model archives (.mar)
-2. Starts TorchServe on the specified GPU
-3. Registers both models with batch inference config
-4. Starts a FastAPI gateway on port 8000
-5. Runs the LangGraph pipeline
-6. Shuts everything down on exit
-
-Both models fit on a single H200 (150GB): ~60GB BF16 + ~30GB FP8 = ~90GB with 60GB headroom for KV cache.
+All AI agents use **Claude Sonnet 4** on Vertex AI by default.
 
 ## Output
 
@@ -209,6 +185,28 @@ The optimization memory is a bounded FIFO queue (capacity 8) of experience items
 - When to apply and when not to apply
 
 Memory persists across runs via `--memory optimization_memory.json`, enabling the planner to learn from past attempts.
+
+## Testing
+
+```bash
+# Test Claude API connection
+python3 test_claude.py
+
+# Test individual agents
+python3 test_agents_individual.py
+
+# Run example pipeline
+./run_example.sh
+```
+
+## Features
+
+- 🤖 **AI-Powered**: Claude analyzes NCU profiles and generates optimizations
+- 🔄 **Iterative**: Multi-iteration optimization with learning memory
+- 🎯 **Targeted**: NCU rules guide specific bottleneck fixes
+- ✅ **Safe**: Agentic correctness checking (Claude generates CPU reference tests)
+- 📊 **Transparent**: Full NCU reports + optimization logs
+- 🧠 **Learning**: Builds reusable optimization memory across runs
 
 ## License
 
