@@ -18,6 +18,7 @@ def check_correctness(
     model: str = "claude-sonnet-4@20250514",
     project_id: str | None = None,
     region: str | None = None,
+    kernel_args: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Verify an optimized kernel is correct.
@@ -25,6 +26,7 @@ def check_correctness(
     Args:
         use_agentic: If True, use Claude to generate CPU reference and compare.
                      If False, use subprocess mode (relies on built-in tests).
+        kernel_args: Command-line args for test configuration consistency.
 
     Returns (passed, diagnosis_message).
     """
@@ -38,6 +40,7 @@ def check_correctness(
             model=model,
             project_id=project_id,
             region=region,
+            kernel_args=kernel_args,
         )
     else:
         return check_correctness_subprocess(

@@ -26,7 +26,7 @@ from kernelopt.agents.profiler import (
     run_ncu,
 )
 from kernelopt.agents.summarizer import run_summarizer
-from kernelopt.functions.correctness import check_correctness_subprocess
+from kernelopt.functions.correctness import check_correctness
 from kernelopt.functions.csv_parser import parse_ncu_csv
 from kernelopt.memory import append_items, save_memory, select_top_k
 from kernelopt.state import (
@@ -60,14 +60,16 @@ def run_pipeline(state: PipelineState) -> PipelineState:
     else:
         console.print("[bold]Profiling baseline kernel...[/]")
         baseline_base = str(output_dir / "baseline")
-        csv_path, ncu_rep = run_ncu(
+        csv_path, ncu_rep, ctx_json = run_ncu(
             state.kernel_path,
             baseline_base,
-            kernel_name_regex=cfg.kernel_name_regex,
+            kernel_name=cfg.kernel_name,
             launch_skip=cfg.launch_skip,
             launch_count=cfg.launch_count,
             ncu_extra_args=cfg.ncu_extra_args or None,
             kernel_args=cfg.kernel_args or None,
+            kernel_id=state.kernel_id,
+            save_profiling_context=True,
         )
 
     sections, rules, launch = parse_ncu_csv(csv_path, state.kernel_id)
@@ -171,7 +173,8 @@ def _run_iteration(
                 optimization_memory=state.optimization_memory,
                 api_key=cfg.api_key,
                 model=cfg.planner_model or cfg.model,
-                base_url=cfg.planner_base_url or cfg.base_url,
+                project_id=cfg.project_id,
+                region=cfg.region,
                 plan_index=i,
                 total_plans=cfg.N,
                 previous_directions=previous_directions,
@@ -204,7 +207,8 @@ def _run_iteration(
                     framework=state.framework,
                     api_key=cfg.api_key,
                     model=cfg.executor_model or cfg.model,
-                    base_url=cfg.executor_base_url or cfg.base_url,
+                    project_id=cfg.project_id,
+                    region=cfg.region,
                     attempt=attempt,
                 )
             except Exception as e:
@@ -227,8 +231,13 @@ def _run_iteration(
             Path(kernel_file).write_text(optimized_source)
 
             # Correctness check
-            passed, msg = check_correctness_subprocess(
+            passed, msg = check_correctness(
                 state.kernel_path, optimized_source, state.framework,
+                use_agentic=cfg.agentic_correctness,
+                api_key=cfg.api_key,
+                project_id=cfg.project_id,
+                region=cfg.region,
+                kernel_args=cfg.kernel_args,
             )
 
             # Update execution_result with correctness outcome
@@ -270,14 +279,16 @@ def _run_iteration(
         Path(kernel_file).write_text(c.optimized_kernel)
 
         try:
-            csv_path, ncu_rep_path = run_ncu(
+            csv_path, ncu_rep_path, ctx_json_path = run_ncu(
                 kernel_file,
                 output_base,
-                kernel_name_regex=cfg.kernel_name_regex,
+                kernel_name=cfg.kernel_name,
                 launch_skip=cfg.launch_skip,
                 launch_count=cfg.launch_count,
                 ncu_extra_args=cfg.ncu_extra_args or None,
                 kernel_args=cfg.kernel_args or None,
+                kernel_id=state.kernel_id,
+                save_profiling_context=True,
             )
             sections, rules, launch = parse_ncu_csv(
                 csv_path, state.kernel_id
@@ -329,7 +340,8 @@ def _run_iteration(
                 execution_result=c.execution_result,
                 api_key=cfg.api_key,
                 model=cfg.summarizer_model or cfg.model,
-                base_url=cfg.summarizer_base_url or cfg.base_url,
+                project_id=cfg.project_id,
+                region=cfg.region,
             )
             experience_items.append(item)
             memory_updates.append(mem_update)

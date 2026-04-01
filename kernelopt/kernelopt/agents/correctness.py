@@ -153,9 +153,14 @@ def run_correctness_agent(
     model: str = "claude-sonnet-4@20250514",
     project_id: str | None = None,
     region: str | None = None,
+    kernel_args: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Call Claude to generate and run a correctness test.
+
+    Args:
+        kernel_args: Command-line args used for profiling (e.g., ['--m', '64', '--n', '8192'])
+                     The test should use these same input shapes for consistency.
 
     Returns (passed, message).
     """
@@ -168,10 +173,22 @@ def run_correctness_agent(
         region=region,
     )
 
+    # Extract test configuration from kernel_args
+    config_note = ""
+    if kernel_args:
+        args_str = " ".join(kernel_args)
+        config_note = (
+            f"\n\n## Test Configuration\n"
+            f"The kernel is being profiled with these arguments: `{args_str}`\n"
+            f"Your test MUST use the same input shapes/sizes for consistency with profiling.\n"
+            f"Parse these args to extract the test dimensions (e.g., --m 64 --n 8192 means M=64, N=8192)."
+        )
+
     human_msg = (
         f"## Framework: {framework}\n\n"
         f"## Kernel Source ({Path(kernel_path).name})\n"
-        f"```\n{kernel_source}\n```\n\n"
+        f"```\n{kernel_source}\n```"
+        f"{config_note}\n\n"
         f"Generate a correctness test that validates this kernel against a CPU reference."
     )
 
@@ -210,14 +227,31 @@ def run_correctness_agent(
             print(f"[DEBUG] Correctness test skipped: {reason}")
             return True, f"Skipped: {reason}"
 
+        # Write optimized kernel to temp file so test can import it
+        kernel_basename = Path(kernel_path).stem
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False, dir='/tmp',
+            prefix=f'{kernel_basename}_optimized_'
+        ) as f:
+            optimized_kernel_path = f.name
+            f.write(kernel_source)
+
+        # Inject sys.path manipulation into test code to import optimized kernel
+        kernel_module = Path(optimized_kernel_path).stem
+        test_code_fixed = test_code.replace(
+            f"from {kernel_basename} import",
+            f"import sys; sys.path.insert(0, '/tmp'); from {kernel_module} import"
+        )
+
         # Write test to temp file
         with tempfile.NamedTemporaryFile(
             mode='w', suffix='.py', delete=False, dir='/tmp'
         ) as f:
             test_path = f.name
-            f.write(test_code)
+            f.write(test_code_fixed)
 
         print(f"[DEBUG] Running agentic correctness test: {test_path}")
+        print(f"[DEBUG] Optimized kernel saved to: {optimized_kernel_path}")
 
         # Run test
         result = subprocess.run(
@@ -233,8 +267,13 @@ def run_correctness_agent(
         print(f"[DEBUG] Test stdout: {result.stdout[:300]}")
         print(f"[DEBUG] Test stderr: {result.stderr[:300]}")
 
-        # Clean up
-        Path(test_path).unlink()
+        # Clean up (keep files for debugging if test failed)
+        if result.returncode == 0:
+            Path(test_path).unlink()
+            Path(optimized_kernel_path).unlink()
+        else:
+            print(f"[DEBUG] Keeping test file for debugging: {test_path}")
+            print(f"[DEBUG] Keeping optimized kernel for debugging: {optimized_kernel_path}")
 
         if result.returncode == 0:
             print(f"[DEBUG] Agentic correctness test PASSED")

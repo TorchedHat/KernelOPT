@@ -60,45 +60,32 @@ def run(
         help="Extra args passed to the kernel program (e.g. '--profile-only --m 4096')"
     ),
     api_key: Optional[str] = typer.Option(
-        None, "--api-key", help="API key (not needed for local vLLM)"
+        None, "--api-key", help="API key (not needed for Vertex AI)"
     ),
     model: str = typer.Option(
-        "Qwen/Qwen3-32B", help="Default model name (used when per-agent models not set)"
+        "claude-sonnet-4@20250514", help="Default model name (used when per-agent models not set)"
     ),
-    base_url: str = typer.Option(
-        "http://localhost:8000/v1", "--base-url",
-        help="Default vLLM/OpenAI-compatible API base URL"
+    project_id: Optional[str] = typer.Option(
+        None, "--project-id", envvar="ANTHROPIC_VERTEX_PROJECT_ID",
+        help="Google Cloud project ID for Vertex AI"
     ),
-    local: bool = typer.Option(
-        False, "--local",
-        help="Use dual local vLLM servers (planner+summarizer on 8001, executor on 8000)"
+    region: str = typer.Option(
+        "us-east5", "--region", help="Vertex AI region"
     ),
     planner_model: Optional[str] = typer.Option(
         None, "--planner-model", help="Model for planner agent"
     ),
-    planner_url: Optional[str] = typer.Option(
-        None, "--planner-url", help="Base URL for planner agent"
-    ),
     summarizer_model: Optional[str] = typer.Option(
         None, "--summarizer-model", help="Model for summarizer agent"
-    ),
-    summarizer_url: Optional[str] = typer.Option(
-        None, "--summarizer-url", help="Base URL for summarizer agent"
     ),
     executor_model: Optional[str] = typer.Option(
         None, "--executor-model", help="Model for executor agent"
     ),
-    executor_url: Optional[str] = typer.Option(
-        None, "--executor-url", help="Base URL for executor agent"
-    ),
-    torchserve: bool = typer.Option(
-        False, "--torchserve",
-        help="Use TorchServe backend with LangGraph pipeline (auto-starts servers)"
-    ),
-    gpu: int = typer.Option(
-        2, "--gpu", help="GPU device ID for TorchServe models"
-    ),
     verbose: bool = typer.Option(False, help="Verbose output"),
+    agentic_correctness: bool = typer.Option(
+        True, "--agentic-correctness/--no-agentic-correctness",
+        help="Use Claude to generate CPU reference tests (default: True)"
+    ),
 ):
     """Run the full optimization pipeline.
 
@@ -118,45 +105,27 @@ def run(
 
     kernel_basename = kernel_path.stem
 
-    # --torchserve sets defaults for TorchServe + LangGraph on a single GPU
-    if torchserve:
-        planner_model = planner_model or "Qwen/Qwen3-30B-A3B"
-        planner_url = planner_url or "http://localhost:8000/v1"
-        summarizer_model = summarizer_model or "Qwen/Qwen3-30B-A3B"
-        summarizer_url = summarizer_url or "http://localhost:8000/v1"
-        executor_model = executor_model or "Qwen/Qwen3-Coder-Next-FP8"
-        executor_url = executor_url or "http://localhost:8000/v1"
-    # --local sets defaults for dual vLLM servers
-    elif local:
-        planner_model = planner_model or "Qwen/Qwen3-30B-A3B"
-        planner_url = planner_url or "http://localhost:8001/v1"
-        summarizer_model = summarizer_model or "Qwen/Qwen3-30B-A3B"
-        summarizer_url = summarizer_url or "http://localhost:8001/v1"
-        executor_model = executor_model or "Qwen/Qwen3-Coder-Next-FP8"
-        executor_url = executor_url or "http://localhost:8000/v1"
-
     cfg = PipelineConfig(
         T=iterations,
         N=plans,
         K=attempts,
         TopK=top_k,
-        kernel_name_regex=kernel_name,
+        kernel_name=kernel_name,
         launch_skip=launch_skip,
         launch_count=launch_count,
         kernel_args=kernel_args.split() if kernel_args else [],
         model=model,
         api_key=api_key,
-        base_url=base_url,
+        project_id=project_id or "",
+        region=region,
         planner_model=planner_model,
-        planner_base_url=planner_url,
         summarizer_model=summarizer_model,
-        summarizer_base_url=summarizer_url,
         executor_model=executor_model,
-        executor_base_url=executor_url,
         output_dir=str(output_dir),
         kernel_path=str(kernel_path),
         baseline_csv=str(csv) if csv else None,
         verbose=verbose,
+        agentic_correctness=agentic_correctness,
     )
 
     state = PipelineState(
@@ -173,25 +142,12 @@ def run(
         f"[bold green]kernelopt[/] starting on "
         f"[cyan]{kernel_path.name}[/]\n"
         f"  T={iterations} iterations, N={plans} plans/iter, "
-        f"K={attempts} attempts/plan, TopK={top_k}"
+        f"K={attempts} attempts/plan, TopK={top_k}\n"
+        f"  Backend: [cyan]Claude on Vertex AI[/] ({model})"
     )
-    if torchserve:
-        console.print(f"  Backend: [cyan]TorchServe + LangGraph[/] on GPU {gpu}")
 
-    if torchserve:
-        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
-        from kernelopt.serving.manager import TorchServeManager
-
-        with TorchServeManager(
-            gpu_id=gpu,
-            planner_model=planner_model or "Qwen/Qwen3-30B-A3B",
-            executor_model=executor_model or "Qwen/Qwen3-Coder-Next-FP8",
-        ) as ts:
-            ts.wait_ready()
-            final = run_langgraph_pipeline(state)
-    else:
-        from kernelopt.graph import run_pipeline
-        final = run_pipeline(state)
+    from kernelopt.langgraph_pipeline import run_langgraph_pipeline
+    final = run_langgraph_pipeline(state)
 
     baseline_lat = final.baseline_profiling_context.get(
         "sections", {}
@@ -250,16 +206,19 @@ def profile(
         f"[bold green]kernelopt profile[/] "
         f"[cyan]{kernel_path.name}[/] → {output}"
     )
-    csv_path, ncu_rep = run_ncu(
+    csv_path, ncu_rep, ctx_json = run_ncu(
         str(kernel_path),
         str(output),
-        kernel_name_regex=kernel_name,
+        kernel_name=kernel_name,
         launch_skip=launch_skip,
         launch_count=launch_count,
         kernel_args=kernel_args.split() if kernel_args else None,
+        kernel_id=kernel_id,
+        save_profiling_context=True,
     )
     console.print(f"  CSV: [cyan]{csv_path}[/]")
     console.print(f"  ncu-rep: [cyan]{ncu_rep}[/]")
+    console.print(f"  profiling context: [cyan]{ctx_json}[/]")
 
     sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
     ctx = build_profiling_context(
@@ -299,7 +258,14 @@ def plan(
     api_key: Optional[str] = typer.Option(
         None, envvar="ANTHROPIC_API_KEY"
     ),
-    model: str = typer.Option("claude-sonnet-4-5"),
+    model: str = typer.Option("claude-sonnet-4@20250514"),
+    project_id: Optional[str] = typer.Option(
+        None, "--project-id", envvar="ANTHROPIC_VERTEX_PROJECT_ID",
+        help="Google Cloud project ID for Vertex AI"
+    ),
+    region: str = typer.Option(
+        "us-east5", "--region", help="Vertex AI region"
+    ),
 ):
     """Generate optimization plan(s) from a profile CSV (no execution)."""
     import json
@@ -319,6 +285,7 @@ def plan(
         result = run_planner(
             ctx, kernel_path.read_text(), mem,
             api_key=api_key, model=model,
+            project_id=project_id, region=region,
         )
         if num_plans > 1:
             console.print(f"\n[bold]Plan {i + 1}/{num_plans}:[/]")

@@ -61,7 +61,7 @@ def profile_baseline(state: GraphState) -> dict:
     else:
         console.print("[bold]Profiling baseline kernel...[/]")
         baseline_base = str(output_dir / "baseline")
-        csv_path, ncu_rep = run_ncu(
+        csv_path, ncu_rep, ctx_json = run_ncu(
             kernel_path,
             baseline_base,
             kernel_name=cfg.kernel_name,
@@ -69,6 +69,8 @@ def profile_baseline(state: GraphState) -> dict:
             launch_count=cfg.launch_count,
             ncu_extra_args=cfg.ncu_extra_args or None,
             kernel_args=cfg.kernel_args or None,
+            kernel_id=kernel_id,
+            save_profiling_context=True,
         )
 
     sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
@@ -85,6 +87,7 @@ def profile_baseline(state: GraphState) -> dict:
         f"  Baseline: [cyan]{latency:.0f} ns[/]  "
         f"Framework: [green]{framework}[/]"
     )
+    console.print(f"  [dim]Profiling context: {ctx_json}[/]")
 
     return {
         "baseline_profiling_context": baseline_ctx,
@@ -235,6 +238,7 @@ def execute_plans(state: GraphState) -> dict:
                 api_key=cfg.api_key,
                 project_id=cfg.project_id,
                 region=cfg.region,
+                kernel_args=cfg.kernel_args,
             )
             execution_result["correctness"] = "passed" if passed else "failed"
 
@@ -292,7 +296,7 @@ def profile_candidates(state: GraphState) -> dict:
         Path(kernel_file).write_text(c.optimized_kernel)
 
         try:
-            csv_path, ncu_rep_path = run_ncu(
+            csv_path, ncu_rep_path, ctx_json_path = run_ncu(
                 kernel_file,
                 output_base,
                 kernel_name=cfg.kernel_name,
@@ -300,6 +304,8 @@ def profile_candidates(state: GraphState) -> dict:
                 launch_count=cfg.launch_count,
                 ncu_extra_args=cfg.ncu_extra_args or None,
                 kernel_args=cfg.kernel_args or None,
+                kernel_id=kernel_id,
+                save_profiling_context=True,
             )
             sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
             ctx = build_profiling_context(

@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from kernelopt.functions.csv_parser import parse_ncu_csv
+from kernelopt.agents.gpu_specs import get_gpu_specs
 
 
 def detect_framework(kernel_name: str) -> str:
@@ -33,14 +34,14 @@ def detect_framework(kernel_name: str) -> str:
         return "cuda"
     if "__global__" in kernel_name or re.search(r"void\s+\w+<", kernel_name):
         return "cuda"
-    return "cuda" if kernel_name else "unknown"
+    return "unknown"
 
 
 def build_ncu_command(
     kernel_path: str,
     output_basename: str,
     *,
-    kernel_name_regex: str | None = None,
+    kernel_name: str | None = None,
     launch_skip: int = 0,
     launch_count: int | None = None,
     ncu_extra_args: list[str] | None = None,
@@ -54,6 +55,9 @@ def build_ncu_command(
       Step 2: Export  → ncu --import {ncu-rep} --csv > {output_basename}.csv
 
     Args:
+        kernel_name:    Kernel name filter. Pass as-is to NCU --kernel-name.
+                        For exact match: "my_kernel"
+                        For regex: "regex:my_.*_kernel" or "regex:(forward|backward)_kernel"
         ncu_extra_args: Extra flags passed to NCU itself (before the runner).
         kernel_args:    Extra args passed to the kernel program (after the runner).
                         e.g. ["--profile-only", "--m", "4096"]
@@ -72,8 +76,8 @@ def build_ncu_command(
         "--kernel-name-base", "demangled",
     ]
 
-    if kernel_name_regex:
-        cmd.extend(["--kernel-name", f"regex:{kernel_name_regex}"])
+    if kernel_name:
+        cmd.extend(["--kernel-name", kernel_name])
 
     cmd.extend(["--launch-skip", str(launch_skip)])
 
@@ -95,8 +99,24 @@ def build_ncu_command(
 
 def _export_csv_from_ncu_rep(ncu_rep_path: str, csv_path: str) -> None:
     """Export CSV from an existing .ncu-rep file using ncu --import --csv."""
+    import os
+
+    # Clean environment - NCU uses Python internally and can conflict with virtualenv
+    env = os.environ.copy()
+    env.pop('VIRTUAL_ENV', None)
+    env.pop('VIRTUAL_ENV_PROMPT', None)
+    env.pop('PYTHONHOME', None)
+    env.pop('PYTHONPATH', None)
+    env.pop('PYTHONSTARTUP', None)
+
+    # Remove venv from PATH
+    if 'PATH' in env:
+        path_parts = env['PATH'].split(':')
+        path_parts = [p for p in path_parts if '.venv' not in p]
+        env['PATH'] = ':'.join(path_parts)
+
     cmd = ["ncu", "--import", ncu_rep_path, "--csv"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
     if result.returncode != 0:
         raise RuntimeError(
             f"NCU CSV export failed (exit {result.returncode}):\n"
@@ -110,24 +130,28 @@ def run_ncu(
     kernel_path: str,
     output_basename: str,
     *,
-    kernel_name_regex: str | None = None,
+    kernel_name: str | None = None,
     launch_skip: int = 0,
     launch_count: int | None = None,
     ncu_extra_args: list[str] | None = None,
     kernel_args: list[str] | None = None,
-) -> tuple[str, str]:
+    kernel_id: int = 0,
+    save_profiling_context: bool = True,
+) -> tuple[str, str, str]:
     """
-    Execute NCU profiling in two steps:
+    Execute NCU profiling in three steps:
       1. Profile the kernel → .ncu-rep
       2. Export CSV from .ncu-rep → .csv
+      3. Build and save profiling_context.json → profiling context
 
-    Returns (csv_path, ncu_rep_path).
+    Returns (csv_path, ncu_rep_path, profiling_context_path).
     """
     # Step 1: Profile
+    # Don't clean environment here - the kernel script needs access to torch/triton
     cmd = build_ncu_command(
         kernel_path,
         output_basename,
-        kernel_name_regex=kernel_name_regex,
+        kernel_name=kernel_name,
         launch_skip=launch_skip,
         launch_count=launch_count,
         ncu_extra_args=ncu_extra_args,
@@ -147,7 +171,16 @@ def run_ncu(
     # Step 2: Export CSV from .ncu-rep
     _export_csv_from_ncu_rep(ncu_rep_path, csv_path)
 
-    return csv_path, ncu_rep_path
+    # Step 3: Build and save profiling_context.json (profiler agent's primary output)
+    profiling_context_path = f"{output_basename}_profiling_context.json"
+    if save_profiling_context:
+        from kernelopt.functions.csv_parser import parse_ncu_csv
+        import json
+        sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
+        ctx = build_profiling_context(sections, rules, launch, kernel_path, kernel_id)
+        Path(profiling_context_path).write_text(json.dumps(ctx, indent=2))
+
+    return csv_path, ncu_rep_path, profiling_context_path
 
 
 def _extract_short_name(full_name: str) -> str:
@@ -201,8 +234,9 @@ def build_profiling_context(
     regs = _to_int(
         launch_stats.get("Registers Per Thread", {}).get("value")
     )
+    # NCU uses "# SMs", not "SM Count"
     sm_count = _to_int(
-        launch_stats.get("SM Count", {}).get("value")
+        launch_stats.get("# SMs", {}).get("value")
     )
     dyn_smem = _to_int(
         launch_stats.get("Dynamic Shared Memory Per Block", {}).get("value")
@@ -214,9 +248,16 @@ def build_profiling_context(
         launch_stats.get("Threads", {}).get("value")
     )
 
+    # Extract waves_per_sm from CSV (more accurate than calculating from grid/sm_count)
+    waves_per_sm_raw = launch_stats.get("Waves Per SM", {}).get("value")
     waves_per_sm = None
-    if sm_count and sm_count > 0 and grid_size:
-        waves_per_sm = round(grid_size / sm_count, 2)
+    if waves_per_sm_raw is not None:
+        try:
+            waves_per_sm = float(waves_per_sm_raw)
+        except (ValueError, TypeError):
+            # Fallback to calculation if parse fails
+            if sm_count and sm_count > 0 and grid_size:
+                waves_per_sm = round(grid_size / sm_count, 2)
 
     launch_config: dict = {
         "block_size": block_size,
@@ -229,6 +270,9 @@ def build_profiling_context(
         "threads": threads,
     }
 
+    # Get GPU hardware specs for roofline analysis
+    gpu_specs = get_gpu_specs(sm_count, cc)
+
     return {
         "kernel_name": kernel_name,
         "kernel_name_full": kernel_name_full,
@@ -237,6 +281,7 @@ def build_profiling_context(
         "device": device,
         "compute_capability": cc,
         "launch": launch_config,
+        "gpu_specs": gpu_specs,
         "sections": sections,
         "rules": list(rules),
     }

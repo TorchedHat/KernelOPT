@@ -1,14 +1,54 @@
-"""Shared LLM factory — uses a local vLLM server with OpenAI-compatible API."""
+"""Shared LLM factory — uses Claude on Vertex AI via langchain-anthropic."""
 
 from __future__ import annotations
 
+import os
 import re
+from functools import cached_property
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
 
-DEFAULT_MODEL = "Qwen/Qwen3-32B"
-DEFAULT_BASE_URL = "http://localhost:8000/v1"
+DEFAULT_MODEL = "claude-sonnet-4@20250514"
+DEFAULT_PROJECT_ID = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
+DEFAULT_REGION = "us-east5"
+
+
+def _build_vertex_llm(
+    model: str,
+    project_id: str,
+    region: str,
+    max_tokens: int,
+    temperature: float,
+) -> BaseChatModel:
+    """Return a ChatAnthropic subclass backed by AnthropicVertex."""
+    from anthropic import AnthropicVertex, AsyncAnthropicVertex
+    from langchain_anthropic import ChatAnthropic
+
+    class _ChatAnthropicVertex(ChatAnthropic):
+        _vertex_project_id: str = project_id
+        _vertex_region: str = region
+
+        @cached_property
+        def _client(self):
+            return AnthropicVertex(
+                project_id=self._vertex_project_id,
+                region=self._vertex_region,
+            )
+
+        @cached_property
+        def _async_client(self):
+            return AsyncAnthropicVertex(
+                project_id=self._vertex_project_id,
+                region=self._vertex_region,
+            )
+
+    return _ChatAnthropicVertex(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        anthropic_api_key="not-needed",
+    )
 
 
 def build_llm(
@@ -16,26 +56,25 @@ def build_llm(
     api_key: str | None = None,
     max_tokens: int = 4096,
     temperature: float = 0.2,
-    base_url: str = DEFAULT_BASE_URL,
+    project_id: str | None = None,
+    region: str | None = None,
 ) -> BaseChatModel:
     """
-    Return a LangChain chat model pointing at a local vLLM server.
+    Return a LangChain chat model backed by Claude on Vertex AI.
 
-    Uses ChatOpenAI with a custom base_url (OpenAI-compatible API).
+    Uses ChatAnthropic with AnthropicVertex client underneath.
     """
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(
+    return _build_vertex_llm(
         model=model,
-        base_url=base_url,
-        api_key=api_key or "not-needed",
+        project_id=project_id or DEFAULT_PROJECT_ID,
+        region=region or DEFAULT_REGION,
         max_tokens=max_tokens,
         temperature=temperature,
     )
 
 
 def strip_thinking(content: str) -> str:
-    """Strip <think>...</think> blocks from Qwen3 thinking model output."""
+    """Strip <think>...</think> blocks from thinking model output."""
     return re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
 
 

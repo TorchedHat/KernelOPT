@@ -47,24 +47,22 @@ class PipelineConfig:
     t_neg: float = 1.15  # min slowdown factor to store negative item
 
     # NCU options
-    kernel_name_regex: str | None = None
+    kernel_name: str | None = None
     launch_skip: int = 0
     launch_count: int | None = None
     ncu_extra_args: list[str] = field(default_factory=list)
     kernel_args: list[str] = field(default_factory=list)  # args passed to kernel program
 
     # LLM options (defaults, used when per-agent options are not set)
-    model: str = "Qwen/Qwen3-32B"
+    model: str = "claude-sonnet-4@20250514"
     api_key: str | None = None
-    base_url: str = "http://localhost:8000/v1"
+    project_id: str = ""
+    region: str = "us-east5"
 
-    # Per-agent model/URL overrides (for dual-model / --local mode)
+    # Per-agent model overrides
     planner_model: str | None = None
-    planner_base_url: str | None = None
     summarizer_model: str | None = None
-    summarizer_base_url: str | None = None
     executor_model: str | None = None
-    executor_base_url: str | None = None
 
     # Paths
     output_dir: str = "pipeline_output"
@@ -73,6 +71,7 @@ class PipelineConfig:
 
     # Runtime
     verbose: bool = False
+    agentic_correctness: bool = True  # Use Claude to generate CPU reference tests
 
 
 @dataclass

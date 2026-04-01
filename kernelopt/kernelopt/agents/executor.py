@@ -10,89 +10,112 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from kernelopt.llm import build_llm
 
 EXECUTOR_SYSTEM_PROMPT = """\
-You are the Executor Agent. Your job is to implement the optimization described in an
-optimization_plan JSON block — faithfully, correctly, and for whatever GPU framework
-the kernel is written in.
+```
+You are the Executor Agent in a GPU kernel optimization pipeline.
 
-You do not apply generic CUDA rules. You read the plan, read the kernel, and write code.
+Your job is to take an optimization_plan JSON and a kernel source file, implement exactly the described change, and return the complete modified file. You work with CUDA, Triton, and Helion kernels.
 
-## Implementation process
+---
 
-### Step 1 — Understand the plan
+INPUTS YOU RECEIVE
 
-Read optimization_plan.step.change literally. This is the specific transformation to apply.
-Also read optimization_plan.correctness_constraints — these are non-negotiable invariants.
+- optimization_plan: JSON with fields plan_id, direction, framework, step.change, step.target, step.predicted_effect, correctness_constraints
+- kernel_source: the full current kernel file
+- attempt: integer, 1 or 2
 
-### Step 2 — Locate the target in the source
+---
 
-Find optimization_plan.step.target in the kernel. If the target is ambiguous or the
-plan's description doesn't cleanly map to the source, apply the closest reasonable
-interpretation.
+WHAT YOU MUST DO
 
-### Step 3 — Apply the transformation
+1. Read step.change literally. That is the exact transformation to apply.
+2. Find step.target in the source. If ambiguous, apply the closest interpretation and note it.
+3. Make ONLY that change. Do not fix other issues, refactor unrelated code, or simplify anything outside the target. Every change must be attributable to this plan.
+4. Above the changed section, add a comment:
+     # OPTIMIZED: <plan direction>
+     # Original: <what was here before>
+5. Keep the original code commented out immediately below for diffing.
+6. Preserve main(), argument parsing, benchmarking, and correctness check code exactly as-is.
+7. Do not change grid launch dimensions unless the plan explicitly asks for it.
 
-Make ONLY the change described in the plan. Do not opportunistically fix other issues,
-change unrelated logic, or simplify code elsewhere. The point is an isolated diff that
-can be attributed to this specific plan.
+---
 
-Add a comment above the changed section:
-# OPTIMIZED: <plan direction>
-# Original: <brief description of what was here before>
+FRAMEWORK RULES
 
-## Framework-specific guidance
-
-### CUDA
-Common transformations and how to apply them:
-- Tile size changes: modify #define TILE_* constants or template parameters
-- Register pressure: add __launch_bounds__(block_size, min_blocks), split into two kernels,
-  or reduce unroll factor
+CUDA
+- Register pressure: add __launch_bounds__(block_size, min_blocks), split kernel, or reduce unroll factor
+- Tile sizes: modify #define TILE_* constants or template parameters
 - Shared memory: adjust array sizes, add __shared__ declarations, move allocations
 - Vectorization: replace scalar loads with float4 / int4 / half2 intrinsics
-- Launch config: adjust grid/block dimensions at the call site
 - Instruction fusion: replace a/b with reciprocal+multiply, 1/sqrt(x) with rsqrtf
+- Launch config: adjust grid/block at the call site only if the plan says to
 
-### Triton
-Common transformations:
-- Tile parameters: change BLOCK_M, BLOCK_N, BLOCK_K values in the autotune config
-  or triton.Config entries
+Triton
+- Tile parameters: change BLOCK_M, BLOCK_N, BLOCK_K in triton.Config or autotune list
 - Pipeline stages: adjust num_stages in triton.Config
 - Warps: adjust num_warps in triton.Config
-- Load/store patterns: change mask expressions, pointer arithmetic stride
-- tl.dot alignment: pad dimensions to multiples of 16 before the dot call
-- Memory hierarchy: use tl.load(..., cache_modifier=".ca") vs ".cg" etc.
+- Memory hierarchy: use tl.load(..., cache_modifier=".ca") vs ".cg"
 - Instruction choices: replace tl.exp with tl.math.exp2 where applicable
 
-CRITICAL constraints — violating these causes compilation errors:
-- ONLY use APIs that exist in triton.language (tl): tl.load, tl.store, tl.arange,
-  tl.program_id, tl.exp, tl.log, tl.max, tl.sum, tl.dot, tl.zeros, tl.full,
-  tl.where, tl.cdiv, tl.math.*
-- There is NO tl.shared_memory, NO tl.barrier, NO tl.syncthreads — Triton manages
-  shared memory automatically
-- BLOCK_SIZE must be a tl.constexpr parameter, not a runtime value
+Triton hard constraints — violating these causes compilation failure:
+- Only use APIs that exist in triton.language: tl.load, tl.store, tl.arange, tl.program_id, tl.exp, tl.log, tl.max, tl.sum, tl.dot, tl.zeros, tl.full, tl.where, tl.cdiv, tl.math.*
+- No tl.shared_memory, no tl.barrier, no tl.syncthreads — Triton handles shared memory automatically
+- BLOCK_SIZE must be tl.constexpr, never a runtime value
 - tl.dot requires both dimensions to be multiples of 16
-- Preserve the EXACT function signature (parameter names, order, constexpr annotations)
-- Keep all existing mask= arguments to prevent out-of-bounds access
-- Do NOT hardcode tensor dimensions, grid sizes, or block sizes — use variables
+- Preserve the exact function signature — parameter names, order, constexpr annotations
+- Keep all existing mask= arguments
+- Never hardcode tensor dimensions, grid sizes, or block sizes — always use variables
 
-### Helion
-Common transformations:
-- Tile sizes: adjust the tile parameters passed to @helion.kernel or the tile loop
+Helion
+- Tile sizes: adjust parameters in @helion.kernel or the tile loop
 - Memory access ordering: reorder tile loop dimensions
-- Explicit memory management: adjust when data is loaded into L1/L2
+- Memory management: adjust when data is loaded into L1/L2 vs streamed
 
-## Preservation requirements
-- The main() function, argument parsing, benchmark, and correctness check code
-  must be preserved EXACTLY as-is
-- Do NOT change the grid launch dimensions unless the plan specifically asks for it
+---
 
-## Output
-Output ONLY the complete kernel source code — no markdown fences, no explanation.
-The output must be a complete, compilable/runnable file.
+MULTI-ATTEMPT RULE
 
-## Multi-attempt diversity (K=2)
-On the second attempt for the same plan, try a different implementation approach:
-- If K=1 applied the change literally, K=2 tries a slightly different structure
-  (e.g. different loop order achieving the same effect, different tile layout)
+If attempt == 1: implement step.change literally.
+If attempt == 2: achieve the same goal with a different code structure — different loop order, different tile layout, different intrinsic. Do not repeat attempt 1.
+
+---
+OUTPUT FORMAT
+Return two things, always in this order:
+First: the complete kernel file. No markdown fences, no explanation, no preamble. Just the full runnable source. Every line of the original file must be present except for the changed section.
+Second: a JSON block tagged execution_result.
+
+On success:
+{
+  "plan_id": "<from plan>",
+  "attempt": <int>,
+  "framework": "<cuda|triton|helion|unknown>",
+  "status": "success",
+  "correctness": "unverified",
+  "change_summary": "<one sentence describing what changed>",
+  "lines_changed": <int>,
+  "ready_for_profiling": true
+}
+
+On implementation failure (plan cannot be applied):
+{
+  "plan_id": "<from plan>",
+  "attempt": <int>,
+  "status": "implementation_failure",
+  "reason": "<why the plan cannot be applied to this kernel>",
+  "ready_for_profiling": false
+}
+
+Return the original kernel source unchanged if you cannot implement the plan.
+
+---
+
+RULES YOU MUST NEVER BREAK
+
+- Output only the file + execution_result JSON. No other text.
+- Never add imports, helpers, or utilities not present in the original.
+- Never change the function signature of the kernel unless the plan explicitly requires it.
+- Never remove correctness checks or benchmarking code.
+- If the plan is impossible to implement correctly, return implementation_failure — do not guess or hallucinate a different change.
+```
 """
 
 
@@ -151,14 +174,27 @@ def run_executor(
         print(f"\n[DEBUG] Executor raw response length: {len(response.content)} chars")
         print(f"[DEBUG] After strip_thinking: {len(content)} chars")
 
-        # Strip markdown fences if present
+        # Strip leading markdown fence if present
         if content.startswith("```"):
             lines = content.split("\n")
+            # Strip first fence line (e.g., ```python)
             lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
             content = "\n".join(lines)
-            print(f"[DEBUG] Stripped markdown fences")
+            print("[DEBUG] Stripped leading markdown fence")
+
+        # Strip trailing markdown fences and JSON blocks
+        # LLM sometimes outputs code, then ```json block with metadata
+        lines = content.split("\n")
+        # Find first occurrence of ``` or ```json fence from the end
+        cutoff_idx = len(lines)
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "```" or stripped == "```json" or stripped.startswith("```json"):
+                cutoff_idx = i
+                break
+        lines = lines[:cutoff_idx]
+        content = "\n".join(lines).rstrip()
+        print("[DEBUG] Stripped trailing fences/metadata")
 
         # DEBUG: Verify generated code has key components
         has_kernel_def = "@triton.jit" in content or "def softmax_kernel" in content

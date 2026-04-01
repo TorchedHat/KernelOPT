@@ -84,6 +84,19 @@ summarize, threshold, or omit values. The planner needs the full picture.
     "threads": <int>
   },
 
+  "gpu_specs": {
+    "gpu_model": "<H100 SXM5|H100 PCIe|A100 SXM4|RTX 4090|RTX 3090|A100 SXM4 (assumed)>",
+    "gpu_model_detected": <bool>,
+    "peak_hbm_bandwidth_gbs": <float>,
+    "peak_fp32_tflops": <float>,
+    "peak_fp32_tensor_tflops": <float>,
+    "peak_fp16_tensor_tflops": <float>,
+    "peak_bf16_tensor_tflops": <float>,
+    "l2_cache_mb": <int>,
+    "sm_count": <int>,
+    "max_warps_per_sm": <int>
+  },
+
   "sections": {
     "<Section Name>": {
       "<Metric Name>": { "value": <number or string>, "unit": "<unit>" },
