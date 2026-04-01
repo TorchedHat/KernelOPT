@@ -8,13 +8,50 @@ import tempfile
 from pathlib import Path
 
 
+def check_correctness(
+    original_path: str,
+    optimized_source: str,
+    framework: str,
+    *,
+    use_agentic: bool = True,
+    api_key: str | None = None,
+    model: str = "claude-sonnet-4@20250514",
+    project_id: str | None = None,
+    region: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Verify an optimized kernel is correct.
+
+    Args:
+        use_agentic: If True, use Claude to generate CPU reference and compare.
+                     If False, use subprocess mode (relies on built-in tests).
+
+    Returns (passed, diagnosis_message).
+    """
+    if use_agentic:
+        from kernelopt.agents.correctness import run_correctness_agent
+        return run_correctness_agent(
+            kernel_source=optimized_source,
+            kernel_path=original_path,
+            framework=framework,
+            api_key=api_key,
+            model=model,
+            project_id=project_id,
+            region=region,
+        )
+    else:
+        return check_correctness_subprocess(
+            original_path, optimized_source, framework
+        )
+
+
 def check_correctness_subprocess(
     original_path: str,
     optimized_source: str,
     framework: str,
 ) -> tuple[bool, str]:
     """
-    Verify an optimized kernel is correct.
+    Legacy correctness check (runs kernel file as subprocess).
 
     For Python kernels: runs the optimized kernel (which should have its own
     correctness check built in). Passes if exit code is 0 and no failure
@@ -60,8 +97,15 @@ def _check_python_kernel(
 
         combined = result.stdout + result.stderr
 
+        # DEBUG: Log subprocess results
+        print(f"[DEBUG] Correctness subprocess returncode: {result.returncode}")
+        print(f"[DEBUG] stdout length: {len(result.stdout)}")
+        print(f"[DEBUG] stderr length: {len(result.stderr)}")
+        print(f"[DEBUG] Combined output preview:\n{combined[:300]}")
+
         # Check for crash
         if result.returncode != 0:
+            print(f"[DEBUG] Kernel crashed with exit code {result.returncode}")
             return False, (
                 f"Optimized kernel crashed (exit {result.returncode}):\n"
                 f"{combined[:500]}"
@@ -74,11 +118,16 @@ def _check_python_kernel(
         ]
         for indicator in failure_indicators:
             if indicator in combined:
+                context_start = max(0, combined.find(indicator) - 100)
+                context_end = combined.find(indicator) + 200
+                print(f"[DEBUG] Triggered by indicator: '{indicator}'")
+                print(f"[DEBUG] Context: {combined[context_start:context_end]}")
                 return False, (
                     f"Failure indicator '{indicator}' found in output:\n"
                     f"{combined[:500]}"
                 )
 
+        print(f"[DEBUG] Correctness check PASSED")
         return True, f"Kernel ran successfully (exit 0).\n{result.stdout[:200]}"
 
     except subprocess.TimeoutExpired:

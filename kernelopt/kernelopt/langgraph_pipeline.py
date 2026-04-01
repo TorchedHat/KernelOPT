@@ -25,7 +25,7 @@ from kernelopt.agents.profiler import (
     run_ncu,
 )
 from kernelopt.agents.summarizer import run_summarizer
-from kernelopt.functions.correctness import check_correctness_subprocess
+from kernelopt.functions.correctness import check_correctness
 from kernelopt.functions.csv_parser import parse_ncu_csv
 from kernelopt.memory import append_items, save_memory, select_top_k
 from kernelopt.state import (
@@ -64,7 +64,7 @@ def profile_baseline(state: GraphState) -> dict:
         csv_path, ncu_rep = run_ncu(
             kernel_path,
             baseline_base,
-            kernel_name_regex=cfg.kernel_name_regex,
+            kernel_name=cfg.kernel_name,
             launch_skip=cfg.launch_skip,
             launch_count=cfg.launch_count,
             ncu_extra_args=cfg.ncu_extra_args or None,
@@ -128,7 +128,8 @@ def generate_plans(state: GraphState) -> dict:
             optimization_memory=memory,
             api_key=cfg.api_key,
             model=cfg.planner_model or cfg.model,
-            base_url=cfg.planner_base_url or cfg.base_url,
+            project_id=cfg.project_id,
+            region=cfg.region,
             plan_index=i,
             total_plans=N,
             previous_directions=[],
@@ -183,6 +184,7 @@ def execute_plans(state: GraphState) -> dict:
         file_stem = f"{kernel_basename}_iter{iteration + 1}_plan{plan_letter}_{safe_dir}"
 
         for attempt in range(1, cfg.K + 1):
+            console.print(f"  [dim]Executing plan {plan_letter}, attempt {attempt}...[/]")
             try:
                 optimized_source, execution_result = run_executor(
                     kernel_source=current_kernel,
@@ -190,14 +192,25 @@ def execute_plans(state: GraphState) -> dict:
                     framework=framework,
                     api_key=cfg.api_key,
                     model=cfg.executor_model or cfg.model,
-                    base_url=cfg.executor_base_url or cfg.base_url,
+                    project_id=cfg.project_id,
+                    region=cfg.region,
                     attempt=attempt,
                 )
+
+                # DEBUG: Log execution result
+                console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
+                console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
+                console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
+                if "debug_info" in execution_result:
+                    console.print(f"  [dim]Debug info: {execution_result['debug_info']}[/]")
+
             except Exception as e:
                 console.print(
                     f"    [red]Executor failed "
                     f"(plan {plan_letter}, attempt {attempt}): {e}[/]"
                 )
+                import traceback
+                console.print(f"  [dim]{traceback.format_exc()[:500]}[/]")
                 continue
 
             if not execution_result.get("ready_for_profiling", False):
@@ -205,17 +218,28 @@ def execute_plans(state: GraphState) -> dict:
                     f"    [red]Plan {plan_letter}: "
                     f"{execution_result.get('status', 'failed')}[/]"
                 )
+                if "reason" in execution_result:
+                    console.print(f"    [dim]Reason: {execution_result['reason']}[/]")
                 continue
 
             # Save kernel file
             kernel_file = str(output_dir / f"{file_stem}{ext}")
             Path(kernel_file).write_text(optimized_source)
+            console.print(f"  [dim]Saved kernel to: {kernel_file}[/]")
 
             # Correctness check
-            passed, msg = check_correctness_subprocess(
+            console.print(f"  [dim]Running correctness check...[/]")
+            passed, msg = check_correctness(
                 kernel_path, optimized_source, framework,
+                use_agentic=cfg.agentic_correctness,
+                api_key=cfg.api_key,
+                project_id=cfg.project_id,
+                region=cfg.region,
             )
             execution_result["correctness"] = "passed" if passed else "failed"
+
+            # DEBUG: Log correctness result details
+            console.print(f"  [dim]Correctness message: {msg[:200]}[/]")
 
             candidate = PlanCandidate(
                 plan_id=plan.get("plan_id", ""),
@@ -230,6 +254,8 @@ def execute_plans(state: GraphState) -> dict:
 
             status = "[green]passed[/]" if passed else "[red]failed[/]"
             console.print(f"    Plan {plan_letter}: correctness {status}")
+            if not passed:
+                console.print(f"    [dim]Failure details: {msg[:300]}[/]")
 
             if passed:
                 candidates.append(candidate)
@@ -269,7 +295,7 @@ def profile_candidates(state: GraphState) -> dict:
             csv_path, ncu_rep_path = run_ncu(
                 kernel_file,
                 output_base,
-                kernel_name_regex=cfg.kernel_name_regex,
+                kernel_name=cfg.kernel_name,
                 launch_skip=cfg.launch_skip,
                 launch_count=cfg.launch_count,
                 ncu_extra_args=cfg.ncu_extra_args or None,
@@ -337,7 +363,8 @@ def summarize_results(state: GraphState) -> dict:
             execution_result=c.execution_result,
             api_key=cfg.api_key,
             model=cfg.summarizer_model or cfg.model,
-            base_url=cfg.summarizer_base_url or cfg.base_url,
+            project_id=cfg.project_id,
+            region=cfg.region,
         )
 
     with ThreadPoolExecutor(max_workers=len(summarize_candidates) or 1) as pool:
