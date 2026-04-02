@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 from pathlib import Path
@@ -10,31 +11,103 @@ from kernelopt.functions.csv_parser import parse_ncu_csv
 from kernelopt.agents.gpu_specs import get_gpu_specs
 
 
-def detect_framework(kernel_name: str) -> str:
-    """Detect kernel framework from the mangled kernel name.
-
-    Patterns from the skill spec:
-      triton_ prefix, __triton, triton::  → triton
-      helion_ prefix, helion::            → helion
-      at:: namespace                      → cuda (PyTorch ATen)
-      __global__, void kernel_name<       → cuda (native)
-      pycuda_ prefix                      → cuda (PyCUDA)
-      jit_ prefix with numba patterns     → cuda (Numba)
-      anything else                       → unknown
+def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
     """
+    Parse the kernel source file with AST (Python) or regex (CUDA) to detect
+    the framework and extract the names of all JIT/GPU kernel functions.
+
+    Returns:
+        (framework, kernel_names)
+        framework:    "triton" | "helion" | "cuda" | "unknown"
+        kernel_names: list of function names suitable for NCU --kernel-name
+
+    For Python files, walks the AST looking for:
+      @triton.jit or @tl.jit       → Triton kernel
+      @helion.kernel or @hl.kernel → Helion kernel
+
+    For .cu files, uses regex to find __global__ function names.
+
+    kernel_names can be passed directly to build_ncu_command():
+      1 name  → used as-is
+      N names → joined as "regex:(name1|name2|...)"
+      0 names → no --kernel-name flag (NCU profiles all kernels)
+    """
+    path = Path(kernel_path)
+    ext = path.suffix.lower()
+
+    if ext == ".py":
+        try:
+            source = path.read_text()
+            tree = ast.parse(source)
+        except (OSError, SyntaxError):
+            return "unknown", []
+        return _extract_python_kernels(tree)
+
+    elif ext == ".cu":
+        try:
+            source = path.read_text()
+        except OSError:
+            return "unknown", []
+        return _extract_cuda_kernels(source)
+
+    return "unknown", []
+
+
+def _extract_python_kernels(tree: ast.AST) -> tuple[str, list[str]]:
+    """Walk a Python AST and return (framework, [kernel_function_names])."""
+    triton_kernels: list[str] = []
+    helion_kernels: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            # @triton.jit  or  @tl.jit
+            if isinstance(dec, ast.Attribute) and dec.attr == "jit":
+                if isinstance(dec.value, ast.Name) and dec.value.id in ("triton", "tl"):
+                    triton_kernels.append(node.name)
+            # @helion.kernel  or  @hl.kernel
+            elif isinstance(dec, ast.Attribute) and dec.attr == "kernel":
+                if isinstance(dec.value, ast.Name) and dec.value.id in ("helion", "hl"):
+                    helion_kernels.append(node.name)
+
+    if triton_kernels:
+        return "triton", triton_kernels
+    if helion_kernels:
+        return "helion", helion_kernels
+    return "unknown", []
+
+
+def _extract_cuda_kernels(source: str) -> tuple[str, list[str]]:
+    """Extract __global__ kernel function names from CUDA source."""
+    names = re.findall(r'__global__\s+[\w\s*]+?\s+(\w+)\s*[(<]', source)
+    if names:
+        return "cuda", names
+    return "unknown", []
+
+
+def _detect_framework_from_name(kernel_name: str) -> str:
+    """Fallback: detect framework from the NCU demangled kernel name string."""
     if any(p in kernel_name for p in ["triton_", "__triton", "triton::"]):
         return "triton"
     if any(p in kernel_name for p in ["helion_", "helion::"]):
         return "helion"
-    if "at::" in kernel_name:
-        return "cuda"
-    if "pycuda_" in kernel_name:
+    if any(p in kernel_name for p in ["at::", "pycuda_"]):
         return "cuda"
     if kernel_name.startswith("jit_"):
         return "cuda"
     if "__global__" in kernel_name or re.search(r"void\s+\w+<", kernel_name):
         return "cuda"
     return "unknown"
+
+
+def _build_kernel_name_filter(kernel_names: list[str]) -> str | None:
+    """Convert a list of kernel names into an NCU --kernel-name argument."""
+    if not kernel_names:
+        return None
+    if len(kernel_names) == 1:
+        return kernel_names[0]
+    return "regex:(" + "|".join(kernel_names) + ")"
 
 
 def build_ncu_command(
@@ -44,6 +117,7 @@ def build_ncu_command(
     kernel_name: str | None = None,
     launch_skip: int = 0,
     launch_count: int | None = None,
+    replay_mode: str = "kernel",
     ncu_extra_args: list[str] | None = None,
     kernel_args: list[str] | None = None,
 ) -> list[str]:
@@ -54,24 +128,35 @@ def build_ncu_command(
       Step 1: Profile → writes {output_basename}.ncu-rep (no --csv)
       Step 2: Export  → ncu --import {ncu-rep} --csv > {output_basename}.csv
 
-    Args:
-        kernel_name:    Kernel name filter. Pass as-is to NCU --kernel-name.
-                        For exact match: "my_kernel"
-                        For regex: "regex:my_.*_kernel" or "regex:(forward|backward)_kernel"
-        ncu_extra_args: Extra flags passed to NCU itself (before the runner).
-        kernel_args:    Extra args passed to the kernel program (after the runner).
-                        e.g. ["--profile-only", "--m", "4096"]
+    kernel_name:
+      - If provided explicitly, used as-is (supports "regex:..." syntax).
+      - If None, auto-detected from the kernel source via AST/regex.
+      - If detection finds nothing, no --kernel-name flag is added (NCU
+        profiles all kernels and the first one is used).
+
+    replay_mode:
+      - "kernel" (default): replays only the kernel, lower overhead but
+        higher peak GPU memory (NCU saves/restores GPU memory state).
+      - "application": replays the full program, lower peak memory but
+        slower. Use for large inputs that cause OOM with kernel replay.
     """
+    import sys
+
     ext = Path(kernel_path).suffix
     if ext == ".py":
-        runner = ["python", kernel_path]
+        runner = [sys.executable, kernel_path]
     else:
         runner = [kernel_path.replace(ext, "")]
+
+    # Auto-detect kernel name from source when not explicitly provided
+    if kernel_name is None:
+        _, detected_names = extract_kernel_info(kernel_path)
+        kernel_name = _build_kernel_name_filter(detected_names)
 
     cmd = [
         "ncu",
         "--set", "full",
-        "--replay-mode", "kernel",
+        "--replay-mode", replay_mode,
         "--target-processes", "all",
         "--kernel-name-base", "demangled",
     ]
@@ -133,6 +218,7 @@ def run_ncu(
     kernel_name: str | None = None,
     launch_skip: int = 0,
     launch_count: int | None = None,
+    replay_mode: str = "kernel",
     ncu_extra_args: list[str] | None = None,
     kernel_args: list[str] | None = None,
     kernel_id: int = 0,
@@ -147,25 +233,37 @@ def run_ncu(
     Returns (csv_path, ncu_rep_path, profiling_context_path).
     """
     # Step 1: Profile
-    # Don't clean environment here - the kernel script needs access to torch/triton
+    # Inherit the full environment so the kernel script can import torch/triton.
+    # Set both PYTHONIOENCODING and PYTHONUTF8 to prevent NCU's frozen Python
+    # from hitting "LookupError: unknown encoding: utf-8-sig" inside
+    # site.addpackage() when it opens .pth files with the locale encoding.
+    import os
+    prof_env = os.environ.copy()
+    prof_env["PYTHONIOENCODING"] = "utf-8"
+    prof_env["PYTHONUTF8"] = "1"
+
     cmd = build_ncu_command(
         kernel_path,
         output_basename,
         kernel_name=kernel_name,
         launch_skip=launch_skip,
         launch_count=launch_count,
+        replay_mode=replay_mode,
         ncu_extra_args=ncu_extra_args,
         kernel_args=kernel_args,
     )
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    # Let NCU's stdout stream to the terminal (shows profiling progress).
+    # Only capture stderr so we have it for error messages on failure.
+    result = subprocess.run(cmd, stdout=None, stderr=subprocess.PIPE, text=True, timeout=600, env=prof_env)
+
+    ncu_rep_path = f"{output_basename}.ncu-rep"
+
     if result.returncode != 0:
         raise RuntimeError(
             f"NCU profiling failed (exit {result.returncode}):\n"
             f"Command: {' '.join(cmd)}\n"
             f"stderr: {result.stderr[:1000]}"
         )
-
-    ncu_rep_path = f"{output_basename}.ncu-rep"
     csv_path = f"{output_basename}.csv"
 
     # Step 2: Export CSV from .ncu-rep
@@ -220,7 +318,11 @@ def build_profiling_context(
     kernel_name_full = launch.get("kernel_name", "")
     kernel_name = _extract_short_name(kernel_name_full)
 
-    framework_hint = detect_framework(kernel_name_full)
+    # Detect framework from source (AST) — reliable for any kernel name.
+    # Falls back to demangled name pattern matching only if source unreadable.
+    framework_hint, _ = extract_kernel_info(kernel_path)
+    if framework_hint == "unknown":
+        framework_hint = _detect_framework_from_name(kernel_name_full)
 
     cc = str(launch.get("cc", ""))
     device = str(launch.get("device", ""))

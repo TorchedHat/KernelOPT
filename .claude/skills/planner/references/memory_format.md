@@ -12,7 +12,7 @@ Items are framework-agnostic — the same schema stores insights from CUDA, Trit
   "item_id": "<uuid>",
   "iteration": <int>,
   "speedup": <float>,
-  "rewrite_type": "positive" | "negative",
+  "rewrite_type": "positive" | "negative" | "implementation_flaw",
   "framework": "<cuda|triton|helion|unknown|multi>",
   "direction": "<snake_case, e.g. 'reduce_register_pressure'>",
 
@@ -74,6 +74,37 @@ Items are framework-agnostic — the same schema stores insights from CUDA, Trit
   "applicable_when": "Block Limit Registers < Block Limit Warps AND registers_per_thread > 32 AND TheoreticalOccupancy rule fires",
   "do_not_apply_when": "Kernel is already compute-bound (high SM throughput); reducing tile size increases loop iterations and may hurt more than it helps. Check that the tl.dot dimensions remain multiples of 16 after the change.",
   "framework_notes": "Triton: change BLOCK_K in @triton.autotune configs. CUDA: use __launch_bounds__(block_size, target_blocks_per_sm) or split the kernel."
+}
+```
+
+---
+
+## Implementation flaw example (Triton, invalid PTX modifier combination)
+
+```json
+{
+  "item_id": "g9h0i1j2",
+  "iteration": 2,
+  "speedup": 0.0,
+  "rewrite_type": "implementation_flaw",
+  "framework": "triton",
+  "direction": "enable_l2_compression",
+
+  "profiling_signal": {
+    "ncu_rule_triggered": "MemoryL2Compression",
+    "key_metric_before": {
+      "Memory Workload Analysis.DRAM Throughput": 48.1
+    },
+    "key_metric_after": {}
+  },
+
+  "strategy_title": "L2 eviction policy combined with wrong cache modifier",
+  "strategy_description": "The direction (L2 eviction hints to improve cache reuse) is valid for memory-bound kernels. The implementation failed because tl.load was called with both cache_modifier='.cg' and eviction_policy='evict_last' simultaneously — ptxas rejects this combination on sm_90a. The correct approach is to use only one modifier: either cache_modifier='.cg' (cache in L2 globally) or tl.load with an explicit cache hint via inline PTX, not both.",
+  "slow_pseudocode": "# WRONG: combining .cg and evict_last\nx = tl.load(ptr, cache_modifier='.cg', eviction_policy='evict_last')",
+  "fast_pseudocode": "# CORRECT: use only one cache modifier\nx = tl.load(ptr, cache_modifier='.cg')",
+  "applicable_when": "DRAM throughput > 40% on memory-bound kernels where L2 reuse is low",
+  "do_not_apply_when": "Never combine cache_modifier='.cg' with eviction_policy='evict_last' — invalid on Hopper (sm_90a). Choose one.",
+  "framework_notes": "Triton on sm_90a: cache_modifier and eviction_policy generate separate PTX modifiers. ptxas will reject .cg + .evict_last. Use cache_modifier='.cg' alone or eviction_policy='evict_last' alone."
 }
 ```
 

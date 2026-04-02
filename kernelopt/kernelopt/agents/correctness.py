@@ -1,148 +1,85 @@
-"""Correctness agent: Generate CPU reference and validate GPU kernel output."""
+"""Correctness agent: verify optimized kernel output against a CPU reference."""
 
 from __future__ import annotations
 
-import json
-import subprocess
+import importlib.util
 import tempfile
+import types
 from pathlib import Path
 
+import torch
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from kernelopt.llm import build_llm
 
 CORRECTNESS_SYSTEM_PROMPT = """\
-You are the Correctness Agent. Your job is to verify that a GPU kernel produces
-correct results by comparing against a CPU reference implementation.
+You are the Correctness Agent. Given an optimized GPU kernel, return a JSON
+specification. Python will use that spec to load the kernel, run it, run a CPU
+reference, and compare with torch.allclose. You do NOT write a test script.
 
-You do not assume the kernel file has built-in tests. You generate tests.
+---
 
-## Process
+## WHAT TO RETURN
 
-### Step 1 — Understand the kernel operation
+### wrapper_function
+The name of the plain Python wrapper function in the file — the function that
+allocates the output tensor and calls the @triton.jit kernel with a grid.
+Example: "run_triton_softmax", "matmul", "flash_attn_forward".
+Do NOT name the @triton.jit kernel itself.
 
-Read the kernel source code and determine:
-- What mathematical operation it performs (e.g., vector addition, softmax, matmul)
-- Input tensor shapes and types
-- Output tensor shapes and types
-- Any special parameters (e.g., tile sizes, reduction dimensions)
+### reference_code
+A self-contained Python string that defines a function named exactly `reference`.
+It receives the same positional arguments as wrapper_function but as CPU tensors.
+It must use only standard torch operations (no Triton, no CUDA).
+Start with `import torch` if needed.
 
-### Step 2 — Generate CPU reference implementation
+Example for row-wise softmax:
+    import torch
+    def reference(x):
+        return torch.softmax(x, dim=-1)
 
-Write a pure PyTorch CPU implementation that computes the same result.
-Use standard PyTorch operations only (no custom CUDA/Triton).
+### test_inputs
+An ordered list of input tensor specs matching the arguments wrapper_function
+expects. For each input specify:
+- shape: exact list of ints (use kernel_args dimensions if provided)
+- dtype: "float32", "float16", "bfloat16", "int32", or "int64"
+- distribution: "randn" for most ops, "rand" for ops needing [0,1], "ones"/"zeros" for special cases
 
-The reference must:
-- Accept the same logical inputs as the kernel
-- Produce identical outputs (within numerical tolerance)
-- Use torch operations with device='cpu'
-
-### Step 3 — Generate test harness
-
-Create a complete Python test script that:
-1. Generates random test inputs with torch.manual_seed
-2. Runs the GPU kernel
-3. Runs the CPU reference
-4. Compares outputs with appropriate tolerances
-5. Tests multiple random seeds (at least 3)
-6. Exits with code 0 if all tests pass, code 1 if any fail
-
-## Output format
-
-Emit a `correctness_test` code block containing the complete test script:
-
-````correctness_test
-import torch
-import sys
-
-# Set device
-DEVICE = 'cuda'
-
-# Import the kernel function
-# For Triton: from <module> import <kernel_name>
-# For CUDA: compile and import
-
-def reference_implementation(<params>):
-    \"\"\"CPU reference implementation using PyTorch.\"\"\"
-    # Pure PyTorch operations on CPU
-    ...
-    return result
-
-def test_correctness():
-    \"\"\"Test kernel against reference with multiple seeds.\"\"\"
-    seeds = [0, 42, 1337]
-    atol = 1e-4  # FP32
-    rtol = 1e-2
-
-    for seed in seeds:
-        torch.manual_seed(seed)
-
-        # Generate inputs
-        <generate_test_inputs>
-
-        # Run GPU kernel
-        output_gpu = <call_kernel>(inputs...)
-
-        # Run CPU reference
-        inputs_cpu = [x.cpu() for x in inputs]
-        output_ref = reference_implementation(*inputs_cpu)
-
-        # Compare
-        diff = torch.max(torch.abs(output_gpu.cpu() - output_ref))
-
-        if diff > atol:
-            print(f"FAIL: seed={seed}, max_diff={diff}")
-            return False
-
-        print(f"PASS: seed={seed}, max_diff={diff}")
-
-    return True
-
-if __name__ == "__main__":
-    passed = test_correctness()
-    sys.exit(0 if passed else 1)
-````
-
-## Framework-specific guidance
-
-### Triton kernels
-- Import the kernel function from the file
-- Call it like: `output = kernel_fn(x, y, ...)`
-- Kernel may return output or write to pre-allocated tensor
-
-### CUDA kernels
-- Need to compile with pybind11 or load as a module
-- May require ctypes wrapper
-- If too complex, state: "Cannot generate automated test for CUDA kernel — requires manual test harness"
-
-### PyTorch kernels
-- Import and call directly
-- Should be straightforward
-
-## Tolerance guidelines
-
-- FP32: atol=1e-4, rtol=1e-2
+### atol / rtol
+Tolerances for torch.allclose:
+- FP32 element-wise: atol=1e-4, rtol=1e-3
+- FP32 reductions (softmax, layernorm, sum): atol=1e-2, rtol=1e-2
 - FP16/BF16: atol=1e-2, rtol=1e-1
-- Integer: exact match (atol=0)
-- Reductions (sum, softmax): may need higher tolerance due to accumulation
 
-## Important
-
-- Output ONLY the correctness_test code block, no markdown fences around it
-- The script must be runnable as-is: `python test.py`
-- Do not assume the kernel file has __main__ — generate a standalone test
-- Test with realistic input sizes (not too small, not too large)
-
-## If unable to generate test
-
-If the kernel is too complex or framework support is missing, output:
-
-````correctness_test
-# SKIP: <reason why automatic test cannot be generated>
-import sys
-sys.exit(0)  # Assume correct
-````
+### skip
+Set true ONLY if the operation cannot be tested automatically (custom RNG,
+hardware-specific stateful op). Default: false.
 """
+
+
+def _make_tensor(inp, device: str) -> torch.Tensor:
+    dtype_map = {
+        "float32":  torch.float32,
+        "float16":  torch.float16,
+        "bfloat16": torch.bfloat16,
+        "int32":    torch.int32,
+        "int64":    torch.int64,
+    }
+    dtype = dtype_map.get(inp.dtype, torch.float32)
+    dist = inp.distribution
+    if dist == "randn":
+        return torch.randn(inp.shape, dtype=dtype, device=device)
+    elif dist == "rand":
+        return torch.rand(inp.shape, dtype=dtype, device=device)
+    elif dist == "ones":
+        return torch.ones(inp.shape, dtype=dtype, device=device)
+    elif dist == "zeros":
+        return torch.zeros(inp.shape, dtype=dtype, device=device)
+    elif dist == "randint":
+        lo = int(inp.low) if inp.low is not None else 0
+        hi = int(inp.high) if inp.high is not None else 128
+        return torch.randint(lo, hi, inp.shape, dtype=dtype, device=device)
+    return torch.randn(inp.shape, dtype=dtype, device=device)
 
 
 def run_correctness_agent(
@@ -156,32 +93,35 @@ def run_correctness_agent(
     kernel_args: list[str] | None = None,
 ) -> tuple[bool, str]:
     """
-    Call Claude to generate and run a correctness test.
+    Verify an optimized kernel against a CPU reference.
 
-    Args:
-        kernel_args: Command-line args used for profiling (e.g., ['--m', '64', '--n', '8192'])
-                     The test should use these same input shapes for consistency.
-
-    Returns (passed, message).
+    Flow:
+      1. LLM returns a CorrectnessSpec (structured JSON):
+           wrapper_function, reference_code, test_inputs, atol, rtol
+      2. Python loads the optimized kernel via importlib (exact file path —
+         no import patching, no cwd ambiguity).
+      3. Python exec()s the reference_code to get a `reference(*args)` function.
+      4. For 3 random seeds: generate inputs, call wrapper + reference,
+         compare with torch.allclose.
+      5. Return (passed, message).
     """
+    from kernelopt.agents.schemas import CorrectnessSpec
+
     llm = build_llm(
         model=model,
         api_key=api_key,
-        max_tokens=4096,
-        temperature=0.2,
+        max_tokens=2048,
+        temperature=0.1,
         project_id=project_id,
         region=region,
     )
 
-    # Extract test configuration from kernel_args
     config_note = ""
     if kernel_args:
-        args_str = " ".join(kernel_args)
         config_note = (
-            f"\n\n## Test Configuration\n"
-            f"The kernel is being profiled with these arguments: `{args_str}`\n"
-            f"Your test MUST use the same input shapes/sizes for consistency with profiling.\n"
-            f"Parse these args to extract the test dimensions (e.g., --m 64 --n 8192 means M=64, N=8192)."
+            f"\n\n## Kernel Args\n"
+            f"Profiled with: `{' '.join(kernel_args)}`\n"
+            f"Use these exact dimensions for test_inputs shapes."
         )
 
     human_msg = (
@@ -189,98 +129,104 @@ def run_correctness_agent(
         f"## Kernel Source ({Path(kernel_path).name})\n"
         f"```\n{kernel_source}\n```"
         f"{config_note}\n\n"
-        f"Generate a correctness test that validates this kernel against a CPU reference."
+        f"Return the CorrectnessSpec JSON for this kernel."
     )
 
+    # --- Step 1: LLM returns structured spec ---
+    structured_llm = llm.with_structured_output(CorrectnessSpec)
     try:
-        response = llm.invoke([
+        spec = structured_llm.invoke([
             SystemMessage(content=CORRECTNESS_SYSTEM_PROMPT),
             HumanMessage(content=human_msg),
         ])
-
-        from kernelopt.llm import strip_thinking
-        content = strip_thinking(response.content)
-
-        # Extract test code
-        if "```correctness_test" in content:
-            start = content.find("```correctness_test") + len("```correctness_test")
-            end = content.find("```", start)
-            test_code = content[start:end].strip()
-        elif content.startswith("```"):
-            # Fallback: strip any markdown fences
-            lines = content.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            test_code = "\n".join(lines)
-        else:
-            test_code = content
-
-        # DEBUG: Log generated test
-        print(f"[DEBUG] Agentic correctness test code length: {len(test_code)} chars")
-        print(f"[DEBUG] Test code preview:\n{test_code[:400]}")
-
-        # Check for SKIP
-        if test_code.strip().startswith("# SKIP:"):
-            reason = test_code.split("\n")[0].replace("# SKIP:", "").strip()
-            print(f"[DEBUG] Correctness test skipped: {reason}")
-            return True, f"Skipped: {reason}"
-
-        # Write optimized kernel to temp file so test can import it
-        kernel_basename = Path(kernel_path).stem
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.py', delete=False, dir='/tmp',
-            prefix=f'{kernel_basename}_optimized_'
-        ) as f:
-            optimized_kernel_path = f.name
-            f.write(kernel_source)
-
-        # Inject sys.path manipulation into test code to import optimized kernel
-        kernel_module = Path(optimized_kernel_path).stem
-        test_code_fixed = test_code.replace(
-            f"from {kernel_basename} import",
-            f"import sys; sys.path.insert(0, '/tmp'); from {kernel_module} import"
-        )
-
-        # Write test to temp file
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.py', delete=False, dir='/tmp'
-        ) as f:
-            test_path = f.name
-            f.write(test_code_fixed)
-
-        print(f"[DEBUG] Running agentic correctness test: {test_path}")
-        print(f"[DEBUG] Optimized kernel saved to: {optimized_kernel_path}")
-
-        # Run test
-        result = subprocess.run(
-            ["python3", test_path],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=str(Path(kernel_path).parent),
-        )
-
-        # DEBUG: Log test results
-        print(f"[DEBUG] Test returncode: {result.returncode}")
-        print(f"[DEBUG] Test stdout: {result.stdout[:300]}")
-        print(f"[DEBUG] Test stderr: {result.stderr[:300]}")
-
-        # Clean up (keep files for debugging if test failed)
-        if result.returncode == 0:
-            Path(test_path).unlink()
-            Path(optimized_kernel_path).unlink()
-        else:
-            print(f"[DEBUG] Keeping test file for debugging: {test_path}")
-            print(f"[DEBUG] Keeping optimized kernel for debugging: {optimized_kernel_path}")
-
-        if result.returncode == 0:
-            print(f"[DEBUG] Agentic correctness test PASSED")
-            return True, f"Correctness passed\n{result.stdout}"
-        else:
-            print(f"[DEBUG] Agentic correctness test FAILED")
-            return False, f"Correctness failed\nstdout: {result.stdout}\nstderr: {result.stderr}"
-
     except Exception as e:
-        return False, f"Correctness agent error: {e}"
+        return False, f"Correctness agent failed to produce spec: {e}"
+
+    if spec.skip:
+        reason = spec.skip_reason or "no reason given"
+        print(f"[correctness] SKIP: {reason}")
+        return False, f"Correctness skipped: {reason}"
+
+    print(f"[correctness] wrapper={spec.wrapper_function!r}  atol={spec.atol}  rtol={spec.rtol}")
+    print(f"[correctness] reference_code:\n{spec.reference_code}")
+
+    # --- Step 2: Load optimized kernel via importlib (exact file, no ambiguity) ---
+    kernel_basename = Path(kernel_path).stem
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.py', delete=False, dir='/tmp',
+        prefix=f'{kernel_basename}_optimized_',
+    ) as f:
+        f.write(kernel_source)
+        optimized_path = f.name
+
+    try:
+        mod_spec = importlib.util.spec_from_file_location("_opt_kernel", optimized_path)
+        module = types.ModuleType("_opt_kernel")
+        mod_spec.loader.exec_module(module)
+    except Exception as e:
+        Path(optimized_path).unlink(missing_ok=True)
+        return False, f"Failed to import optimized kernel from {optimized_path}: {e}"
+
+    wrapper_fn = getattr(module, spec.wrapper_function, None)
+    if wrapper_fn is None:
+        available = [n for n in dir(module) if not n.startswith("_")]
+        Path(optimized_path).unlink(missing_ok=True)
+        return False, (
+            f"Wrapper function '{spec.wrapper_function}' not found. "
+            f"Available names: {available}"
+        )
+
+    # --- Step 3: Build reference function from LLM-provided code ---
+    ref_ns: dict = {"torch": torch}
+    try:
+        exec(spec.reference_code, ref_ns)  # noqa: S102
+    except Exception as e:
+        Path(optimized_path).unlink(missing_ok=True)
+        return False, f"Failed to compile reference_code: {e}\n\nCode:\n{spec.reference_code}"
+
+    reference_fn = ref_ns.get("reference")
+    if reference_fn is None:
+        Path(optimized_path).unlink(missing_ok=True)
+        return False, (
+            f"reference_code must define a function named 'reference'. "
+            f"Defined names: {[k for k in ref_ns if not k.startswith('_')]}"
+        )
+
+    # --- Step 4: Run GPU vs CPU comparison for 3 seeds ---
+    seeds = [0, 42, 1337]
+    failures: list[str] = []
+
+    for seed in seeds:
+        torch.manual_seed(seed)
+        try:
+            inputs_cuda = [_make_tensor(inp, device="cuda") for inp in spec.test_inputs]
+            inputs_cpu  = [t.cpu() for t in inputs_cuda]
+
+            gpu_out = wrapper_fn(*inputs_cuda)
+            ref_out = reference_fn(*inputs_cpu)
+
+            # Unwrap tuples (some kernels return (output, lse) etc.)
+            if isinstance(gpu_out, (tuple, list)):
+                gpu_out = gpu_out[0]
+            if isinstance(ref_out, (tuple, list)):
+                ref_out = ref_out[0]
+
+            gpu_f = gpu_out.cpu().float()
+            ref_f = ref_out.float()
+
+            passed = torch.allclose(gpu_f, ref_f, atol=spec.atol, rtol=spec.rtol)
+            max_diff = (gpu_f - ref_f).abs().max().item()
+            print(f"[correctness] seed={seed}  passed={passed}  max_diff={max_diff:.3e}")
+
+            if not passed:
+                failures.append(f"seed={seed}: max_diff={max_diff:.3e} > atol={spec.atol}")
+
+        except Exception as e:
+            import traceback
+            failures.append(f"seed={seed}: {e}\n{traceback.format_exc()}")
+
+    Path(optimized_path).unlink(missing_ok=True)
+
+    if failures:
+        return False, "Correctness FAILED:\n" + "\n".join(failures)
+    return True, f"Correctness passed (3 seeds, atol={spec.atol}, rtol={spec.rtol})"

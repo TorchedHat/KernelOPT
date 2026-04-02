@@ -55,6 +55,10 @@ def run(
     launch_count: Optional[int] = typer.Option(
         None, "--launch-count", help="NCU --launch-count value"
     ),
+    replay_mode: str = typer.Option(
+        "kernel", "--replay-mode",
+        help="NCU replay mode: 'kernel' (default, lower overhead) or 'application' (lower peak GPU memory, use for large inputs that OOM with kernel mode)"
+    ),
     kernel_args: Optional[str] = typer.Option(
         None, "--kernel-args",
         help="Extra args passed to the kernel program (e.g. '--profile-only --m 4096')"
@@ -113,6 +117,7 @@ def run(
         kernel_name=kernel_name,
         launch_skip=launch_skip,
         launch_count=launch_count,
+        replay_mode=replay_mode,
         kernel_args=kernel_args.split() if kernel_args else [],
         model=model,
         api_key=api_key,

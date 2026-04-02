@@ -10,7 +10,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from kernelopt.llm import build_llm
 
 EXECUTOR_SYSTEM_PROMPT = """\
-```
 You are the Executor Agent in a GPU kernel optimization pipeline.
 
 Your job is to take an optimization_plan JSON and a kernel source file, implement exactly the described change, and return the complete modified file. You work with CUDA, Triton, and Helion kernels.
@@ -30,11 +29,9 @@ WHAT YOU MUST DO
 1. Read step.change literally. That is the exact transformation to apply.
 2. Find step.target in the source. If ambiguous, apply the closest interpretation and note it.
 3. Make ONLY that change. Do not fix other issues, refactor unrelated code, or simplify anything outside the target. Every change must be attributable to this plan.
-4. Above the changed section, add a comment:
+4. Above the changed section, add a comment marking the optimization:
      # OPTIMIZED: <plan direction>
-     # Original: <what was here before>
-5. Keep the original code commented out immediately below for diffing.
-6. Preserve main(), argument parsing, benchmarking, and correctness check code exactly as-is.
+5. Preserve main(), argument parsing, benchmarking, and correctness check code exactly as-is.
 7. Do not change grid launch dimensions unless the plan explicitly asks for it.
 
 ---
@@ -80,7 +77,11 @@ If attempt == 2: achieve the same goal with a different code structure — diffe
 ---
 OUTPUT FORMAT
 Return two things, always in this order:
-First: the complete kernel file. No markdown fences, no explanation, no preamble. Just the full runnable source. Every line of the original file must be present except for the changed section.
+First: the complete, runnable optimized kernel. No markdown fences, no explanation, no preamble. Output the complete kernel file where:
+- All code outside the changed section remains identical to the original
+- The changed section contains ONLY the new optimized code
+- Do NOT include commented-out original code within the function body
+- The output must be syntactically valid and immediately executable
 Second: a JSON block tagged execution_result.
 
 On success:
@@ -115,7 +116,6 @@ RULES YOU MUST NEVER BREAK
 - Never change the function signature of the kernel unless the plan explicitly requires it.
 - Never remove correctness checks or benchmarking code.
 - If the plan is impossible to implement correctly, return implementation_failure — do not guess or hallucinate a different change.
-```
 """
 
 
@@ -128,9 +128,19 @@ def run_executor(
     project_id: str | None = None,
     region: str | None = None,
     attempt: int = 1,
+    gpu_specs: dict | None = None,
+    launch_config: dict | None = None,
+    previous_errors: list[str] | None = None,
 ) -> tuple[str, dict]:
     """
     Call the LLM to apply the optimization plan to the kernel source.
+
+    Args:
+        gpu_specs:     Hardware ceiling from get_gpu_specs() — peak bandwidth,
+                       TFLOPS, SM count. Lets executor size changes correctly.
+        launch_config: Current kernel launch config from NCU — registers per
+                       thread, block size, waves per SM. Lets executor reason
+                       about resource headroom before making changes.
 
     Returns (optimized_kernel_source, execution_result).
     """
@@ -138,23 +148,51 @@ def run_executor(
         model=model,
         api_key=api_key,
         max_tokens=8192,
-        temperature=0.2,  # Use 0.2 for all attempts for diversity
+        temperature=0.2 if attempt == 1 else 0.6,
         project_id=project_id,
         region=region,
     )
 
     attempt_note = ""
     if attempt > 1:
+        error_detail = ""
+        if previous_errors:
+            formatted = "\n".join(
+                f"  Attempt {i + 1}: {e}" for i, e in enumerate(previous_errors)
+            )
+            error_detail = (
+                f"\n\n## Previous Attempt Errors\n"
+                f"{formatted}\n\n"
+                f"Fix these specific errors in your implementation. "
+                f"Do not repeat the same structure that produced them."
+            )
         attempt_note = (
-            f"\n\nThis is attempt {attempt} — try an ALTERNATIVE implementation "
-            f"approach to the same plan (different loop order, different tile layout, "
-            f"etc.) while achieving the same optimization goal."
+            f"\n\nThis is attempt {attempt}. The previous attempt failed. "
+            f"Try a DIFFERENT implementation structure for the same optimization goal "
+            f"(different loop order, different tile layout, different intrinsic)."
+            f"{error_detail}"
+        )
+
+    hw_section = ""
+    if gpu_specs or launch_config:
+        hw: dict = {}
+        if gpu_specs:
+            hw["gpu_specs"] = gpu_specs
+        if launch_config:
+            hw["launch_config"] = launch_config
+        hw_section = (
+            f"\n## Hardware Context\n"
+            f"```json\n{json.dumps(hw, indent=2)}\n```\n"
+            f"Use gpu_specs to respect hardware ceilings (bandwidth, SM count, "
+            f"max threads). Use launch_config to understand current resource "
+            f"usage (registers_per_thread, waves_per_sm) before sizing changes.\n"
         )
 
     human_msg = (
         f"## Framework: {framework}\n\n"
         f"## Optimization Plan\n"
-        f"```json\n{json.dumps(optimization_plan, indent=2)}\n```\n\n"
+        f"```json\n{json.dumps(optimization_plan, indent=2)}\n```\n"
+        f"{hw_section}\n"
         f"## Current Kernel Source\n"
         f"```\n{kernel_source}\n```\n\n"
         f"Apply the optimization plan and output the complete optimized kernel source."
@@ -177,46 +215,102 @@ def run_executor(
         # Strip leading markdown fence if present
         if content.startswith("```"):
             lines = content.split("\n")
-            # Strip first fence line (e.g., ```python)
-            lines = lines[1:]
+            lines = lines[1:]  # Strip first fence line (e.g., ```python)
             content = "\n".join(lines)
             print("[DEBUG] Stripped leading markdown fence")
 
-        # Strip trailing markdown fences and JSON blocks
-        # LLM sometimes outputs code, then ```json block with metadata
-        lines = content.split("\n")
-        # Find first occurrence of ``` or ```json fence from the end
-        cutoff_idx = len(lines)
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped == "```" or stripped == "```json" or stripped.startswith("```json"):
-                cutoff_idx = i
-                break
-        lines = lines[:cutoff_idx]
-        content = "\n".join(lines).rstrip()
-        print("[DEBUG] Stripped trailing fences/metadata")
+        # Split kernel source from execution_result JSON.
+        # LLM may output JSON:
+        #   (a) inside a ```json ... ``` fence after the code
+        #   (b) raw JSON directly appended with no fence
+        # Strategy: find "ready_for_profiling" (always in execution_result),
+        # scan backwards to the opening '{', then also strip any preceding fence.
 
-        # DEBUG: Verify generated code has key components
-        has_kernel_def = "@triton.jit" in content or "def softmax_kernel" in content
-        has_kernel_launch = "softmax_kernel[" in content
-        print(f"[DEBUG] Has kernel definition: {has_kernel_def}")
-        print(f"[DEBUG] Has kernel launch: {has_kernel_launch}")
+        import re as _re
+
+        marker = '"ready_for_profiling"'
+        if marker in content:
+            pos = content.rfind(marker)
+            # Walk backwards to the opening '{' of the execution_result object
+            depth = 0
+            json_start = None
+            for i in range(pos, -1, -1):
+                c = content[i]
+                if c == '}':
+                    depth += 1
+                elif c == '{':
+                    if depth == 0:
+                        json_start = i
+                        break
+                    depth -= 1
+
+            if json_start is not None:
+                # Parse the LLM's JSON before discarding it — this is the only
+                # way to detect implementation_failure correctly.
+                import json as _json
+                llm_json: dict = {}
+                try:
+                    llm_json = _json.loads(content[json_start:])
+                except _json.JSONDecodeError:
+                    pass
+
+                pre_json = content[:json_start].rstrip()
+                # Strip ALL trailing markdown fences (the LLM may output both a
+                # closing ``` for the code block AND a ```json opener for the JSON).
+                pre_json = _re.sub(r'(\s*`{3}\w*)+\s*$', '', pre_json).rstrip()
+                content = pre_json
+                print("[DEBUG] Stripped execution_result JSON from kernel output")
+
+                # If the LLM signalled it could not apply the plan, honour that.
+                if not llm_json.get("ready_for_profiling", True):
+                    reason = llm_json.get("reason", "LLM returned implementation_failure")
+                    print(f"[DEBUG] LLM returned implementation_failure: {reason}")
+                    return kernel_source, {
+                        "plan_id": optimization_plan.get("plan_id", ""),
+                        "attempt": attempt,
+                        "framework": framework,
+                        "status": "implementation_failure",
+                        "reason": reason,
+                        "ready_for_profiling": False,
+                    }
+
+        # Verify the output still contains a kernel definition.
+        # Use framework-agnostic markers rather than hardcoded kernel names.
+        _KERNEL_MARKERS = ["@triton.jit", "__global__", "@helion.kernel", "@hl.kernel"]
+        has_kernel_def = any(m in content for m in _KERNEL_MARKERS)
+
+        if not content.strip():
+            return kernel_source, {
+                "plan_id": optimization_plan.get("plan_id", ""),
+                "attempt": attempt,
+                "framework": framework,
+                "status": "implementation_failure",
+                "reason": "Executor returned empty kernel source",
+                "ready_for_profiling": False,
+            }
+
+        if not has_kernel_def:
+            return kernel_source, {
+                "plan_id": optimization_plan.get("plan_id", ""),
+                "attempt": attempt,
+                "framework": framework,
+                "status": "implementation_failure",
+                "reason": (
+                    f"Output contains no kernel definition marker "
+                    f"({', '.join(_KERNEL_MARKERS)}). "
+                    f"LLM may have returned explanation text instead of code."
+                ),
+                "ready_for_profiling": False,
+            }
+
         print(f"[DEBUG] First 300 chars:\n{content[:300]}")
 
         # Count changed lines
         orig_lines = set(kernel_source.splitlines())
         new_lines = set(content.splitlines())
         lines_changed = len(new_lines - orig_lines)
-        added_lines = new_lines - orig_lines
-        removed_lines = orig_lines - new_lines
 
         print(f"[DEBUG] Lines changed: {lines_changed}")
-        print(f"[DEBUG] Lines added: {len(added_lines)}")
-        print(f"[DEBUG] Lines removed: {len(removed_lines)}")
-        if added_lines:
-            print(f"[DEBUG] Sample added lines:")
-            for i, line in enumerate(list(added_lines)[:3]):
-                print(f"  + {line}")
 
         direction = optimization_plan.get("direction", "unknown")
 
@@ -226,14 +320,9 @@ def run_executor(
             "framework": framework,
             "status": "success",
             "correctness": "unverified",
-            "change_summary": f"Applied {direction}",
+            "change_summary": llm_json.get("change_summary", f"Applied {direction}"),
             "lines_changed": lines_changed,
             "ready_for_profiling": True,
-            "debug_info": {
-                "has_kernel_def": has_kernel_def,
-                "has_kernel_launch": has_kernel_launch,
-                "response_length": len(content),
-            }
         }
 
         return content, execution_result

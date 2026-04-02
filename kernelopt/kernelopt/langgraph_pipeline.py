@@ -10,7 +10,6 @@ Graph:
 from __future__ import annotations
 
 import string
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from langgraph.graph import END, StateGraph
@@ -67,6 +66,7 @@ def profile_baseline(state: GraphState) -> dict:
             kernel_name=cfg.kernel_name,
             launch_skip=cfg.launch_skip,
             launch_count=cfg.launch_count,
+            replay_mode=cfg.replay_mode,
             ncu_extra_args=cfg.ncu_extra_args or None,
             kernel_args=cfg.kernel_args or None,
             kernel_id=kernel_id,
@@ -105,7 +105,7 @@ def profile_baseline(state: GraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 def generate_plans(state: GraphState) -> dict:
-    """Generate N diverse optimization plans, concurrently for batch inference."""
+    """Generate N diverse optimization plans sequentially."""
     cfg = state["config"]
     N = cfg.N
     current_kernel = state["best_kernel"]
@@ -123,42 +123,32 @@ def generate_plans(state: GraphState) -> dict:
     console.print(f"  Generating {N} optimization plans...")
 
     plans: list[tuple[str, dict]] = []
+    previous_directions: list[str] = []  # Accumulator for diversity
 
-    def _generate(i: int) -> tuple[int, dict]:
-        return i, run_planner(
-            profiling_context=profiling_ctx,
-            kernel_source=current_kernel,
-            optimization_memory=memory,
-            api_key=cfg.api_key,
-            model=cfg.planner_model or cfg.model,
-            project_id=cfg.project_id,
-            region=cfg.region,
-            plan_index=i,
-            total_plans=N,
-            previous_directions=[],
-        )
-
-    with ThreadPoolExecutor(max_workers=N) as pool:
-        futures = {pool.submit(_generate, i): i for i in range(N)}
-        results: dict[int, dict] = {}
-        for future in as_completed(futures):
-            i = futures[future]
-            try:
-                _, plan = future.result()
-                results[i] = plan
-                direction = plan.get("direction", "unknown")
-                confidence = plan.get("confidence", "?")
-                console.print(
-                    f"    Plan {PLAN_LETTERS[i]}: {direction} "
-                    f"[dim](confidence: {confidence})[/]"
-                )
-            except Exception as e:
-                console.print(f"    [red]Plan {PLAN_LETTERS[i]} failed: {e}[/]")
-
-    # Collect in order
     for i in range(N):
-        if i in results:
-            plans.append((PLAN_LETTERS[i], results[i]))
+        try:
+            plan = run_planner(
+                profiling_context=profiling_ctx,
+                kernel_source=current_kernel,
+                optimization_memory=memory,
+                api_key=cfg.api_key,
+                model=cfg.planner_model or cfg.model,
+                project_id=cfg.project_id,
+                region=cfg.region,
+                plan_index=i,
+                total_plans=N,
+                previous_directions=previous_directions,  # Accumulated list
+            )
+            direction = plan.get("direction", "unknown")
+            confidence = plan.get("confidence", "?")
+            plans.append((PLAN_LETTERS[i], plan))
+            previous_directions.append(direction)  # Grows each iteration
+            console.print(
+                f"    Plan {PLAN_LETTERS[i]}: {direction} "
+                f"[dim](confidence: {confidence})[/]"
+            )
+        except Exception as e:
+            console.print(f"    [red]Plan {PLAN_LETTERS[i]} failed: {e}[/]")
 
     return {"plans": plans}
 
@@ -179,6 +169,11 @@ def execute_plans(state: GraphState) -> dict:
     kernel_basename = state["kernel_basename"]
     kernel_path = state["kernel_path"]
 
+    # Extract hardware context from the current profiling context
+    profiling_ctx = state.get("current_profiling_context", {})
+    gpu_specs = profiling_ctx.get("gpu_specs")
+    launch_config = profiling_ctx.get("launch")
+
     candidates: list[PlanCandidate] = []
 
     for plan_letter, plan in plans:
@@ -186,6 +181,7 @@ def execute_plans(state: GraphState) -> dict:
         safe_dir = direction.replace(" ", "_")[:40]
         file_stem = f"{kernel_basename}_iter{iteration + 1}_plan{plan_letter}_{safe_dir}"
 
+        previous_errors: list[str] = []
         for attempt in range(1, cfg.K + 1):
             console.print(f"  [dim]Executing plan {plan_letter}, attempt {attempt}...[/]")
             try:
@@ -198,37 +194,31 @@ def execute_plans(state: GraphState) -> dict:
                     project_id=cfg.project_id,
                     region=cfg.region,
                     attempt=attempt,
+                    gpu_specs=gpu_specs,
+                    launch_config=launch_config,
+                    previous_errors=previous_errors,
                 )
 
-                # DEBUG: Log execution result
                 console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
                 console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
                 console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
-                if "debug_info" in execution_result:
-                    console.print(f"  [dim]Debug info: {execution_result['debug_info']}[/]")
 
             except Exception as e:
-                console.print(
-                    f"    [red]Executor failed "
-                    f"(plan {plan_letter}, attempt {attempt}): {e}[/]"
-                )
                 import traceback
-                console.print(f"  [dim]{traceback.format_exc()[:500]}[/]")
+                err = f"Executor exception: {e}\n{traceback.format_exc()[:500]}"
+                console.print(f"    [red]Executor failed (plan {plan_letter}, attempt {attempt}): {e}[/]")
+                previous_errors.append(err)
                 continue
 
             if not execution_result.get("ready_for_profiling", False):
-                console.print(
-                    f"    [red]Plan {plan_letter}: "
-                    f"{execution_result.get('status', 'failed')}[/]"
-                )
-                if "reason" in execution_result:
-                    console.print(f"    [dim]Reason: {execution_result['reason']}[/]")
+                reason = execution_result.get("reason", execution_result.get("status", "failed"))
+                console.print(f"    [red]Plan {plan_letter}: {reason}[/]")
+                previous_errors.append(f"Implementation failure: {reason}")
                 continue
 
             # Save kernel file
             kernel_file = str(output_dir / f"{file_stem}{ext}")
             Path(kernel_file).write_text(optimized_source)
-            console.print(f"  [dim]Saved kernel to: {kernel_file}[/]")
 
             # Correctness check
             console.print(f"  [dim]Running correctness check...[/]")
@@ -242,8 +232,13 @@ def execute_plans(state: GraphState) -> dict:
             )
             execution_result["correctness"] = "passed" if passed else "failed"
 
-            # DEBUG: Log correctness result details
-            console.print(f"  [dim]Correctness message: {msg[:200]}[/]")
+            status = "[green]passed[/]" if passed else "[red]failed[/]"
+            console.print(f"    Plan {plan_letter}: correctness {status}")
+
+            if not passed:
+                console.print(f"    [dim]Failure: {msg[:300]}[/]")
+                previous_errors.append(f"Correctness failure: {msg[:500]}")
+                continue
 
             candidate = PlanCandidate(
                 plan_id=plan.get("plan_id", ""),
@@ -255,15 +250,8 @@ def execute_plans(state: GraphState) -> dict:
                 correctness_passed=passed,
                 correctness_message=msg,
             )
-
-            status = "[green]passed[/]" if passed else "[red]failed[/]"
-            console.print(f"    Plan {plan_letter}: correctness {status}")
-            if not passed:
-                console.print(f"    [dim]Failure details: {msg[:300]}[/]")
-
-            if passed:
-                candidates.append(candidate)
-                break
+            candidates.append(candidate)
+            break
 
     return {"candidates": candidates}
 
@@ -302,6 +290,7 @@ def profile_candidates(state: GraphState) -> dict:
                 kernel_name=cfg.kernel_name,
                 launch_skip=cfg.launch_skip,
                 launch_count=cfg.launch_count,
+                replay_mode=cfg.replay_mode,
                 ncu_extra_args=cfg.ncu_extra_args or None,
                 kernel_args=cfg.kernel_args or None,
                 kernel_id=kernel_id,
@@ -355,43 +344,42 @@ def summarize_results(state: GraphState) -> dict:
 
     experience_items: list[dict] = []
 
-    def _summarize(c: PlanCandidate) -> tuple[dict, dict]:
-        return run_summarizer(
-            profiling_before=profiling_before,
-            profiling_after=c.profiling_context,
-            optimization_plan=c.optimization_plan,
-            kernel_before=current_kernel,
-            kernel_after=c.optimized_kernel,
-            iteration=iteration + 1,
-            framework=framework,
-            speedup=c.speedup,
-            existing_memory=memory,
-            execution_result=c.execution_result,
-            api_key=cfg.api_key,
-            model=cfg.summarizer_model or cfg.model,
-            project_id=cfg.project_id,
-            region=cfg.region,
-        )
+    # Sequential execution with updated memory for proper deduplication
+    for c in summarize_candidates:
+        try:
+            item, memory_update = run_summarizer(
+                profiling_before=profiling_before,
+                profiling_after=c.profiling_context,
+                optimization_plan=c.optimization_plan,
+                kernel_before=current_kernel,
+                kernel_after=c.optimized_kernel,
+                iteration=iteration + 1,
+                framework=framework,
+                speedup=c.speedup,
+                existing_memory=memory,  # Current state (updated each iteration)
+                execution_result=c.execution_result,
+                api_key=cfg.api_key,
+                model=cfg.summarizer_model or cfg.model,
+                project_id=cfg.project_id,
+                region=cfg.region,
+            )
 
-    with ThreadPoolExecutor(max_workers=len(summarize_candidates) or 1) as pool:
-        futures = {
-            pool.submit(_summarize, c): c for c in summarize_candidates
-        }
-        for future in as_completed(futures):
-            c = futures[future]
-            try:
-                item, _ = future.result()
+            # Apply deduplication immediately
+            if memory_update["action"] == "append":
                 experience_items.append(item)
-            except Exception as e:
-                console.print(
-                    f"    [red]Summarizer failed "
-                    f"(plan {c.plan_letter}): {e}[/]"
-                )
+            elif memory_update["action"] == "replace":
+                replace_id = memory_update["replace_item_id"]
+                memory = [m for m in memory if m.get("item_id") != replace_id]
+                experience_items.append(item)
+            # else: skip (don't add)
+
+        except Exception as e:
+            console.print(
+                f"    [red]Summarizer failed (plan {c.plan_letter}): {e}[/]"
+            )
 
     # Apply memory curation
-    top_items = select_top_k(
-        experience_items, cfg.TopK, cfg.t_pos, cfg.t_neg
-    )
+    top_items = select_top_k(experience_items, cfg.TopK, cfg.t_pos, cfg.t_neg)
     if top_items:
         memory = append_items(memory, top_items, cfg.ExpN)
 
@@ -611,6 +599,21 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     return state
 
 
+def _m(ctx: dict, section: str, metric: str, default: str = "—") -> str:
+    """Safely extract a metric value from a profiling context."""
+    try:
+        entry = ctx["sections"][section][metric]
+        val = entry.get("value", default)
+        unit = entry.get("unit", "").strip()
+        if val is None or val != val:   # NaN check
+            return default
+        if isinstance(val, float):
+            return f"{val:.2f} {unit}".strip() if unit else f"{val:.2f}"
+        return f"{val} {unit}".strip() if unit else str(val)
+    except (KeyError, TypeError):
+        return default
+
+
 def _write_final_outputs(
     state: PipelineState,
     output_dir: Path,
@@ -626,45 +629,194 @@ def _write_final_outputs(
         output_dir / "optimization_memory.json",
     )
 
-    overall_speedup = round(baseline_latency / state.best_latency_ns, 2)
+    overall_speedup = round(baseline_latency / state.best_latency_ns, 4)
     log_path = output_dir / "optimization_log.md"
-    lines = [
-        "# Optimization Log\n\n",
-        f"- **Kernel**: `{state.kernel_path}`\n",
-        f"- **Framework**: {state.framework}\n",
-        f"- **Baseline latency**: {baseline_latency:.0f} ns\n",
-        f"- **Best latency**: {state.best_latency_ns:.0f} ns\n",
-        f"- **Overall speedup**: {overall_speedup}x\n",
-        f"- **Iterations**: {len(state.iteration_results)}\n",
-        f"- **Config**: T={state.config.T}, N={state.config.N}, "
-        f"K={state.config.K}, TopK={state.config.TopK}\n\n",
+
+    # --- Environment ---
+    try:
+        import torch
+        torch_ver = torch.__version__
+        cuda_ver = torch.version.cuda or "—"
+    except Exception:
+        torch_ver = cuda_ver = "—"
+    try:
+        import triton
+        triton_ver = triton.__version__
+    except Exception:
+        triton_ver = "—"
+
+    gpu_specs = state.baseline_profiling_context.get("gpu_specs", {})
+    gpu_model = gpu_specs.get("gpu_model", "—")
+    sm_count  = gpu_specs.get("sm_count", "—")
+    mem_gb    = gpu_specs.get("total_memory_gb", "—")
+    bw_gbs    = gpu_specs.get("peak_hbm_bandwidth_gbs", "—")
+    cc        = state.baseline_profiling_context.get("compute_capability", "—")
+
+    baseline_ctx = state.baseline_profiling_context
+    baseline_launch = baseline_ctx.get("launch", {})
+
+    # Build a memory lookup: direction → memory item (latest / highest speedup)
+    mem_by_dir: dict[str, dict] = {}
+    for item in state.optimization_memory:
+        d = item.get("direction", "")
+        existing = mem_by_dir.get(d)
+        if existing is None or item.get("speedup", 0) > existing.get("speedup", 0):
+            mem_by_dir[d] = item
+
+    lines: list[str] = []
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    lines += [
+        "# Kernel Optimization Log\n\n",
+        "## Environment\n\n",
+        f"- **Device**: {gpu_model}, {sm_count} SMs, {mem_gb} GB HBM\n",
+        f"- **Compute Capability**: {cc}\n",
+        f"- **Peak HBM Bandwidth**: {bw_gbs} GB/s\n",
+        f"- **CUDA**: {cuda_ver} | **Torch**: {torch_ver} | **Triton**: {triton_ver}\n\n",
     ]
 
+    # ── Baseline ────────────────────────────────────────────────────────────
+    kernel_name = baseline_ctx.get("kernel_name", "—")
+    block  = baseline_launch.get("block_size", "—")
+    grid   = baseline_launch.get("grid_size", "—")
+    waves  = baseline_launch.get("waves_per_sm", "—")
+    regs   = baseline_launch.get("registers_per_thread", "—")
+
+    lines += [
+        "## Baseline Kernel\n\n",
+        f"- **Name**: `{kernel_name}`\n",
+        f"- **File**: `{state.kernel_path}`\n",
+        f"- **Framework**: {state.framework}\n",
+        f"- **Launch**: Block ({block},1,1), Grid ({grid},1,1)"
+        + (f", Waves/SM: {waves:.2f}" if isinstance(waves, float) else "") + "\n",
+        f"- **Registers/thread**: {regs}\n",
+        f"- **Duration**: {baseline_latency/1000:.2f} µs ({baseline_latency:.0f} ns)\n",
+        f"- **SM Throughput**: {_m(baseline_ctx, 'GPU Speed Of Light Throughput', 'Compute (SM) Throughput')}"
+        f" | **Memory**: {_m(baseline_ctx, 'GPU Speed Of Light Throughput', 'Memory Throughput')}"
+        f" | **DRAM**: {_m(baseline_ctx, 'Memory Workload Analysis', 'DRAM Throughput')}\n",
+        f"- **Achieved Occupancy**: {_m(baseline_ctx, 'Occupancy', 'Achieved Occupancy')}\n",
+        f"- **IPC Active**: {_m(baseline_ctx, 'Instruction Statistics', 'IPC Active')}"
+        f" | **No Eligible**: {_m(baseline_ctx, 'Scheduler Statistics', 'No Eligible')}\n\n",
+    ]
+
+    # Cumulative best tracking
+    cumulative_best_ns   = baseline_latency
+    cumulative_best_desc = "Baseline"
+    cumulative_history: list[tuple[int, str, float, float]] = []  # iter, direction, ns, speedup
+
+    # ── Per-iteration ────────────────────────────────────────────────────────
     for result in state.iteration_results:
-        lines.append(f"## Iteration {result.iteration}\n\n")
-        lines.append(
-            "| Direction | Speedup | Correctness | Kept | ncu-rep |\n"
-        )
-        lines.append(
-            "|-----------|---------|-------------|------|---------|\n"
-        )
+        iter_num = result.iteration
+        mem_count = sum(1 for r in state.iteration_results[:iter_num] for _ in r.candidates)
+
+        lines.append(f"## Iteration {iter_num}\n\n")
+
+        # Results summary table
+        lines += [
+            f"**Best so far**: {round(baseline_latency / cumulative_best_ns, 4)}×"
+            f" | **Memory items**: {len(state.optimization_memory)}\n\n",
+            "| Plan | Direction | Duration (ns) | Speedup | Correctness | Kept? |\n",
+            "|------|-----------|--------------|---------|-------------|-------|\n",
+        ]
         for c in result.candidates:
-            speedup_str = (
-                f"{c.speedup:.2f}x"
-                if c.latency_ns < float("inf") else "fail"
-            )
-            correct = "passed" if c.correctness_passed else "failed"
-            is_best = (
-                result.best_candidate
-                and c.plan_letter == result.best_candidate.plan_letter
-            )
-            kept = "Y" if is_best else ""
-            ncu = f"[link]({c.ncu_rep_path})" if c.ncu_rep_path else ""
+            dur_str = f"{c.latency_ns:.0f}" if c.latency_ns < float("inf") else "fail"
+            spd_str = f"{c.speedup:.3f}×" if c.latency_ns < float("inf") else "fail"
+            correct = "✓" if c.correctness_passed else "✗"
+            is_best = result.best_candidate and c.plan_letter == result.best_candidate.plan_letter
+            kept    = "**✓ best**" if is_best else ""
             lines.append(
-                f"| {c.direction} | {speedup_str} | "
-                f"{correct} | {kept} | {ncu} |\n"
+                f"| {c.plan_letter} | {c.direction} | {dur_str} | {spd_str} | {correct} | {kept} |\n"
             )
         lines.append("\n")
+
+        # Metric comparison table (only profiled candidates)
+        profiled = [c for c in result.candidates if c.profiling_context]
+        if profiled:
+            metrics_rows = [
+                ("Duration (ns)", "GPU Speed Of Light Throughput", "Duration"),
+                ("SM Throughput (%)", "GPU Speed Of Light Throughput", "Compute (SM) Throughput"),
+                ("Memory Throughput (%)", "GPU Speed Of Light Throughput", "Memory Throughput"),
+                ("DRAM Throughput (%)", "Memory Workload Analysis", "DRAM Throughput"),
+                ("Achieved Occupancy (%)", "Occupancy", "Achieved Occupancy"),
+                ("Registers/Thread", "Launch Statistics", "Registers Per Thread"),
+                ("Waves/SM", "Launch Statistics", "Waves Per SM"),
+                ("No Eligible (%)", "Scheduler Statistics", "No Eligible"),
+                ("IPC Active", "Instruction Statistics", "IPC Active"),
+            ]
+            # Baseline ctx for this iteration (previous best)
+            iter_baseline_ctx = baseline_ctx  # simplified — always compare to original
+
+            header = "| Metric | Baseline |" + "".join(f" {c.direction[:22]} |" for c in profiled) + "\n"
+            sep    = "|--------|---------|" + "".join("-----|" for _ in profiled) + "\n"
+            lines += ["\n### Metric Comparison\n\n", header, sep]
+            for label, section, metric in metrics_rows:
+                base_val = _m(iter_baseline_ctx, section, metric)
+                row = f"| {label} | {base_val} |"
+                for c in profiled:
+                    row += f" {_m(c.profiling_context, section, metric)} |"
+                lines.append(row + "\n")
+            lines.append("\n")
+
+        # Key learnings from optimization_memory
+        learnings: list[str] = []
+        for c in result.candidates:
+            item = mem_by_dir.get(c.direction)
+            if item:
+                rtype  = item.get("rewrite_type", "")
+                speedup = item.get("speedup", 1.0)
+                desc   = item.get("strategy_description", "")
+                app    = item.get("applicable_when", "")
+                avoid  = item.get("do_not_apply_when", "")
+                emoji  = "✅" if rtype == "positive" else ("⚠️" if rtype == "implementation_flaw" else "❌")
+                entry  = f"#### {emoji} Plan {c.plan_letter}: `{c.direction}` ({speedup:.3f}×)\n\n"
+                if desc:  entry += f"{desc}\n\n"
+                if app:   entry += f"> **Applicable when**: {app}\n\n"
+                if avoid: entry += f"> **Avoid when**: {avoid}\n\n"
+                learnings.append(entry)
+            elif not c.correctness_passed:
+                learnings.append(
+                    f"#### ✗ Plan {c.plan_letter}: `{c.direction}` — correctness failed\n\n"
+                    f"```\n{c.correctness_message[:300]}\n```\n\n"
+                )
+
+        if learnings:
+            lines += ["\n### Key Learnings\n\n"] + learnings
+
+        # Track cumulative best
+        if result.best_candidate and result.best_candidate.latency_ns < cumulative_best_ns:
+            cumulative_best_ns   = result.best_candidate.latency_ns
+            cumulative_best_desc = result.best_candidate.direction
+            cumulative_history.append((
+                iter_num,
+                cumulative_best_desc,
+                cumulative_best_ns,
+                round(baseline_latency / cumulative_best_ns, 4),
+            ))
+
+        lines.append("---\n\n")
+
+    # ── Cumulative progress ──────────────────────────────────────────────────
+    lines += [
+        "## Cumulative Progress\n\n",
+        f"```\n",
+        f"Baseline:  {baseline_latency:.0f} ns  (1.000×)\n",
+    ]
+    for iter_num, direction, ns, speedup in cumulative_history:
+        lines.append(f"Iter {iter_num:<3}   {ns:.0f} ns  ({speedup:.3f}×)  — {direction}\n")
+    lines += [
+        f"\nFinal best: {state.best_latency_ns:.0f} ns  ({overall_speedup:.4f}×)\n",
+        "```\n\n",
+    ]
+
+    # ── Config ──────────────────────────────────────────────────────────────
+    cfg = state.config
+    lines += [
+        "## Config\n\n",
+        f"- T={cfg.T}, N={cfg.N}, K={cfg.K}, TopK={cfg.TopK}, ExpN={cfg.ExpN}\n",
+        f"- t_pos={cfg.t_pos}, t_neg={cfg.t_neg}\n",
+        f"- replay_mode={cfg.replay_mode}\n",
+        f"- kernel_args: `{' '.join(cfg.kernel_args) or '—'}`\n",
+    ]
 
     log_path.write_text("".join(lines))
     console.print(f"\n  Log written to [cyan]{log_path}[/]")

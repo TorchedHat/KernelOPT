@@ -76,23 +76,3 @@ def build_llm(
 def strip_thinking(content: str) -> str:
     """Strip <think>...</think> blocks from thinking model output."""
     return re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-
-
-def extract_json(content: str) -> str:
-    """Extract JSON from LLM output, stripping thinking blocks and markdown."""
-    content = strip_thinking(content)
-
-    # Strip markdown fences
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1]
-    if content.endswith("```"):
-        content = content[: content.rfind("```")]
-    content = content.strip()
-
-    # If content doesn't start with {, try to find JSON in it
-    if not content.startswith("{") and not content.startswith("["):
-        match = re.search(r"(\{[\s\S]*\})", content)
-        if match:
-            content = match.group(1)
-
-    return content

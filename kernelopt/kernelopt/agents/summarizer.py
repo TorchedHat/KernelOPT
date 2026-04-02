@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import uuid
@@ -122,6 +123,8 @@ def run_summarizer(
 
     Returns (experience_item, memory_update).
     """
+    from kernelopt.agents.schemas import SummarizerOutput
+
     llm = build_llm(
         model=model,
         api_key=api_key,
@@ -142,6 +145,22 @@ def run_summarizer(
             "recommend 'skip'. If lower, recommend 'replace'."
         )
 
+    # Compute unified diff
+    diff_lines = list(difflib.unified_diff(
+        kernel_before.splitlines(keepends=True),
+        kernel_after.splitlines(keepends=True),
+        fromfile='kernel_before',
+        tofile='kernel_after',
+        lineterm='',
+        n=5  # 5 lines of context around changes
+    ))
+
+    # If diff is too large (>500 lines), truncate to first/last 250
+    if len(diff_lines) > 500:
+        diff_output = ''.join(diff_lines[:250]) + "\n\n... (truncated) ...\n\n" + ''.join(diff_lines[-250:])
+    else:
+        diff_output = ''.join(diff_lines)
+
     human_msg = (
         f"## Iteration: {iteration}\n"
         f"## Speedup: {speedup}x ({rewrite_type})\n"
@@ -152,99 +171,29 @@ def run_summarizer(
         f"```json\n{json.dumps(profiling_after, indent=2)}\n```\n\n"
         f"## Optimization Plan Applied\n"
         f"```json\n{json.dumps(optimization_plan, indent=2)}\n```\n\n"
-        f"## Kernel BEFORE (first 200 lines)\n"
-        f"```\n{''.join(kernel_before.splitlines(True)[:200])}\n```\n\n"
-        f"## Kernel AFTER (first 200 lines)\n"
-        f"```\n{''.join(kernel_after.splitlines(True)[:200])}\n```"
+        f"## Code Changes (Unified Diff)\n"
+        f"```diff\n{diff_output}\n```\n"
         f"{memory_context}"
     )
 
-    response = llm.invoke([
+    # Use structured output for guaranteed schema compliance
+    structured_llm = llm.with_structured_output(SummarizerOutput)
+
+    response = structured_llm.invoke([
         SystemMessage(content=SUMMARIZER_SYSTEM_PROMPT),
         HumanMessage(content=human_msg),
     ])
 
-    from kernelopt.llm import strip_thinking
-    content = strip_thinking(response.content)
-    # Strip markdown fences
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1]
-    if content.endswith("```"):
-        content = content[: content.rfind("```")]
-    content = content.strip()
+    # response is already a Pydantic model with both experience_item and memory_update
+    output = response.model_dump()
 
-    # Parse two JSON objects from response
-    item, memory_update = _parse_two_json(content)
+    item = output["experience_item"]
+    memory_update = output["memory_update"]
 
-    # Ensure required fields on experience_item
-    if not item.get("item_id"):
-        item["item_id"] = uuid.uuid4().hex[:8]
+    # Ensure iteration and speedup are set (should be from structured output, but validate)
     item["iteration"] = iteration
     item["speedup"] = speedup
-    item["rewrite_type"] = rewrite_type
-
-    # Ensure memory_update has required fields
-    if not memory_update:
-        memory_update = {
-            "action": "append",
-            "replace_item_id": None,
-            "reason": "New experience item",
-        }
 
     return item, memory_update
 
 
-def _parse_two_json(content: str) -> tuple[dict, dict]:
-    """Parse two JSON objects from the LLM response using brace balancing."""
-    objects = []
-    i = 0
-    while i < len(content):
-        if content[i] == "{":
-            # Find the matching closing brace
-            depth = 0
-            start = i
-            in_string = False
-            escape = False
-            for j in range(i, len(content)):
-                c = content[j]
-                if escape:
-                    escape = False
-                    continue
-                if c == "\\":
-                    escape = True
-                    continue
-                if c == '"' and not escape:
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if c == "{":
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = content[start : j + 1]
-                        try:
-                            obj = json.loads(candidate)
-                            objects.append(obj)
-                        except json.JSONDecodeError:
-                            pass
-                        i = j + 1
-                        break
-            else:
-                i += 1
-        else:
-            i += 1
-
-    if len(objects) >= 2:
-        # Larger object is experience_item, smaller is memory_update
-        if len(objects[0]) >= len(objects[1]):
-            return objects[0], objects[1]
-        else:
-            return objects[1], objects[0]
-    elif len(objects) == 1:
-        return objects[0], {}
-    else:
-        raise ValueError(
-            f"Could not parse JSON from summarizer response: {content[:500]}"
-        )

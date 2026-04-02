@@ -50,6 +50,7 @@ class PipelineConfig:
     kernel_name: str | None = None
     launch_skip: int = 0
     launch_count: int | None = None
+    replay_mode: str = "kernel"   # "kernel" (default) or "application" (less GPU memory, slower)
     ncu_extra_args: list[str] = field(default_factory=list)
     kernel_args: list[str] = field(default_factory=list)  # args passed to kernel program
 
