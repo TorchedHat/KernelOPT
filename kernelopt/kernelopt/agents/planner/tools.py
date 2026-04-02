@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from typing import Annotated, Any
+
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import InjectedToolArg, tool
+
 
 class PlannerToolServer:
     """Holds immutable profiling data and serves tool calls for planner sub-graphs.
@@ -125,11 +130,6 @@ class PlannerToolServer:
 # LangChain @tool wrappers — delegate to PlannerToolServer via configurable
 # ---------------------------------------------------------------------------
 
-from typing import Annotated
-
-from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import InjectedToolArg, tool
-
 
 @tool
 def query_profiling_context(
@@ -209,7 +209,7 @@ def submit_plan(plan: dict) -> str:
 
 # Map of tool name → tool function for tool_node dispatch.
 # submit_plan is intentionally excluded — handled separately in tool_node.
-_TOOL_MAP: dict[str, object] = {
+_TOOL_MAP: dict[str, Any] = {
     "query_profiling_context": query_profiling_context,
     "get_kernel_source": get_kernel_source,
     "search_memory": search_memory,
