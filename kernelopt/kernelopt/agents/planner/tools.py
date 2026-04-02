@@ -8,6 +8,8 @@ class PlannerToolServer:
     """Holds immutable profiling data and serves tool calls for planner sub-graphs.
 
     Thread-safe for concurrent reads — no mutation after construction.
+    Callers must not mutate the dicts returned by query_profiling_context
+    or search_memory; they share memory with internal state.
     """
 
     def __init__(
@@ -31,7 +33,7 @@ class PlannerToolServer:
             return {
                 "rules": sorted(
                     rules,
-                    key=lambda r: r.get("speedup_pct") or 0,
+                    key=lambda r: r.get("speedup_pct") if r.get("speedup_pct") is not None else 0,
                     reverse=True,
                 )
             }
@@ -97,7 +99,11 @@ class PlannerToolServer:
         return self.kernel_source
 
     def search_memory(self, query: str) -> list[dict]:
-        """Return up to 3 memory items most relevant to the query."""
+        """Return up to 3 memory items most relevant to the query.
+
+        Keyword matching is substring-based: "register" matches "registers_per_thread".
+        An empty query returns the first 3 items in list order.
+        """
         if not self.memory:
             return []
 
