@@ -275,7 +275,7 @@ def plan(
     """Generate optimization plan(s) from a profile CSV (no execution)."""
     import json
 
-    from kernelopt.agents.planner import run_planner
+    from kernelopt.agents.planner import run_planner_agent
     from kernelopt.agents.profiler import build_profiling_context
     from kernelopt.functions.csv_parser import parse_ncu_csv
     from kernelopt.memory import load_memory
@@ -286,14 +286,23 @@ def plan(
     )
     mem = load_memory(memory) if memory else []
 
-    for i in range(num_plans):
-        result = run_planner(
-            ctx, kernel_path.read_text(), mem,
-            api_key=api_key, model=model,
-            project_id=project_id, region=region,
-        )
+    llm_config = {
+        "model": model,
+        "api_key": api_key,
+        "project_id": project_id,
+        "region": region,
+    }
+    plans = run_planner_agent(
+        profiling_context=ctx,
+        kernel_source=kernel_path.read_text(),
+        memory=mem,
+        N=num_plans,
+        llm_config=llm_config,
+        all_tried_directions=[],
+    )
+    for letter, result in plans:
         if num_plans > 1:
-            console.print(f"\n[bold]Plan {i + 1}/{num_plans}:[/]")
+            console.print(f"\n[bold]Plan {letter}:[/]")
         console.print_json(json.dumps(result))
 
 

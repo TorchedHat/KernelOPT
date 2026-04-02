@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 
+from typing import Annotated
+
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 from kernelopt.agents.schemas import OptimizationPlan
@@ -16,7 +19,7 @@ from kernelopt.agents.planner.tools import ALL_TOOLS, _TOOL_MAP
 
 
 class PlannerState(TypedDict, total=False):
-    messages: list
+    messages: Annotated[list, add_messages]
     plan: dict | None
 
 
