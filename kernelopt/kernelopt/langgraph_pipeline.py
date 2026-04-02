@@ -17,7 +17,6 @@ from rich.console import Console
 from rich.table import Table
 
 from kernelopt.agents.executor import run_executor
-from kernelopt.agents.planner import run_planner
 from kernelopt.agents.profiler import (
     build_profiling_context,
     get_latency_ns,
@@ -105,12 +104,11 @@ def profile_baseline(state: GraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 def generate_plans(state: GraphState) -> dict:
-    """Generate N diverse optimization plans sequentially."""
+    """Generate N diverse optimization plans concurrently via parallel planner sub-graphs."""
+    from kernelopt.agents.planner import run_planner_agent
+
     cfg = state["config"]
-    N = cfg.N
-    current_kernel = state["best_kernel"]
     profiling_ctx = state["current_profiling_context"]
-    memory = state.get("optimization_memory", [])
     iteration = state.get("iteration", 0)
     baseline = state.get("baseline_latency_ns", float("inf"))
     best_speedup = round(baseline / state["best_latency_ns"], 2)
@@ -118,37 +116,39 @@ def generate_plans(state: GraphState) -> dict:
     console.print(
         f"\n[bold]Iteration {iteration + 1}/{cfg.T}[/]  "
         f"Best: [green]{best_speedup}x[/]  "
-        f"Memory: {len(memory)} items"
+        f"Memory: {len(state.get('optimization_memory', []))} items"
     )
-    console.print(f"  Generating {N} optimization plans...")
+    console.print(f"  Generating {cfg.N} optimization plans...")
 
-    plans: list[tuple[str, dict]] = []
-    previous_directions: list[str] = []  # Accumulator for diversity
+    # Build cross-iteration direction history
+    all_tried_directions = [
+        c.direction
+        for result in state.get("iteration_results", [])
+        for c in result.candidates
+    ]
 
-    for i in range(N):
-        try:
-            plan = run_planner(
-                profiling_context=profiling_ctx,
-                kernel_source=current_kernel,
-                optimization_memory=memory,
-                api_key=cfg.api_key,
-                model=cfg.planner_model or cfg.model,
-                project_id=cfg.project_id,
-                region=cfg.region,
-                plan_index=i,
-                total_plans=N,
-                previous_directions=previous_directions,  # Accumulated list
-            )
-            direction = plan.get("direction", "unknown")
-            confidence = plan.get("confidence", "?")
-            plans.append((PLAN_LETTERS[i], plan))
-            previous_directions.append(direction)  # Grows each iteration
-            console.print(
-                f"    Plan {PLAN_LETTERS[i]}: {direction} "
-                f"[dim](confidence: {confidence})[/]"
-            )
-        except Exception as e:
-            console.print(f"    [red]Plan {PLAN_LETTERS[i]} failed: {e}[/]")
+    llm_config = {
+        "model": cfg.planner_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
+
+    plans = run_planner_agent(
+        profiling_context=profiling_ctx,
+        kernel_source=state["best_kernel"],
+        memory=state.get("optimization_memory", []),
+        N=cfg.N,
+        llm_config=llm_config,
+        all_tried_directions=all_tried_directions,
+    )
+
+    for letter, plan in plans:
+        direction = plan.get("direction", "unknown")
+        confidence = plan.get("confidence", "?")
+        console.print(
+            f"    Plan {letter}: {direction} [dim](confidence: {confidence})[/]"
+        )
 
     return {"plans": plans}
 
@@ -175,6 +175,7 @@ def execute_plans(state: GraphState) -> dict:
     launch_config = profiling_ctx.get("launch")
 
     candidates: list[PlanCandidate] = []
+    correctness_failure_items: list[dict] = []
 
     for plan_letter, plan in plans:
         direction = plan.get("direction", "unknown")
@@ -238,6 +239,33 @@ def execute_plans(state: GraphState) -> dict:
             if not passed:
                 console.print(f"    [dim]Failure: {msg[:300]}[/]")
                 previous_errors.append(f"Correctness failure: {msg[:500]}")
+                # Create a lightweight implementation_flaw memory item so the
+                # planner knows this direction was attempted and can guide the
+                # executor with better hints next time.
+                import uuid as _uuid
+                correctness_failure_items.append({
+                    "item_id": _uuid.uuid4().hex[:8],
+                    "iteration": iteration + 1,
+                    "speedup": 0.0,
+                    "rewrite_type": "implementation_flaw",
+                    "framework": framework,
+                    "direction": direction,
+                    "profiling_signal": {
+                        "ncu_rule_triggered": plan.get("evidence", {}).get("ncu_rule"),
+                        "key_metric_before": {},
+                        "key_metric_after": {},
+                    },
+                    "strategy_title": f"{direction} — correctness failure",
+                    "strategy_description": (
+                        f"Plan '{direction}' was applied but failed correctness. "
+                        f"Error: {msg[:300]}"
+                    ),
+                    "slow_pseudocode": "",
+                    "fast_pseudocode": "",
+                    "applicable_when": plan.get("evidence", {}).get("reasoning", ""),
+                    "do_not_apply_when": f"Previous implementation failed: {msg[:200]}",
+                    "framework_notes": None,
+                })
                 continue
 
             candidate = PlanCandidate(
@@ -253,7 +281,7 @@ def execute_plans(state: GraphState) -> dict:
             candidates.append(candidate)
             break
 
-    return {"candidates": candidates}
+    return {"candidates": candidates, "correctness_failure_items": correctness_failure_items}
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +406,14 @@ def summarize_results(state: GraphState) -> dict:
                 f"    [red]Summarizer failed (plan {c.plan_letter}): {e}[/]"
             )
 
-    # Apply memory curation
+    # Merge implementation_flaw items from correctness failures — these bypass
+    # the speedup curation threshold and go directly into memory so the planner
+    # can avoid repeating broken implementations.
+    failure_items = state.get("correctness_failure_items", [])
+    if failure_items:
+        memory = append_items(memory, failure_items, cfg.ExpN)
+
+    # Apply memory curation for profiled candidates
     top_items = select_top_k(experience_items, cfg.TopK, cfg.t_pos, cfg.t_neg)
     if top_items:
         memory = append_items(memory, top_items, cfg.ExpN)
