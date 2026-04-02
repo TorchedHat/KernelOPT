@@ -100,3 +100,54 @@ def test_search_memory_returns_at_most_three(sample_profiling_context, sample_ke
     server = PlannerToolServer(sample_profiling_context, sample_kernel_source, memory)
     results = server.search_memory("foo bar")
     assert len(results) <= 3
+
+
+# --- Tool wrapper tests ---
+
+from langchain_core.runnables import RunnableConfig
+from kernelopt.agents.planner.tools import (
+    query_profiling_context as tool_query,
+    get_kernel_source as tool_get_source,
+    search_memory as tool_search,
+    submit_plan as tool_submit,
+    _TOOL_MAP,
+)
+
+
+def _make_config(server: PlannerToolServer) -> RunnableConfig:
+    return RunnableConfig(configurable={"tool_server": server})
+
+
+def test_tool_query_profiling_context(sample_profiling_context, sample_kernel_source):
+    server = PlannerToolServer(sample_profiling_context, sample_kernel_source, [])
+    config = _make_config(server)
+    result = tool_query.invoke({"aspect": "rules"}, config=config)
+    assert "rules" in result
+    assert result["rules"][0]["name"] == "TheoreticalOccupancy"
+
+
+def test_tool_get_kernel_source(sample_profiling_context, sample_kernel_source):
+    server = PlannerToolServer(sample_profiling_context, sample_kernel_source, [])
+    config = _make_config(server)
+    result = tool_get_source.invoke({}, config=config)
+    assert "softmax_kernel" in result
+
+
+def test_tool_search_memory(sample_profiling_context, sample_kernel_source, sample_memory):
+    server = PlannerToolServer(sample_profiling_context, sample_kernel_source, sample_memory)
+    config = _make_config(server)
+    result = tool_search.invoke({"query": "register occupancy"}, config=config)
+    assert isinstance(result, list)
+    assert result[0]["direction"] == "reduce_tile_size_for_occupancy"
+
+
+def test_tool_map_contains_read_tools():
+    assert "query_profiling_context" in _TOOL_MAP
+    assert "get_kernel_source" in _TOOL_MAP
+    assert "search_memory" in _TOOL_MAP
+    # submit_plan is handled specially in tool_node — not in _TOOL_MAP
+    assert "submit_plan" not in _TOOL_MAP
+
+
+def test_submit_plan_tool_has_name():
+    assert tool_submit.name == "submit_plan"

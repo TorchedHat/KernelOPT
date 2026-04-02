@@ -119,3 +119,101 @@ class PlannerToolServer:
             return sum(1 for w in query_words if w in text)
 
         return sorted(self.memory, key=score, reverse=True)[:3]
+
+
+# ---------------------------------------------------------------------------
+# LangChain @tool wrappers — delegate to PlannerToolServer via configurable
+# ---------------------------------------------------------------------------
+
+from typing import Annotated
+
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import InjectedToolArg, tool
+
+
+@tool
+def query_profiling_context(
+    aspect: str,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> dict:
+    """Query a slice of the NCU profiling context.
+
+    aspect must be one of:
+      rules            — NCU optimization rules sorted by estimated speedup
+      occupancy        — Occupancy section + key launch parameters
+      memory_workload  — Memory Workload Analysis section
+      throughput       — GPU Speed of Light throughput percentages
+      scheduler        — Scheduler Statistics (stall reasons)
+      launch           — Full launch configuration (block size, grid, waves/SM, registers)
+      gpu_specs        — GPU hardware specs (peak bandwidth, TFLOPS, SM count)
+      instruction_stats — Instruction Statistics (IPC)
+    """
+    server: PlannerToolServer = config["configurable"]["tool_server"]
+    return server.query_profiling_context(aspect)
+
+
+@tool
+def get_kernel_source(
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> str:
+    """Return the full kernel source code.
+
+    Call this when you need to map a profiling signal to a specific construct
+    in the code — a loop, tile parameter, allocation, or instruction.
+    """
+    server: PlannerToolServer = config["configurable"]["tool_server"]
+    return server.get_kernel_source()
+
+
+@tool
+def search_memory(
+    query: str,
+    config: Annotated[RunnableConfig, InjectedToolArg],
+) -> list[dict]:
+    """Search past optimization experience for relevant strategies.
+
+    query — natural language, e.g. "register pressure triton" or "tile size occupancy".
+    Returns up to 3 memory items ranked by keyword relevance.
+    Each item includes: direction, strategy_description, applicable_when,
+    do_not_apply_when, rewrite_type (positive/negative/implementation_flaw), speedup.
+    """
+    server: PlannerToolServer = config["configurable"]["tool_server"]
+    return server.search_memory(query)
+
+
+@tool
+def submit_plan(plan: dict) -> str:
+    """Submit your final optimization plan. Call this when you have gathered
+    enough information from profiling context and kernel source.
+
+    The plan dict must include:
+      plan_id             — short unique identifier (e.g. "plan_001")
+      direction           — snake_case name (e.g. "reduce_register_pressure")
+      framework           — "cuda" | "triton" | "helion" | "unknown"
+      evidence            — {ncu_rule, ncu_rule_speedup_pct, supporting_metrics, reasoning}
+      step                — {action, target, change, predicted_effect,
+                             implementation_hints, success_criteria}
+      correctness_constraints — list of strings
+      architecture_notes  — string or null
+      memory_item_used    — item_id string or null
+      confidence          — "high" | "medium" | "low"
+      confidence_reason   — string
+
+    step.change must describe EXACTLY what the executor must modify (old → new values).
+    step.implementation_hints must give concrete before/after code snippets.
+    """
+    # This function body is never called — tool_node intercepts submit_plan
+    # and handles validation + state update directly.
+    return "received"
+
+
+# Map of tool name → tool function for tool_node dispatch.
+# submit_plan is intentionally excluded — handled separately in tool_node.
+_TOOL_MAP: dict[str, object] = {
+    "query_profiling_context": query_profiling_context,
+    "get_kernel_source": get_kernel_source,
+    "search_memory": search_memory,
+}
+
+# All tools to bind to the LLM (including submit_plan).
+ALL_TOOLS = [query_profiling_context, get_kernel_source, search_memory, submit_plan]
