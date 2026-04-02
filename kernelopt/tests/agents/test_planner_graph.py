@@ -142,3 +142,87 @@ def test_tool_node_submit_plan_invalid_schema_does_not_set_plan(server):
     assert "validation" in result["messages"][0].content.lower() or \
            "failed" in result["messages"][0].content.lower() or \
            "error" in result["messages"][0].content.lower()
+
+
+# --- run_planner_agent integration ---
+
+from unittest.mock import MagicMock
+from kernelopt.agents.planner import run_planner_agent
+
+
+def _make_mock_llm(tool_calls_sequence):
+    """Return a mock LLM that emits AIMessages with the given tool_calls in sequence."""
+    mock_llm = MagicMock()
+    responses = [
+        AIMessage(content="", tool_calls=tcs) for tcs in tool_calls_sequence
+    ]
+    mock_llm.bind_tools.return_value = mock_llm
+    mock_llm.invoke.side_effect = responses
+    return mock_llm
+
+
+def test_run_planner_agent_returns_plans(
+    sample_profiling_context, sample_kernel_source, sample_memory
+):
+    """run_planner_agent with N=1 should return 1 (letter, plan) tuple."""
+    mock_llm = _make_mock_llm([
+        # First call: submit immediately
+        [{"name": "submit_plan", "args": {"plan": VALID_PLAN}, "id": "tc1"}],
+    ])
+
+    plans = run_planner_agent(
+        profiling_context=sample_profiling_context,
+        kernel_source=sample_kernel_source,
+        memory=sample_memory,
+        N=1,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        all_tried_directions=[],
+        llm_override=mock_llm,
+    )
+    assert len(plans) == 1
+    letter, plan = plans[0]
+    assert letter == "A"
+    assert plan["direction"] == "reduce_register_pressure"
+
+
+def test_run_planner_agent_deduplicates_directions(
+    sample_profiling_context, sample_kernel_source, sample_memory
+):
+    """Two plans with the same direction should be deduplicated to one."""
+    mock_llm = _make_mock_llm([
+        [{"name": "submit_plan", "args": {"plan": VALID_PLAN}, "id": "tc1"}],
+        [{"name": "submit_plan", "args": {"plan": VALID_PLAN}, "id": "tc2"}],
+    ])
+
+    plans = run_planner_agent(
+        profiling_context=sample_profiling_context,
+        kernel_source=sample_kernel_source,
+        memory=sample_memory,
+        N=2,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        all_tried_directions=[],
+        llm_override=mock_llm,
+    )
+    # Both plans have direction "reduce_register_pressure" → deduplicated to 1
+    assert len(plans) == 1
+
+
+def test_run_planner_agent_skips_failed_instances(
+    sample_profiling_context, sample_kernel_source, sample_memory
+):
+    """An instance that never calls submit_plan returns None and is excluded."""
+    mock_llm = _make_mock_llm([
+        # No tool calls → agent gives up → plan is None
+        [],
+    ])
+
+    plans = run_planner_agent(
+        profiling_context=sample_profiling_context,
+        kernel_source=sample_kernel_source,
+        memory=sample_memory,
+        N=1,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        all_tried_directions=[],
+        llm_override=mock_llm,
+    )
+    assert plans == []
