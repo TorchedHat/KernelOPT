@@ -16,7 +16,7 @@ from langgraph.graph import END, StateGraph
 from rich.console import Console
 from rich.table import Table
 
-from kernelopt.agents.executor import run_executor
+from kernelopt.agents.executor import run_executor_agent
 from kernelopt.agents.profiler import (
     build_profiling_context,
     get_latency_ns,
@@ -169,10 +169,12 @@ def execute_plans(state: GraphState) -> dict:
     kernel_basename = state["kernel_basename"]
     kernel_path = state["kernel_path"]
 
-    # Extract hardware context from the current profiling context
-    profiling_ctx = state.get("current_profiling_context", {})
-    gpu_specs = profiling_ctx.get("gpu_specs")
-    launch_config = profiling_ctx.get("launch")
+    llm_config = {
+        "model": cfg.executor_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     candidates: list[PlanCandidate] = []
     correctness_failure_items: list[dict] = []
@@ -182,104 +184,87 @@ def execute_plans(state: GraphState) -> dict:
         safe_dir = direction.replace(" ", "_")[:40]
         file_stem = f"{kernel_basename}_iter{iteration + 1}_plan{plan_letter}_{safe_dir}"
 
-        previous_errors: list[str] = []
-        for attempt in range(1, cfg.K + 1):
-            console.print(f"  [dim]Executing plan {plan_letter}, attempt {attempt}...[/]")
-            try:
-                optimized_source, execution_result = run_executor(
-                    kernel_source=current_kernel,
-                    optimization_plan=plan,
-                    framework=framework,
-                    api_key=cfg.api_key,
-                    model=cfg.executor_model or cfg.model,
-                    project_id=cfg.project_id,
-                    region=cfg.region,
-                    attempt=attempt,
-                    gpu_specs=gpu_specs,
-                    launch_config=launch_config,
-                    previous_errors=previous_errors,
-                )
-
-                console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
-                console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
-                console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
-
-            except Exception as e:
-                import traceback
-                err = f"Executor exception: {e}\n{traceback.format_exc()[:500]}"
-                console.print(f"    [red]Executor failed (plan {plan_letter}, attempt {attempt}): {e}[/]")
-                previous_errors.append(err)
-                continue
-
-            if not execution_result.get("ready_for_profiling", False):
-                reason = execution_result.get("reason", execution_result.get("status", "failed"))
-                console.print(f"    [red]Plan {plan_letter}: {reason}[/]")
-                previous_errors.append(f"Implementation failure: {reason}")
-                continue
-
-            # Save kernel file
-            kernel_file = str(output_dir / f"{file_stem}{ext}")
-            Path(kernel_file).write_text(optimized_source)
-
-            # Correctness check
-            console.print(f"  [dim]Running correctness check...[/]")
-            passed, msg = check_correctness(
-                kernel_path, optimized_source, framework,
-                use_agentic=cfg.agentic_correctness,
-                api_key=cfg.api_key,
-                project_id=cfg.project_id,
-                region=cfg.region,
-                kernel_args=cfg.kernel_args,
-            )
-            execution_result["correctness"] = "passed" if passed else "failed"
-
-            status = "[green]passed[/]" if passed else "[red]failed[/]"
-            console.print(f"    Plan {plan_letter}: correctness {status}")
-
-            if not passed:
-                console.print(f"    [dim]Failure: {msg[:300]}[/]")
-                previous_errors.append(f"Correctness failure: {msg[:500]}")
-                # Create a lightweight implementation_flaw memory item so the
-                # planner knows this direction was attempted and can guide the
-                # executor with better hints next time.
-                import uuid as _uuid
-                correctness_failure_items.append({
-                    "item_id": _uuid.uuid4().hex[:8],
-                    "iteration": iteration + 1,
-                    "speedup": 0.0,
-                    "rewrite_type": "implementation_flaw",
-                    "framework": framework,
-                    "direction": direction,
-                    "profiling_signal": {
-                        "ncu_rule_triggered": plan.get("evidence", {}).get("ncu_rule"),
-                        "key_metric_before": {},
-                        "key_metric_after": {},
-                    },
-                    "strategy_title": f"{direction} — correctness failure",
-                    "strategy_description": (
-                        f"Plan '{direction}' was applied but failed correctness. "
-                        f"Error: {msg[:300]}"
-                    ),
-                    "slow_pseudocode": "",
-                    "fast_pseudocode": "",
-                    "applicable_when": plan.get("evidence", {}).get("reasoning", ""),
-                    "do_not_apply_when": f"Previous implementation failed: {msg[:200]}",
-                    "framework_notes": None,
-                })
-                continue
-
-            candidate = PlanCandidate(
-                plan_id=plan.get("plan_id", ""),
-                plan_letter=plan_letter,
-                direction=direction,
+        console.print(f"  [dim]Executing plan {plan_letter} ({direction})...[/]")
+        try:
+            optimized_source, execution_result = run_executor_agent(
+                kernel_source=current_kernel,
                 optimization_plan=plan,
-                optimized_kernel=optimized_source,
-                execution_result=execution_result,
-                correctness_passed=passed,
-                correctness_message=msg,
+                memory=state.get("optimization_memory", []),
+                K=cfg.K,
+                llm_config=llm_config,
             )
-            candidates.append(candidate)
-            break
+        except Exception as e:
+            import traceback
+            console.print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
+            continue
+
+        console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
+        console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
+        console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
+
+        if not execution_result.get("ready_for_profiling", False):
+            reason = execution_result.get("reason", execution_result.get("status", "failed"))
+            console.print(f"    [red]Plan {plan_letter}: {reason}[/]")
+            continue
+
+        # Save kernel file
+        kernel_file = str(output_dir / f"{file_stem}{ext}")
+        Path(kernel_file).write_text(optimized_source)
+
+        # Correctness check
+        console.print(f"  [dim]Running correctness check...[/]")
+        passed, msg = check_correctness(
+            kernel_path, optimized_source, framework,
+            use_agentic=cfg.agentic_correctness,
+            api_key=cfg.api_key,
+            project_id=cfg.project_id,
+            region=cfg.region,
+            kernel_args=cfg.kernel_args,
+        )
+        execution_result["correctness"] = "passed" if passed else "failed"
+
+        status = "[green]passed[/]" if passed else "[red]failed[/]"
+        console.print(f"    Plan {plan_letter}: correctness {status}")
+
+        if not passed:
+            console.print(f"    [dim]Failure: {msg[:300]}[/]")
+            import uuid as _uuid
+            correctness_failure_items.append({
+                "item_id": _uuid.uuid4().hex[:8],
+                "iteration": iteration + 1,
+                "speedup": 0.0,
+                "rewrite_type": "implementation_flaw",
+                "framework": framework,
+                "direction": direction,
+                "profiling_signal": {
+                    "ncu_rule_triggered": plan.get("evidence", {}).get("ncu_rule"),
+                    "key_metric_before": {},
+                    "key_metric_after": {},
+                },
+                "strategy_title": f"{direction} — correctness failure",
+                "strategy_description": (
+                    f"Plan '{direction}' was applied but failed correctness. "
+                    f"Error: {msg[:300]}"
+                ),
+                "slow_pseudocode": "",
+                "fast_pseudocode": "",
+                "applicable_when": plan.get("evidence", {}).get("reasoning", ""),
+                "do_not_apply_when": f"Previous implementation failed: {msg[:200]}",
+                "framework_notes": None,
+            })
+            continue
+
+        candidate = PlanCandidate(
+            plan_id=plan.get("plan_id", ""),
+            plan_letter=plan_letter,
+            direction=direction,
+            optimization_plan=plan,
+            optimized_kernel=optimized_source,
+            execution_result=execution_result,
+            correctness_passed=passed,
+            correctness_message=msg,
+        )
+        candidates.append(candidate)
 
     return {"candidates": candidates, "correctness_failure_items": correctness_failure_items}
 
