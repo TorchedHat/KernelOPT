@@ -219,3 +219,93 @@ def test_tool_node_submit_no_marker_under_K_continues():
     result = tool_node(state, _config(K=3))
     assert result.get("kernel_result") is None
     assert result["attempt"] == 1
+
+
+# --- run_executor_agent integration ---
+
+from unittest.mock import MagicMock
+from kernelopt.agents.executor import run_executor_agent
+
+
+def _make_mock_llm(tool_calls_sequence):
+    """Return a mock LLM that emits AIMessages with the given tool_calls in sequence."""
+    mock_llm = MagicMock()
+    responses = [
+        AIMessage(content="", tool_calls=tcs) for tcs in tool_calls_sequence
+    ]
+    mock_llm.bind_tools.return_value = mock_llm
+    mock_llm.invoke.side_effect = responses
+    return mock_llm
+
+
+def test_run_executor_agent_success_on_first_attempt(sample_memory):
+    mock_llm = _make_mock_llm([
+        [{"name": "submit_kernel", "args": {"kernel_source": TRITON_KERNEL, "change_summary": "Reduced BLOCK_SIZE"}, "id": "tc1"}],
+    ])
+    kernel, result = run_executor_agent(
+        kernel_source=TRITON_KERNEL,
+        optimization_plan=SAMPLE_PLAN,
+        memory=sample_memory,
+        K=2,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        llm_override=mock_llm,
+    )
+    assert "@triton.jit" in kernel
+    assert result["status"] == "success"
+    assert result["ready_for_profiling"] is True
+    assert result["framework"] == "triton"
+    assert result["attempt"] == 1
+
+
+def test_run_executor_agent_retries_then_succeeds(sample_memory):
+    """Agent fails once (empty kernel), then succeeds on second attempt."""
+    mock_llm = _make_mock_llm([
+        # First submit: empty kernel (fails validation, attempt < K)
+        [{"name": "submit_kernel", "args": {"kernel_source": "", "change_summary": "bad"}, "id": "tc1"}],
+        # Agent tries again: valid kernel
+        [{"name": "submit_kernel", "args": {"kernel_source": TRITON_KERNEL, "change_summary": "fixed"}, "id": "tc2"}],
+    ])
+    kernel, result = run_executor_agent(
+        kernel_source=TRITON_KERNEL,
+        optimization_plan=SAMPLE_PLAN,
+        memory=sample_memory,
+        K=2,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        llm_override=mock_llm,
+    )
+    assert result["status"] == "success"
+    assert result["attempt"] == 2
+
+
+def test_run_executor_agent_exhausts_K_returns_failure(sample_memory):
+    """Agent submits empty kernel K times → implementation_failure returned."""
+    mock_llm = _make_mock_llm([
+        [{"name": "submit_kernel", "args": {"kernel_source": "", "change_summary": "bad"}, "id": "tc1"}],
+        [{"name": "submit_kernel", "args": {"kernel_source": "", "change_summary": "bad"}, "id": "tc2"}],
+    ])
+    kernel, result = run_executor_agent(
+        kernel_source=TRITON_KERNEL,
+        optimization_plan=SAMPLE_PLAN,
+        memory=sample_memory,
+        K=2,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        llm_override=mock_llm,
+    )
+    assert result["status"] == "implementation_failure"
+    assert result["ready_for_profiling"] is False
+    assert kernel == TRITON_KERNEL  # original returned unchanged
+
+
+def test_run_executor_agent_no_submit_returns_failure(sample_memory):
+    """Agent emits no tool calls → graph ends without kernel_result → failure."""
+    mock_llm = _make_mock_llm([[]])  # empty tool_calls list → route_from_agent → END
+    kernel, result = run_executor_agent(
+        kernel_source=TRITON_KERNEL,
+        optimization_plan=SAMPLE_PLAN,
+        memory=sample_memory,
+        K=2,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        llm_override=mock_llm,
+    )
+    assert result["status"] == "implementation_failure"
+    assert result["ready_for_profiling"] is False
