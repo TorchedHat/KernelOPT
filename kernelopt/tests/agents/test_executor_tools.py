@@ -116,3 +116,39 @@ def test_all_tools_has_four_entries():
     assert len(ALL_TOOLS) == 4
     names = {t.name for t in ALL_TOOLS}
     assert names == {"get_kernel_source", "get_optimization_plan", "search_memory", "submit_kernel"}
+
+
+# --- prompts ---
+
+from langchain_core.messages import HumanMessage
+from kernelopt.agents.executor.prompts import SYSTEM_PROMPT, build_initial_message
+
+
+def test_system_prompt_contains_role():
+    assert "Executor Agent" in SYSTEM_PROMPT
+
+
+def test_system_prompt_mentions_submit_kernel():
+    assert "submit_kernel" in SYSTEM_PROMPT
+
+
+def test_system_prompt_has_no_hardcoded_framework_rules():
+    # Must NOT contain framework-specific transformation recipes
+    assert "__launch_bounds__" not in SYSTEM_PROMPT
+    assert "tl.constexpr" not in SYSTEM_PROMPT
+    assert "BLOCK_M" not in SYSTEM_PROMPT
+
+
+def test_build_initial_message_is_human_message():
+    msg = build_initial_message("reduce_register_pressure", K=3)
+    assert isinstance(msg, HumanMessage)
+
+
+def test_build_initial_message_contains_direction():
+    msg = build_initial_message("reduce_register_pressure", K=3)
+    assert "reduce_register_pressure" in msg.content
+
+
+def test_build_initial_message_contains_attempt_count():
+    msg = build_initial_message("increase_tile_k", K=2)
+    assert "2" in msg.content
