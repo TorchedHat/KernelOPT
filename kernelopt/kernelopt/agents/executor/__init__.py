@@ -8,6 +8,8 @@ Exports:
 
 from __future__ import annotations
 
+import traceback
+
 from langchain_core.runnables import RunnableConfig
 
 from kernelopt.agents.executor.graph import executor_subgraph
@@ -59,7 +61,6 @@ def run_executor_agent(
             config=config,
         )
     except Exception as e:
-        import traceback
         return kernel_source, {
             "plan_id": plan_id,
             "attempt": 0,
