@@ -18,7 +18,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from kernelopt.agents.executor import run_executor
+from kernelopt.agents.executor import run_executor_agent
 from kernelopt.agents.planner import run_planner
 from kernelopt.agents.profiler import (
     build_profiling_context,
@@ -201,7 +201,7 @@ def _run_iteration(
 
         for attempt in range(1, cfg.K + 1):
             try:
-                optimized_source, execution_result = run_executor(
+                optimized_source, execution_result = run_executor_agent(
                     kernel_source=current_kernel,
                     optimization_plan=plan,
                     framework=state.framework,
