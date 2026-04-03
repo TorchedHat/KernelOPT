@@ -77,7 +77,7 @@ def test_search_memory_returns_at_most_three():
         for i in range(5)
     ]
     server = ExecutorToolServer(TRITON_KERNEL, SAMPLE_PLAN, memory)
-    assert len(server.search_memory("foo bar")) <= 3
+    assert len(server.search_memory("foo bar")) == 3
 
 
 # --- @tool wrappers ---
@@ -96,8 +96,9 @@ def test_tool_get_optimization_plan():
 
 def test_tool_search_memory(sample_memory):
     server = ExecutorToolServer(TRITON_KERNEL, SAMPLE_PLAN, sample_memory)
-    result = tool_search.invoke({"query": "register pressure"}, config=_config(server))
+    result = tool_search.invoke({"query": "register pressure occupancy"}, config=_config(server))
     assert isinstance(result, list)
+    assert result[0]["direction"] == "reduce_tile_size_for_occupancy"
 
 
 def test_tool_map_excludes_submit_kernel():
