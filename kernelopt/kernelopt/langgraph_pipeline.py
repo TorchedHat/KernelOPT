@@ -194,7 +194,6 @@ def execute_plans(state: GraphState) -> dict:
                 llm_config=llm_config,
             )
         except Exception as e:
-            import traceback
             console.print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
             continue
 
