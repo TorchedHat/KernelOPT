@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 from typing import Annotated
 
@@ -85,9 +86,12 @@ def tool_node(state: ExecutorState, config: RunnableConfig) -> dict:
 
             if is_valid:
                 framework = _infer_framework(kernel_source)
-                orig_lines = set(original_kernel.splitlines())
-                new_lines = set(kernel_source.splitlines())
-                lines_changed = len(new_lines - orig_lines)
+                lines_changed = sum(
+                    1 for line in difflib.unified_diff(
+                        original_kernel.splitlines(), kernel_source.splitlines()
+                    )
+                    if line.startswith("+") and not line.startswith("+++")
+                )
 
                 new_kernel_result = {
                     "kernel_source": kernel_source,
