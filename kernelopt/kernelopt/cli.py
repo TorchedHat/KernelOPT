@@ -85,6 +85,13 @@ def run(
     executor_model: Optional[str] = typer.Option(
         None, "--executor-model", help="Model for executor agent"
     ),
+    profile_hints: str = typer.Option(
+        "", "--profile-hints",
+        help="Natural language hint for the profiler agent (e.g. 'profile only the forward pass')"
+    ),
+    profiler_model: Optional[str] = typer.Option(
+        None, "--profiler-model", help="Model for profiler agent config-decider"
+    ),
     verbose: bool = typer.Option(False, help="Verbose output"),
     agentic_correctness: bool = typer.Option(
         True, "--agentic-correctness/--no-agentic-correctness",
@@ -126,6 +133,8 @@ def run(
         planner_model=planner_model,
         summarizer_model=summarizer_model,
         executor_model=executor_model,
+        profile_hints=profile_hints,
+        profiler_model=profiler_model,
         output_dir=str(output_dir),
         kernel_path=str(kernel_path),
         baseline_csv=str(csv) if csv else None,
