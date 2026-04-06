@@ -64,6 +64,7 @@ class PipelineConfig:
     planner_model: str | None = None
     summarizer_model: str | None = None
     executor_model: str | None = None
+    profiler_model: str | None = None
 
     # Paths
     output_dir: str = "pipeline_output"
@@ -73,6 +74,9 @@ class PipelineConfig:
     # Runtime
     verbose: bool = False
     agentic_correctness: bool = True  # Use Claude to generate CPU reference tests
+
+    # Profiler agent
+    profile_hints: str = ""
 
 
 @dataclass
@@ -97,6 +101,8 @@ class PipelineState:
     baseline_profiling_context: dict = field(default_factory=dict)
     baseline_csv: str = ""
     baseline_ncu_rep: str = ""
+    # NCU config determined at baseline; reused for all candidate profiling
+    ncu_config: dict | None = None
 
     # Current iteration state
     current_profiling_context: dict = field(default_factory=dict)
@@ -128,6 +134,8 @@ class GraphState(TypedDict, total=False):
     baseline_csv: str
     baseline_ncu_rep: str
     baseline_latency_ns: float
+    # NCU config from baseline profiling — reused for all candidates
+    ncu_config: dict | None
 
     # Current best
     best_kernel: str
@@ -140,6 +148,7 @@ class GraphState(TypedDict, total=False):
     no_improvement_streak: int
     plans: list[tuple[str, dict]]
     candidates: list[PlanCandidate]
+    correctness_failure_items: list   # implementation_flaw items from correctness failures
 
     # Memory
     optimization_memory: list[dict]
