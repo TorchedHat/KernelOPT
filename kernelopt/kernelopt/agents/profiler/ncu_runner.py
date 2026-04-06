@@ -198,8 +198,13 @@ def run_ncu(
         kernel_args=kernel_args,
     )
     result = subprocess.run(
-        cmd, stdout=None, stderr=subprocess.PIPE, text=True, timeout=600, env=prof_env
+        cmd, capture_output=True, text=True, timeout=600, env=prof_env
     )
+    # Stream NCU stdout to terminal so profiling progress is visible
+    if result.stdout:
+        import sys
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
 
     ncu_rep_path = f"{output_basename}.ncu-rep"
 
@@ -208,6 +213,21 @@ def run_ncu(
             f"NCU profiling failed (exit {result.returncode}):\n"
             f"Command: {' '.join(cmd)}\n"
             f"stderr: {result.stderr[:1000]}"
+        )
+
+    # Detect "No kernels were profiled" — NCU exits 0 but the .ncu-rep is empty.
+    # This usually means the --kernel-name filter didn't match anything.
+    if "No kernels were profiled" in result.stdout:
+        kernel_filter = next(
+            (cmd[i + 1] for i, a in enumerate(cmd) if a == "--kernel-name"),
+            "(none)",
+        )
+        raise RuntimeError(
+            f"NCU ran successfully but profiled 0 kernels.\n"
+            f"--kernel-name filter used: {kernel_filter!r}\n"
+            f"Check the filter matches actual kernel names. "
+            f"Run without --kernel-name to profile all kernels and inspect the CSV.\n"
+            f"NCU output:\n{result.stdout[:2000]}"
         )
 
     csv_path = f"{output_basename}.csv"

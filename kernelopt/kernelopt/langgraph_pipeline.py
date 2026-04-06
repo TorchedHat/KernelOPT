@@ -67,14 +67,17 @@ def profile_baseline(state: GraphState) -> dict:
         ncu_config = None
     else:
         console.print("[bold]Profiling baseline kernel...[/]")
-        baseline_ctx, ncu_config = run_profiler_agent(
-            kernel_path,
-            str(output_dir / "baseline"),
-            ncu_config=None,
-            pipeline_config=cfg,
-            kernel_id=kernel_id,
-            llm_config=llm_config,
-        )
+        try:
+            baseline_ctx, ncu_config = run_profiler_agent(
+                kernel_path,
+                str(output_dir / "baseline"),
+                ncu_config=None,
+                pipeline_config=cfg,
+                kernel_id=kernel_id,
+                llm_config=llm_config,
+            )
+        except RuntimeError as e:
+            raise RuntimeError(f"Baseline profiling failed: {e}") from e
         ctx_json = str(output_dir / "baseline_profiling_context.json")
         console.print(f"  [dim]Profiling context: {ctx_json}[/]")
 
