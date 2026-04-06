@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 from kernelopt.agents.gpu_specs import get_gpu_specs
 from kernelopt.agents.profiler.ncu_runner import (
@@ -16,7 +15,11 @@ from kernelopt.agents.profiler.ncu_runner import (
 def _extract_short_name(full_name: str) -> str:
     # Extract the base name (everything before angle-bracket template args or parens)
     m = re.search(r"(?:void\s+)?(\w+)\s*[<(]", full_name)
-    base = m.group(1) if m else (re.match(r"(\w+)", full_name).group(1) if re.match(r"(\w+)", full_name) else full_name[:50])
+    if m:
+        base = m.group(1)
+    else:
+        m2 = re.match(r"(\w+)", full_name)
+        base = m2.group(1) if m2 else full_name[:50]
 
     # For Triton-style names like "triton__0d1d2d3_softmax_kernel", extract the
     # human-readable suffix by stripping leading hex-digest segments (e.g. "0d1d2d3_").
