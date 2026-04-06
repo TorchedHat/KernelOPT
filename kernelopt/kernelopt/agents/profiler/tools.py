@@ -1,8 +1,9 @@
+# kernelopt/kernelopt/agents/profiler/tools.py
 """ProfilerToolServer and LangChain tool definitions for the Profiler Agent."""
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
@@ -54,8 +55,12 @@ def submit_ncu_config(
         replay_mode: 'kernel' (default, lower overhead) or 'application'
                      (lower peak GPU memory, use for inputs >4 GB).
     """
-    return "Config submitted."  # intercepted in tool_node; never executed directly
+    return "received"  # Body never called — tool_node intercepts submit_ncu_config and handles validation + state update directly
 
 
-_TOOL_MAP = {"read_kernel_source": read_kernel_source}
+# Map of tool name → tool function for tool_node dispatch.
+# submit_ncu_config is intentionally excluded — tool_node intercepts it for validation and state update.
+_TOOL_MAP: dict[str, Any] = {"read_kernel_source": read_kernel_source}
+
+# All tools to bind to the LLM (including submit_ncu_config for schema generation).
 ALL_TOOLS = [read_kernel_source, submit_ncu_config]
