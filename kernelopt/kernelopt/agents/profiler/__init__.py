@@ -122,6 +122,10 @@ def _resolve_ncu_config(
 
     llm_result = result.get("ncu_config")
     if llm_result is not None:
+        # Honor explicit user-provided replay_mode over LLM decision.
+        # Default is "kernel"; if user changed it, they know better.
+        if pipeline_config.replay_mode != "kernel":
+            llm_result = {**llm_result, "replay_mode": pipeline_config.replay_mode}
         return llm_result
 
     # Fallback — deterministic extraction if LLM never called submit_ncu_config.
