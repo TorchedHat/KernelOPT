@@ -124,9 +124,11 @@ def _resolve_ncu_config(
     if llm_result is not None:
         return llm_result
 
-    # Fallback — deterministic extraction if LLM never called submit_ncu_config
-    _, detected_names = extract_kernel_info(kernel_path)
-    kernel_name_filter = _build_kernel_name_filter(detected_names)
+    # Fallback — deterministic extraction if LLM never called submit_ncu_config.
+    # For CUDA, function names match NCU's demangled names directly.
+    # For Triton/Helion, JIT compilers mangle names — don't filter by name.
+    framework, detected_names = extract_kernel_info(kernel_path)
+    kernel_name_filter = _build_kernel_name_filter(detected_names) if framework == "cuda" else None
     return {
         "kernel_name": kernel_name_filter or "",
         "launch_skip": pipeline_config.launch_skip,
