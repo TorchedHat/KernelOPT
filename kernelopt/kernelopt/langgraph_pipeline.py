@@ -17,14 +17,8 @@ from rich.console import Console
 from rich.table import Table
 
 from kernelopt.agents.executor import run_executor_agent
-from kernelopt.agents.profiler import (
-    build_profiling_context,
-    get_latency_ns,
-    run_ncu,
-)
 from kernelopt.agents.summarizer import run_summarizer
 from kernelopt.functions.correctness import check_correctness
-from kernelopt.functions.csv_parser import parse_ncu_csv
 from kernelopt.memory import append_items, save_memory, select_top_k
 from kernelopt.state import (
     GraphState,
@@ -44,40 +38,47 @@ PLAN_LETTERS = list(string.ascii_uppercase)
 
 def profile_baseline(state: GraphState) -> dict:
     """Run NCU on the original kernel and establish baseline metrics."""
+    from kernelopt.agents.profiler import (
+        build_profiling_context,
+        get_latency_ns,
+        run_profiler_agent,
+    )
+    from kernelopt.functions.csv_parser import parse_ncu_csv
+
     cfg = state["config"]
     output_dir = Path(state["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = state["kernel_path"]
     kernel_id = state.get("kernel_id", 0)
 
-    # Check for existing CSV
-    baseline_csv = cfg.baseline_csv
-    if baseline_csv and Path(baseline_csv).exists():
+    llm_config = {
+        "model": cfg.profiler_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
+
+    if cfg.baseline_csv and Path(cfg.baseline_csv).exists():
         console.print("[dim]Using provided baseline CSV[/]")
-        csv_path = baseline_csv
-        ncu_rep = ""
+        sections, rules, launch = parse_ncu_csv(cfg.baseline_csv, kernel_id)
+        baseline_ctx = build_profiling_context(
+            sections, rules, launch, kernel_path, kernel_id=kernel_id
+        )
+        ncu_config = None
     else:
         console.print("[bold]Profiling baseline kernel...[/]")
-        baseline_base = str(output_dir / "baseline")
-        csv_path, ncu_rep, ctx_json = run_ncu(
+        baseline_ctx, ncu_config = run_profiler_agent(
             kernel_path,
-            baseline_base,
-            kernel_name=cfg.kernel_name,
-            launch_skip=cfg.launch_skip,
-            launch_count=cfg.launch_count,
-            replay_mode=cfg.replay_mode,
-            ncu_extra_args=cfg.ncu_extra_args or None,
-            kernel_args=cfg.kernel_args or None,
+            str(output_dir / "baseline"),
+            ncu_config=None,
+            pipeline_config=cfg,
             kernel_id=kernel_id,
-            save_profiling_context=True,
+            llm_config=llm_config,
         )
+        ctx_json = str(output_dir / "baseline_profiling_context.json")
+        console.print(f"  [dim]Profiling context: {ctx_json}[/]")
 
-    sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
-    baseline_ctx = build_profiling_context(
-        sections, rules, launch, kernel_path, kernel_id=kernel_id,
-    )
     latency = get_latency_ns(baseline_ctx)
-
     framework = state["framework"]
     if framework == "auto":
         framework = baseline_ctx["framework_hint"]
@@ -86,16 +87,16 @@ def profile_baseline(state: GraphState) -> dict:
         f"  Baseline: [cyan]{latency:.0f} ns[/]  "
         f"Framework: [green]{framework}[/]"
     )
-    console.print(f"  [dim]Profiling context: {ctx_json}[/]")
 
     return {
         "baseline_profiling_context": baseline_ctx,
-        "baseline_csv": csv_path,
-        "baseline_ncu_rep": ncu_rep,
+        "baseline_csv": cfg.baseline_csv or str(output_dir / "baseline.csv"),
+        "baseline_ncu_rep": str(output_dir / "baseline.ncu-rep"),
         "baseline_latency_ns": latency,
         "best_latency_ns": latency,
         "current_profiling_context": baseline_ctx,
         "framework": framework,
+        "ncu_config": ncu_config,
     }
 
 
@@ -274,6 +275,8 @@ def execute_plans(state: GraphState) -> dict:
 
 def profile_candidates(state: GraphState) -> dict:
     """Run NCU on each candidate that passed correctness."""
+    from kernelopt.agents.profiler import get_latency_ns, run_profiler_agent
+
     cfg = state["config"]
     candidates = list(state["candidates"])
     output_dir = Path(state["output_dir"])
@@ -282,6 +285,14 @@ def profile_candidates(state: GraphState) -> dict:
     kernel_basename = state["kernel_basename"]
     kernel_id = state.get("kernel_id", 0)
     best_latency = state["best_latency_ns"]
+    saved_ncu_config = state.get("ncu_config")  # reuse baseline config — full bypass
+
+    llm_config = {
+        "model": cfg.profiler_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     console.print(f"  Profiling {len(candidates)} valid candidates...")
 
@@ -296,25 +307,17 @@ def profile_candidates(state: GraphState) -> dict:
         Path(kernel_file).write_text(c.optimized_kernel)
 
         try:
-            csv_path, ncu_rep_path, ctx_json_path = run_ncu(
+            ctx, _ = run_profiler_agent(
                 kernel_file,
                 output_base,
-                kernel_name=cfg.kernel_name,
-                launch_skip=cfg.launch_skip,
-                launch_count=cfg.launch_count,
-                replay_mode=cfg.replay_mode,
-                ncu_extra_args=cfg.ncu_extra_args or None,
-                kernel_args=cfg.kernel_args or None,
+                ncu_config=saved_ncu_config,  # full bypass — no LLM call
+                pipeline_config=cfg,
                 kernel_id=kernel_id,
-                save_profiling_context=True,
-            )
-            sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
-            ctx = build_profiling_context(
-                sections, rules, launch, kernel_file, kernel_id=kernel_id,
+                llm_config=llm_config,
             )
             c.profiling_context = ctx
-            c.csv_path = csv_path
-            c.ncu_rep_path = ncu_rep_path
+            c.csv_path = f"{output_base}.csv"
+            c.ncu_rep_path = f"{output_base}.ncu-rep"
             c.latency_ns = get_latency_ns(ctx)
             c.speedup = (
                 round(best_latency / c.latency_ns, 4)
@@ -592,6 +595,7 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
         "plans": [],
         "candidates": [],
         "iteration_results": [],
+        "ncu_config": state.ncu_config,
     }
 
     # Provide baseline CSV if available
@@ -609,6 +613,7 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     state.optimization_memory = final.get("optimization_memory", [])
     state.iteration_results = final.get("iteration_results", [])
     state.framework = final.get("framework", state.framework)
+    state.ncu_config = final.get("ncu_config")
 
     # Write final outputs
     output_dir = Path(cfg.output_dir)
