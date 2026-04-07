@@ -187,6 +187,20 @@ def run_ncu(
     prof_env["PYTHONIOENCODING"] = "utf-8"
     prof_env["PYTHONUTF8"] = "1"
 
+    # Strip PyTorch source tree from PYTHONPATH. NCU application replay launches
+    # the script as a subprocess; if PYTHONPATH points at an unbuilt pytorch source
+    # directory, Python loads the source torch/__init__.py but the compiled .so
+    # from the venv — causing ImportError on symbols not yet compiled in.
+    if "PYTHONPATH" in prof_env:
+        clean = [
+            p for p in prof_env["PYTHONPATH"].split(":")
+            if not (p.endswith("/pytorch") or "/pytorch/torch" in p)
+        ]
+        if clean:
+            prof_env["PYTHONPATH"] = ":".join(clean)
+        else:
+            del prof_env["PYTHONPATH"]
+
     cmd = build_ncu_command(
         kernel_path,
         output_basename,
