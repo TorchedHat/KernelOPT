@@ -1,6 +1,6 @@
-# Kernel Optimization Tool - Test Suite
+# Kernel Optimization Tool - Unified Test Suite
 
-Comprehensive test suite for the GPU kernel optimization tool. This suite includes unit tests, integration tests, end-to-end tests, and agent-specific tests.
+Comprehensive test suite for the GPU kernel optimization tool. This unified suite consolidates all tests from `kernelopt/tests/` into a single location with unit tests, integration tests, end-to-end tests, and agent-specific tests.
 
 **✨ Optimized for NVIDIA H200 GPUs** with interactive GPU selection, resource validation, and Claude Sonnet 4 on Vertex AI.
 
@@ -60,10 +60,10 @@ Simply run tests without specifying a GPU ID, and you'll be prompted:
 
 ```bash
 # You'll be prompted to select a GPU
-pytest test/
+pytest tests_suite/
 
 # Or using the test runner
-python test/run_all_tests.py
+python tests_suite/run_all_tests.py
 ```
 
 **The test suite will:**
@@ -108,20 +108,20 @@ Use GPU 0? [Y/n]: y
 **Via Command Line:**
 ```bash
 # Run tests on GPU 2
-pytest test/ --gpu 2
+pytest tests_suite/ --gpu 2
 
 # Using test runner
-python test/run_all_tests.py --gpu 2
+python tests_suite/run_all_tests.py --gpu 2
 ```
 
 **Via Environment Variable:**
 ```bash
 # Set GPU for all tests
 export TEST_GPU_ID=2
-pytest test/
+pytest tests_suite/
 
 # One-liner
-TEST_GPU_ID=2 pytest test/
+TEST_GPU_ID=2 pytest tests_suite/
 ```
 
 **Priority Order:**
@@ -132,7 +132,7 @@ TEST_GPU_ID=2 pytest test/
 ### Skip GPU Checks (Not Recommended)
 
 ```bash
-pytest test/ --skip-gpu-check
+pytest tests_suite/ --skip-gpu-check
 ```
 
 ⚠️ **Warning**: Skipping checks may result in:
@@ -144,8 +144,10 @@ pytest test/ --skip-gpu-check
 
 ## 📁 Test Structure
 
+> **Note**: This unified test suite consolidates all tests. Previously, tests were split between `test/` (new suite) and `kernelopt/tests/` (upstream). All tests are now in `tests_suite/`.
+
 ```
-test/
+tests_suite/
 ├── unit/                        # Fast, isolated unit tests (no GPU)
 │   ├── core/                    # (3 files, 73 tests)
 │   │   ├── test_llm.py          # Claude Vertex AI integration
@@ -228,7 +230,7 @@ pip install -r requirements-test.txt
 pip install pytest pytest-cov
 
 # 2. Run sanity check
-cd test/
+cd tests_suite/
 python sanity_check.py
 
 # Expected output:
@@ -244,16 +246,16 @@ python sanity_check.py
 
 ```bash
 # Interactive GPU selection (recommended)
-pytest test/
+pytest tests_suite/
 
 # Specify GPU explicitly
-pytest test/ --gpu 2
+pytest tests_suite/ --gpu 2
 
 # Using test runner
-python test/run_all_tests.py --gpu 2
+python tests_suite/run_all_tests.py --gpu 2
 
 # Use environment variable
-TEST_GPU_ID=2 pytest test/
+TEST_GPU_ID=2 pytest tests_suite/
 ```
 
 ### Run Specific Test Suites
@@ -627,7 +629,7 @@ pytest test_memory.py::TestMemoryAppend::test_append_single_item -v
 nvidia-smi
 
 # Wait and retry
-pytest test/ --gpu 2
+pytest tests_suite/ --gpu 2
 ```
 
 **Solution 2**: Use a different GPU
@@ -636,14 +638,14 @@ pytest test/ --gpu 2
 python -c "from utils.gpu_utils import print_gpu_summary; print_gpu_summary()"
 
 # Select a free one
-pytest test/ --gpu 3
+pytest tests_suite/ --gpu 3
 ```
 
 **Solution 3**: Clear GPU memory
 ```bash
 # Clear cache and retry
 python -c "import torch; torch.cuda.empty_cache()"
-pytest test/ --gpu 2
+pytest tests_suite/ --gpu 2
 ```
 
 #### Problem: GPU utilization too high
@@ -655,7 +657,7 @@ pytest test/ --gpu 2
 nvidia-smi
 
 # Use a different GPU
-pytest test/ --gpu 3
+pytest tests_suite/ --gpu 3
 ```
 
 #### Problem: Tests failing with OOM
@@ -667,13 +669,13 @@ pytest test/ --gpu 3
 nvidia-smi
 
 # Use GPU with more free memory
-pytest test/ --gpu 0
+pytest tests_suite/ --gpu 0
 ```
 
 #### Problem: GPU is Busy
 
 ```bash
-$ pytest test/ --gpu 1
+$ pytest tests_suite/ --gpu 1
 
 GPU 1 (NVIDIA H200):
   Total memory: 144480 MB
