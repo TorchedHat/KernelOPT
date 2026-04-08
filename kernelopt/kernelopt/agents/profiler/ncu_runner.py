@@ -126,6 +126,11 @@ def build_ncu_command(
 
     # Only add --kernel-name if we have a non-empty filter
     if kernel_name:
+        # Ensure substring matching. NCU requires the "regex:" prefix for regex
+        # patterns; without it the match is exact. Wrap bare names so they match
+        # demangled CUDA names like "void softmax_kernel<1024>(float*, ...)".
+        if not kernel_name.startswith("regex:"):
+            kernel_name = f"regex:.*{kernel_name}.*"
         cmd.extend(["--kernel-name", kernel_name])
 
     cmd.extend(["--launch-skip", str(launch_skip)])

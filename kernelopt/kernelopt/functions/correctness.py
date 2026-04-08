@@ -30,7 +30,10 @@ def check_correctness(
 
     Returns (passed, diagnosis_message).
     """
-    if use_agentic:
+    # Agentic correctness only works for Python-based kernels (Triton, Helion).
+    # CUDA (.cu) kernels are C++ and must be compiled; use subprocess mode.
+    ext = Path(original_path).suffix
+    if use_agentic and ext != ".cu":
         from kernelopt.agents.correctness import run_correctness_agent
         return run_correctness_agent(
             kernel_source=optimized_source,

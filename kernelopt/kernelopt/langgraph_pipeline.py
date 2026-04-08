@@ -9,6 +9,7 @@ Graph:
 
 from __future__ import annotations
 
+import subprocess
 import string
 from pathlib import Path
 
@@ -30,6 +31,18 @@ from kernelopt.state import (
 
 console = Console()
 PLAN_LETTERS = list(string.ascii_uppercase)
+
+
+def _compile_cuda(cu_path: str) -> str:
+    """Compile a .cu file with nvcc and return the binary path. Raises on failure."""
+    binary = cu_path.replace(".cu", "")
+    result = subprocess.run(
+        ["nvcc", "-O2", "-o", binary, cu_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"nvcc failed:\n{result.stderr}")
+    return binary
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +321,15 @@ def profile_candidates(state: GraphState) -> dict:
         output_base = str(output_dir / file_stem)
         kernel_file = f"{output_base}{ext}"
         Path(kernel_file).write_text(c.optimized_kernel)
+
+        if ext == ".cu":
+            try:
+                _compile_cuda(kernel_file)
+            except RuntimeError as e:
+                console.print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
+                c.latency_ns = float("inf")
+                c.speedup = 0.0
+                continue
 
         try:
             ctx, _ = run_profiler_agent(

@@ -93,12 +93,15 @@ def _resolve_ncu_config(
     if ncu_config is not None:
         return ncu_config
 
-    # (b) User bypass — kernel_name + launch_count both provided
-    if pipeline_config.kernel_name and pipeline_config.launch_count:
+    # (b) User bypass — kernel_name provided (launch_count optional).
+    # When kernel_name is given without launch_count, use None (no limit) so NCU
+    # profiles all matching kernels regardless of how many non-matching launches
+    # precede the target (e.g. torch.randn before a Triton kernel).
+    if pipeline_config.kernel_name:
         return {
             "kernel_name": pipeline_config.kernel_name,
             "launch_skip": pipeline_config.launch_skip,
-            "launch_count": pipeline_config.launch_count,
+            "launch_count": pipeline_config.launch_count,  # None = no limit
             "kernel_args": list(pipeline_config.kernel_args),
             "replay_mode": pipeline_config.replay_mode,
         }
