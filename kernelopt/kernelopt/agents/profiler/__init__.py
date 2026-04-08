@@ -61,7 +61,7 @@ def run_profiler_agent(
     csv_path, ncu_rep_path, _ = run_ncu(
         kernel_path,
         output_basename,
-        kernel_name=resolved["kernel_name"] or None,
+        kernel_name=resolved["kernel_name"],  # "" means no filter, None means auto-detect
         launch_skip=resolved["launch_skip"],
         launch_count=resolved["launch_count"],
         replay_mode=resolved["replay_mode"],
@@ -121,25 +121,38 @@ def _resolve_ncu_config(
     )
 
     llm_result = result.get("ncu_config")
+
+    # Detect framework ONCE before any logic
+    framework, detected_names = extract_kernel_info(kernel_path)
+
     if llm_result is not None:
         # Honor explicit user-provided replay_mode over LLM decision.
         # Default is "kernel"; if user changed it, they know better.
         if pipeline_config.replay_mode != "kernel":
             llm_result = {**llm_result, "replay_mode": pipeline_config.replay_mode}
+
+        # Force kernel_name to be empty for Triton/Helion frameworks.
+        # JIT-compiled kernels have mangled names that don't match Python function names.
+        if framework in ("triton", "helion"):
+            print(f"[DEBUG] Detected {framework} kernel, forcing kernel_name='' (was: {llm_result.get('kernel_name')})")
+            llm_result = {**llm_result, "kernel_name": ""}
+
+        print(f"[DEBUG] Final LLM config: {llm_result}")
         return llm_result
 
     # Fallback — deterministic extraction if LLM never called submit_ncu_config.
     # For CUDA, function names match NCU's demangled names directly.
     # For Triton/Helion, JIT compilers mangle names — don't filter by name.
-    framework, detected_names = extract_kernel_info(kernel_path)
     kernel_name_filter = _build_kernel_name_filter(detected_names) if framework == "cuda" else None
-    return {
+    fallback_config = {
         "kernel_name": kernel_name_filter or "",
         "launch_skip": pipeline_config.launch_skip,
         "launch_count": pipeline_config.launch_count or 1,
         "kernel_args": list(pipeline_config.kernel_args),
         "replay_mode": pipeline_config.replay_mode,
     }
+    print(f"[DEBUG] Using fallback config (LLM didn't call submit_ncu_config): {fallback_config}")
+    return fallback_config
 
 
 __all__ = [
