@@ -201,30 +201,93 @@ def execute_plans(state: GraphState) -> dict:
         file_stem = f"{kernel_basename}_iter{iteration + 1}_plan{plan_letter}_{safe_dir}"
 
         console.print(f"  [dim]Executing plan {plan_letter} ({direction})...[/]")
-        try:
-            optimized_source, execution_result = run_executor_agent(
-                kernel_source=current_kernel,
-                optimization_plan=plan,
-                memory=state.get("optimization_memory", []),
-                K=cfg.K,
-                llm_config=llm_config,
-            )
-        except Exception as e:
-            console.print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
+
+        # For .cu kernels: up to K outer attempts (executor + compile).
+        # Each attempt feeds the previous nvcc error back to the executor.
+        # For non-.cu kernels: single executor call (existing behaviour).
+        last_compile_err: str | None = None
+        optimized_source: str | None = None
+        execution_result: dict = {}
+        compiled_binary: str | None = None
+        outer_attempts = cfg.K if ext == ".cu" else 1
+        executor_K = 1 if ext == ".cu" else cfg.K
+
+        for attempt_idx in range(outer_attempts):
+            try:
+                optimized_source, execution_result = run_executor_agent(
+                    kernel_source=current_kernel,
+                    optimization_plan=plan,
+                    memory=state.get("optimization_memory", []),
+                    K=executor_K,
+                    llm_config=llm_config,
+                    compile_error=last_compile_err,
+                )
+            except Exception as e:
+                console.print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
+                optimized_source = None
+                break
+
+            console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
+            console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
+            console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
+
+            if not execution_result.get("ready_for_profiling", False):
+                reason = execution_result.get("reason", execution_result.get("status", "failed"))
+                console.print(f"    [red]Plan {plan_letter}: {reason}[/]")
+                optimized_source = None
+                break
+
+            # Save source to disk
+            kernel_file = str(output_dir / f"{file_stem}{ext}")
+            Path(kernel_file).write_text(optimized_source)
+
+            if ext == ".cu":
+                binary_path, err = compile_cuda(kernel_file)
+                if err:
+                    last_compile_err = err
+                    console.print(
+                        f"    [yellow]Plan {plan_letter} attempt {attempt_idx + 1}/"
+                        f"{outer_attempts}: compile failed[/]\n"
+                        f"    {err.splitlines()[0] if err else ''}"
+                    )
+                    if attempt_idx == outer_attempts - 1:
+                        # All K attempts exhausted — record for planner memory
+                        import uuid as _uuid
+                        correctness_failure_items.append({
+                            "item_id": _uuid.uuid4().hex[:8],
+                            "iteration": iteration + 1,
+                            "speedup": 0.0,
+                            "rewrite_type": "implementation_flaw",
+                            "framework": framework,
+                            "direction": direction,
+                            "profiling_signal": {
+                                "ncu_rule_triggered": plan.get("evidence", {}).get("ncu_rule"),
+                                "key_metric_before": {},
+                                "key_metric_after": {},
+                            },
+                            "strategy_title": f"{direction} — compile failed after {outer_attempts} attempts",
+                            "strategy_description": (
+                                f"Plan '{direction}' produced a .cu file that nvcc rejected "
+                                f"after {outer_attempts} attempt(s). "
+                                f"Last error: {(last_compile_err or '')[:300]}"
+                            ),
+                            "slow_pseudocode": "",
+                            "fast_pseudocode": "",
+                            "applicable_when": plan.get("evidence", {}).get("reasoning", ""),
+                            "do_not_apply_when": f"Compilation failed: {(last_compile_err or '')[:200]}",
+                            "framework_notes": None,
+                        })
+                        optimized_source = None
+                    continue  # retry with error feedback
+
+                compiled_binary = binary_path
+
+            break  # compiled successfully (or non-.cu)
+
+        if optimized_source is None:
             continue
 
-        console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
-        console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
-        console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
-
-        if not execution_result.get("ready_for_profiling", False):
-            reason = execution_result.get("reason", execution_result.get("status", "failed"))
-            console.print(f"    [red]Plan {plan_letter}: {reason}[/]")
-            continue
-
-        # Save kernel file
-        kernel_file = str(output_dir / f"{file_stem}{ext}")
-        Path(kernel_file).write_text(optimized_source)
+        execution_result["correctness"] = "unverified"
 
         # Correctness check
         console.print(f"  [dim]Running correctness check...[/]")
@@ -235,6 +298,7 @@ def execute_plans(state: GraphState) -> dict:
             project_id=cfg.project_id,
             region=cfg.region,
             kernel_args=cfg.kernel_args,
+            binary_path=compiled_binary,
         )
         execution_result["correctness"] = "passed" if passed else "failed"
 
@@ -278,6 +342,7 @@ def execute_plans(state: GraphState) -> dict:
             execution_result=execution_result,
             correctness_passed=passed,
             correctness_message=msg,
+            compiled_binary_path=compiled_binary or "",
         )
         candidates.append(candidate)
 
