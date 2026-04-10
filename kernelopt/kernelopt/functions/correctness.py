@@ -57,8 +57,8 @@ def _check_cuda_kernel(
             capture_output=True, text=True, timeout=60,
         )
         if compile_result.returncode != 0:
-            if tmp_cu:
-                tmp_cu.unlink(missing_ok=True)
+            tmp_cu.unlink(missing_ok=True)
+            opt_bin.unlink(missing_ok=True)
             return False, f"Compilation failed:\n{compile_result.stderr[:500]}"
 
     try:
@@ -215,7 +215,7 @@ def check_correctness(
         return _check_cuda_kernel(original_path, optimized_source, binary_path=binary_path)
 
     # Python kernels (Triton / Helion)
-    if use_agentic and ext != ".cu":
+    if use_agentic:
         from kernelopt.agents.correctness import run_correctness_agent
         return run_correctness_agent(
             kernel_source=optimized_source,
