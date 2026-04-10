@@ -33,7 +33,8 @@ User submits .cu file
   executor produces optimized .cu source
   save source to file
   compile_cuda(kernel_file) ──► binary_path stored on PlanCandidate
-        │ fail ──► candidate.correctness_message = clean error, skip to next plan
+        │ fail ──► retry executor with nvcc error (up to K attempts)
+        │          after K failures → skip candidate, add to correctness_failure_items
         ▼
   check_correctness(..., binary_path=candidate.compiled_binary_path)
     ├─ _has_builtin_self_test(source) == True
@@ -169,30 +170,48 @@ needed there.
 
 #### `execute_plans` node
 
-After saving the `.cu` source to disk, before the correctness check:
+For `.cu` files, the executor call and compile step are wrapped in a K-attempt retry loop.
+If compilation fails, the error is passed back to the executor as context for the next attempt.
+Only after all K attempts are exhausted does the plan get skipped and recorded as a failure.
+
 ```python
-if ext == ".cu":
-    binary_path, err = compile_cuda(kernel_file)
-    if err:
-        console.print(f"    [red]Plan {plan_letter}: compile failed[/]\n{err[:300]}")
-        # Record as correctness failure so planner learns from it
-        correctness_failure_items.append({
-            "item_id": uuid4().hex[:8],
-            "iteration": iteration + 1,
-            "speedup": 0.0,
-            "rewrite_type": "implementation_flaw",
-            "framework": framework,
-            "direction": direction,
-            "profiling_signal": {"ncu_rule_triggered": None, "key_metric_before": {}, "key_metric_after": {}},
-            "strategy_title": f"{direction} — compile failed",
-            "strategy_description": f"Plan '{direction}' produced a .cu file that nvcc rejected. Error: {err[:300]}",
-            "slow_pseudocode": "", "fast_pseudocode": "",
-            "applicable_when": "", "do_not_apply_when": f"Compilation failed: {err[:200]}",
-            "framework_notes": None,
-        })
-        continue
-    candidate.compiled_binary_path = binary_path
+last_compile_err = None
+for attempt in range(cfg.K):
+    optimized_source, execution_result = run_executor_agent(
+        ...,
+        compile_error=last_compile_err,   # None on first attempt
+    )
+    if ext == ".cu":
+        binary_path, err = compile_cuda(kernel_file)
+        if err:
+            last_compile_err = err
+            console.print(f"    [red]Plan {plan_letter} attempt {attempt+1}/{cfg.K}: compile failed[/]")
+            continue   # retry executor with error context
+    break  # compiled successfully (or non-.cu kernel — no compile step)
+else:
+    # All K attempts failed to compile
+    correctness_failure_items.append({
+        "item_id": uuid4().hex[:8],
+        "iteration": iteration + 1,
+        "speedup": 0.0,
+        "rewrite_type": "implementation_flaw",
+        "framework": framework,
+        "direction": direction,
+        "profiling_signal": {"ncu_rule_triggered": None, "key_metric_before": {}, "key_metric_after": {}},
+        "strategy_title": f"{direction} — compile failed after {cfg.K} attempts",
+        "strategy_description": f"Plan '{direction}' produced a .cu file that nvcc rejected after {cfg.K} attempts. Last error: {last_compile_err[:300]}",
+        "slow_pseudocode": "", "fast_pseudocode": "",
+        "applicable_when": "", "do_not_apply_when": f"Compilation failed: {last_compile_err[:200]}",
+        "framework_notes": None,
+    })
+    continue
+
+candidate.compiled_binary_path = binary_path
 ```
+
+`run_executor_agent()` gains an optional `compile_error: str | None = None` kwarg. When set,
+the executor's initial message includes the previous attempt's nvcc error so the LLM can
+correct the specific issue rather than starting from scratch.
 
 `check_correctness()` call gains `binary_path=candidate.compiled_binary_path`.
 
@@ -220,7 +239,8 @@ run_profiler_agent("softmax_cuda", ...)  ← NCU uses binary
         ▼  execute_plans (per plan)
 executor produces optimized .cu source
 save → "softmax_cuda_iter1_planA_direction.cu"
-compile_cuda("...planA....cu") → binary "...planA..." | err → skip
+compile_cuda("...planA....cu") → binary "...planA..."
+        | err → retry executor with nvcc error (up to K attempts) | K exhausted → skip
 check_correctness(..., binary_path="...planA...")
   _has_builtin_self_test() → True  → run binary, check markers
                            → False → LLM harness → compile → run
@@ -236,7 +256,7 @@ run_profiler_agent("...planA....cu", ...)  ← binary already exists, no recompi
 | Failure point | Behavior |
 |---|---|
 | Baseline `.cu` won't compile | `RuntimeError` propagates, pipeline stops with clean message |
-| Optimized `.cu` won't compile | Candidate skipped; `correctness_failure_items` entry added so planner learns |
+| Optimized `.cu` won't compile | Executor retried up to K times with the nvcc error as context; skipped and added to `correctness_failure_items` only after all K attempts fail |
 | LLM harness won't compile | `(False, "LLM-generated harness failed to compile: ...")` |
 | LLM harness exits non-zero | `(False, "Runtime error (exit N): ...")` |
 | Built-in self-test prints FAIL | `(False, "Failure indicator 'FAIL' found in output: ...")` |
