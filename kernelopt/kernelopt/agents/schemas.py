@@ -308,3 +308,25 @@ class SummarizerOutput(BaseModel):
         ...,
         description="How to update the memory queue"
     )
+
+
+class CudaCorrectnessSpec(BaseModel):
+    """LLM-generated .cu test harness for kernels without a built-in self-test."""
+
+    test_harness_code: str = Field(
+        ...,
+        description=(
+            "Complete, self-contained .cu source with a main() that: "
+            "(1) generates random float inputs on CPU, "
+            "(2) copies to device, "
+            "(3) calls the GPU kernel, "
+            "(4) computes a CPU reference using standard C math, "
+            "(5) compares element-wise within tolerance, "
+            "(6) prints 'Correctness: PASS' or 'Correctness: FAIL' and exits 0/1."
+        ),
+    )
+    skip: bool = Field(
+        False,
+        description="True only if automated testing is impossible (e.g. custom RNG).",
+    )
+    skip_reason: str | None = Field(None, description="Required when skip=True.")
