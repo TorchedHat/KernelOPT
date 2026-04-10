@@ -25,10 +25,22 @@ If submit_kernel returns a validation error, diagnose what went wrong and resubm
 """
 
 
-def build_initial_message(plan_direction: str, K: int) -> HumanMessage:
+def build_initial_message(
+    plan_direction: str,
+    K: int,
+    compile_error: str | None = None,
+) -> HumanMessage:
     """Build the opening human message for the executor sub-graph."""
-    return HumanMessage(content=(
+    content = (
         f"Implement the optimization plan.\n\n"
         f"Direction: {plan_direction}\n"
         f"You have up to {K} attempts via submit_kernel."
-    ))
+    )
+    if compile_error:
+        content += (
+            f"\n\n## Previous attempt failed to compile\n"
+            f"The kernel you produced in the previous attempt was rejected by nvcc:\n\n"
+            f"```\n{compile_error}\n```\n\n"
+            f"Fix the compilation error in your new implementation."
+        )
+    return HumanMessage(content=content)
