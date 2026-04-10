@@ -8,6 +8,17 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+import warnings
+
+# ADC user creds without a quota project — noisy on every Vertex call.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*authenticated using end user credentials.*quota project.*",
+    category=UserWarning,
+    module=r"google\.auth\._default",
+)
+
+
 app = typer.Typer(
     name="kernelopt",
     help="Multi-agent GPU kernel optimizer. Powered by LangGraph + NCU.",
