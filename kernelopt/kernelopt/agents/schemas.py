@@ -199,49 +199,6 @@ class ExperienceItem(BaseModel):
 
 
 class TestInput(BaseModel):
-    """Specification for one input tensor to the kernel."""
-    shape: list[int] = Field(..., description="Tensor shape, e.g. [4096, 1024]")
-    dtype: str = Field(..., description="PyTorch dtype name: 'float32', 'float16', 'bfloat16', 'int32', 'int64'")
-    distribution: str = Field(
-        "randn",
-        description="How to generate: 'randn' (normal), 'rand' (uniform 0-1), 'randint' (integers), 'ones', 'zeros'"
-    )
-    low: float | None = Field(None, description="Lower bound for randint")
-    high: float | None = Field(None, description="Upper bound for randint")
-
-
-class CorrectnessSpec(BaseModel):
-    """Structured spec returned by the correctness agent."""
-    wrapper_function: str = Field(
-        ...,
-        description=(
-            "Name of the Python wrapper function to call — NOT the @triton.jit kernel. "
-            "E.g. 'run_triton_softmax'. This function must be importable from the kernel module."
-        )
-    )
-    reference_code: str = Field(
-        ...,
-        description=(
-            "Complete Python source defining a function named exactly 'reference(*args)' "
-            "that computes the same operation on CPU using only torch operations. "
-            "Receives the same positional args as wrapper_function but as CPU tensors. "
-            "Example: 'def reference(x):\\n    return torch.softmax(x, dim=-1)'"
-        )
-    )
-    test_inputs: list[TestInput] = Field(
-        ...,
-        description="Ordered list of input tensor specs passed to wrapper_function"
-    )
-    atol: float = Field(1e-3, description="Absolute tolerance for torch.allclose")
-    rtol: float = Field(1e-2, description="Relative tolerance for torch.allclose")
-    skip: bool = Field(
-        False,
-        description="True ONLY if automated testing is structurally impossible (e.g. custom RNG). Default False."
-    )
-    skip_reason: str | None = Field(None, description="Required when skip=True")
-
-
-class TestInput(BaseModel):
     """Specification for one input tensor passed to the kernel wrapper."""
     shape: list[int] = Field(..., description="Tensor shape, e.g. [4096, 1024]")
     dtype: str = Field(..., description="PyTorch dtype: 'float32', 'float16', 'bfloat16', 'int32', 'int64'")
