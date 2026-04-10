@@ -221,13 +221,22 @@ kernelopt/
 │       ├── csv_parser.py        # NCU CSV parser
 │       ├── correctness.py       # Correctness check dispatcher
 │       └── selector.py          # Candidate selector utilities
-└── tests/
-    └── agents/
-        ├── test_planner_graph.py
-        ├── test_planner_tools.py
-        ├── test_executor_graph.py
-        └── test_executor_tools.py
+└── tests_suite/              # Unified test suite (366 tests)
+    ├── unit/                 # Unit tests (no GPU required)
+    ├── component/            # Component tests with mocks
+    │   └── agents/
+    │       ├── test_planner_graph.py
+    │       ├── test_planner_tools.py
+    │       ├── test_executor_graph.py
+    │       └── test_executor_tools.py
+    ├── integration/          # Integration tests
+    ├── e2e/                  # End-to-end pipeline tests
+    ├── quality/              # Architecture & API stability tests
+    ├── fixtures/             # Test kernels and sample data
+    └── README.md             # Complete testing guide
 ```
+
+> **Testing**: See `tests_suite/README.md` for the complete testing guide. Run tests with `pytest tests_suite/ --gpu <id>` or use interactive GPU selection with `pytest tests_suite/`.
 
 ---
 
