@@ -9,7 +9,6 @@ Graph:
 
 from __future__ import annotations
 
-import subprocess
 import string
 from pathlib import Path
 
@@ -19,6 +18,7 @@ from rich.table import Table
 
 from kernelopt.agents.executor import run_executor_agent
 from kernelopt.agents.summarizer import run_summarizer
+from kernelopt.functions.compiler import compile_cuda
 from kernelopt.functions.correctness import check_correctness
 from kernelopt.memory import append_items, save_memory, select_top_k
 from kernelopt.state import (
@@ -31,18 +31,6 @@ from kernelopt.state import (
 
 console = Console()
 PLAN_LETTERS = list(string.ascii_uppercase)
-
-
-def _compile_cuda(cu_path: str) -> str:
-    """Compile a .cu file with nvcc and return the binary path. Raises on failure."""
-    binary = cu_path.replace(".cu", "")
-    result = subprocess.run(
-        ["nvcc", "-O2", "-o", binary, cu_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"nvcc failed:\n{result.stderr}")
-    return binary
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +51,17 @@ def profile_baseline(state: GraphState) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = state["kernel_path"]
     kernel_id = state.get("kernel_id", 0)
+
+    # For .cu kernels: compile the baseline binary once so NCU can run it.
+    ext = Path(kernel_path).suffix
+    if ext == ".cu":
+        binary_path, err = compile_cuda(kernel_path)
+        if err:
+            raise RuntimeError(
+                f"Baseline .cu compilation failed:\n{err}\n\n"
+                f"Fix the kernel source and rerun."
+            )
+        console.print(f"  [dim]Compiled baseline binary: {binary_path}[/]")
 
     llm_config = {
         "model": cfg.profiler_model or cfg.model,
