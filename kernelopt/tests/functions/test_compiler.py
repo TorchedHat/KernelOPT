@@ -74,3 +74,11 @@ def test_compile_cuda_invokes_nvcc_with_O2():
         compile_cuda("/tmp/k.cu")
     cmd = mock_run.call_args[0][0]
     assert "-O2" in cmd
+
+
+def test_compile_cuda_timeout_returns_error():
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["nvcc"], timeout=60)):
+        binary, err = compile_cuda("/tmp/k.cu")
+    assert binary == "/tmp/k"
+    assert err is not None
+    assert "timeout" in err.lower() or "timed out" in err.lower()

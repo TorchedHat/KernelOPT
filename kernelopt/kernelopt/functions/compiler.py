@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from pathlib import Path
 
 
 def compile_cuda(cu_path: str) -> tuple[str, str | None]:
@@ -16,13 +17,17 @@ def compile_cuda(cu_path: str) -> tuple[str, str | None]:
     binary_path is always cu_path with .cu stripped — predictable without
     inspecting the return value.
     """
-    binary = cu_path.replace(".cu", "")
-    result = subprocess.run(
-        ["nvcc", "-O2", "-o", binary, cu_path],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    p = Path(cu_path)
+    binary = str(p.parent / p.stem)
+    try:
+        result = subprocess.run(
+            ["nvcc", "-O2", "-o", binary, cu_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return binary, "nvcc timed out after 60 seconds."
     if result.returncode != 0:
         return binary, _format_nvcc_errors(result.stderr)
     return binary, None
