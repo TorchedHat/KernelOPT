@@ -161,6 +161,8 @@ def _check_cuda_with_llm_reference(
             return False, f"Runtime error (exit {run_result.returncode}):\n{combined[:500]}"
         if "FAIL" in combined:
             return False, f"Correctness FAILED:\n{combined[:500]}"
+        if "PASS" not in combined:
+            return False, f"No 'Correctness: PASS' marker found in output:\n{combined[:500]}"
         return True, "CUDA correctness passed (LLM-generated C harness)."
     except subprocess.TimeoutExpired:
         return False, "Harness compilation or execution timed out."
