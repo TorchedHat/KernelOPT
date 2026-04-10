@@ -386,15 +386,6 @@ def profile_candidates(state: GraphState) -> dict:
         kernel_file = f"{output_base}{ext}"
         Path(kernel_file).write_text(c.optimized_kernel)
 
-        if ext == ".cu":
-            try:
-                _compile_cuda(kernel_file)
-            except RuntimeError as e:
-                console.print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
-                c.latency_ns = float("inf")
-                c.speedup = 0.0
-                continue
-
         try:
             ctx, _ = run_profiler_agent(
                 kernel_file,
