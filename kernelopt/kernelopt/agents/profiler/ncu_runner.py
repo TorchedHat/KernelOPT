@@ -108,6 +108,10 @@ def build_ncu_command(
     else:
         runner = [kernel_path.replace(ext, "")]
 
+    # kernel_name semantics:
+    #   None: auto-detect from source (for backward compat)
+    #   "": explicitly no filter (profile all kernels - for Triton/Helion)
+    #   "foo": use this exact filter
     if kernel_name is None:
         _, detected_names = extract_kernel_info(kernel_path)
         kernel_name = _build_kernel_name_filter(detected_names)
@@ -120,6 +124,7 @@ def build_ncu_command(
         "--kernel-name-base", "demangled",
     ]
 
+    # Only add --kernel-name if we have a non-empty filter
     if kernel_name:
         cmd.extend(["--kernel-name", kernel_name])
 
