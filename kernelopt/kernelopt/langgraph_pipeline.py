@@ -10,6 +10,7 @@ Graph:
 from __future__ import annotations
 
 import string
+import uuid
 from pathlib import Path
 
 from langgraph.graph import END, StateGraph
@@ -252,9 +253,8 @@ def execute_plans(state: GraphState) -> dict:
                     )
                     if attempt_idx == outer_attempts - 1:
                         # All K attempts exhausted — record for planner memory
-                        import uuid as _uuid
                         correctness_failure_items.append({
-                            "item_id": _uuid.uuid4().hex[:8],
+                            "item_id": uuid.uuid4().hex[:8],
                             "iteration": iteration + 1,
                             "speedup": 0.0,
                             "rewrite_type": "implementation_flaw",
@@ -307,9 +307,8 @@ def execute_plans(state: GraphState) -> dict:
 
         if not passed:
             console.print(f"    [dim]Failure: {msg[:300]}[/]")
-            import uuid as _uuid
             correctness_failure_items.append({
-                "item_id": _uuid.uuid4().hex[:8],
+                "item_id": uuid.uuid4().hex[:8],
                 "iteration": iteration + 1,
                 "speedup": 0.0,
                 "rewrite_type": "implementation_flaw",
