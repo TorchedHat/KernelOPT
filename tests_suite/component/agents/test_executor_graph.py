@@ -309,3 +309,24 @@ def test_run_executor_agent_no_submit_returns_failure(sample_memory):
     )
     assert result["status"] == "implementation_failure"
     assert result["ready_for_profiling"] is False
+
+
+def test_run_executor_agent_passes_compile_error_in_initial_message(sample_memory):
+    """compile_error kwarg is accepted without error and surfaces in initial message."""
+    mock_llm = _make_mock_llm([
+        [{"name": "submit_kernel", "args": {"kernel_source": TRITON_KERNEL, "change_summary": "fixed"}, "id": "tc1"}],
+    ])
+    kernel, result = run_executor_agent(
+        kernel_source=TRITON_KERNEL,
+        optimization_plan=SAMPLE_PLAN,
+        memory=sample_memory,
+        K=1,
+        llm_config={"model": "unused", "api_key": None, "project_id": None, "region": None},
+        llm_override=mock_llm,
+        compile_error="kernel.cu(5): error: expected ';'",
+    )
+    assert result["status"] == "success"
+    invoke_calls = mock_llm.invoke.call_args_list
+    first_call_messages = invoke_calls[0][0][0]
+    combined = " ".join(str(m.content) for m in first_call_messages)
+    assert "expected ';'" in combined
