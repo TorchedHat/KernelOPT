@@ -98,6 +98,9 @@ def _resolve_ncu_config(
     # profiles all matching kernels regardless of how many non-matching launches
     # precede the target (e.g. torch.randn before a Triton kernel).
     if pipeline_config.kernel_name:
+        import sys as _sys
+        _sys.stdout.write("[profiler] user bypass — skipping LLM (kernel_name provided)\n")
+        _sys.stdout.flush()
         return {
             "kernel_name": pipeline_config.kernel_name,
             "launch_skip": pipeline_config.launch_skip,
@@ -107,6 +110,9 @@ def _resolve_ncu_config(
         }
 
     # (c) LLM sub-graph
+    import sys as _sys
+    _sys.stdout.write("[profiler] running LLM config-decider...\n")
+    _sys.stdout.flush()
     kernel_source = Path(kernel_path).read_text()
     server = ProfilerToolServer(kernel_path, kernel_source)
     profile_hints = getattr(pipeline_config, "profile_hints", "")
