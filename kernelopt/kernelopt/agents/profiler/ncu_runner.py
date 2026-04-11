@@ -241,18 +241,46 @@ def run_ncu(
 
     # Detect "No kernels were profiled" — NCU exits 0 but the .ncu-rep is empty.
     # This usually means the --kernel-name filter didn't match anything.
+    # Auto-retry without the filter so we always capture something.
     if "No kernels were profiled" in result.stdout:
-        kernel_filter = next(
-            (cmd[i + 1] for i, a in enumerate(cmd) if a == "--kernel-name"),
-            "(none)",
-        )
-        raise RuntimeError(
-            f"NCU ran successfully but profiled 0 kernels.\n"
-            f"--kernel-name filter used: {kernel_filter!r}\n"
-            f"Check the filter matches actual kernel names. "
-            f"Run without --kernel-name to profile all kernels and inspect the CSV.\n"
-            f"NCU output:\n{result.stdout[:2000]}"
-        )
+        has_kernel_filter = any(a == "--kernel-name" for a in cmd)
+        if has_kernel_filter:
+            kernel_filter = next(
+                cmd[i + 1] for i, a in enumerate(cmd) if a == "--kernel-name"
+            )
+            import sys as _sys
+            _sys.stdout.write(
+                f"[profiler] --kernel-name {kernel_filter!r} matched 0 kernels — "
+                f"retrying without filter to capture all kernels.\n"
+            )
+            _sys.stdout.flush()
+            # Strip --kernel-name and its value from the command and retry.
+            retry_cmd = [
+                a for i, a in enumerate(cmd)
+                if a != "--kernel-name" and (i == 0 or cmd[i - 1] != "--kernel-name")
+            ]
+            result = subprocess.run(
+                retry_cmd, capture_output=True, text=True, timeout=600, env=prof_env
+            )
+            if result.stdout:
+                _sys.stdout.write(result.stdout)
+                _sys.stdout.flush()
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"NCU profiling failed on retry (exit {result.returncode}):\n"
+                    f"Command: {' '.join(retry_cmd)}\n"
+                    f"stderr: {result.stderr[:1000]}"
+                )
+            if "No kernels were profiled" in result.stdout:
+                raise RuntimeError(
+                    f"NCU profiled 0 kernels even without a --kernel-name filter.\n"
+                    f"NCU output:\n{result.stdout[:2000]}"
+                )
+        else:
+            raise RuntimeError(
+                f"NCU profiled 0 kernels (no filter was applied).\n"
+                f"NCU output:\n{result.stdout[:2000]}"
+            )
 
     csv_path = f"{output_basename}.csv"
     _export_csv_from_ncu_rep(ncu_rep_path, csv_path)
