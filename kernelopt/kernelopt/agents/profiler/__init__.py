@@ -42,6 +42,7 @@ def run_profiler_agent(
     kernel_id: int = 0,
     llm_config: dict,
     llm_override=None,
+    binary_path: str | None = None,     # For .cu kernels: path to compiled binary
 ) -> tuple[dict, dict]:
     """Profile a kernel with NCU and return (profiling_context, ncu_config).
 
@@ -51,6 +52,10 @@ def run_profiler_agent(
       c) LLM sub-graph: reads source, decides kernel_name / launch_count / kernel_args
 
     Phase 2 — deterministic: run NCU, export CSV, parse, build profiling_context.
+
+    Args:
+        binary_path: For .cu kernels, path to the pre-compiled binary that NCU should execute.
+                     If None, binary is assumed to be at kernel_path with extension stripped.
 
     Returns (profiling_context, resolved_ncu_config).
     """
@@ -68,6 +73,7 @@ def run_profiler_agent(
         kernel_args=resolved["kernel_args"] or None,
         kernel_id=kernel_id,
         save_profiling_context=False,   # we build it below
+        binary_path=binary_path,
     )
 
     sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
