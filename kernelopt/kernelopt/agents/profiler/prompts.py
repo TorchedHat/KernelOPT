@@ -33,11 +33,14 @@ When analyzing the source:
      all kernels; use launch_skip + launch_count to target the right ones.
 
 3. Infer launch_skip from the benchmark harness:
+   - IMPORTANT: cudaMalloc, cudaMemcpy, and other CUDA API calls are NOT kernel launches.
+     Only calls to __global__ functions are kernel launches.
+   - For CUDA: look for warmup loops (e.g. "for (int i=0; i<5; i++) solve(...)").
+     Count warmup iterations. If no warmup, use launch_skip=0.
    - For Triton: count torch/numpy tensor init calls before the first kernel call.
      Each torch.randn / torch.zeros / torch.ones on CUDA = 1 kernel launch.
      E.g. 3 input tensors created → launch_skip = 3.
-   - For all frameworks: also add explicit warmup iterations from any warmup loop.
-   - If unsure, use 0.
+   - If unsure or no warmup found, use 0.
 
 4. Infer launch_count from steady-state repetitions:
    - Look for a timing/profiling loop (e.g. "for _ in range(100): kernel(...)")
@@ -51,8 +54,11 @@ When analyzing the source:
 6. Choose replay_mode:
    - Triton / Helion: always use 'application'. JIT-compiled kernels are not
      compatible with NCU kernel replay mode.
-   - CUDA: use 'kernel' (default, lower overhead). Use 'application' only if
-     the kernel uses very large inputs (>4 GB tensors) that cause OOM in kernel mode.
+   - CUDA (.cu files): check if the file contains 'int main(' or 'void main(':
+     * If main() exists → use 'application' (standalone binary)
+     * If no main() → use 'kernel' (library mode, lower overhead)
+   - Use 'application' if the kernel uses very large inputs (>4 GB tensors)
+     that could cause OOM in kernel mode.
 
 Call submit_ncu_config once. Do NOT produce a human-readable summary or recommendations.
 """
