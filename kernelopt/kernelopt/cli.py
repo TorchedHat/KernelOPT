@@ -171,19 +171,23 @@ def run(
         f"  Backend: [cyan]Claude on Vertex AI[/] ({model})"
     )
 
+    from kernelopt.agents.profiler import get_latency_ns
     from kernelopt.langgraph_pipeline import run_langgraph_pipeline
+
     final = run_langgraph_pipeline(state)
 
-    baseline_lat = final.baseline_profiling_context.get(
-        "sections", {}
-    ).get(
-        "GPU Speed Of Light Throughput", {}
-    ).get("Duration", {}).get("value", "?")
+    baseline_ns = get_latency_ns(final.baseline_profiling_context)
+    best_ns = final.best_latency_ns
+
+    def _lat_summary(ns: float) -> str:
+        if ns != ns or ns == float("inf"):  # NaN or missing
+            return "?"
+        return f"{ns / 1000:.2f} µs ({ns:.0f} ns)"
 
     console.print(
         f"\n[bold]Done.[/] "
-        f"Baseline: {baseline_lat} ns -> "
-        f"Best: [green]{final.best_latency_ns:.0f} ns[/]\n"
+        f"Baseline: {_lat_summary(baseline_ns)} -> "
+        f"Best: [green]{_lat_summary(best_ns)}[/]\n"
         f"Results in [cyan]{output_dir}/[/]"
     )
 
