@@ -34,6 +34,14 @@ console = Console()
 PLAN_LETTERS = list(string.ascii_uppercase)
 
 
+def _compile_cuda(cu_path: str, output_dir: str | None = None) -> str:
+    """Compile a .cu file with nvcc and return the binary path. Raises on failure."""
+    binary_path, err = compile_cuda(cu_path, output_dir=output_dir)
+    if err:
+        raise RuntimeError(f"nvcc failed:\n{err}")
+    return binary_path
+
+
 # ---------------------------------------------------------------------------
 # Node 1: Profile baseline kernel
 # ---------------------------------------------------------------------------
@@ -56,7 +64,7 @@ def profile_baseline(state: GraphState) -> dict:
     # For .cu kernels: compile the baseline binary once so NCU can run it.
     ext = Path(kernel_path).suffix
     if ext == ".cu":
-        binary_path, err = compile_cuda(kernel_path)
+        binary_path, err = compile_cuda(kernel_path, output_dir=str(output_dir))
         if err:
             raise RuntimeError(
                 f"Baseline .cu compilation failed:\n{err}\n\n"
@@ -243,7 +251,7 @@ def execute_plans(state: GraphState) -> dict:
             Path(kernel_file).write_text(optimized_source)
 
             if ext == ".cu":
-                binary_path, err = compile_cuda(kernel_file)
+                binary_path, err = compile_cuda(kernel_file, output_dir=str(output_dir))
                 if err:
                     last_compile_err = err
                     console.print(
@@ -384,6 +392,15 @@ def profile_candidates(state: GraphState) -> dict:
         output_base = str(output_dir / file_stem)
         kernel_file = f"{output_base}{ext}"
         Path(kernel_file).write_text(c.optimized_kernel)
+
+        if ext == ".cu":
+            try:
+                _compile_cuda(kernel_file, output_dir=str(output_dir))
+            except RuntimeError as e:
+                console.print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
+                c.latency_ns = float("inf")
+                c.speedup = 0.0
+                continue
 
         try:
             ctx, _ = run_profiler_agent(
