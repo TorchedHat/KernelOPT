@@ -152,3 +152,19 @@ def test_build_initial_message_contains_direction():
 def test_build_initial_message_contains_attempt_count():
     msg = build_initial_message("increase_tile_k", K=2)
     assert "2" in msg.content
+
+
+def test_build_initial_message_without_compile_error_has_no_nvcc_section():
+    msg = build_initial_message("tiling", K=2)
+    assert "nvcc" not in msg.content
+    assert "compilation" not in msg.content.lower()
+
+
+def test_build_initial_message_with_compile_error_includes_error():
+    msg = build_initial_message("tiling", K=2, compile_error="kernel.cu(5): error: expected ';'")
+    assert "kernel.cu(5): error: expected ';'" in msg.content
+
+
+def test_build_initial_message_with_compile_error_instructs_fix():
+    msg = build_initial_message("tiling", K=2, compile_error="kernel.cu(3): error: foo")
+    assert "compile" in msg.content.lower() or "nvcc" in msg.content.lower()

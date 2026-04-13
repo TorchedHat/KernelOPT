@@ -17,6 +17,7 @@ class PlanCandidate:
     execution_result: dict = field(default_factory=dict)
     correctness_passed: bool = False
     correctness_message: str = ""
+    compiled_binary_path: str = ""        # set after compile in execute_plans; reused in profile_candidates
     profiling_context: dict = field(default_factory=dict)
     csv_path: str = ""
     ncu_rep_path: str = ""

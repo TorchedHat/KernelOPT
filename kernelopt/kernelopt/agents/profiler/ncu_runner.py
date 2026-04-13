@@ -100,13 +100,22 @@ def build_ncu_command(
     replay_mode: str = "kernel",
     ncu_extra_args: list[str] | None = None,
     kernel_args: list[str] | None = None,
+    binary_path: str | None = None,
 ) -> list[str]:
-    """Build the ncu command line for profiling."""
+    """Build the ncu command line for profiling.
+
+    Args:
+        binary_path: For .cu kernels, path to the compiled binary. If None, derived from kernel_path.
+    """
     ext = Path(kernel_path).suffix
     if ext == ".py":
         runner = [sys.executable, kernel_path]
     else:
-        runner = [kernel_path.replace(ext, "")]
+        # Use provided binary_path or derive from kernel_path
+        if binary_path:
+            runner = [binary_path]
+        else:
+            runner = [kernel_path.replace(ext, "")]
 
     # kernel_name semantics:
     #   None: auto-detect from source (for backward compat)
@@ -188,8 +197,12 @@ def run_ncu(
     kernel_args: list[str] | None = None,
     kernel_id: int = 0,
     save_profiling_context: bool = True,
+    binary_path: str | None = None,
 ) -> tuple[str, str, str]:
     """Execute NCU profiling: profile → .ncu-rep → export CSV → optionally build context JSON.
+
+    Args:
+        binary_path: For .cu kernels, path to the compiled binary. If None, derived from kernel_path.
 
     Returns (csv_path, ncu_rep_path, profiling_context_path).
     """
@@ -220,6 +233,7 @@ def run_ncu(
         replay_mode=replay_mode,
         ncu_extra_args=ncu_extra_args,
         kernel_args=kernel_args,
+        binary_path=binary_path,
     )
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=600, env=prof_env

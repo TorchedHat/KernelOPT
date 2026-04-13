@@ -42,6 +42,7 @@ def run_profiler_agent(
     kernel_id: int = 0,
     llm_config: dict,
     llm_override=None,
+    binary_path: str | None = None,     # For .cu kernels: path to compiled binary
 ) -> tuple[dict, dict]:
     """Profile a kernel with NCU and return (profiling_context, ncu_config).
 
@@ -51,6 +52,10 @@ def run_profiler_agent(
       c) LLM sub-graph: reads source, decides kernel_name / launch_count / kernel_args
 
     Phase 2 — deterministic: run NCU, export CSV, parse, build profiling_context.
+
+    Args:
+        binary_path: For .cu kernels, path to the pre-compiled binary that NCU should execute.
+                     If None, binary is assumed to be at kernel_path with extension stripped.
 
     Returns (profiling_context, resolved_ncu_config).
     """
@@ -68,6 +73,7 @@ def run_profiler_agent(
         kernel_args=resolved["kernel_args"] or None,
         kernel_id=kernel_id,
         save_profiling_context=False,   # we build it below
+        binary_path=binary_path,
     )
 
     sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
@@ -101,12 +107,21 @@ def _resolve_ncu_config(
         import sys as _sys
         _sys.stdout.write("[profiler] user bypass — skipping LLM (kernel_name provided)\n")
         _sys.stdout.flush()
+
+        # Detect if CUDA file has main() — need application mode for standalone binaries
+        replay_mode = pipeline_config.replay_mode
+        if kernel_path.endswith(".cu"):
+            kernel_source = Path(kernel_path).read_text()
+            if "int main(" in kernel_source or "void main(" in kernel_source:
+                print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
+                replay_mode = "application"
+
         return {
             "kernel_name": pipeline_config.kernel_name,
             "launch_skip": pipeline_config.launch_skip,
             "launch_count": pipeline_config.launch_count,  # None = no limit
             "kernel_args": list(pipeline_config.kernel_args),
-            "replay_mode": pipeline_config.replay_mode,
+            "replay_mode": replay_mode,
         }
 
     # (c) LLM sub-graph
@@ -146,6 +161,13 @@ def _resolve_ncu_config(
             print(f"[DEBUG] Detected {framework} kernel, forcing kernel_name='' (was: {llm_result.get('kernel_name')})")
             llm_result = {**llm_result, "kernel_name": ""}
 
+        # Force application mode for CUDA files with main() — kernel mode doesn't work with standalone binaries.
+        if framework == "cuda" and kernel_path.endswith(".cu"):
+            kernel_source = Path(kernel_path).read_text()
+            if "int main(" in kernel_source or "void main(" in kernel_source:
+                print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application' (was: {llm_result.get('replay_mode')})")
+                llm_result = {**llm_result, "replay_mode": "application"}
+
         print(f"[DEBUG] Final LLM config: {llm_result}")
         return llm_result
 
@@ -153,12 +175,21 @@ def _resolve_ncu_config(
     # For CUDA, function names match NCU's demangled names directly.
     # For Triton/Helion, JIT compilers mangle names — don't filter by name.
     kernel_name_filter = _build_kernel_name_filter(detected_names) if framework == "cuda" else None
+
+    # Detect if CUDA file has main() — need application mode for standalone binaries
+    replay_mode = pipeline_config.replay_mode
+    if framework == "cuda" and kernel_path.endswith(".cu"):
+        kernel_source = Path(kernel_path).read_text()
+        if "int main(" in kernel_source or "void main(" in kernel_source:
+            print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
+            replay_mode = "application"
+
     fallback_config = {
         "kernel_name": kernel_name_filter or "",
         "launch_skip": pipeline_config.launch_skip,
         "launch_count": pipeline_config.launch_count or 1,
         "kernel_args": list(pipeline_config.kernel_args),
-        "replay_mode": pipeline_config.replay_mode,
+        "replay_mode": replay_mode,
     }
     print(f"[DEBUG] Using fallback config (LLM didn't call submit_ncu_config): {fallback_config}")
     return fallback_config
