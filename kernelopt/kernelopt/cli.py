@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,14 @@ app = typer.Typer(
 console = Console()
 
 
+def _run_output_dir(base: Path, *, run_subdir: bool) -> Path:
+    """Place this run under base/run_YYYYmmdd_HHMMSS_microseconds/ when run_subdir is True."""
+    if not run_subdir:
+        return base
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return base / f"run_{stamp}"
+
+
 @app.command()
 def run(
     kernel_path: Path = typer.Argument(
@@ -48,7 +57,12 @@ def run(
         4, "--top-k", help="Max experience items per iteration"
     ),
     output_dir: Path = typer.Option(
-        Path("pipeline_output"), "-o", "--output-dir", help="Output directory"
+        Path("pipeline_output"), "-o", "--output-dir",
+        help="Output base directory for this kernelopt run; default: new run_<timestamp>/ here",
+    ),
+    run_subdir: bool = typer.Option(
+        True, "--run-subdir/--no-run-subdir",
+        help="Every kernelopt run: write under <output-dir>/run_<timestamp>/ (default: on)",
     ),
     csv: Optional[Path] = typer.Option(
         None, "--csv", help="Existing baseline NCU CSV (skip baseline profiling)"
@@ -113,7 +127,8 @@ def run(
 
     Generates N plans per iteration, profiles each valid candidate with NCU,
     and selects the best. Outputs best_kernel, optimization_log.md, and
-    .ncu-rep files for every candidate.
+    .ncu-rep files for every candidate. Each kernelopt run uses a new
+    run_<timestamp>/ folder under --output-dir unless --no-run-subdir.
 
     Example:
         kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
@@ -126,6 +141,7 @@ def run(
         raise typer.Exit(1)
 
     kernel_basename = kernel_path.stem
+    resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
 
     cfg = PipelineConfig(
         T=iterations,
@@ -146,7 +162,7 @@ def run(
         executor_model=executor_model,
         profile_hints=profile_hints,
         profiler_model=profiler_model,
-        output_dir=str(output_dir),
+        output_dir=str(resolved_output),
         kernel_path=str(kernel_path),
         baseline_csv=str(csv) if csv else None,
         verbose=verbose,
@@ -168,6 +184,7 @@ def run(
         f"[cyan]{kernel_path.name}[/]\n"
         f"  T={iterations} iterations, N={plans} plans/iter, "
         f"K={attempts} attempts/plan, TopK={top_k}\n"
+        f"  Output: [cyan]{resolved_output}/[/]\n"
         f"  Backend: [cyan]Claude on Vertex AI[/] ({model})"
     )
 
@@ -188,7 +205,7 @@ def run(
         f"\n[bold]Done.[/] "
         f"Baseline: {_lat_summary(baseline_ns)} -> "
         f"Best: [green]{_lat_summary(best_ns)}[/]\n"
-        f"Results in [cyan]{output_dir}/[/]"
+        f"Results in [cyan]{resolved_output}/[/]"
     )
 
 
