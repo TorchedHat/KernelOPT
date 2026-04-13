@@ -63,14 +63,15 @@ def profile_baseline(state: GraphState) -> dict:
 
     # For .cu kernels: compile the baseline binary once so NCU can run it.
     ext = Path(kernel_path).suffix
+    compiled_binary = None
     if ext == ".cu":
-        binary_path, err = compile_cuda(kernel_path, output_dir=str(output_dir))
+        compiled_binary, err = compile_cuda(kernel_path, output_dir=str(output_dir))
         if err:
             raise RuntimeError(
                 f"Baseline .cu compilation failed:\n{err}\n\n"
                 f"Fix the kernel source and rerun."
             )
-        console.print(f"  [dim]Compiled baseline binary: {binary_path}[/]")
+        console.print(f"  [dim]Compiled baseline binary: {compiled_binary}[/]")
 
     llm_config = {
         "model": cfg.profiler_model or cfg.model,
@@ -96,6 +97,7 @@ def profile_baseline(state: GraphState) -> dict:
                 pipeline_config=cfg,
                 kernel_id=kernel_id,
                 llm_config=llm_config,
+                binary_path=compiled_binary,
             )
         except RuntimeError as e:
             raise RuntimeError(f"Baseline profiling failed: {e}") from e
@@ -393,9 +395,10 @@ def profile_candidates(state: GraphState) -> dict:
         kernel_file = f"{output_base}{ext}"
         Path(kernel_file).write_text(c.optimized_kernel)
 
+        candidate_binary = None
         if ext == ".cu":
             try:
-                _compile_cuda(kernel_file, output_dir=str(output_dir))
+                candidate_binary = _compile_cuda(kernel_file, output_dir=str(output_dir))
             except RuntimeError as e:
                 console.print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
                 c.latency_ns = float("inf")
@@ -409,6 +412,7 @@ def profile_candidates(state: GraphState) -> dict:
                 ncu_config=saved_ncu_config,  # full bypass — no LLM call
                 pipeline_config=cfg,
                 kernel_id=kernel_id,
+                binary_path=candidate_binary,
                 llm_config=llm_config,
             )
             c.profiling_context = ctx
