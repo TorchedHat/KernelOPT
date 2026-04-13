@@ -6,6 +6,28 @@ Supports **Triton**, **CUDA**, and **Helion** kernels. Powered by **LangGraph** 
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Install kernelopt package (REQUIRED FIRST)
+cd kernelopt
+pip install -e ".[triton]"
+
+# 2. Run automated setup
+cd ..
+./setup_environment.py
+
+# 3. Load environment
+source .env
+
+# 4. Optimize a kernel!
+CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 3 -N 4
+```
+
+> **Note:** The package MUST be installed before running `setup_environment.py`. The setup script will verify the installation and guide you through configuring your Google Cloud credentials.
+
+---
+
 ## How it works
 
 Each iteration runs six phases in a LangGraph pipeline:
@@ -108,13 +130,56 @@ The planner reads this memory to avoid dead ends and reinforce strategies that w
 
 ## Installation
 
+### Quick Setup (Recommended)
+
+**IMPORTANT:** Install the kernelopt package BEFORE running the setup script.
+
 ```bash
+# Step 1: Install the package (REQUIRED)
+cd kernelopt
+pip install -e ".[triton]"   # add triton support
+
+# Step 2: Run interactive environment setup
+cd ..
+python setup_environment.py
+```
+
+The setup script will:
+- Check for gcloud CLI (installs if missing)
+- Guide you through authentication
+- Prompt for your Vertex AI project ID and region
+- Create a `.env` file with your configuration
+- Verify all dependencies are installed
+- Check that kernelopt is properly installed
+
+### Manual Setup
+
+```bash
+# 1. Install package (REQUIRED FIRST)
 cd kernelopt
 pip install -e ".[triton]"   # add triton support
 pip install -e ".[dev]"      # add pytest/ruff/mypy
+cd ..
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your values:
+#   ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
+#   VERTEX_REGION=us-east5
+
+# 3. Set up authentication
+gcloud auth application-default login
+
+# 4. Load environment
+source .env
 ```
 
-Requires `ncu` (Nsight Compute) on `$PATH` and a GPU.
+**System Requirements:**
+- Python 3.10+ (**verified by setup script**)
+- `ncu` (Nsight Compute) on `$PATH` (**verified by setup script**)
+- CUDA-capable GPU with compute capability >= 6.0 (**verified by setup script**)
+- Google Cloud project with Vertex AI API enabled (**verified by setup script**)
+- gcloud CLI installed (**setup script can install this**)
 
 ---
 
