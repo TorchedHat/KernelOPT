@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from click.core import ParameterSource
 from rich.console import Console
 
 import warnings
@@ -28,6 +29,40 @@ app = typer.Typer(
 console = Console()
 
 
+# With --memory + checkpoint, these may not be set on the CLI (config comes from checkpoint).
+_RESUME_CKPT_FORBIDDEN = frozenset({
+    "framework",
+    "top_k",
+    "output_dir",
+    "run_subdir",
+    "csv",
+    "kernel_name",
+    "launch_skip",
+    "launch_count",
+    "replay_mode",
+    "kernel_args",
+    "api_key",
+    "model",
+    "project_id",
+    "region",
+    "planner_model",
+    "summarizer_model",
+    "executor_model",
+    "profile_hints",
+    "profiler_model",
+    "verbose",
+    "agentic_correctness",
+})
+
+
+def _cli_set_param(ctx: typer.Context, name: str) -> bool:
+    """True if the user supplied this option on the command line (not defaults/env)."""
+    try:
+        return ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
+    except (ValueError, AttributeError):
+        return False
+
+
 def _run_output_dir(base: Path, *, run_subdir: bool) -> Path:
     """Place this run under base/run_YYYYmmdd_HHMMSS_microseconds/ when run_subdir is True."""
     if not run_subdir:
@@ -38,20 +73,24 @@ def _run_output_dir(base: Path, *, run_subdir: bool) -> Path:
 
 @app.command()
 def run(
+    ctx: typer.Context,
     kernel_path: Path = typer.Argument(
         ..., help="Kernel file (.cu, .py, .hl)"
     ),
     framework: str = typer.Option(
         "auto", help="cuda|triton|helion|auto"
     ),
-    iterations: int = typer.Option(
-        5, "-T", "--iterations", help="Max optimization iterations"
+    iterations: Optional[int] = typer.Option(
+        None, "-T", "--iterations",
+        help="Max optimization iterations (default 5; with --memory + checkpoint: from checkpoint if omitted)",
     ),
-    plans: int = typer.Option(
-        4, "-N", "--plans", help="Plans generated per iteration"
+    plans: Optional[int] = typer.Option(
+        None, "-N", "--plans",
+        help="Plans per iteration (default 4; with --memory + checkpoint: from checkpoint if omitted)",
     ),
-    attempts: int = typer.Option(
-        1, "-K", "--attempts", help="Executor attempts per plan"
+    attempts: Optional[int] = typer.Option(
+        None, "-K", "--attempts",
+        help="Executor attempts per plan (default 1; with --memory + checkpoint: from checkpoint if omitted)",
     ),
     top_k: int = typer.Option(
         4, "--top-k", help="Max experience items per iteration"
@@ -68,7 +107,8 @@ def run(
         None, "--csv", help="Existing baseline NCU CSV (skip baseline profiling)"
     ),
     memory: Optional[Path] = typer.Option(
-        None, "--memory", help="Load existing optimization_memory.json"
+        None, "--memory",
+        help="Resume from a prior run directory (pipeline_output/run_…/) with checkpoint or baseline artifacts",
     ),
     kernel_name: Optional[str] = typer.Option(
         None, "--kernel-name",
@@ -129,63 +169,173 @@ def run(
     and selects the best. Outputs best_kernel, optimization_log.md, and
     .ncu-rep files for every candidate. Each kernelopt run uses a new
     run_<timestamp>/ folder under --output-dir unless --no-run-subdir.
+    With --memory and a pipeline_checkpoint.json, NCU/LLM options are taken from the
+    checkpoint; only -T, -N, -K may be overridden (omit them to use saved values).
 
     Example:
         kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
     """
-    from kernelopt.memory import load_memory
+    from kernelopt.checkpoint import load_checkpoint_file, pipeline_config_from_checkpoint_dict
     from kernelopt.state import PipelineConfig, PipelineState
+
+    ckpt: dict | None = None
+    if memory is not None:
+        run_dir_pre = memory.resolve()
+        if not run_dir_pre.is_dir():
+            console.print(f"[red]Error:[/] --memory must be an existing directory: {run_dir_pre}")
+            raise typer.Exit(1)
+        ckpt = load_checkpoint_file(run_dir_pre)
+        gs_pre = ckpt.get("graph_state") if ckpt else None
+        saved_pre = (gs_pre or {}).get("config") if isinstance(gs_pre, dict) else None
+        will_resume_ckpt = (
+            ckpt is not None
+            and isinstance(saved_pre, dict)
+            and bool(saved_pre)
+        )
+        if will_resume_ckpt:
+            bad = sorted(
+                p for p in _RESUME_CKPT_FORBIDDEN if _cli_set_param(ctx, p)
+            )
+            if bad:
+                def _flag_label(name: str) -> str:
+                    if name == "agentic_correctness":
+                        return "--agentic-correctness / --no-agentic-correctness"
+                    return "--" + name.replace("_", "-")
+
+                console.print(
+                    "[red]Error:[/] With [cyan]--memory[/] and a [cyan]pipeline_checkpoint.json[/], "
+                    "config is loaded from the checkpoint.\n"
+                    "  Only these options are allowed on the command line:\n"
+                    "    • kernel file (positional)\n"
+                    "    • [cyan]--memory[/] DIR\n"
+                    "    • [cyan]-T[/] / [cyan]-N[/] / [cyan]-K[/] (optional overrides)\n"
+                    f"  Remove: {', '.join(_flag_label(p) for p in bad)}"
+                )
+                raise typer.Exit(2)
+        else:
+            for p in ("output_dir", "run_subdir"):
+                if _cli_set_param(ctx, p):
+                    console.print(
+                        "[red]Error:[/] With [cyan]--memory[/], output is the run directory; "
+                        "do not pass [cyan]-o[/] / [cyan]--output-dir[/] or "
+                        "[cyan]--run-subdir[/] / [cyan]--no-run-subdir[/]."
+                    )
+                    raise typer.Exit(2)
 
     if not kernel_path.exists():
         console.print(f"[red]Error:[/] kernel file not found: {kernel_path}")
         raise typer.Exit(1)
 
     kernel_basename = kernel_path.stem
-    resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
+    resume_from_ckpt = False
+    run_framework = framework
 
-    cfg = PipelineConfig(
-        T=iterations,
-        N=plans,
-        K=attempts,
-        TopK=top_k,
-        kernel_name=kernel_name,
-        launch_skip=launch_skip,
-        launch_count=launch_count,
-        replay_mode=replay_mode,
-        kernel_args=kernel_args.split() if kernel_args else [],
-        model=model,
-        api_key=api_key,
-        project_id=project_id or "",
-        region=region,
-        planner_model=planner_model,
-        summarizer_model=summarizer_model,
-        executor_model=executor_model,
-        profile_hints=profile_hints,
-        profiler_model=profiler_model,
-        output_dir=str(resolved_output),
-        kernel_path=str(kernel_path),
-        baseline_csv=str(csv) if csv else None,
-        verbose=verbose,
-        agentic_correctness=agentic_correctness,
-    )
+    def _defaults_tnk() -> tuple[int, int, int]:
+        return (
+            iterations if iterations is not None else 5,
+            plans if plans is not None else 4,
+            attempts if attempts is not None else 1,
+        )
+
+    if memory is not None:
+        run_dir = memory.resolve()
+        resolved_output = run_dir
+        gs = ckpt.get("graph_state") if ckpt else None
+        saved_cfg_dict = (gs or {}).get("config") if isinstance(gs, dict) else None
+
+        if ckpt is not None and isinstance(saved_cfg_dict, dict) and saved_cfg_dict:
+            cfg = pipeline_config_from_checkpoint_dict(saved_cfg_dict)
+            cfg.output_dir = str(resolved_output)
+            cfg.kernel_path = str(kernel_path.resolve())
+            if iterations is not None:
+                cfg.T = iterations
+            if plans is not None:
+                cfg.N = plans
+            if attempts is not None:
+                cfg.K = attempts
+            run_framework = gs.get("framework", framework) if isinstance(gs, dict) else framework
+            resume_from_ckpt = True
+        else:
+            t0, n0, k0 = _defaults_tnk()
+            cfg = PipelineConfig(
+                T=t0,
+                N=n0,
+                K=k0,
+                TopK=top_k,
+                kernel_name=kernel_name,
+                launch_skip=launch_skip,
+                launch_count=launch_count,
+                replay_mode=replay_mode,
+                kernel_args=kernel_args.split() if kernel_args else [],
+                model=model,
+                api_key=api_key,
+                project_id=project_id or "",
+                region=region,
+                planner_model=planner_model,
+                summarizer_model=summarizer_model,
+                executor_model=executor_model,
+                profile_hints=profile_hints,
+                profiler_model=profiler_model,
+                output_dir=str(resolved_output),
+                kernel_path=str(kernel_path),
+                baseline_csv=str(csv) if csv else None,
+                verbose=verbose,
+                agentic_correctness=agentic_correctness,
+            )
+    else:
+        resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
+        t0, n0, k0 = _defaults_tnk()
+        cfg = PipelineConfig(
+            T=t0,
+            N=n0,
+            K=k0,
+            TopK=top_k,
+            kernel_name=kernel_name,
+            launch_skip=launch_skip,
+            launch_count=launch_count,
+            replay_mode=replay_mode,
+            kernel_args=kernel_args.split() if kernel_args else [],
+            model=model,
+            api_key=api_key,
+            project_id=project_id or "",
+            region=region,
+            planner_model=planner_model,
+            summarizer_model=summarizer_model,
+            executor_model=executor_model,
+            profile_hints=profile_hints,
+            profiler_model=profiler_model,
+            output_dir=str(resolved_output),
+            kernel_path=str(kernel_path),
+            baseline_csv=str(csv) if csv else None,
+            verbose=verbose,
+            agentic_correctness=agentic_correctness,
+        )
 
     state = PipelineState(
         config=cfg,
         kernel_path=str(kernel_path),
         kernel_source=kernel_path.read_text(),
         best_kernel=kernel_path.read_text(),
-        framework=framework,
+        framework=run_framework,
         kernel_basename=kernel_basename,
-        optimization_memory=load_memory(memory) if memory else [],
+        optimization_memory=[],
+        resume_run_dir=str(resolved_output) if memory is not None else None,
     )
 
+    extra = ""
+    if resume_from_ckpt:
+        extra = (
+            "\n  [dim]Resume:[/] pipeline config from checkpoint "
+            "(other CLI flags ignored; only -T/-N/-K override T/N/K)"
+        )
     console.print(
         f"[bold green]kernelopt[/] starting on "
         f"[cyan]{kernel_path.name}[/]\n"
-        f"  T={iterations} iterations, N={plans} plans/iter, "
-        f"K={attempts} attempts/plan, TopK={top_k}\n"
+        f"  T={cfg.T} iterations, N={cfg.N} plans/iter, "
+        f"K={cfg.K} attempts/plan, TopK={cfg.TopK}\n"
         f"  Output: [cyan]{resolved_output}/[/]\n"
-        f"  Backend: [cyan]Claude on Vertex AI[/] ({model})"
+        f"  Backend: [cyan]Claude on Vertex AI[/] ({cfg.model})"
+        f"{extra}"
     )
 
     from kernelopt.agents.profiler import get_latency_ns
@@ -298,8 +448,9 @@ def plan(
     num_plans: int = typer.Option(
         1, "-N", help="Number of plans to generate"
     ),
-    memory: Optional[Path] = typer.Option(
-        None, help="Existing optimization_memory.json"
+    experience: Optional[Path] = typer.Option(
+        None, "-E", "--experience",
+        help="Path to optimization_memory.json (experience items for the planner)",
     ),
     api_key: Optional[str] = typer.Option(
         None, envvar="ANTHROPIC_API_KEY"
@@ -325,7 +476,7 @@ def plan(
     ctx = build_profiling_context(
         sections, rules, launch, str(kernel_path)
     )
-    mem = load_memory(memory) if memory else []
+    mem = load_memory(experience) if experience else []
 
     llm_config = {
         "model": model,
