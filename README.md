@@ -197,13 +197,14 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-T`, `--iterations` | 5 | Max optimization iterations |
-| `-N`, `--plans` | 4 | Plans generated per iteration |
-| `-K`, `--attempts` | 1 | Executor attempts per plan |
+| `-T`, `--iterations` | 5 | Max optimization iterations (omit = default 5; with `--memory` + checkpoint: from checkpoint) |
+| `-N`, `--plans` | 4 | Plans per iteration (omit = default 4; with `--memory` + checkpoint: from checkpoint) |
+| `-K`, `--attempts` | 1 | Executor attempts per plan (omit = default 1; with `--memory` + checkpoint: from checkpoint) |
 | `--top-k` | 4 | Max experience items added per iteration |
-| `-o`, `--output-dir` | `pipeline_output/` | Output directory |
+| `-o`, `--output-dir` | `pipeline_output/` | Output **base** directory for `kernelopt run` (see Outputs) |
+| `--run-subdir` / `--no-run-subdir` | on | **Every** `kernelopt run` creates `run_<timestamp>/` under `-o` (default: on) |
 | `--csv` | — | Skip baseline profiling, use existing NCU CSV |
-| `--memory` | — | Load an existing `optimization_memory.json` |
+| `--memory` | — | **Resume** from a run directory. If `pipeline_checkpoint.json` exists: **reload full pipeline config from it** (NCU names, `kernel_args`, models, project, etc.); only **`-T` / `-N` / `-K`** may be overridden from the CLI (omit those to use saved values). Other flags are ignored. Continues from the last checkpoint stage. If no checkpoint: baseline CSV + context fallback (then normal CLI applies). Same kernel **basename** required. `-o` / `--run-subdir` ignored. Example Usage: kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 3 -N 4 -K 1 --memory pipeline_output/run_20260414_063558_408400|
 | `--kernel-name` | auto | NCU `--kernel-name` regex |
 | `--launch-skip` | 0 | NCU `--launch-skip` |
 | `--launch-count` | — | NCU `--launch-count` |
@@ -223,11 +224,20 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 # Triton softmax — 3 iterations, 4 plans, profile only kernels named 'softmax_kernel'
 kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
 
-# CUDA kernel — skip baseline (use existing CSV)
-kernelopt run my_kernel.cu --csv pipeline_output/baseline.csv
+# CUDA kernel — skip baseline (use existing CSV from a prior run folder)
+kernelopt run my_kernel.cu --csv pipeline_output/run_20260413_120000_000000/baseline.csv
 
-# Resume from saved memory
-kernelopt run softmax.py --memory pipeline_output/optimization_memory.json
+# Resume (only kernel path + run dir required; T/N/K from checkpoint unless you pass -T -N -K)
+kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/
+
+# Resume with more iterations only
+kernelopt run softmax.py -T 5 --memory pipeline_output/run_20260413_120000_000000/
+
+# Plan-only: pass experience JSON with -E/--experience (not --memory)
+kernelopt plan profile.csv softmax.py -N 2 -E pipeline_output/run_20260413_120000_000000/optimization_memory.json
+
+# Flat layout under -o (no run_* subfolder), same as older behavior
+kernelopt run softmax.py -o pipeline_output --no-run-subdir
 
 # Profile only (no optimization)
 kernelopt profile softmax.py -o pipeline_output/baseline
@@ -243,12 +253,21 @@ kernelopt run big_kernel.py --replay-mode application
 
 ## Outputs
 
-All files land in `--output-dir` (default `pipeline_output/`):
+**`kernelopt run` only:** by default, **every** time you run `kernelopt run`, artifacts go in a **new** timestamped folder under `--output-dir`:
+
+`pipeline_output/run_YYYYMMDD_HHMMSS_microseconds/`
+
+Other commands (`profile`, `show`, `plan`, …) are unchanged and do not use this layout.
+
+Use **`--no-run-subdir`** on `kernelopt run` to write directly into `-o` (flat layout, overwrites on repeat runs).
+
+All artifact paths below are relative to that **run directory**:
 
 | File | Description |
 |------|-------------|
 | `best_kernel{ext}` | Best optimized kernel source |
 | `optimization_memory.json` | Accumulated experience items |
+| `pipeline_checkpoint.json` | Updated after each major stage: baseline, **plans**, **execute** (pre-NCU), **summarize**, **select**, then each **iteration** — resume continues from the last completed stage (same plans are not regenerated when resuming after `after_plans`) |
 | `optimization_log.md` | Full per-iteration log with metric comparison tables |
 | `baseline.csv` / `baseline.ncu-rep` | Baseline profiling artifacts |
 | `{kernel}_iter{N}_plan{L}_{direction}.{ext}` | Each candidate kernel |
@@ -266,6 +285,7 @@ kernelopt/
 │   ├── langgraph_pipeline.py    # LangGraph pipeline (active impl)
 │   ├── state.py                 # PipelineConfig, PipelineState, GraphState, PlanCandidate, IterationResult
 │   ├── memory.py                # Bounded experience queue
+│   ├── checkpoint.py            # Resume checkpoints (--memory run dir)
 │   ├── llm.py                   # LLM builder (Anthropic / Vertex AI)
 │   ├── schemas.py               # Shared Pydantic schemas
 │   ├── agents/
