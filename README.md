@@ -55,6 +55,70 @@ select_best ──► increment_iteration ──► (loop or stop)
 
 ---
 
+## GPU Monitoring
+
+`kernelopt run` automatically displays GPU and system status before profiling and monitors GPU activity during optimization.
+
+### Pre-run Validation
+
+Before starting the optimization pipeline, kernelopt shows:
+
+```
+System Status:
+  CPU Memory (RAM): 1700 MB available / 1805 MB total (94.2% available)
+  GPU Device: GPU 0 (NVIDIA H200)
+  GPU Memory (VRAM): 130070 MB free / 143771 MB total (90.5% free)
+  GPU Utilization: 0.0%
+  GPU Temperature: 30°C
+  Active processes: 7 (12920 MB GPU memory)
+
+   Active GPU Processes    
+ User      PID  GPU Memory 
+ host  2605259     4782 MB 
+ host  3331695     3544 MB 
+ ...
+```
+
+**Features:**
+- **System RAM** and **GPU VRAM** clearly labeled to avoid confusion
+- **GPU utilization** and **temperature** monitoring
+- **Active GPU processes** with memory usage breakdown
+- **Warnings** if GPU memory is low (<40% free) or GPU is busy (>20% utilization)
+
+### Per-iteration Monitoring
+
+During optimization, kernelopt monitors GPU activity at the start of each iteration (silent when idle):
+
+```
+Iteration 2/5  Best: 1.42x  Memory: 4 items
+  GPU activity: GPU utilization: 38.3% | 2 processes using 5248 MB
+```
+
+**Non-blocking design:** All monitoring is informational only — warnings are displayed but execution never halts.
+
+### Container Support
+
+When running inside containers (Docker, devcontainers), GPU processes from the host system are labeled as `"host"`:
+
+```
+   Active GPU Processes    
+ User      PID  GPU Memory 
+ host  2605259     4782 MB 
+ host  3331695     3544 MB 
+  Note: 'host' = process running outside container namespace
+```
+
+**Limitations in containers:**
+- ✅ GPU memory usage per process (accurate)
+- ✅ Total GPU utilization (accurate)
+- ✅ System RAM status (accurate)
+- ❌ Process usernames (shows "host" for processes outside container)
+- ❌ CPU% usage (hidden, not accessible due to PID namespace isolation)
+
+**For full process details**, run kernelopt directly on the host system (not in a container).
+
+---
+
 ## Agents
 
 ### Planner (`agents/planner/`)
@@ -305,6 +369,7 @@ kernelopt/
 │   └── functions/
 │       ├── csv_parser.py        # NCU CSV parser
 │       ├── correctness.py       # Correctness check dispatcher
+│       ├── gpu_monitoring.py    # GPU/system monitoring utilities
 │       └── selector.py          # Candidate selector utilities
 └── tests_suite/              # Unified test suite (366 tests)
     ├── unit/                 # Unit tests (no GPU required)
