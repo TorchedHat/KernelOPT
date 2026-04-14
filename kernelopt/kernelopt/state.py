@@ -116,6 +116,9 @@ class PipelineState:
     # History
     iteration_results: list[IterationResult] = field(default_factory=list)
 
+    # Resume: directory from --memory (prior run output folder)
+    resume_run_dir: str | None = None
+
 
 class GraphState(TypedDict, total=False):
     """LangGraph-compatible state for the optimization pipeline."""
@@ -156,3 +159,6 @@ class GraphState(TypedDict, total=False):
 
     # History
     iteration_results: list[IterationResult]
+
+    # Internal: LangGraph entry routing (fresh | after_baseline | after_iteration)
+    _entry: str

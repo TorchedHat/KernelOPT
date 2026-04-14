@@ -14,6 +14,11 @@ import uuid
 from pathlib import Path
 
 from langgraph.graph import END, StateGraph
+
+try:
+    from langgraph.graph import START
+except ImportError:  # pragma: no cover
+    START = "__start__"
 from rich.console import Console
 from rich.table import Table
 
@@ -21,7 +26,13 @@ from kernelopt.agents.executor import run_executor_agent
 from kernelopt.agents.summarizer import run_summarizer
 from kernelopt.functions.compiler import compile_cuda
 from kernelopt.functions.correctness import check_correctness
-from kernelopt.memory import append_items, save_memory, select_top_k
+from kernelopt.checkpoint import (
+    graph_state_from_checkpoint_payload,
+    load_baseline_artifacts,
+    load_checkpoint_file,
+    save_checkpoint,
+)
+from kernelopt.memory import append_items, load_memory, save_memory, select_top_k
 from kernelopt.state import (
     GraphState,
     IterationResult,
@@ -32,6 +43,15 @@ from kernelopt.state import (
 
 console = Console()
 PLAN_LETTERS = list(string.ascii_uppercase)
+
+
+def _checkpoint_stage(state: GraphState, updates: dict, stage: str) -> None:
+    """Persist merged state after a pipeline stage (for --memory resume)."""
+    try:
+        merged: GraphState = {**state, **updates}  # type: ignore[misc]
+        save_checkpoint(Path(str(merged["output_dir"])), merged, stage)
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/] checkpoint [{stage}] failed: {e}")
 
 
 def _compile_cuda(cu_path: str, output_dir: str | None = None) -> str:
@@ -114,7 +134,7 @@ def profile_baseline(state: GraphState) -> dict:
         f"Framework: [green]{framework}[/]"
     )
 
-    return {
+    out = {
         "baseline_profiling_context": baseline_ctx,
         "baseline_csv": cfg.baseline_csv or str(output_dir / "baseline.csv"),
         "baseline_ncu_rep": str(output_dir / "baseline.ncu-rep"),
@@ -124,6 +144,8 @@ def profile_baseline(state: GraphState) -> dict:
         "framework": framework,
         "ncu_config": ncu_config,
     }
+    _checkpoint_stage(state, out, "after_baseline")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +199,9 @@ def generate_plans(state: GraphState) -> dict:
             f"    Plan {letter}: {direction} [dim](confidence: {confidence})[/]"
         )
 
-    return {"plans": plans}
+    out = {"plans": plans}
+    _checkpoint_stage(state, out, "after_plans")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +379,9 @@ def execute_plans(state: GraphState) -> dict:
         )
         candidates.append(candidate)
 
-    return {"candidates": candidates, "correctness_failure_items": correctness_failure_items}
+    out = {"candidates": candidates, "correctness_failure_items": correctness_failure_items}
+    _checkpoint_stage(state, out, "after_execute")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +531,9 @@ def summarize_results(state: GraphState) -> dict:
     if top_items:
         memory = append_items(memory, top_items, cfg.ExpN)
 
-    return {"optimization_memory": memory}
+    out = {"optimization_memory": memory}
+    _checkpoint_stage(state, out, "after_summarize")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +606,7 @@ def select_best_candidate(state: GraphState) -> dict:
         t.add_row(c.direction, speedup_str, correct, "Y" if is_best else "")
     console.print(t)
 
-    return {
+    out = {
         "best_kernel": best_kernel,
         "best_latency_ns": best_latency,
         "best_ncu_rep": best_ncu_rep,
@@ -586,6 +614,8 @@ def select_best_candidate(state: GraphState) -> dict:
         "no_improvement_streak": no_improvement_streak,
         "iteration_results": iteration_results,
     }
+    _checkpoint_stage(state, out, "after_select")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +663,40 @@ def should_continue(state: GraphState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Resume / checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def route_start(state: GraphState) -> str:
+    """Route from START to the first node to run (fresh or --memory resume)."""
+    entry = state.get("_entry", "fresh")
+    resume_targets = {
+        "after_baseline": "generate_plans",
+        "after_plans": "execute_plans",
+        "after_execute": "profile_candidates",
+        "after_summarize": "select_best",
+        "after_select": "increment_iteration",
+        "after_iteration": "continuation_entry",
+    }
+    if entry in resume_targets:
+        return resume_targets[entry]
+    return "profile_baseline"
+
+
+def continuation_entry(state: GraphState) -> dict:
+    """No-op node before should_continue when resuming mid-pipeline."""
+    return {}
+
+
+def save_iter_checkpoint(state: GraphState) -> dict:
+    """Persist full graph state between iterations (enables --memory resume)."""
+    try:
+        save_checkpoint(Path(state["output_dir"]), state, "after_iteration")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/] could not save checkpoint: {e}")
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
 
@@ -647,17 +711,37 @@ def build_graph():
     graph.add_node("summarize_results", summarize_results)
     graph.add_node("select_best", select_best_candidate)
     graph.add_node("increment_iteration", increment_iteration)
+    graph.add_node("continuation_entry", continuation_entry)
+    graph.add_node("save_iter_checkpoint", save_iter_checkpoint)
 
-    graph.set_entry_point("profile_baseline")
+    graph.add_conditional_edges(
+        START,
+        route_start,
+        {
+            "profile_baseline": "profile_baseline",
+            "generate_plans": "generate_plans",
+            "execute_plans": "execute_plans",
+            "profile_candidates": "profile_candidates",
+            "select_best": "select_best",
+            "increment_iteration": "increment_iteration",
+            "continuation_entry": "continuation_entry",
+        },
+    )
     graph.add_edge("profile_baseline", "generate_plans")
+    graph.add_conditional_edges(
+        "continuation_entry",
+        should_continue,
+        {"continue": "generate_plans", "stop": END},
+    )
     graph.add_edge("generate_plans", "execute_plans")
     graph.add_edge("execute_plans", "profile_candidates")
     graph.add_edge("profile_candidates", "summarize_results")
     graph.add_edge("summarize_results", "select_best")
     graph.add_edge("select_best", "increment_iteration")
 
+    graph.add_edge("increment_iteration", "save_iter_checkpoint")
     graph.add_conditional_edges(
-        "increment_iteration",
+        "save_iter_checkpoint",
         should_continue,
         {"continue": "generate_plans", "stop": END},
     )
@@ -669,13 +753,7 @@ def build_graph():
 # Entry point: convert PipelineState ↔ GraphState
 # ---------------------------------------------------------------------------
 
-def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
-    """Run the LangGraph optimization pipeline."""
-    cfg = state.config
-    ext = Path(state.kernel_path).suffix
-
-    graph = build_graph()
-
+def _build_fresh_initial(state: PipelineState, cfg: PipelineConfig, ext: str) -> GraphState:
     initial: GraphState = {
         "config": cfg,
         "kernel_path": state.kernel_path,
@@ -696,11 +774,94 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
         "candidates": [],
         "iteration_results": [],
         "ncu_config": state.ncu_config,
+        "_entry": "fresh",
     }
-
-    # Provide baseline CSV if available
     if state.baseline_csv:
         initial["baseline_csv"] = state.baseline_csv
+    return initial
+
+
+def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
+    """Run the LangGraph optimization pipeline."""
+    from kernelopt.agents.profiler import get_latency_ns
+
+    cfg = state.config
+    ext = Path(state.kernel_path).suffix
+
+    graph = build_graph()
+
+    resume_path = (
+        Path(state.resume_run_dir).resolve()
+        if state.resume_run_dir
+        else None
+    )
+
+    if resume_path:
+        if not resume_path.is_dir():
+            raise FileNotFoundError(f"--memory run directory not found: {resume_path}")
+        ckpt_raw = load_checkpoint_file(resume_path)
+        if ckpt_raw:
+            entry = ckpt_raw.get("entry", "after_baseline")
+            initial, _ = graph_state_from_checkpoint_payload(
+                ckpt_raw,
+                resume_path,
+                live_config=cfg,
+                live_kernel_path=state.kernel_path,
+                live_kernel_source=state.kernel_source,
+                live_kernel_basename=state.kernel_basename,
+                live_framework=state.framework,
+            )
+            initial["_entry"] = entry
+            console.print(
+                f"[bold green]Resuming[/] from [cyan]{resume_path}/[/] "
+                f"(checkpoint: [dim]{entry}[/])"
+            )
+        else:
+            base = load_baseline_artifacts(resume_path)
+            if not base:
+                raise FileNotFoundError(
+                    f"No {resume_path / 'pipeline_checkpoint.json'} and no "
+                    f"baseline.csv + baseline_profiling_context.json in {resume_path}"
+                )
+            mem_path = resume_path / "optimization_memory.json"
+            mem = load_memory(mem_path) if mem_path.is_file() else []
+            bctx = base["baseline_profiling_context"]
+            latency = get_latency_ns(bctx)
+            fw = state.framework
+            if fw == "auto":
+                fw = bctx.get("framework_hint", "triton")
+            initial = {
+                "config": cfg,
+                "kernel_path": state.kernel_path,
+                "kernel_source": state.kernel_source,
+                "kernel_basename": state.kernel_basename,
+                "kernel_id": state.kernel_id,
+                "framework": fw,
+                "output_dir": str(resume_path),
+                "ext": ext,
+                "best_kernel": state.kernel_source,
+                "best_latency_ns": latency,
+                "best_ncu_rep": "",
+                "baseline_profiling_context": bctx,
+                "baseline_csv": base["baseline_csv"],
+                "baseline_ncu_rep": base["baseline_ncu_rep"],
+                "baseline_latency_ns": latency,
+                "current_profiling_context": bctx,
+                "optimization_memory": mem,
+                "iteration": 0,
+                "no_improvement_streak": 0,
+                "plans": [],
+                "candidates": [],
+                "iteration_results": [],
+                "ncu_config": None,
+                "_entry": "after_baseline",
+            }
+            console.print(
+                f"[bold green]Resuming[/] from [cyan]{resume_path}/[/] "
+                f"(baseline artifacts only — starting at iteration 1)"
+            )
+    else:
+        initial = _build_fresh_initial(state, cfg, ext)
 
     final = graph.invoke(initial)
 
