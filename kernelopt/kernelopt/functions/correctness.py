@@ -269,12 +269,23 @@ def _check_python_kernel(
       1. Exit code == 0 (no crashes, no assertion errors)
       2. No failure indicators in output (FAILED, Error, Traceback)
     """
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False,
-        dir=Path(original_path).parent,
-    ) as tmp:
-        tmp.write(optimized_source)
-        tmp_path = tmp.name
+    # Determine temp directory - use parent if it exists, otherwise use /tmp
+    try:
+        parent_dir = Path(original_path).parent
+        if not parent_dir.exists():
+            parent_dir = None  # Will use system temp dir
+    except Exception:
+        parent_dir = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False,
+            dir=parent_dir,
+        ) as tmp:
+            tmp.write(optimized_source)
+            tmp_path = tmp.name
+    except (FileNotFoundError, OSError) as e:
+        return False, f"Failed to create temp file for correctness check: {e}"
 
     try:
         result = subprocess.run(

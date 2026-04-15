@@ -9,22 +9,25 @@ Supports **Triton**, **CUDA**, and **Helion** kernels. Powered by **LangGraph** 
 ## Quick Start
 
 ```bash
-# 1. Install kernelopt package (REQUIRED FIRST)
-cd kernelopt
-pip install -e ".[triton]"
-
-# 2. Run automated setup
-cd ..
+# 1. Run automated setup (installs everything you need)
 ./setup_environment.py
 
-# 3. Load environment
+# 2. Load environment variables (IMPORTANT - run this in your current shell!)
 source .env
 
-# 4. Optimize a kernel!
+# 3. Optimize a kernel!
 CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 3 -N 4
 ```
 
-> **Note:** The package MUST be installed before running `setup_environment.py`. The setup script will verify the installation and guide you through configuring your Google Cloud credentials.
+> **Important:** After running `setup_environment.py`, you MUST run `source .env` to load the configuration into your current shell session. The setup script will display this command prominently at the end.
+>
+> **Note:** `setup_environment.py` is fully automated and end-to-end. It will:
+> - Detect if you're in a container/devcontainer (recommends containers for easier setup)
+> - Install kernelopt package if not already installed
+> - Install/configure gcloud CLI and authenticate
+> - Set up Vertex AI credentials
+> - Verify all dependencies (NCU, GPU, Python packages, procps-ng)
+> - Create `.env` configuration file (auto-loads in NEW shells, but you must source it manually for the current session)
 
 ---
 
@@ -33,25 +36,345 @@ CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.
 Each iteration runs six phases in a LangGraph pipeline:
 
 ```
-profile_baseline
+profile_baseline  ──────────────────► [💾 checkpoint: after_baseline]
        │
        ▼
-generate_plans (N plans, concurrent)
+generate_plans (N plans, concurrent) ► [💾 checkpoint: after_plans]
        │
        ▼
 execute_plans (executor agent × N, correctness gate)
+       │                               [💾 checkpoint: after_execute]
+       ├─► PASS ──► profile_candidates (NCU) ► [💾 checkpoint: after_profile]
+       │
+       └─► FAIL ──► (skip profiling)
        │
        ▼
-profile_candidates (NCU on passing candidates)
+summarize_results (update memory) ──► [💾 checkpoint: after_summarize]
        │
        ▼
-summarize_results (update optimization memory)
+select_best ─────────────────────────► [💾 checkpoint: after_select]
        │
        ▼
-select_best ──► increment_iteration ──► (loop or stop)
+increment_iteration ─────────────────► [💾 checkpoint: iteration_{N}]
+       │
+       ▼
+  ┌────┴────┐
+Loop?   Done?
+  │        └──► Output best kernel + artifacts
+  │
+  └─► Back to generate_plans (next iteration)
 ```
 
 **Stopping conditions**: max T iterations reached, 2 consecutive iterations with no improvement, or all plans report low confidence.
+
+**Resume logic**: When using `--memory`, the pipeline detects the last checkpoint stage and continues from there (e.g., if stopped at `after_plans`, it skips re-generating plans and goes straight to execution).
+
+### Complete Flow with Checkpoints
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ START: kernelopt run kernel.py -T 5 -N 4                        │
+│   or: kernelopt run kernel.py --memory <run_dir>/  (resume)    │
+└──────────────────┬──────────────────────────────────────────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │ Load/Create State     │
+       │ - New: Initialize     │
+       │ - Resume: Load from   │
+       │   pipeline_checkpoint │
+       └───────────┬───────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ BASELINE PHASE (once, or skip if resuming with checkpoint)      │
+├──────────────────────────────────────────────────────────────────┤
+│ (1) Profiler Agent: profile_baseline()                          │
+│     - Run NCU on original kernel                                │
+│     - Parse profiling context                                   │
+│     💾 Checkpoint: after_baseline                               │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │ ITERATION LOOP        │
+       │ (up to T iterations)  │
+       └───────────┬───────────┘
+                   │
+    ┌──────────────┴──────────────┐
+    │                             │
+    ▼                             │
+┌──────────────────────────────────────────────────────────────────┐
+│ PLANNING PHASE                                                   │
+├──────────────────────────────────────────────────────────────────┤
+│ (2) Planner Agents: generate_plans()                            │
+│     - N concurrent planner agents                               │
+│     - Each gets diversity hint + memory                         │
+│     - Generate OptimizationPlan (direction, steps, confidence)  │
+│     💾 Checkpoint: after_plans                                  │
+│     (Resume skips if already at this stage)                     │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ EXECUTION PHASE                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ (3) Executor Agents: execute_plans()                            │
+│     - N concurrent executor agents                              │
+│     - K attempts per plan                                       │
+│     - Apply optimizations to kernel                             │
+│     - Correctness check (agentic or static)                     │
+│     💾 Checkpoint: after_execute                                │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+              ┌─────────┐
+              │ Pass    │ Correctness Check
+              │ Check?  │
+              └────┬────┘
+                   │
+         ┌─────────┴──────────┐
+         │                    │
+      PASS                  FAIL
+         │                    │
+         ▼                    ▼
+┌─────────────────┐   ┌──────────────────┐
+│ PROFILING       │   │ Skip profiling   │
+│ (4) NCU on      │   │ (broken kernel)  │
+│ passing         │   │                  │
+│ candidates      │   │                  │
+│ 💾 after_profile│   │                  │
+└────────┬────────┘   └────────┬─────────┘
+         │                     │
+         └──────────┬──────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ SUMMARIZATION PHASE                                              │
+├──────────────────────────────────────────────────────────────────┤
+│ (5) Summarizer Agent: summarize_results()                       │
+│     - Compare slow/fast kernels (or note failure)               │
+│     - Extract experience_item                                   │
+│     - Update optimization memory (FIFO queue)                   │
+│     💾 Checkpoint: after_summarize                              │
+│     💾 Save: optimization_memory.json                           │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ SELECTION PHASE                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ (6) Orchestrator: select_best()                                 │
+│     - Pick best candidate from this iteration                   │
+│     - Update best_kernel if improvement                         │
+│     - Update optimization_log.md                                │
+│     💾 Checkpoint: after_select                                 │
+│     💾 Save: best_kernel.{py|cu|hl}                             │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │ Increment Iteration   │
+       │ 💾 Checkpoint:        │
+       │    iteration_{N}      │
+       └───────────┬───────────┘
+                   │
+                   ▼
+           ┌───────────────┐
+           │ Check Stopping│
+           │ Conditions    │
+           └───────┬───────┘
+                   │
+        ┌──────────┴──────────┐
+        │                     │
+     Continue?              Stop?
+        │                     │
+        │  ● Iteration < T    │  ● Max iterations
+        │  ● Improvement      │  ● 2x no improvement
+        │    found            │  ● Low confidence
+        │                     │
+        └──► Loop back        └──► Output & Exit
+             to (2)                │
+                                   ▼
+                          ┌─────────────────┐
+                          │ FINAL OUTPUT    │
+                          ├─────────────────┤
+                          │ ✓ best_kernel   │
+                          │ ✓ memory.json   │
+                          │ ✓ checkpoint    │
+                          │ ✓ log.md        │
+                          │ ✓ all artifacts │
+                          └─────────────────┘
+```
+
+**Key Points:**
+- 💾 **Checkpoint saved** after every major stage
+- **Resume**: Load state from `pipeline_checkpoint.json`, jump to last incomplete stage
+- **Fail path**: Correctness failures skip profiling but still generate negative experience
+- **Loop**: Continues until T iterations or stopping condition met
+- **Output**: All artifacts in timestamped `run_<timestamp>/` directory
+
+---
+
+## Pipeline State Management & Checkpointing
+
+kernelopt automatically saves pipeline state throughout execution, allowing you to **pause and resume** optimization runs at any time.
+
+### Checkpoint Mechanism
+
+The pipeline saves checkpoints after each major stage:
+
+```
+pipeline_checkpoint.json updated after:
+  ✓ Baseline profiling complete
+  ✓ Plans generated (all N plans ready)
+  ✓ Plans executed (before NCU profiling)
+  ✓ Candidates profiled (NCU complete)
+  ✓ Results summarized (memory updated)
+  ✓ Best candidate selected
+  ✓ Each iteration complete
+```
+
+**What gets saved:**
+- Full pipeline configuration (T, N, K, models, NCU flags, kernel args)
+- Current iteration number and best speedup
+- Optimization memory (experience items)
+- Profiling context (baseline metrics)
+- All candidate results from completed iterations
+- Last completed stage (for resume logic)
+
+### Resuming from Checkpoint
+
+Use `--memory <run_directory>` to resume a previous run:
+
+```bash
+# Original run (interrupted or completed)
+kernelopt run softmax.py -T 5 -N 4 -K 1
+# Creates: pipeline_output/run_20260414_120000_000000/
+
+# Resume from checkpoint (continues where it left off)
+kernelopt run softmax.py --memory pipeline_output/run_20260414_120000_000000/
+
+# Resume with MORE iterations (override T only)
+kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260414_120000_000000/
+```
+
+**Resume behavior:**
+- **Same kernel basename required** (e.g., both `softmax.py`)
+- **Reloads full config** from checkpoint (NCU settings, models, kernel args)
+- **Only T/N/K can be overridden** from CLI (omit to use saved values)
+- **Continues from last checkpoint stage:**
+  - After `after_plans`: Re-uses existing plans (doesn't regenerate)
+  - After `after_execute`: Continues with profiling
+  - After iteration N: Starts iteration N+1
+- **All other flags ignored** during resume (`-o`, `--run-subdir`, `--model`, etc.)
+
+**Use cases:**
+- **Job timeout:** Resume after cluster time limit
+- **Iterative tuning:** Start with `-T 3`, then extend with `-T 10`
+- **Checkpoint inspection:** Examine `pipeline_checkpoint.json` to see progress
+
+### Output Structure
+
+Every `kernelopt run` creates a timestamped directory under `--output-dir` (default: `pipeline_output/`):
+
+```
+pipeline_output/
+└── run_20260414_120000_000000/          # Unique run directory
+    ├── pipeline_checkpoint.json         # Resume state
+    ├── optimization_memory.json         # Experience items
+    ├── optimization_log.md              # Human-readable log
+    ├── best_kernel.py                   # Best optimized kernel
+    ├── baseline.csv                     # Baseline NCU profile
+    ├── baseline.ncu-rep                 # Baseline NCU raw data
+    ├── baseline_profiling_context.json  # Parsed baseline metrics
+    ├── softmax_kernel_iter1_plan0_reduce_bank_conflicts.py
+    ├── softmax_kernel_iter1_plan0_reduce_bank_conflicts.csv
+    ├── softmax_kernel_iter1_plan0_reduce_bank_conflicts.ncu-rep
+    ├── softmax_kernel_iter1_plan0_reduce_bank_conflicts_profiling_context.json
+    └── ... (more candidates from other iterations)
+```
+
+**Key files:**
+- `pipeline_checkpoint.json` — Resume state (automatically created/updated)
+- `optimization_memory.json` — Experience memory (grows over iterations)
+- `optimization_log.md` — Per-iteration summary with metric tables
+- `best_kernel{.py|.cu|.hl}` — Best kernel found so far (updated each iteration)
+- `baseline.*` — Original kernel profiling artifacts
+- `{kernel}_iter{N}_plan{L}_{direction}.*` — Each candidate's artifacts
+
+**Flat layout (no timestamped subdirectory):**
+
+```bash
+kernelopt run softmax.py -o pipeline_output --no-run-subdir
+# Writes directly to: pipeline_output/ (overwrites on repeat runs)
+```
+
+Use `--no-run-subdir` when you want predictable paths (CI/CD, scripting) or are managing directories manually.
+
+---
+
+## GPU Monitoring
+
+`kernelopt run` automatically displays GPU and system status before profiling and monitors GPU activity during optimization.
+
+### Pre-run Validation
+
+Before starting the optimization pipeline, kernelopt shows:
+
+```
+System Status:
+  CPU Memory (RAM): 1700 MB available / 1805 MB total (94.2% available)
+  GPU Device: GPU 0 (NVIDIA H200)
+  GPU Memory (VRAM): 130070 MB free / 143771 MB total (90.5% free)
+  GPU Utilization: 0.0%
+  GPU Temperature: 30°C
+  Active processes: 7 (12920 MB GPU memory)
+
+   Active GPU Processes    
+ User      PID  GPU Memory 
+ host  2605259     4782 MB 
+ host  3331695     3544 MB 
+ ...
+```
+
+**Features:**
+- **System RAM** and **GPU VRAM** clearly labeled to avoid confusion
+- **GPU utilization** and **temperature** monitoring
+- **Active GPU processes** with memory usage breakdown
+- **Warnings** if GPU memory is low (<40% free) or GPU is busy (>20% utilization)
+
+### Per-iteration Monitoring
+
+During optimization, kernelopt monitors GPU activity at the start of each iteration (silent when idle):
+
+```
+Iteration 2/5  Best: 1.42x  Memory: 4 items
+  GPU activity: GPU utilization: 38.3% | 2 processes using 5248 MB
+```
+
+**Non-blocking design:** All monitoring is informational only — warnings are displayed but execution never halts.
+
+### Container Support
+
+When running inside containers (Docker, devcontainers), GPU processes from the host system are labeled as `"host"`:
+
+```
+   Active GPU Processes    
+ User      PID  GPU Memory 
+ host  2605259     4782 MB 
+ host  3331695     3544 MB 
+  Note: 'host' = process running outside container namespace
+```
+
+**Limitations in containers:**
+- ✅ GPU memory usage per process (accurate)
+- ✅ Total GPU utilization (accurate)
+- ✅ System RAM status (accurate)
+- ❌ Process usernames (shows "host" for processes outside container)
+- ❌ CPU% usage (hidden, not accessible due to PID namespace isolation)
+
+**For full process details**, run kernelopt directly on the host system (not in a container).
 
 ---
 
@@ -132,33 +455,43 @@ The planner reads this memory to avoid dead ends and reinforce strategies that w
 
 ### Quick Setup (Recommended)
 
-**IMPORTANT:** Install the kernelopt package BEFORE running the setup script.
+**Fully automated setup** — just run the setup script:
 
 ```bash
-# Step 1: Install the package (REQUIRED)
-cd kernelopt
-pip install -e ".[triton]"   # add triton support
-
-# Step 2: Run interactive environment setup
-cd ..
+# Step 1: Run the setup script
 python setup_environment.py
+
+# Step 2: Load environment variables in your current shell (IMPORTANT!)
+source .env
+
+# Step 3: Test the installation
+CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 1 -N 1
 ```
 
 The setup script will:
-- Check for gcloud CLI (installs if missing)
-- Guide you through authentication
-- Prompt for your Vertex AI project ID and region
-- Create a `.env` file with your configuration
-- Verify all dependencies are installed
-- Check that kernelopt is properly installed
+- **Detect environment** (container vs bare metal, recommends containers)
+- **Install kernelopt package** with your choice of extras (triton/dev/both)
+- **Install gcloud CLI** if missing
+- **Authenticate** with Google Cloud
+- **Configure Vertex AI** (project ID, region)
+- **Verify dependencies** (NCU, GPU, Python packages, procps-ng)
+- **Create `.env` file** with your configuration
+- **Test installation** (verify CLI works)
+- **Add auto-load to shell** (`.zshrc`/`.bashrc` for future sessions)
 
-### Manual Setup
+> **⚠️ Important:** After the setup script finishes, you MUST run `source .env` to activate the configuration in your current shell session. The setup script will display this command prominently at the end with the exact path.
+>
+> **Container Recommendation:** The script will detect if you're on bare metal and recommend using the devcontainer for easier setup. All CUDA dependencies and system packages are pre-configured in the container.
+
+### Manual Setup (Advanced)
+
+If you prefer manual installation or need custom configuration:
 
 ```bash
-# 1. Install package (REQUIRED FIRST)
+# 1. Install kernelopt package
 cd kernelopt
-pip install -e ".[triton]"   # add triton support
-pip install -e ".[dev]"      # add pytest/ruff/mypy
+pip install -e ".[triton]"   # Triton support
+pip install -e ".[dev]"      # Development tools (pytest, ruff, mypy)
 cd ..
 
 # 2. Configure environment
@@ -172,14 +505,35 @@ gcloud auth application-default login
 
 # 4. Load environment
 source .env
+
+# 5. Install procps-ng (for GPU process monitoring)
+sudo dnf install -y procps-ng    # RHEL/Fedora
+# or: sudo apt install -y procps  # Ubuntu/Debian
 ```
 
 **System Requirements:**
-- Python 3.10+ (**verified by setup script**)
-- `ncu` (Nsight Compute) on `$PATH` (**verified by setup script**)
-- CUDA-capable GPU with compute capability >= 6.0 (**verified by setup script**)
-- Google Cloud project with Vertex AI API enabled (**verified by setup script**)
-- gcloud CLI installed (**setup script can install this**)
+- Python 3.10+
+- `ncu` (Nsight Compute) on `$PATH`
+- CUDA-capable GPU with compute capability >= 6.0
+- Google Cloud project with Vertex AI API enabled
+- gcloud CLI installed
+- `procps-ng` package (provides `ps` command for GPU monitoring)
+
+### Common Setup Issue
+
+**Problem:** `kernelopt` complains about missing Vertex AI credentials
+
+```bash
+Error: ANTHROPIC_VERTEX_PROJECT_ID environment variable not set
+```
+
+**Solution:** You forgot to load the environment variables! Run:
+
+```bash
+source .env
+```
+
+**Why?** The `setup_environment.py` script creates a `.env` file with your configuration, but it cannot automatically load it into your current shell session (Unix limitation). You must manually source it once. Future shell sessions will auto-load it (if you said "yes" to adding it to `.zshrc`/`.bashrc`).
 
 ---
 
@@ -204,7 +558,7 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 | `-o`, `--output-dir` | `pipeline_output/` | Output **base** directory for `kernelopt run` (see Outputs) |
 | `--run-subdir` / `--no-run-subdir` | on | **Every** `kernelopt run` creates `run_<timestamp>/` under `-o` (default: on) |
 | `--csv` | — | Skip baseline profiling, use existing NCU CSV |
-| `--memory` | — | **Resume** from a run directory. If `pipeline_checkpoint.json` exists: **reload full pipeline config from it** (NCU names, `kernel_args`, models, project, etc.); only **`-T` / `-N` / `-K`** may be overridden from the CLI (omit those to use saved values). Other flags are ignored. Continues from the last checkpoint stage. If no checkpoint: baseline CSV + context fallback (then normal CLI applies). Same kernel **basename** required. `-o` / `--run-subdir` ignored. Example Usage: kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 3 -N 4 -K 1 --memory pipeline_output/run_20260414_063558_408400|
+| `--memory` | — | **Resume** from checkpoint in run directory. Reloads full config from `pipeline_checkpoint.json` and continues from last completed stage. Only `-T`/`-N`/`-K` can be overridden. See [Pipeline State Management](#pipeline-state-management--checkpointing) for details. |
 | `--kernel-name` | auto | NCU `--kernel-name` regex |
 | `--launch-skip` | 0 | NCU `--launch-skip` |
 | `--launch-count` | — | NCU `--launch-count` |
@@ -221,31 +575,43 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 ### Examples
 
 ```bash
-# Triton softmax — 3 iterations, 4 plans, profile only kernels named 'softmax_kernel'
+# Basic: Triton softmax — 3 iterations, 4 plans per iteration
 kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
 
-# CUDA kernel — skip baseline (use existing CSV from a prior run folder)
+# Skip baseline profiling: use existing CSV from prior run
 kernelopt run my_kernel.cu --csv pipeline_output/run_20260413_120000_000000/baseline.csv
 
-# Resume (only kernel path + run dir required; T/N/K from checkpoint unless you pass -T -N -K)
+# ──────────────────────────────────────────────────────────────
+# Checkpoint/Resume Examples
+# ──────────────────────────────────────────────────────────────
+
+# Resume from checkpoint (continues where it left off)
+# Use case: Job timeout, interrupted run, incremental tuning
 kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/
 
-# Resume with more iterations only
-kernelopt run softmax.py -T 5 --memory pipeline_output/run_20260413_120000_000000/
+# Resume and extend iterations (original had -T 3, now run up to 10 total)
+kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260413_120000_000000/
 
-# Plan-only: pass experience JSON with -E/--experience (not --memory)
+# Resume with different N/K (increase exploration)
+kernelopt run softmax.py -T 5 -N 8 -K 2 --memory pipeline_output/run_20260413_120000_000000/
+
+# ──────────────────────────────────────────────────────────────
+# Other Commands
+# ──────────────────────────────────────────────────────────────
+
+# Plan-only mode: generate plans without executing (uses experience JSON)
 kernelopt plan profile.csv softmax.py -N 2 -E pipeline_output/run_20260413_120000_000000/optimization_memory.json
 
-# Flat layout under -o (no run_* subfolder), same as older behavior
+# Flat layout (no timestamped subdirectory, overwrites on re-run)
 kernelopt run softmax.py -o pipeline_output --no-run-subdir
 
-# Profile only (no optimization)
+# Profile only (no optimization, just baseline NCU profiling)
 kernelopt profile softmax.py -o pipeline_output/baseline
 
-# Inspect a profiling CSV
+# Inspect profiling results (pretty-print NCU CSV)
 kernelopt show pipeline_output/baseline.csv
 
-# Large input that OOMs with kernel replay
+# Large input that OOMs with kernel replay mode
 kernelopt run big_kernel.py --replay-mode application
 ```
 
@@ -257,21 +623,27 @@ kernelopt run big_kernel.py --replay-mode application
 
 `pipeline_output/run_YYYYMMDD_HHMMSS_microseconds/`
 
+**Exception:** When using `--memory` to resume, writes continue in the **same** directory (no new timestamped folder created).
+
 Other commands (`profile`, `show`, `plan`, …) are unchanged and do not use this layout.
 
 Use **`--no-run-subdir`** on `kernelopt run` to write directly into `-o` (flat layout, overwrites on repeat runs).
 
 All artifact paths below are relative to that **run directory**:
 
-| File | Description |
-|------|-------------|
-| `best_kernel{ext}` | Best optimized kernel source |
-| `optimization_memory.json` | Accumulated experience items |
-| `pipeline_checkpoint.json` | Updated after each major stage: baseline, **plans**, **execute** (pre-NCU), **summarize**, **select**, then each **iteration** — resume continues from the last completed stage (same plans are not regenerated when resuming after `after_plans`) |
-| `optimization_log.md` | Full per-iteration log with metric comparison tables |
-| `baseline.csv` / `baseline.ncu-rep` | Baseline profiling artifacts |
-| `{kernel}_iter{N}_plan{L}_{direction}.{ext}` | Each candidate kernel |
-| `{stem}.csv` / `{stem}.ncu-rep` / `{stem}_profiling_context.json` | Per-candidate profiling artifacts |
+| File | Description | When Updated |
+|------|-------------|--------------|
+| `best_kernel{ext}` | Best optimized kernel source | After each iteration (if improvement found) |
+| `optimization_memory.json` | Accumulated experience items (FIFO queue) | After summarize phase each iteration |
+| `pipeline_checkpoint.json` | **Full pipeline state for resume** — saves config, iteration, best speedup, profiling context, candidate results | After every major stage (see [checkpoint section](#pipeline-state-management--checkpointing)) |
+| `optimization_log.md` | Human-readable per-iteration log with metric tables | After each iteration completes |
+| `baseline.csv` / `baseline.ncu-rep` | Baseline profiling artifacts (NCU data) | Once at start (or skipped with `--csv`) |
+| `baseline_profiling_context.json` | Parsed baseline metrics (rules, launch stats, GPU specs) | Once at start |
+| `{kernel}_iter{N}_plan{L}_{direction}.{ext}` | Candidate kernel source from iteration N, plan L | After executor phase |
+| `{stem}.csv` / `{stem}.ncu-rep` | Candidate NCU profiling data (only if passed correctness) | After profile phase |
+| `{stem}_profiling_context.json` | Parsed candidate metrics (only if passed correctness) | After profile phase |
+
+> **Note on Resume:** When using `--memory`, all files continue to update in-place in the existing run directory. The `pipeline_checkpoint.json` is the key file that tracks progress and enables resuming from the last completed stage.
 
 ---
 
@@ -305,6 +677,7 @@ kernelopt/
 │   └── functions/
 │       ├── csv_parser.py        # NCU CSV parser
 │       ├── correctness.py       # Correctness check dispatcher
+│       ├── gpu_monitoring.py    # GPU/system monitoring utilities
 │       └── selector.py          # Candidate selector utilities
 └── tests_suite/              # Unified test suite (366 tests)
     ├── unit/                 # Unit tests (no GPU required)
