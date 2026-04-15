@@ -1,3 +1,10 @@
+"""
+Pipeline state management.
+
+Defines PipelineConfig, PipelineState, GraphState, and related types
+for the kernel optimization pipeline.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

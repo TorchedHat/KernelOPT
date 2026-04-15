@@ -133,92 +133,8 @@ After
         assert "think" not in result.lower()
 
 
-@pytest.mark.skip(reason="extract_json function not implemented in llm.py")
-class TestJSONExtraction:
-    """Test JSON extraction from LLM output."""
 
-    def test_extract_json_plain(self):
-        """Test extracting plain JSON."""
-        from kernelopt.llm import extract_json
-
-        content = '{"key": "value"}'
-        result = extract_json(content)
-        assert result == content
-
-    def test_extract_json_with_thinking(self):
-        """Test extracting JSON with thinking blocks."""
-        from kernelopt.llm import extract_json
-
-        content = '<think>reasoning</think>{"key": "value"}'
-        result = extract_json(content)
-        assert "think" not in result.lower()
-        assert "key" in result
-
-    def test_extract_json_markdown_fences(self):
-        """Test extracting JSON from markdown code blocks."""
-        from kernelopt.llm import extract_json
-
-        content = '```json\n{"key": "value"}\n```'
-        result = extract_json(content)
-        assert "```" not in result
-        assert '{"key": "value"}' in result
-
-    def test_extract_json_with_prefix(self):
-        """Test extracting JSON when preceded by text."""
-        from kernelopt.llm import extract_json
-
-        content = 'Here is the JSON: {"key": "value"}'
-        result = extract_json(content)
-        # Should extract the JSON part
-        assert "{" in result
-        assert "key" in result
-
-    def test_extract_json_array(self):
-        """Test extracting JSON array."""
-        from kernelopt.llm import extract_json
-
-        content = '[{"item": 1}, {"item": 2}]'
-        result = extract_json(content)
-        assert result.strip().startswith("[")
-
-    def test_extract_json_complex(self):
-        """Test extracting complex JSON with thinking and markdown."""
-        from kernelopt.llm import extract_json
-
-        content = """<think>Let me analyze this</think>
-Here's the result:
-```json
-{
-  "status": "success",
-  "data": {
-    "value": 42
-  }
-}
-```
-"""
-        result = extract_json(content)
-        assert "think" not in result.lower()
-        assert "```" not in result
-        assert "status" in result
-        assert "success" in result
-
-    def test_extract_json_empty(self):
-        """Test extracting from empty content."""
-        from kernelopt.llm import extract_json
-
-        content = ""
-        result = extract_json(content)
-        assert result == ""
-
-    def test_extract_json_no_json(self):
-        """Test extracting when there's no JSON."""
-        from kernelopt.llm import extract_json
-
-        content = "Just some text without JSON"
-        result = extract_json(content)
-        # Should return the cleaned content
-        assert isinstance(result, str)
-
+# TestJSONExtraction class removed - no longer needed\n# The codebase now uses structured outputs with Pydantic models via\n# llm.with_structured_output() instead of manual JSON extraction\n
 
 class TestLLMConfiguration:
     """Test LLM configuration constants."""
@@ -265,15 +181,5 @@ class TestLLMErrorHandling:
         # Unclosed thinking block
         content = "A <think>unclosed"
         result = strip_thinking(content)
-        # Should handle gracefully
-        assert isinstance(result, str)
-
-    @pytest.mark.skip(reason="extract_json function not implemented in llm.py")
-    def test_extract_json_malformed(self):
-        """Test extracting from malformed content."""
-        from kernelopt.llm import extract_json
-
-        content = "<think>unclosed {"
-        result = extract_json(content)
         # Should handle gracefully
         assert isinstance(result, str)

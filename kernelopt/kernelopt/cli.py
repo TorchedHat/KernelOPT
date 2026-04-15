@@ -12,6 +12,11 @@ from rich.console import Console
 
 import warnings
 
+from kernelopt.functions.gpu_monitoring import (
+    select_gpu,
+    validate_gpu_for_profiling,
+)
+
 # ADC user creds without a quota project — noisy on every Vertex call.
 warnings.filterwarnings(
     "ignore",
@@ -337,6 +342,10 @@ def run(
         f"  Backend: [cyan]Claude on Vertex AI[/] ({cfg.model})"
         f"{extra}"
     )
+
+    # Pre-run GPU validation
+    gpu_id = select_gpu()
+    validate_gpu_for_profiling(gpu_id, console=console)
 
     from kernelopt.agents.profiler import get_latency_ns
     from kernelopt.langgraph_pipeline import run_langgraph_pipeline
