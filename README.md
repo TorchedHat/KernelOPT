@@ -35,35 +35,7 @@ CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.
 
 Each iteration runs six phases in a LangGraph pipeline:
 
-```
-profile_baseline  ──────────────────► [💾 checkpoint: after_baseline]
-       │
-       ▼
-generate_plans (N plans, concurrent) ► [💾 checkpoint: after_plans]
-       │
-       ▼
-execute_plans (executor agent × N, correctness gate)
-       │                               [💾 checkpoint: after_execute]
-       ├─► PASS ──► profile_candidates (NCU) ► [💾 checkpoint: after_profile]
-       │
-       └─► FAIL ──► (skip profiling)
-       │
-       ▼
-summarize_results (update memory) ──► [💾 checkpoint: after_summarize]
-       │
-       ▼
-select_best ─────────────────────────► [💾 checkpoint: after_select]
-       │
-       ▼
-increment_iteration ─────────────────► [💾 checkpoint: iteration_{N}]
-       │
-       ▼
-  ┌────┴────┐
-Loop?   Done?
-  │        └──► Output best kernel + artifacts
-  │
-  └─► Back to generate_plans (next iteration)
-```
+![Pipeline Flow Diagram](docs/images/pipeline-flow.png)
 
 **Stopping conditions**: max T iterations reached, 2 consecutive iterations with no improvement, or all plans report low confidence.
 
