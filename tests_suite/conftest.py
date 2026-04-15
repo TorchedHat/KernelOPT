@@ -537,8 +537,11 @@ def gpu_id(request):
     """
     Get GPU ID for tests.
 
-    Prompts user to select GPU if not specified via TEST_GPU_ID environment variable.
-    Checks that GPU has sufficient resources for testing (40% free memory minimum).
+    Priority order:
+    1. --gpu CLI option
+    2. TEST_GPU_ID environment variable
+    3. Auto-select best GPU (only if interactive terminal)
+    4. Default to GPU 0 (for CI/automated tests)
     """
     from unit.utils.gpu_utils import (
         list_available_gpus,
@@ -548,15 +551,23 @@ def gpu_id(request):
         check_gpu_for_profiling,
     )
 
-    # Check if GPU ID is specified via environment variable or command line
-    gpu_id_env = os.environ.get("TEST_GPU_ID")
+    # Check if GPU ID is specified via command line (highest priority)
     gpu_id_cli = request.config.getoption("--gpu", default=None)
-
     if gpu_id_cli is not None:
         selected_gpu = int(gpu_id_cli)
-    elif gpu_id_env is not None:
+        print(f"[TEST] Using GPU {selected_gpu} from --gpu option")
+        return selected_gpu
+
+    # Check environment variable (second priority)
+    gpu_id_env = os.environ.get("TEST_GPU_ID")
+    if gpu_id_env is not None:
         selected_gpu = int(gpu_id_env)
-    else:
+        print(f"[TEST] Using GPU {selected_gpu} from TEST_GPU_ID environment variable")
+        return selected_gpu
+
+    # Only use interactive prompts if running in interactive terminal
+    # This prevents stdin errors when running pytest in CI or with output capture
+    if sys.stdin.isatty() and not request.config.getoption("--skip-gpu-check"):
         # Show available GPUs
         print("\n" + "="*70)
         print("GPU SELECTION FOR TESTS (H200 Optimized)")
@@ -583,16 +594,32 @@ def gpu_id(request):
             print("Warning: No GPU with ≥40% free memory found")
             selected_gpu = int(input(f"Enter GPU ID to use {gpus}: "))
 
-    # Validate selected GPU
-    try:
-        check_gpu_for_profiling(selected_gpu)
-    except Exception as e:
-        print(f"\nWarning: {e}")
-        response = input("Continue anyway? [y/N]: ").strip().lower()
-        if response not in ['y', 'yes']:
-            pytest.skip(f"GPU {selected_gpu} does not meet requirements")
+        # Validate selected GPU interactively
+        try:
+            check_gpu_for_profiling(selected_gpu)
+        except Exception as e:
+            print(f"\nWarning: {e}")
+            response = input("Continue anyway? [y/N]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                pytest.skip(f"GPU {selected_gpu} does not meet requirements")
 
-    return selected_gpu
+        return selected_gpu
+    else:
+        # Non-interactive mode: use default GPU 0
+        # This happens in CI, pytest with -s flag, or when --skip-gpu-check is used
+        print("[TEST] Non-interactive mode detected. Using default GPU 0")
+        print("[TEST] Set TEST_GPU_ID env var or use --gpu <id> to override")
+        selected_gpu = 0
+
+        # Skip validation check in non-interactive mode if GPU 0 doesn't exist
+        try:
+            import torch
+            if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+                pytest.skip("No CUDA GPUs available")
+        except Exception:
+            pytest.skip("Cannot verify GPU availability")
+
+        return selected_gpu
 
 
 @pytest.fixture(scope="session")
