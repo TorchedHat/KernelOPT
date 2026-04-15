@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from kernelopt.agents.executor import run_executor_agent
-from kernelopt.agents.planner import run_planner
+from kernelopt.agents.planner import run_planner  # Legacy API - graph.py is deprecated
 from kernelopt.agents.profiler import (
     build_profiling_context,
     get_latency_ns,
