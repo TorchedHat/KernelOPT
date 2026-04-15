@@ -26,6 +26,10 @@ from kernelopt.agents.executor import run_executor_agent
 from kernelopt.agents.summarizer import run_summarizer
 from kernelopt.functions.compiler import compile_cuda
 from kernelopt.functions.correctness import check_correctness
+from kernelopt.functions.gpu_monitoring import (
+    monitor_gpu_activity,
+    select_gpu,
+)
 from kernelopt.checkpoint import (
     graph_state_from_checkpoint_payload,
     load_baseline_artifacts,
@@ -167,6 +171,11 @@ def generate_plans(state: GraphState) -> dict:
         f"Best: [green]{best_speedup}x[/]  "
         f"Memory: {len(state.get('optimization_memory', []))} items"
     )
+
+    # Per-iteration GPU monitoring (non-blocking warnings)
+    gpu_id = select_gpu()
+    monitor_gpu_activity(gpu_id, iteration + 1, console=console)
+
     console.print(f"  Generating {cfg.N} optimization plans...")
 
     # Build cross-iteration direction history

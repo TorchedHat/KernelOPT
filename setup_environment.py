@@ -143,6 +143,31 @@ If using a virtual environment:
   cd kernelopt
   pip install -e ".[triton]"
 """,
+
+    "procps_ng_not_installed": """
+╔════════════════════════════════════════════════════════════════════╗
+║              procps-ng Not Installed                               ║
+╚════════════════════════════════════════════════════════════════════╝
+
+procps-ng provides the 'ps' command needed for detailed GPU process
+monitoring (usernames, CPU%, etc.).
+
+Install methods:
+
+  RHEL/Fedora:
+    sudo dnf install -y procps-ng
+
+  Ubuntu/Debian:
+    sudo apt install -y procps
+
+  In devcontainer:
+    Add 'procps-ng' to Dockerfile dependencies
+
+Verify:
+  ps --version
+
+Note: GPU monitoring works without this, but with limited process info.
+""",
 }
 
 
@@ -180,6 +205,54 @@ def check_command_exists(command: str) -> bool:
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return False
+
+
+def is_running_in_container() -> bool:
+    """Detect if running inside a container (Docker/devcontainer)."""
+    # Check for /.dockerenv file
+    if Path("/.dockerenv").exists():
+        return True
+
+    # Check cgroup for docker/containerd
+    try:
+        with open("/proc/1/cgroup", "r") as f:
+            content = f.read()
+            if "docker" in content or "containerd" in content or "lxc" in content:
+                return True
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # Check for DEVCONTAINER environment variable
+    if os.environ.get("DEVCONTAINER") or os.environ.get("REMOTE_CONTAINERS"):
+        return True
+
+    return False
+
+
+def show_container_recommendation():
+    """Show recommendation to use containers for better environment isolation."""
+    print("\n" + "="*70)
+    print("  ⚠️  Running on Bare Metal System")
+    print("="*70)
+    print("\nFor better environment isolation and easier setup, we recommend")
+    print("running kernelopt inside a container/devcontainer.")
+    print("\nBenefits:")
+    print("  • Pre-configured CUDA environment")
+    print("  • All system dependencies installed")
+    print("  • No conflicts with host system")
+    print("  • Easier to reproduce issues")
+    print("\nTo use the devcontainer:")
+    print("  1. Install VS Code + Remote-Containers extension")
+    print("  2. Open this project in VS Code")
+    print("  3. Click 'Reopen in Container'")
+    print("  4. Select the CUDA configuration")
+    print("\nAlternatively, you can continue with bare metal setup.")
+    print("="*70)
+
+    choice = input("\nContinue with bare metal setup? [y/N]: ").strip().lower()
+    if choice not in ['y', 'yes']:
+        print("\nSetup cancelled. Consider using the devcontainer for easier setup!")
+        sys.exit(0)
 
 
 def enhanced_check(
@@ -400,11 +473,117 @@ def check_kernelopt_installed() -> Tuple[bool, str]:
         return False, "Cannot check package status"
 
 
+def install_kernelopt() -> Tuple[bool, str]:
+    """Install kernelopt package from the kernelopt subdirectory."""
+    # Find kernelopt package directory
+    script_dir = Path(__file__).parent
+    kernelopt_dir = script_dir / "kernelopt"
+
+    if not kernelopt_dir.exists():
+        return False, "kernelopt directory not found at {}".format(kernelopt_dir)
+
+    pyproject_path = kernelopt_dir / "pyproject.toml"
+    if not pyproject_path.exists():
+        return False, "pyproject.toml not found in kernelopt directory"
+
+    print("\nInstalling kernelopt package...")
+    print("  Location: {}".format(kernelopt_dir))
+
+    # Ask user which extras to install
+    print("\nOptional dependencies:")
+    print("  1. triton   - Triton kernel support (recommended)")
+    print("  2. dev      - Development tools (pytest, ruff, mypy)")
+    print("  3. both     - Both triton and dev")
+    print("  4. none     - Just core dependencies")
+
+    choice = input("\nChoice [1]: ").strip() or "1"
+
+    extras = ""
+    if choice == "1":
+        extras = "[triton]"
+    elif choice == "2":
+        extras = "[dev]"
+    elif choice == "3":
+        extras = "[triton,dev]"
+
+    try:
+        install_cmd = [sys.executable, "-m", "pip", "install", "-e", ".{}".format(extras)]
+        print("\nRunning: {}".format(" ".join(install_cmd)))
+
+        result = subprocess.run(
+            install_cmd,
+            cwd=str(kernelopt_dir),
+            check=True,
+            timeout=300  # 5 minute timeout for installation
+        )
+
+        return True, "kernelopt installed successfully"
+
+    except subprocess.TimeoutExpired:
+        return False, "Installation timeout (network issue?)"
+    except subprocess.CalledProcessError as e:
+        return False, "Installation failed: {}".format(e)
+    except Exception as e:
+        return False, "Installation error: {}".format(e)
+
+
+def verify_kernelopt_cli() -> Tuple[bool, str]:
+    """Verify that kernelopt CLI is working."""
+    try:
+        result = subprocess.run(
+            ["kernelopt", "--help"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10
+        )
+
+        if "Multi-agent GPU kernel optimizer" in result.stdout or "Usage:" in result.stdout:
+            return True, "kernelopt CLI working"
+
+        return False, "kernelopt CLI returned unexpected output"
+
+    except subprocess.TimeoutExpired:
+        return False, "kernelopt CLI timeout"
+    except subprocess.CalledProcessError as e:
+        return False, "kernelopt CLI failed: {}".format(e)
+    except FileNotFoundError:
+        return False, "kernelopt command not found in PATH"
+
+
+def check_procps_ng() -> Tuple[bool, str]:
+    """Check if procps-ng (provides ps command) is installed."""
+    if check_command_exists("ps"):
+        try:
+            # Verify ps works with the flags we need
+            result = subprocess.run(
+                ["ps", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            # procps-ng version will be in output
+            version_line = result.stdout.split('\n')[0] if result.stdout else ""
+            return True, "procps-ng installed ({})".format(version_line.strip() if version_line else "version unknown")
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return True, "ps command available"
+
+    return False, "procps-ng not installed (needed for GPU process monitoring)"
+
+
 def print_system_summary():
     """Print system information summary"""
     print("\n╔════════════════════════════════════════════════════════════════════╗")
     print("║                    System Information                              ║")
     print("╚════════════════════════════════════════════════════════════════════╝\n")
+
+    # Environment type
+    in_container = is_running_in_container()
+    print("  Environment:     {} {}".format(
+        "Container/Devcontainer" if in_container else "Bare Metal",
+        "✓" if in_container else "⚠"
+    ))
 
     # Python
     success, msg = check_python_version()
@@ -449,6 +628,14 @@ def print_system_summary():
             print("  gcloud CLI:      Installed ✓")
     else:
         print("  gcloud CLI:      Not found ✗")
+
+    # procps-ng
+    success, msg = check_procps_ng()
+    status = "✓" if success else "⚠"
+    print("  procps-ng (ps):  {} {}".format(
+        msg.split('(')[0].strip() if success else "Not installed",
+        status
+    ))
 
     print()
 
@@ -574,11 +761,11 @@ def create_env_file(config: dict):
 
     env_path.write_text("\n".join(lines))
     print("\n✓ Configuration saved to: {}".format(env_path))
-    print("\n  To use in future sessions, run:")
-    print("    source {}".format(env_path))
 
     # Also update shell RC file
-    shell_rc = Path.home() / ".zshrc" if Path.home() / ".zshrc" else Path.home() / ".bashrc"
+    zshrc = Path.home() / ".zshrc"
+    bashrc = Path.home() / ".bashrc"
+    shell_rc = zshrc if zshrc.exists() else bashrc
 
     update_rc = input("\nAdd to {} for automatic loading? [Y/n]: ".format(shell_rc.name)).strip().lower()
     if not update_rc or update_rc == 'y':
@@ -586,6 +773,9 @@ def create_env_file(config: dict):
             f.write("\n# kernelopt environment (added by setup_environment.py)\n")
             f.write("[ -f {} ] && source {}\n".format(env_path, env_path))
         print("✓ Added to {}".format(shell_rc))
+        print("  (Will auto-load in new shell sessions)")
+
+    return env_path
 
 
 def main():
@@ -601,6 +791,13 @@ def main():
     if proceed and proceed != 'y':
         print("Setup cancelled.")
         sys.exit(0)
+
+    # Check if running in container
+    in_container = is_running_in_container()
+    if in_container:
+        print("\n✓ Running inside container/devcontainer")
+    else:
+        show_container_recommendation()
 
     # Show system summary
     print_system_summary()
@@ -720,7 +917,7 @@ def main():
     # Step 6: Create configuration files
     print_step(6, "Saving Configuration")
 
-    create_env_file(config)
+    env_file_path = create_env_file(config)
 
     # Step 7: Verify setup
     print_step(7, "Verifying Setup")
@@ -751,41 +948,113 @@ def main():
         required=False  # Can skip and verify later when running
     )
 
-    # Check kernelopt installation
-    print("\nChecking kernelopt installation...")
-    kernelopt_ok = enhanced_check(
-        "kernelopt Package",
-        check_kernelopt_installed,
-        "kernelopt_not_installed",
-        required=False  # Can skip if they want to install later
-    )
+    # Step 8: Install/Check kernelopt package
+    print_step(8, "kernelopt Package Installation")
+
+    success, msg = check_kernelopt_installed()
+    kernelopt_ok = success
+
+    if success:
+        print(f"✓ {msg}")
+    else:
+        print(f"✗ {msg}")
+        print("\nkernelopt package needs to be installed.")
+
+        install_choice = input("\nInstall kernelopt now? [Y/n]: ").strip().lower()
+        if not install_choice or install_choice == 'y':
+            success, msg = install_kernelopt()
+
+            if success:
+                print(f"\n✓ {msg}")
+                kernelopt_ok = True
+
+                # Verify CLI works
+                print("\nVerifying kernelopt CLI...")
+                cli_success, cli_msg = verify_kernelopt_cli()
+                if cli_success:
+                    print(f"✓ {cli_msg}")
+                else:
+                    print(f"⚠️  {cli_msg}")
+                    print("  You may need to restart your shell for PATH updates")
+            else:
+                print(f"\n✗ {msg}")
+                print_troubleshooting("kernelopt_not_installed")
+                kernelopt_ok = False
+        else:
+            print("  Skipping installation. You'll need to install manually later.")
+            kernelopt_ok = False
+
+    # Step 9: Check procps-ng (for GPU monitoring)
+    print_step(9, "GPU Monitoring Dependencies")
+
+    success, msg = check_procps_ng()
+    if success:
+        print(f"✓ {msg}")
+    else:
+        print(f"⚠️  {msg}")
+        print("\nNote: procps-ng provides detailed GPU process monitoring.")
+        print("      GPU monitoring will work but with limited process information.")
+
+        if is_running_in_container():
+            print("\n  In containers, install with:")
+            print("    dnf install -y procps-ng    # RHEL/Fedora")
+            print("    apt install -y procps       # Ubuntu/Debian")
+        else:
+            install_choice = input("\nAttempt to install procps-ng? [y/N]: ").strip().lower()
+            if install_choice == 'y':
+                print("\n  Trying: sudo dnf install -y procps-ng")
+                try:
+                    subprocess.run(
+                        ["sudo", "dnf", "install", "-y", "procps-ng"],
+                        check=True,
+                        timeout=120
+                    )
+                    print("  ✓ procps-ng installed")
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+                    print("  ⚠️  Installation failed. Install manually if needed.")
 
     # Final summary
     print_header("Setup Complete!")
 
     print("Configuration summary:")
+    print("  Environment: {}".format("Container" if is_running_in_container() else "Bare Metal"))
     print("  Project ID: {}".format(config['project_id']))
     print("  Region: {}".format(config['region']))
     print("  Auth method: {}".format('Service Account' if config.get('sa_key_path') else 'Application Default'))
+    print("  kernelopt: {}".format("Installed ✓" if kernelopt_ok else "Not installed ✗"))
 
-    print("\nNext steps:")
+    print("\n" + "="*70)
+    print("  IMPORTANT: Load environment variables in current shell")
+    print("="*70)
+    print("\nRun this command to activate the configuration NOW:")
+    print("\n  >>> source {}".format(env_file_path))
+    print("\nOr copy-paste these export commands:")
+    print("  export ANTHROPIC_VERTEX_PROJECT_ID={}".format(config['project_id']))
+    print("  export VERTEX_REGION={}".format(config['region']))
+    if config.get('sa_key_path'):
+        print("  export GOOGLE_APPLICATION_CREDENTIALS={}".format(config['sa_key_path']))
+
+    print("\n" + "-"*70)
 
     if not kernelopt_ok:
-        print("  ⚠️  WARNING: kernelopt package not installed!")
-        print("\n  1. Install kernelopt package:")
+        print("\n⚠️  WARNING: kernelopt package not installed!")
+        print("\nAfter loading environment variables:")
+        print("  1. Install kernelopt:")
         print("       cd {}".format(Path(__file__).parent / "kernelopt"))
         print("       pip install -e \".[triton]\"")
-        print("\n  2. Load environment variables:")
-        print("       source {}".format(Path(__file__).parent / '.env'))
-        print("\n  3. Test the tool:")
-        print("       kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 1 -N 1")
-    else:
-        print("  1. Load environment variables:")
-        print("       source {}".format(Path(__file__).parent / '.env'))
         print("\n  2. Test the tool:")
-        print("       kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 1 -N 1")
+        print("       CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 1 -N 1")
+    else:
+        print("\nAfter loading environment variables, test the tool:")
+        print("  CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 1 -N 1")
+        print("\nView example kernels:")
+        print("  ls tests_suite/fixtures/kernels/")
 
-    print("\n✓ All done! Happy optimizing! 🚀")
+    print("\n" + "="*70)
+    print("  ✓ Setup Complete! Ready to optimize kernels 🚀")
+    print("="*70)
+    print("\nNote: Environment variables will auto-load in NEW shell sessions.")
+    print("      For THIS session, run the source command above first!")
 
 
 if __name__ == "__main__":

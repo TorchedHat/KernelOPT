@@ -74,5 +74,23 @@ def build_llm(
 
 
 def strip_thinking(content: str) -> str:
-    """Strip <think>...</think> blocks from thinking model output."""
-    return re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+    """
+    Strip <think>...</think> blocks from thinking model output.
+
+    Handles nested blocks by repeatedly removing innermost blocks first.
+    Pattern uses negative lookahead (?!<think>) to match blocks with no
+    nested <think> tags inside them.
+
+    Examples:
+        - "A <think>B</think> C" → "A  C"
+        - "A <think>1</think> B <think>2</think> C" → "A  B  C"
+        - "A <think>outer <think>inner</think> outer</think> B" → "A  B"
+    """
+    # Repeatedly remove innermost blocks (blocks with no nested <think>)
+    while '<think>' in content:
+        prev = content
+        # (?:(?!<think>)[\s\S])*? matches any char that's NOT start of <think>
+        content = re.sub(r"<think>(?:(?!<think>)[\s\S])*?</think>", "", content)
+        if prev == content:  # Safety: prevent infinite loop on malformed input
+            break
+    return content.strip()
