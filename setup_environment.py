@@ -445,7 +445,7 @@ def check_kernelopt_installed() -> Tuple[bool, str]:
     # Check if package is installed
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", "kernelopt"],
+            ["pip", "show", "kernelopt"],
             capture_output=True,
             text=True,
             check=True,
@@ -507,7 +507,7 @@ def install_kernelopt() -> Tuple[bool, str]:
         extras = "[triton,dev]"
 
     try:
-        install_cmd = [sys.executable, "-m", "pip", "install", "-e", ".{}".format(extras)]
+        install_cmd = ["pip", "install", "-e", ".{}".format(extras)]
         print("\nRunning: {}".format(" ".join(install_cmd)))
 
         result = subprocess.run(
@@ -884,7 +884,7 @@ def main():
         print("⚠️  anthropic package not found")
         install = input("  Install now? [Y/n]: ").strip().lower()
         if not install or install == 'y':
-            subprocess.run([sys.executable, "-m", "pip", "install", "anthropic[vertex]"], check=True)
+            subprocess.run(["pip", "install", "anthropic[vertex]"], check=True)
 
     try:
         __import__('google.cloud.aiplatform')
@@ -893,7 +893,7 @@ def main():
         print("⚠️  google-cloud-aiplatform not found")
         install = input("  Install now? [Y/n]: ").strip().lower()
         if not install or install == 'y':
-            subprocess.run([sys.executable, "-m", "pip", "install", "google-cloud-aiplatform"], check=True)
+            subprocess.run(["pip", "install", "google-cloud-aiplatform"], check=True)
 
     # Step 5: Check CUDA
     print_step(5, "Checking GPU/CUDA")
