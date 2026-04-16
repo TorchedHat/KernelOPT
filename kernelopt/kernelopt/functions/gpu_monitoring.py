@@ -526,6 +526,12 @@ def validate_gpu_for_profiling(
                 )
 
         console.print("")  # blank line
+        # Extra keys for HUD / callers (backward compatible with get_gpu_metrics shape)
+        metrics["gpu_id"] = gpu_id
+        metrics["active_process_count"] = len(processes_detailed)
+        if sys_mem_available:
+            metrics["sys_mem_total_mb"] = float(sys_mem["total_mb"])
+            metrics["sys_mem_available_mb"] = float(sys_mem["available_mb"])
         return metrics
 
     except GPUMonitoringError as e:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +75,14 @@ def _run_output_dir(base: Path, *, run_subdir: bool) -> Path:
         return base
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return base / f"run_{stamp}"
+
+
+def _resolve_hud_tty(cli_path: Optional[Path]) -> Optional[str]:
+    """CLI --hud-tty wins; else KERNELOPT_HUD_TTY."""
+    if cli_path is not None:
+        return str(cli_path.expanduser().resolve())
+    env = os.environ.get("KERNELOPT_HUD_TTY", "").strip()
+    return env or None
 
 
 @app.command()
@@ -163,6 +172,11 @@ def run(
         None, "--profiler-model", help="Model for profiler agent config-decider"
     ),
     verbose: bool = typer.Option(False, help="Verbose output"),
+    hud_tty: Optional[Path] = typer.Option(
+        None,
+        "--hud-tty",
+        help="Second terminal device path from `tty` in that window; HUD renders there only (main tty = full NCU/log). Env: KERNELOPT_HUD_TTY",
+    ),
     agentic_correctness: bool = typer.Option(
         True, "--agentic-correctness/--no-agentic-correctness",
         help="Use Claude to generate CPU reference tests (default: True)"
@@ -175,7 +189,7 @@ def run(
     .ncu-rep files for every candidate. Each kernelopt run uses a new
     run_<timestamp>/ folder under --output-dir unless --no-run-subdir.
     With --memory and a pipeline_checkpoint.json, NCU/LLM options are taken from the
-    checkpoint; only -T, -N, -K may be overridden (omit them to use saved values).
+    checkpoint; only -T, -N, -K and --hud-tty may be set (omit T/N/K to use saved values).
 
     Example:
         kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
@@ -214,6 +228,7 @@ def run(
                     "    • kernel file (positional)\n"
                     "    • [cyan]--memory[/] DIR\n"
                     "    • [cyan]-T[/] / [cyan]-N[/] / [cyan]-K[/] (optional overrides)\n"
+                    "    • [cyan]--hud-tty[/] PATH (display only; or KERNELOPT_HUD_TTY)\n"
                     f"  Remove: {', '.join(_flag_label(p) for p in bad)}"
                 )
                 raise typer.Exit(2)
@@ -316,6 +331,8 @@ def run(
             agentic_correctness=agentic_correctness,
         )
 
+    cfg.hud_tty = _resolve_hud_tty(hud_tty)
+
     state = PipelineState(
         config=cfg,
         kernel_path=str(kernel_path),
@@ -331,7 +348,14 @@ def run(
     if resume_from_ckpt:
         extra = (
             "\n  [dim]Resume:[/] pipeline config from checkpoint "
-            "(other CLI flags ignored; only -T/-N/-K override T/N/K)"
+            "(other CLI flags ignored; only -T/-N/-K override T/N/K; "
+            "--hud-tty / KERNELOPT_HUD_TTY always from this shell)"
+        )
+    hud_note = ""
+    if cfg.hud_tty:
+        hud_note = (
+            f"\n  [dim]HUD:[/] status panel → secondary TTY [cyan]{cfg.hud_tty}[/] "
+            f"(main window shows full NCU + logs)"
         )
     console.print(
         f"[bold green]kernelopt[/] starting on "
@@ -340,12 +364,16 @@ def run(
         f"K={cfg.K} attempts/plan, TopK={cfg.TopK}\n"
         f"  Output: [cyan]{resolved_output}/[/]\n"
         f"  Backend: [cyan]Claude on Vertex AI[/] ({cfg.model})"
-        f"{extra}"
+        f"{extra}{hud_note}"
     )
 
-    # Pre-run GPU validation
+    # Pre-run GPU validation (snapshot reused by HUD so it matches System Status)
     gpu_id = select_gpu()
-    validate_gpu_for_profiling(gpu_id, console=console)
+    pre_snap = validate_gpu_for_profiling(gpu_id, console=console)
+    if isinstance(pre_snap, dict) and pre_snap:
+        state.pre_run_system_snapshot = pre_snap
+    else:
+        state.pre_run_system_snapshot = {}
 
     from kernelopt.agents.profiler import get_latency_ns
     from kernelopt.langgraph_pipeline import run_langgraph_pipeline
