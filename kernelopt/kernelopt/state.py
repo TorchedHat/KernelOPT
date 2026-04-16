@@ -82,6 +82,8 @@ class PipelineConfig:
     # Runtime
     verbose: bool = False
     agentic_correctness: bool = True  # Use Claude to generate CPU reference tests
+    # Rich Live HUD on a *second* terminal only (--hud-tty / KERNELOPT_HUD_TTY); main tty stays full log
+    hud_tty: str | None = None
 
     # Profiler agent
     profile_hints: str = ""
@@ -125,6 +127,9 @@ class PipelineState:
 
     # Resume: directory from --memory (prior run output folder)
     resume_run_dir: str | None = None
+
+    # Pre-run metrics from validate_gpu_for_profiling (for HUD; same source as CLI System Status)
+    pre_run_system_snapshot: dict = field(default_factory=dict)
 
 
 class GraphState(TypedDict, total=False):

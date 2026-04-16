@@ -259,6 +259,8 @@ class TestValidateGPUForProfiling:
                     )
 
                     assert metrics["name"] == "NVIDIA H200"
+                    assert metrics["gpu_id"] == 0
+                    assert metrics["active_process_count"] == 0
                     assert mock_console.print.called
 
     def test_validate_gpu_low_memory_warning(self):
