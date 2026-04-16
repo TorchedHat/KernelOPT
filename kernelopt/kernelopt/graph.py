@@ -100,8 +100,7 @@ def run_pipeline(state: PipelineState) -> PipelineState:
         best_speedup = round(baseline_latency / state.best_latency_ns, 2)
         console.print(
             f"\n[bold]Iteration {iteration + 1}/{cfg.T}[/]  "
-            f"Best: [green]{best_speedup}x[/]  "
-            f"Memory: {len(state.optimization_memory)} items"
+            f"Best: [green]{best_speedup}x[/]"
         )
 
         iter_result = _run_iteration(state, cfg, output_dir, ext)
@@ -392,8 +391,7 @@ def _print_iteration_table(
         title=(
             f"Iteration {iter_num}/{total}  |  "
             f"Framework: {state.framework}  |  "
-            f"Best: {overall_speedup}x  |  "
-            f"Memory: {len(state.optimization_memory)} items"
+            f"Best: {overall_speedup}x"
         ),
         show_header=True,
     )
