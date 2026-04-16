@@ -37,6 +37,11 @@ from kernelopt.checkpoint import (
     save_checkpoint,
 )
 from kernelopt.memory import append_items, load_memory, save_memory, select_top_k
+from kernelopt.pipeline_ui import (
+    get_pipeline_ui,
+    pipe_print,
+    run_hud_session,
+)
 from kernelopt.state import (
     GraphState,
     IterationResult,
@@ -55,7 +60,7 @@ def _checkpoint_stage(state: GraphState, updates: dict, stage: str) -> None:
         merged: GraphState = {**state, **updates}  # type: ignore[misc]
         save_checkpoint(Path(str(merged["output_dir"])), merged, stage)
     except Exception as e:
-        console.print(f"[yellow]Warning:[/] checkpoint [{stage}] failed: {e}")
+        pipe_print(f"[yellow]Warning:[/] checkpoint [{stage}] failed: {e}")
 
 
 def _compile_cuda(cu_path: str, output_dir: str | None = None) -> str:
@@ -85,6 +90,10 @@ def profile_baseline(state: GraphState) -> dict:
     kernel_path = state["kernel_path"]
     kernel_id = state.get("kernel_id", 0)
 
+    ui = get_pipeline_ui()
+    if ui:
+        ui.set_phase("Baseline profiling", Path(kernel_path).name)
+
     # For .cu kernels: compile the baseline binary once so NCU can run it.
     ext = Path(kernel_path).suffix
     compiled_binary = None
@@ -95,7 +104,7 @@ def profile_baseline(state: GraphState) -> dict:
                 f"Baseline .cu compilation failed:\n{err}\n\n"
                 f"Fix the kernel source and rerun."
             )
-        console.print(f"  [dim]Compiled baseline binary: {compiled_binary}[/]")
+        pipe_print(f"  [dim]Compiled baseline binary: {compiled_binary}[/]")
 
     llm_config = {
         "model": cfg.profiler_model or cfg.model,
@@ -105,14 +114,14 @@ def profile_baseline(state: GraphState) -> dict:
     }
 
     if cfg.baseline_csv and Path(cfg.baseline_csv).exists():
-        console.print("[dim]Using provided baseline CSV[/]")
+        pipe_print("[dim]Using provided baseline CSV[/]")
         sections, rules, launch = parse_ncu_csv(cfg.baseline_csv, kernel_id)
         baseline_ctx = build_profiling_context(
             sections, rules, launch, kernel_path, kernel_id=kernel_id
         )
         ncu_config = None
     else:
-        console.print("[bold]Profiling baseline kernel...[/]")
+        pipe_print("[bold]Profiling baseline kernel...[/]")
         try:
             baseline_ctx, ncu_config = run_profiler_agent(
                 kernel_path,
@@ -126,17 +135,26 @@ def profile_baseline(state: GraphState) -> dict:
         except RuntimeError as e:
             raise RuntimeError(f"Baseline profiling failed: {e}") from e
         ctx_json = str(output_dir / "baseline_profiling_context.json")
-        console.print(f"  [dim]Profiling context: {ctx_json}[/]")
+        pipe_print(f"  [dim]Profiling context: {ctx_json}[/]")
 
     latency = get_latency_ns(baseline_ctx)
     framework = state["framework"]
     if framework == "auto":
         framework = baseline_ctx["framework_hint"]
 
-    console.print(
+    pipe_print(
         f"  Baseline: [cyan]{latency:.0f} ns[/]  "
         f"Framework: [green]{framework}[/]"
     )
+
+    ui_done = get_pipeline_ui()
+    if ui_done:
+        ui_done.ingest_post_baseline(
+            baseline_latency_ns=latency,
+            best_latency_ns=latency,
+            framework=str(framework),
+            iteration_0based=state.get("iteration", 0),
+        )
 
     out = {
         "baseline_profiling_context": baseline_ctx,
@@ -166,17 +184,25 @@ def generate_plans(state: GraphState) -> dict:
     baseline = state.get("baseline_latency_ns", float("inf"))
     best_speedup = round(baseline / state["best_latency_ns"], 2)
 
-    console.print(
+    ui = get_pipeline_ui()
+    if ui:
+        ui.sync_iteration_header(
+            iteration,
+            baseline,
+            state["best_latency_ns"],
+        )
+        ui.set_phase("Planning", f"{cfg.N} optimization plans")
+
+    pipe_print(
         f"\n[bold]Iteration {iteration + 1}/{cfg.T}[/]  "
-        f"Best: [green]{best_speedup}x[/]  "
-        f"Memory: {len(state.get('optimization_memory', []))} items"
+        f"Best: [green]{best_speedup}x[/]"
     )
 
-    # Per-iteration GPU monitoring (non-blocking warnings)
+    # Per-iteration GPU monitoring (non-blocking warnings; main terminal)
     gpu_id = select_gpu()
     monitor_gpu_activity(gpu_id, iteration + 1, console=console)
 
-    console.print(f"  Generating {cfg.N} optimization plans...")
+    pipe_print(f"  Generating {cfg.N} optimization plans...")
 
     # Build cross-iteration direction history
     all_tried_directions = [
@@ -204,7 +230,7 @@ def generate_plans(state: GraphState) -> dict:
     for letter, plan in plans:
         direction = plan.get("direction", "unknown")
         confidence = plan.get("confidence", "?")
-        console.print(
+        pipe_print(
             f"    Plan {letter}: {direction} [dim](confidence: {confidence})[/]"
         )
 
@@ -229,6 +255,10 @@ def execute_plans(state: GraphState) -> dict:
     kernel_basename = state["kernel_basename"]
     kernel_path = state["kernel_path"]
 
+    ui = get_pipeline_ui()
+    if ui:
+        ui.set_phase("Execute + correctness", f"{len(plans)} plans")
+
     llm_config = {
         "model": cfg.executor_model or cfg.model,
         "api_key": cfg.api_key,
@@ -244,7 +274,7 @@ def execute_plans(state: GraphState) -> dict:
         safe_dir = direction.replace(" ", "_")[:40]
         file_stem = f"{kernel_basename}_iter{iteration + 1}_plan{plan_letter}_{safe_dir}"
 
-        console.print(f"  [dim]Executing plan {plan_letter} ({direction})...[/]")
+        pipe_print(f"  [dim]Executing plan {plan_letter} ({direction})...[/]")
 
         # For .cu kernels: up to K outer attempts (executor + compile).
         # Each attempt feeds the previous nvcc error back to the executor.
@@ -267,17 +297,17 @@ def execute_plans(state: GraphState) -> dict:
                     compile_error=last_compile_err,
                 )
             except Exception as e:
-                console.print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
+                pipe_print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
                 optimized_source = None
                 break
 
-            console.print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
-            console.print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
-            console.print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
+            pipe_print(f"  [dim]Execution status: {execution_result.get('status')}[/]")
+            pipe_print(f"  [dim]Ready for profiling: {execution_result.get('ready_for_profiling')}[/]")
+            pipe_print(f"  [dim]Lines changed: {execution_result.get('lines_changed')}[/]")
 
             if not execution_result.get("ready_for_profiling", False):
                 reason = execution_result.get("reason", execution_result.get("status", "failed"))
-                console.print(f"    [red]Plan {plan_letter}: {reason}[/]")
+                pipe_print(f"    [red]Plan {plan_letter}: {reason}[/]")
                 optimized_source = None
                 break
 
@@ -289,7 +319,7 @@ def execute_plans(state: GraphState) -> dict:
                 binary_path, err = compile_cuda(kernel_file, output_dir=str(output_dir))
                 if err:
                     last_compile_err = err
-                    console.print(
+                    pipe_print(
                         f"    [yellow]Plan {plan_letter} attempt {attempt_idx + 1}/"
                         f"{outer_attempts}: compile failed[/]\n"
                         f"    {err.splitlines()[0] if err else ''}"
@@ -333,7 +363,7 @@ def execute_plans(state: GraphState) -> dict:
         execution_result["correctness"] = "unverified"
 
         # Correctness check
-        console.print(f"  [dim]Running correctness check...[/]")
+        pipe_print(f"  [dim]Running correctness check...[/]")
         passed, msg = check_correctness(
             kernel_path, optimized_source, framework,
             use_agentic=cfg.agentic_correctness,
@@ -346,10 +376,10 @@ def execute_plans(state: GraphState) -> dict:
         execution_result["correctness"] = "passed" if passed else "failed"
 
         status = "[green]passed[/]" if passed else "[red]failed[/]"
-        console.print(f"    Plan {plan_letter}: correctness {status}")
+        pipe_print(f"    Plan {plan_letter}: correctness {status}")
 
         if not passed:
-            console.print(f"    [dim]Failure: {msg[:300]}[/]")
+            pipe_print(f"    [dim]Failure: {msg[:300]}[/]")
             correctness_failure_items.append({
                 "item_id": uuid.uuid4().hex[:8],
                 "iteration": iteration + 1,
@@ -418,7 +448,11 @@ def profile_candidates(state: GraphState) -> dict:
         "region": cfg.region,
     }
 
-    console.print(f"  Profiling {len(candidates)} valid candidates...")
+    ui = get_pipeline_ui()
+    if ui:
+        ui.set_phase("Profiling (NCU)", f"{len(candidates)} candidates")
+
+    pipe_print(f"  Profiling {len(candidates)} valid candidates...")
 
     for c in candidates:
         safe_dir = c.direction.replace(" ", "_")[:40]
@@ -435,7 +469,7 @@ def profile_candidates(state: GraphState) -> dict:
             try:
                 candidate_binary = _compile_cuda(kernel_file, output_dir=str(output_dir))
             except RuntimeError as e:
-                console.print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
+                pipe_print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
                 c.latency_ns = float("inf")
                 c.speedup = 0.0
                 continue
@@ -458,12 +492,12 @@ def profile_candidates(state: GraphState) -> dict:
                 round(best_latency / c.latency_ns, 4)
                 if c.latency_ns > 0 else 0.0
             )
-            console.print(
+            pipe_print(
                 f"    Plan {c.plan_letter} ({c.direction}): "
                 f"{c.latency_ns:.0f} ns -> {c.speedup:.2f}x"
             )
         except Exception as e:
-            console.print(
+            pipe_print(
                 f"    [red]Profiling plan {c.plan_letter} failed: {e}[/]"
             )
             c.latency_ns = float("inf")
@@ -485,6 +519,10 @@ def summarize_results(state: GraphState) -> dict:
     framework = state["framework"]
     iteration = state.get("iteration", 0)
     memory = list(state.get("optimization_memory", []))
+
+    ui = get_pipeline_ui()
+    if ui:
+        ui.set_phase("Summarize + memory", "")
 
     summarize_candidates = sorted(
         [c for c in candidates if c.latency_ns < float("inf")],
@@ -524,7 +562,7 @@ def summarize_results(state: GraphState) -> dict:
             # else: skip (don't add)
 
         except Exception as e:
-            console.print(
+            pipe_print(
                 f"    [red]Summarizer failed (plan {c.plan_letter}): {e}[/]"
             )
 
@@ -587,6 +625,10 @@ def select_best_candidate(state: GraphState) -> dict:
 
     iteration_results.append(iter_result)
 
+    ui = get_pipeline_ui()
+    if ui:
+        ui.set_phase("Select best", "")
+
     # Print iteration table
     overall_speedup = round(baseline_latency / best_latency, 2)
     cfg = state["config"]
@@ -594,8 +636,7 @@ def select_best_candidate(state: GraphState) -> dict:
         title=(
             f"Iteration {iteration + 1}/{cfg.T}  |  "
             f"Framework: {framework}  |  "
-            f"Best: {overall_speedup}x  |  "
-            f"Memory: {len(memory)} items"
+            f"Best: {overall_speedup}x"
         ),
         show_header=True,
     )
@@ -613,7 +654,23 @@ def select_best_candidate(state: GraphState) -> dict:
             and c.plan_letter == iter_result.best_candidate.plan_letter
         )
         t.add_row(c.direction, speedup_str, correct, "Y" if is_best else "")
+
     console.print(t)
+    if ui and ui.is_split_hud:
+        summary_bits = [
+            f"{c.plan_letter}: "
+            f"{'%.2fx' % c.speedup if c.latency_ns < float('inf') else 'fail'}"
+            for c in candidates
+        ]
+        ui.add_event(
+            f"Iter {iteration + 1}/{cfg.T} cumulative {overall_speedup}x | "
+            + (" | ".join(summary_bits) if summary_bits else "no candidates")
+        )
+        ui.sync_iteration_header(
+            state.get("iteration", 0),
+            baseline_latency,
+            best_latency,
+        )
 
     out = {
         "best_kernel": best_kernel,
@@ -648,7 +705,7 @@ def should_continue(state: GraphState) -> str:
     if iteration >= cfg.T:
         return "stop"
     if state.get("no_improvement_streak", 0) >= 2:
-        console.print(
+        pipe_print(
             "[yellow]Stopping:[/] 2 consecutive iterations "
             "with no improvement."
         )
@@ -662,7 +719,7 @@ def should_continue(state: GraphState) -> str:
             c.optimization_plan.get("confidence") == "low"
             for c in latest.candidates
         ):
-            console.print(
+            pipe_print(
                 "[yellow]Stopping:[/] All plans report low confidence "
                 "-- NCU rule opportunities exhausted."
             )
@@ -701,7 +758,7 @@ def save_iter_checkpoint(state: GraphState) -> dict:
     try:
         save_checkpoint(Path(state["output_dir"]), state, "after_iteration")
     except Exception as e:
-        console.print(f"[yellow]Warning:[/] could not save checkpoint: {e}")
+        pipe_print(f"[yellow]Warning:[/] could not save checkpoint: {e}")
     return {}
 
 
@@ -821,7 +878,7 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
                 live_framework=state.framework,
             )
             initial["_entry"] = entry
-            console.print(
+            pipe_print(
                 f"[bold green]Resuming[/] from [cyan]{resume_path}/[/] "
                 f"(checkpoint: [dim]{entry}[/])"
             )
@@ -865,14 +922,22 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
                 "ncu_config": None,
                 "_entry": "after_baseline",
             }
-            console.print(
+            pipe_print(
                 f"[bold green]Resuming[/] from [cyan]{resume_path}/[/] "
                 f"(baseline artifacts only — starting at iteration 1)"
             )
     else:
         initial = _build_fresh_initial(state, cfg, ext)
 
-    final = graph.invoke(initial)
+    hud_path = (cfg.hud_tty or "").strip()
+    if hud_path:
+        with run_hud_session(hud_path) as hud:
+            if state.pre_run_system_snapshot:
+                hud.set_pre_run_system_snapshot(state.pre_run_system_snapshot)
+            hud.seed_from_graph(initial)
+            final = graph.invoke(initial)
+    else:
+        final = graph.invoke(initial)
 
     # Map back to PipelineState
     state.best_kernel = final["best_kernel"]
@@ -1113,4 +1178,4 @@ def _write_final_outputs(
     ]
 
     log_path.write_text("".join(lines))
-    console.print(f"\n  Log written to [cyan]{log_path}[/]")
+    pipe_print(f"\n  Log written to [cyan]{log_path}[/]")
