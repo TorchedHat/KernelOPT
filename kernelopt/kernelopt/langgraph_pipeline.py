@@ -958,19 +958,128 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     return state
 
 
+def _fmt_metric(entry: dict) -> str | None:
+    """Format a single NCU metric dict, or None if unusable."""
+    if not isinstance(entry, dict):
+        return None
+    val = entry.get("value")
+    unit = (entry.get("unit") or "").strip()
+    if val is None or (isinstance(val, float) and val != val):  # NaN
+        return None
+    if isinstance(val, float):
+        return f"{val:.2f} {unit}".strip() if unit else f"{val:.2f}"
+    return f"{val} {unit}".strip() if unit else str(val)
+
+
 def _m(ctx: dict, section: str, metric: str, default: str = "—") -> str:
     """Safely extract a metric value from a profiling context."""
     try:
         entry = ctx["sections"][section][metric]
-        val = entry.get("value", default)
-        unit = entry.get("unit", "").strip()
-        if val is None or val != val:   # NaN check
-            return default
-        if isinstance(val, float):
-            return f"{val:.2f} {unit}".strip() if unit else f"{val:.2f}"
-        return f"{val} {unit}".strip() if unit else str(val)
+        out = _fmt_metric(entry)
+        return out if out is not None else default
     except (KeyError, TypeError):
         return default
+
+
+# NCU CSV places some metrics under different sections/names across tool versions.
+_LOG_METRIC_ALTERNATIVES: dict[str, list[tuple[str, str]]] = {
+    "DRAM Throughput (%)": [
+        ("GPU Speed Of Light Throughput", "DRAM Throughput"),
+        ("Memory Workload Analysis", "DRAM Throughput"),
+    ],
+    "IPC Active": [
+        ("Compute Workload Analysis", "Executed Ipc Active"),
+        ("Compute Workload Analysis", "Issued Ipc Active"),
+        ("Instruction Statistics", "IPC Active"),
+    ],
+}
+
+
+def _m_any(ctx: dict, alternatives: list[tuple[str, str]], default: str = "—") -> str:
+    """Like _m but try several (section, metric) pairs (first hit wins)."""
+    for section, metric in alternatives:
+        try:
+            entry = ctx["sections"][section][metric]
+            out = _fmt_metric(entry)
+            if out is not None:
+                return out
+        except (KeyError, TypeError):
+            continue
+    return default
+
+
+def _duration_ns_display(ctx: dict) -> str:
+    """Format kernel duration from profiling context as integer nanoseconds."""
+    from kernelopt.agents.profiler.context_builder import get_latency_ns
+
+    v = get_latency_ns(ctx)
+    if v == float("inf") or v != v:
+        return "—"
+    return f"{v:.0f} ns"
+
+
+def _metric_numeric(
+    ctx: dict,
+    label: str,
+    section: str,
+    metric: str,
+    alts: list[tuple[str, str]] | None,
+) -> float | None:
+    """Parse a comparable float for delta computation; None if missing."""
+    if label == "Duration (ns)":
+        from kernelopt.agents.profiler.context_builder import get_latency_ns
+
+        v = get_latency_ns(ctx)
+        if v == float("inf") or v != v:
+            return None
+        return float(v)
+    if alts:
+        for s, m in alts:
+            try:
+                raw = ctx["sections"][s][m].get("value")
+                if raw is None or (isinstance(raw, float) and raw != raw):
+                    continue
+                return float(raw)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
+    try:
+        raw = ctx["sections"][section][metric]["value"]
+        if raw is None or (isinstance(raw, float) and raw != raw):
+            return None
+        return float(raw)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _delta_cell(label: str, base_v: float | None, cand_v: float | None) -> str:
+    """Human-readable delta vs baseline for one metric row."""
+    if base_v is None or cand_v is None:
+        return "—"
+    d = cand_v - base_v
+    if label == "Duration (ns)":
+        rel_pct = (cand_v / base_v - 1.0) * 100.0 if base_v else 0.0
+        return f"{d:+.0f} ns ({rel_pct:+.1f}%)"
+    if label.endswith("(%)") or "Occupancy" in label:
+        return f"{d:+.2f} pp"
+    if label == "Registers/Thread":
+        return f"{d:+.0f}"
+    if label == "Waves/SM":
+        return f"{d:+.2f}"
+    if label == "IPC Active":
+        return f"{d:+.2f}"
+    return f"{d:+.2f}"
+
+
+def _best_direction_for_latency(
+    state: PipelineState, latency_ns: float, tol: float = 0.5
+) -> str:
+    """Find a candidate direction whose measured latency matches the run best."""
+    for r in reversed(state.iteration_results):
+        for c in r.candidates:
+            if c.latency_ns < float("inf") and abs(c.latency_ns - latency_ns) <= tol:
+                return c.direction
+    return "baseline"
 
 
 def _write_final_outputs(
@@ -988,7 +1097,13 @@ def _write_final_outputs(
         output_dir / "optimization_memory.json",
     )
 
-    overall_speedup = round(baseline_latency / state.best_latency_ns, 4)
+    if (
+        state.best_latency_ns > 0
+        and state.best_latency_ns < float("inf")
+    ):
+        overall_speedup = round(baseline_latency / state.best_latency_ns, 4)
+    else:
+        overall_speedup = 1.0
     log_path = output_dir / "optimization_log.md"
 
     # --- Environment ---
@@ -1013,6 +1128,11 @@ def _write_final_outputs(
 
     baseline_ctx = state.baseline_profiling_context
     baseline_launch = baseline_ctx.get("launch", {})
+    kernel_name = baseline_ctx.get("kernel_name", "—")
+    block = baseline_launch.get("block_size", "—")
+    grid = baseline_launch.get("grid_size", "—")
+    waves = baseline_launch.get("waves_per_sm", "—")
+    regs = baseline_launch.get("registers_per_thread", "—")
 
     # Build a memory lookup: direction → memory item (latest / highest speedup)
     mem_by_dir: dict[str, dict] = {}
@@ -1022,11 +1142,33 @@ def _write_final_outputs(
         if existing is None or item.get("speedup", 0) > existing.get("speedup", 0):
             mem_by_dir[d] = item
 
+    best_ns = state.best_latency_ns
+    best_ns_ok = best_ns < float("inf") and best_ns > 0
+    beat_baseline = best_ns_ok and best_ns + 0.5 < baseline_latency
+    best_dir = (
+        _best_direction_for_latency(state, best_ns)
+        if beat_baseline
+        else "—"
+    )
+    n_iters = len(state.iteration_results)
+    outcome = (
+        f"Best configuration **`{best_dir}`** beats baseline latency."
+        if beat_baseline
+        else "**No** candidate beat baseline latency (best equals or slower than starting point)."
+    )
+    best_ns_display = f"{best_ns:.0f}" if best_ns_ok else "—"
+
     lines: list[str] = []
 
     # ── Header ──────────────────────────────────────────────────────────────
     lines += [
         "# Kernel Optimization Log\n\n",
+        "## Summary\n\n",
+        f"- **Kernel**: `{kernel_name}` on **{gpu_model}** (CC {cc})\n",
+        f"- **Baseline latency**: {baseline_latency:.0f} ns — **Best latency**: "
+        f"{best_ns_display} ns (**{overall_speedup:.4f}×** vs baseline)\n",
+        f"- **Iterations completed**: {n_iters}\n",
+        f"- **Outcome**: {outcome}\n\n",
         "## Environment\n\n",
         f"- **Device**: {gpu_model}, {sm_count} SMs, {mem_gb} GB HBM\n",
         f"- **Compute Capability**: {cc}\n",
@@ -1035,12 +1177,6 @@ def _write_final_outputs(
     ]
 
     # ── Baseline ────────────────────────────────────────────────────────────
-    kernel_name = baseline_ctx.get("kernel_name", "—")
-    block  = baseline_launch.get("block_size", "—")
-    grid   = baseline_launch.get("grid_size", "—")
-    waves  = baseline_launch.get("waves_per_sm", "—")
-    regs   = baseline_launch.get("registers_per_thread", "—")
-
     lines += [
         "## Baseline Kernel\n\n",
         f"- **Name**: `{kernel_name}`\n",
@@ -1049,12 +1185,12 @@ def _write_final_outputs(
         f"- **Launch**: Block ({block},1,1), Grid ({grid},1,1)"
         + (f", Waves/SM: {waves:.2f}" if isinstance(waves, float) else "") + "\n",
         f"- **Registers/thread**: {regs}\n",
-        f"- **Duration**: {baseline_latency/1000:.2f} µs ({baseline_latency:.0f} ns)\n",
+        f"- **Duration**: {baseline_latency:.0f} ns\n",
         f"- **SM Throughput**: {_m(baseline_ctx, 'GPU Speed Of Light Throughput', 'Compute (SM) Throughput')}"
         f" | **Memory**: {_m(baseline_ctx, 'GPU Speed Of Light Throughput', 'Memory Throughput')}"
-        f" | **DRAM**: {_m(baseline_ctx, 'Memory Workload Analysis', 'DRAM Throughput')}\n",
+        f" | **DRAM**: {_m_any(baseline_ctx, _LOG_METRIC_ALTERNATIVES['DRAM Throughput (%)'])}\n",
         f"- **Achieved Occupancy**: {_m(baseline_ctx, 'Occupancy', 'Achieved Occupancy')}\n",
-        f"- **IPC Active**: {_m(baseline_ctx, 'Instruction Statistics', 'IPC Active')}"
+        f"- **IPC Active**: {_m_any(baseline_ctx, _LOG_METRIC_ALTERNATIVES['IPC Active'])}"
         f" | **No Eligible**: {_m(baseline_ctx, 'Scheduler Statistics', 'No Eligible')}\n\n",
     ]
 
@@ -1078,7 +1214,11 @@ def _write_final_outputs(
             "|------|-----------|--------------|---------|-------------|-------|\n",
         ]
         for c in result.candidates:
-            dur_str = f"{c.latency_ns:.0f}" if c.latency_ns < float("inf") else "fail"
+            dur_str = (
+                f"{c.latency_ns:.0f} ns"
+                if c.latency_ns < float("inf")
+                else "fail"
+            )
             spd_str = f"{c.speedup:.3f}×" if c.latency_ns < float("inf") else "fail"
             correct = "✓" if c.correctness_passed else "✗"
             is_best = result.best_candidate and c.plan_letter == result.best_candidate.plan_letter
@@ -1105,15 +1245,53 @@ def _write_final_outputs(
             # Baseline ctx for this iteration (previous best)
             iter_baseline_ctx = baseline_ctx  # simplified — always compare to original
 
-            header = "| Metric | Baseline |" + "".join(f" {c.direction[:22]} |" for c in profiled) + "\n"
-            sep    = "|--------|---------|" + "".join("-----|" for _ in profiled) + "\n"
-            lines += ["\n### Metric Comparison\n\n", header, sep]
+            col_max = 18
+            header = "| Metric | Baseline |"
+            sep = "|--------|----------|"
+            for c in profiled:
+                short = (
+                    c.direction[: col_max - 1] + "..."
+                    if len(c.direction) > col_max
+                    else c.direction
+                )
+                header += f" {short} | Δ |"
+                sep += "----------|-----|"
+            lines += ["\n### Metric Comparison\n\n", header + "\n", sep + "\n"]
             for label, section, metric in metrics_rows:
-                base_val = _m(iter_baseline_ctx, section, metric)
-                row = f"| {label} | {base_val} |"
-                for c in profiled:
-                    row += f" {_m(c.profiling_context, section, metric)} |"
-                lines.append(row + "\n")
+                alts = _LOG_METRIC_ALTERNATIVES.get(label)
+                base_num = _metric_numeric(
+                    iter_baseline_ctx, label, section, metric, alts
+                )
+                if label == "Duration (ns)":
+                    base_val = _duration_ns_display(iter_baseline_ctx)
+                    row = f"| {label} | {base_val} |"
+                    for c in profiled:
+                        cand_val = _duration_ns_display(c.profiling_context)
+                        cn = _metric_numeric(
+                            c.profiling_context, label, section, metric, alts
+                        )
+                        row += f" {cand_val} | {_delta_cell(label, base_num, cn)} |"
+                    lines.append(row + "\n")
+                elif alts:
+                    base_val = _m_any(iter_baseline_ctx, alts)
+                    row = f"| {label} | {base_val} |"
+                    for c in profiled:
+                        row += f" {_m_any(c.profiling_context, alts)} |"
+                        cn = _metric_numeric(
+                            c.profiling_context, label, section, metric, alts
+                        )
+                        row += f" {_delta_cell(label, base_num, cn)} |"
+                    lines.append(row + "\n")
+                else:
+                    base_val = _m(iter_baseline_ctx, section, metric)
+                    row = f"| {label} | {base_val} |"
+                    for c in profiled:
+                        row += f" {_m(c.profiling_context, section, metric)} |"
+                        cn = _metric_numeric(
+                            c.profiling_context, label, section, metric, None
+                        )
+                        row += f" {_delta_cell(label, base_num, cn)} |"
+                    lines.append(row + "\n")
             lines.append("\n")
 
         # Key learnings from optimization_memory
@@ -1163,7 +1341,7 @@ def _write_final_outputs(
     for iter_num, direction, ns, speedup in cumulative_history:
         lines.append(f"Iter {iter_num:<3}   {ns:.0f} ns  ({speedup:.3f}×)  — {direction}\n")
     lines += [
-        f"\nFinal best: {state.best_latency_ns:.0f} ns  ({overall_speedup:.4f}×)\n",
+        f"\nFinal best: {best_ns_display} ns  ({overall_speedup:.4f}×)\n",
         "```\n\n",
     ]
 
