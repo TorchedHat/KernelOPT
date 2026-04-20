@@ -520,32 +520,3 @@ int main() {
         # May miss this and profile all kernels
         kernel_name = resolved_config.get("kernel_name", "")
         assert kernel_name != ""  # Should filter to specific kernel
-
-
-@pytest.mark.xfail(reason="Edge cases in optimization may expose bugs in pipeline")
-@pytest.mark.e2e
-@pytest.mark.slow
-class TestPipelineEdgeCases:
-    """Edge case scenarios that may expose pipeline bugs."""
-
-    def test_zero_speedup_optimization(
-        self, temp_output_dir, test_kernel_path, patch_build_llm, gpu_id
-    ):
-        """Test handling of optimization with exactly 1.0x speedup (xfail - edge case)."""
-        # This tests the t_pos threshold logic
-        # If speedup = 1.0, should it be stored as positive? Skipped?
-        pytest.skip("Complex scenario requiring specific mock setup")
-
-    def test_massive_slowdown(
-        self, temp_output_dir, test_kernel_path, patch_build_llm, gpu_id
-    ):
-        """Test handling of severe regression (100x slowdown) (xfail - may overflow)."""
-        # Tests numeric stability with extreme speedup values
-        pytest.skip("Complex scenario requiring specific mock setup")
-
-    def test_compilation_timeout(
-        self, temp_output_dir
-    ):
-        """Test handling of CUDA compilation timeout (xfail - timeout handling)."""
-        # Very complex CUDA code that takes >60s to compile
-        pytest.skip("Requires actual slow compilation scenario")

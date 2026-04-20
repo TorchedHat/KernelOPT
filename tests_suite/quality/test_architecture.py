@@ -75,9 +75,10 @@ class TestModularDesign:
 
     def test_single_responsibility_principle(self):
         """Each module should have a single, clear responsibility."""
-        # graph.py = pipeline orchestration
-        from kernelopt import graph
-        assert 'run_pipeline' in dir(graph)
+        # langgraph_pipeline.py = LangGraph pipeline orchestration
+        from kernelopt import langgraph_pipeline as lgp
+        assert "run_langgraph_pipeline" in dir(lgp)
+        assert "build_graph" in dir(lgp)
 
         # memory.py = optimization memory management
         from kernelopt import memory
@@ -102,15 +103,15 @@ class TestSeparationOfConcerns:
     """Test clear boundaries between layers."""
 
     def test_agents_dont_import_main_graph(self):
-        """Agents shouldn't depend on main pipeline graph."""
+        """Agents shouldn't depend on main LangGraph pipeline orchestrator."""
         from kernelopt.agents import planner, executor
 
         planner_source = inspect.getsource(planner)
         executor_source = inspect.getsource(executor)
 
-        # Agents are reusable components, shouldn't import main pipeline
-        assert 'from kernelopt.graph import' not in planner_source
-        assert 'from kernelopt.graph import' not in executor_source
+        # Agents are reusable components, shouldn't import main pipeline module
+        assert "from kernelopt.langgraph_pipeline import" not in planner_source
+        assert "from kernelopt.langgraph_pipeline import" not in executor_source
 
         # They have their own sub-graphs (LangGraph compiled graphs)
         from kernelopt.agents.planner import graph as planner_graph
@@ -155,7 +156,7 @@ class TestSeparationOfConcerns:
         # Should only parse CSV, not know about agents or LLM
         assert 'from kernelopt.agents' not in source
         assert 'from kernelopt.llm' not in source
-        assert 'from kernelopt.graph' not in source
+        assert "from kernelopt.langgraph_pipeline" not in source
 
 
 # ===========================================================================
@@ -282,12 +283,12 @@ class TestCodeOrganization:
     def test_no_circular_imports(self):
         """No circular dependencies between modules."""
         # This test passes if import succeeds without errors
-        from kernelopt import graph
-        from kernelopt import memory
-        from kernelopt import state
-        from kernelopt.agents import planner
-        from kernelopt.agents import executor
-        from kernelopt.functions import csv_parser
+        from kernelopt import langgraph_pipeline  # noqa: F401
+        from kernelopt import memory  # noqa: F401
+        from kernelopt import state  # noqa: F401
+        from kernelopt.agents import planner  # noqa: F401
+        from kernelopt.agents import executor  # noqa: F401
+        from kernelopt.functions import csv_parser  # noqa: F401
 
         # If there were circular imports, this would fail
 
@@ -318,11 +319,11 @@ class TestCodeOrganization:
     def test_no_wildcard_imports(self):
         """Modules should avoid 'from X import *'."""
         modules_to_check = [
-            'kernelopt.graph',
-            'kernelopt.memory',
-            'kernelopt.state',
-            'kernelopt.agents.planner.tools',
-            'kernelopt.agents.executor.tools',
+            "kernelopt.langgraph_pipeline",
+            "kernelopt.memory",
+            "kernelopt.state",
+            "kernelopt.agents.planner.tools",
+            "kernelopt.agents.executor.tools",
         ]
 
         for module_name in modules_to_check:
@@ -435,9 +436,9 @@ class TestDocumentation:
 
     def test_modules_have_module_docstrings(self):
         """All modules should have module-level docstrings."""
-        from kernelopt import graph, memory, state
+        from kernelopt import langgraph_pipeline, memory, state
 
-        modules = [graph, memory, state]
+        modules = [langgraph_pipeline, memory, state]
 
         for module in modules:
             assert module.__doc__ is not None, f"{module.__name__} missing module docstring"
