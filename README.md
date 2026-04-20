@@ -9,25 +9,15 @@ Supports **Triton**, **CUDA**, and **Helion** kernels. Powered by **LangGraph** 
 ## Quick Start
 
 ```bash
-# 1. Run automated setup (installs everything you need)
-./setup_environment.py
+# 1. Install
+pip install -e "kernelopt/.[triton]"
 
-# 2. Load environment variables (IMPORTANT - run this in your current shell!)
-source .env
+# 2. Configure Vertex AI credentials
+kernelopt setup
 
 # 3. Optimize a kernel!
 CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 3 -N 4
 ```
-
-> **Important:** After running `setup_environment.py`, you MUST run `source .env` to load the configuration into your current shell session. The setup script will display this command prominently at the end.
->
-> **Note:** `setup_environment.py` is fully automated and end-to-end. It will:
-> - Detect if you're in a container/devcontainer (recommends containers for easier setup)
-> - Install kernelopt package if not already installed
-> - Install/configure gcloud CLI and authenticate
-> - Set up Vertex AI credentials
-> - Verify all dependencies (NCU, GPU, Python packages, procps-ng)
-> - Create `.env` configuration file (auto-loads in NEW shells, but you must source it manually for the current session)
 
 ---
 
@@ -427,33 +417,26 @@ The planner reads this memory to avoid dead ends and reinforce strategies that w
 
 ### Quick Setup (Recommended)
 
-**Fully automated setup** — just run the setup script:
+**One command after install:**
 
 ```bash
-# Step 1: Run the setup script
-python setup_environment.py
+# Step 1: Install
+pip install -e ".[triton]"
 
-# Step 2: Load environment variables in your current shell (IMPORTANT!)
-source .env
+# Step 2: Configure (interactive wizard — sets Vertex AI project, region, auth)
+kernelopt setup
 
-# Step 3: Test the installation
+# Step 3: Test
 CUDA_VISIBLE_DEVICES=0 kernelopt run tests_suite/fixtures/kernels/matmul_triton.py -T 1 -N 1
 ```
 
-The setup script will:
-- **Detect environment** (container vs bare metal, recommends containers)
-- **Install kernelopt package** with your choice of extras (triton/dev/both)
-- **Install gcloud CLI** if missing
-- **Authenticate** with Google Cloud
-- **Configure Vertex AI** (project ID, region)
-- **Verify dependencies** (NCU, GPU, Python packages, procps-ng)
-- **Create `.env` file** with your configuration
-- **Test installation** (verify CLI works)
-- **Add auto-load to shell** (`.zshrc`/`.bashrc` for future sessions)
+`kernelopt setup` will:
+- Prompt for your Google Cloud **project ID** and **region**
+- Save config to `~/.config/kernelopt/config.toml` (no manual `source` needed)
+- Check/run Google Cloud authentication (`gcloud auth application-default login`)
+- Verify GPU, NCU, and Vertex AI connectivity
 
-> **⚠️ Important:** After the setup script finishes, you MUST run `source .env` to activate the configuration in your current shell session. The setup script will display this command prominently at the end with the exact path.
->
-> **Container Recommendation:** The script will detect if you're on bare metal and recommend using the devcontainer for easier setup. All CUDA dependencies and system packages are pre-configured in the container.
+Run `kernelopt doctor` at any time to re-check your environment.
 
 ### Manual Setup (Advanced)
 
@@ -467,10 +450,8 @@ pip install -e ".[dev]"      # Development tools (pytest, ruff, mypy)
 cd ..
 
 # 2. Configure environment
-cp .env.example .env
-# Edit .env with your values:
-#   ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
-#   VERTEX_REGION=us-east5
+export ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
+export VERTEX_REGION=us-east5
 
 # 3. Set up authentication
 gcloud auth application-default login
@@ -505,7 +486,7 @@ Error: ANTHROPIC_VERTEX_PROJECT_ID environment variable not set
 source .env
 ```
 
-**Why?** The `setup_environment.py` script creates a `.env` file with your configuration, but it cannot automatically load it into your current shell session (Unix limitation). You must manually source it once. Future shell sessions will auto-load it (if you said "yes" to adding it to `.zshrc`/`.bashrc`).
+**Why?** You haven't run `kernelopt setup` yet, or `ANTHROPIC_VERTEX_PROJECT_ID` is not set. Run `kernelopt setup` to configure credentials, or set the env var manually.
 
 ---
 
