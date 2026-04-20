@@ -46,10 +46,10 @@ expects. For each input specify:
 - distribution: "randn" for most ops, "rand" for ops needing [0,1], "ones"/"zeros" for special cases
 
 ### atol / rtol
-Tolerances for torch.allclose:
-- FP32 element-wise: atol=1e-4, rtol=1e-3
-- FP32 reductions (softmax, layernorm, sum): atol=1e-2, rtol=1e-2
-- FP16/BF16: atol=1e-2, rtol=1e-1
+Tolerances for torch.allclose (matches torch.testing.assert_close defaults):
+- FP32 (element-wise or reductions): atol=1e-5, rtol=1.3e-6
+- FP16: atol=1e-3, rtol=1e-3
+- BF16: atol=1e-5, rtol=1.6e-2
 
 ### skip
 Set true ONLY if the operation cannot be tested automatically (custom RNG,

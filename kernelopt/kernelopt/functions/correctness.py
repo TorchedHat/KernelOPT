@@ -96,7 +96,7 @@ The harness must:
 4. Call the GPU kernel
 5. Copy results back to host
 6. Compute the expected result using a simple CPU reference (pure C math, no CUDA)
-7. Compare element-wise: if max absolute diff > 1e-3, print "Correctness: FAIL" and exit(1)
+7. Compare element-wise: if max absolute diff > 1e-5, print "Correctness: FAIL" and exit(1)
 8. Otherwise print "Correctness: PASS" and return 0
 
 The harness must be a single compilable .cu file with int main(). Do NOT use #include of
