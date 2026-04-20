@@ -104,11 +104,11 @@ class TestCLIExecution:
     """Test CLI execution flow."""
 
     def test_cli_entry_point_exists(self):
-        """Test CLI has main entry point."""
+        """Typer CLI exposes ``app`` (see ``[project.scripts]`` in pyproject)."""
         try:
             from kernelopt import cli
-            # Should have main() or similar
-            assert hasattr(cli, 'main') or hasattr(cli, '__main__')
+
+            assert hasattr(cli, "app"), "kernelopt.cli should define typer.Typer app"
         except ImportError:
             pytest.skip("CLI module not found")
 

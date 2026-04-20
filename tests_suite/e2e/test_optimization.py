@@ -50,7 +50,7 @@ class TestSingleIterationE2E:
         patch_build_llm(gpu_id)
 
         # Import pipeline after patching
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Configure for single iteration
         cfg = PipelineConfig(
@@ -74,7 +74,7 @@ class TestSingleIterationE2E:
         )
 
         # Run pipeline
-        final_state = run_pipeline(state)
+        final_state = run_langgraph_pipeline(state)
 
         # Verify outputs
         assert final_state.iteration >= 0
@@ -102,7 +102,7 @@ class TestMultiIterationE2E:
     ):
         """Test complete multi-iteration optimization."""
         from kernelopt.state import PipelineState, PipelineConfig
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Patch LLM
         patch_build_llm(gpu_id)
@@ -129,16 +129,20 @@ class TestMultiIterationE2E:
         )
 
         # Run pipeline
-        final_state = run_pipeline(state)
+        final_state = run_langgraph_pipeline(state)
 
         # Verify multiple iterations ran
         assert len(final_state.iteration_results) >= 1
         assert final_state.iteration >= 0
 
-        # Check stopping conditions were evaluated
-        # Either reached T iterations or stopped early
-        assert final_state.iteration < cfg.T or \
-               final_state.no_improvement_streak >= 2
+        # Check stopping conditions were evaluated (LangGraph: iteration counts
+        # completed cycles and may equal cfg.T after the last increment).
+        assert len(final_state.iteration_results) <= cfg.T
+        assert (
+            len(final_state.iteration_results) < cfg.T
+            or final_state.no_improvement_streak >= 2
+            or final_state.iteration >= cfg.T
+        )
 
     @pytest.mark.slow
     @pytest.mark.optimization
@@ -148,7 +152,7 @@ class TestMultiIterationE2E:
     ):
         """Test early stopping on no improvement."""
         from kernelopt.state import PipelineState, PipelineConfig
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Patch LLM
         patch_build_llm(gpu_id)
@@ -174,7 +178,7 @@ class TestMultiIterationE2E:
         )
 
         # Run pipeline
-        final_state = run_pipeline(state)
+        final_state = run_langgraph_pipeline(state)
 
         # May stop early (no_improvement_streak >= 2) or complete all iterations
         assert final_state.iteration >= 0
@@ -195,7 +199,7 @@ class TestOutputVerification:
     ):
         """Test that all expected output files are generated."""
         from kernelopt.state import PipelineState, PipelineConfig
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Patch LLM
         patch_build_llm(gpu_id)
@@ -221,7 +225,7 @@ class TestOutputVerification:
         )
 
         # Run pipeline
-        run_pipeline(state)
+        run_langgraph_pipeline(state)
 
         # Verify output directory exists
         assert output_path.exists()
@@ -245,7 +249,7 @@ class TestOutputVerification:
     ):
         """Test that optimization memory is persisted correctly."""
         from kernelopt.state import PipelineState, PipelineConfig
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Patch LLM
         patch_build_llm(gpu_id)
@@ -272,7 +276,7 @@ class TestOutputVerification:
         )
 
         # Run pipeline
-        final_state = run_pipeline(state)
+        final_state = run_langgraph_pipeline(state)
 
         # Verify memory file
         memory_file = output_path / "optimization_memory.json"
@@ -295,7 +299,7 @@ class TestOutputVerification:
     ):
         """Test that NCU profiling artifacts are generated."""
         from kernelopt.state import PipelineState, PipelineConfig
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Patch LLM
         patch_build_llm(gpu_id)
@@ -321,7 +325,7 @@ class TestOutputVerification:
         )
 
         # Run pipeline
-        run_pipeline(state)
+        run_langgraph_pipeline(state)
 
         # Check for baseline CSV
         csv_files = list(output_path.glob("*.csv"))
@@ -375,7 +379,7 @@ class TestPerformanceVerification:
     ):
         """Test that speedup is calculated correctly."""
         from kernelopt.state import PipelineState, PipelineConfig
-        from kernelopt.graph import run_pipeline
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
         # Patch LLM
         patch_build_llm(gpu_id)
@@ -401,7 +405,7 @@ class TestPerformanceVerification:
         )
 
         # Run pipeline
-        final_state = run_pipeline(state)
+        final_state = run_langgraph_pipeline(state)
 
         # Verify speedup calculation
         if final_state.iteration_results:
