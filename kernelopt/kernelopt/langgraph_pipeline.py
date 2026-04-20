@@ -949,6 +949,10 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     state.iteration_results = final.get("iteration_results", [])
     state.framework = final.get("framework", state.framework)
     state.ncu_config = final.get("ncu_config")
+    if "iteration" in final:
+        state.iteration = int(final["iteration"])
+    if "no_improvement_streak" in final:
+        state.no_improvement_streak = int(final["no_improvement_streak"])
 
     # Write final outputs
     output_dir = Path(cfg.output_dir)

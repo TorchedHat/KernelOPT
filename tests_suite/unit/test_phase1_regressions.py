@@ -78,7 +78,7 @@ class TestImportErrorRegression:
     Regression tests for import errors (Phase 1 Fix #2).
 
     ISSUE: 4 tests failing with "cannot import name 'run_planner'"
-    ROOT CAUSE: graph.py imported run_planner but it was renamed to run_planner_agent
+    ROOT CAUSE: legacy pipeline imported run_planner but it was renamed to run_planner_agent
     FIX: Added backwards compatibility wrapper that delegates to new API
     """
 
@@ -232,29 +232,23 @@ class TestMissingPathHandlingRegression:
             pass
 
 
-class TestBackwardsCompatibilityRegression:
-    """
-    Regression tests for backwards compatibility maintained in Phase 1.
+class TestPipelineModuleRegression:
+    """Regression tests for the production LangGraph pipeline module."""
 
-    Ensures that legacy code continues to work after refactoring.
-    """
+    def test_langgraph_pipeline_module_importable(self):
+        """Production pipeline module should be importable."""
+        from kernelopt import langgraph_pipeline as lgp
 
-    def test_graph_py_still_exists(self):
-        """Test that legacy graph.py still exists."""
-        from kernelopt import graph
+        assert lgp is not None
+        assert hasattr(lgp, "run_langgraph_pipeline")
+        assert hasattr(lgp, "build_graph")
 
-        # Should be importable
-        assert graph is not None
+    def test_langgraph_pipeline_has_module_docstring(self):
+        """LangGraph pipeline module should document its purpose."""
+        from kernelopt import langgraph_pipeline as lgp
 
-    def test_graph_py_has_deprecation_comment(self):
-        """Test that graph.py has deprecation notice."""
-        import inspect
-        from kernelopt import graph
-
-        source = inspect.getsource(graph)
-
-        # Should have deprecation comment
-        assert "legacy" in source.lower() or "deprecated" in source.lower() or "reference" in source.lower()
+        assert lgp.__doc__ is not None
+        assert len(lgp.__doc__.strip()) > 10
 
     def test_constants_used_instead_of_hardcoded_values(self):
         """Test that DEFAULT_MODEL constant is used instead of hardcoded strings."""
@@ -336,7 +330,7 @@ class TestPhase1Summary:
             "kernelopt/kernelopt/agents/planner/__init__.py",  # backwards compat
             "kernelopt/kernelopt/llm.py",  # nested thinking tags
             "kernelopt/kernelopt/functions/correctness.py",  # missing paths
-            "kernelopt/kernelopt/graph.py",  # deprecation comment
+            "kernelopt/kernelopt/langgraph_pipeline.py",  # LangGraph pipeline
         ]
 
         # 5 files modified
