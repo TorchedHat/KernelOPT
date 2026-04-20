@@ -108,7 +108,7 @@ def run_planner(
     previous_directions: list[str] | None = None,
 ) -> dict:
     """
-    Legacy API for single-plan generation (used by deprecated graph.py).
+    Legacy API for single-plan generation (tests and older call sites).
 
     This is a compatibility wrapper. New code should use run_planner_agent().
 

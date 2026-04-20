@@ -157,63 +157,66 @@ class TestNCUExecution:
 
 
 class TestNCUOutputParsing:
-    """Test NCU CSV output parsing."""
+    """Test NCU CSV output parsing (parse_ncu_csv expects a file path)."""
 
-    def test_parse_ncu_csv_basic(self):
+    def test_parse_ncu_csv_basic(self, tmp_path):
         """Test parsing basic NCU CSV output."""
         from kernelopt.functions.csv_parser import parse_ncu_csv
 
-        # Minimal NCU CSV format
-        ncu_csv_content = """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
+        csv_path = tmp_path / "ncu.csv"
+        csv_path.write_text(
+            """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
 "0","kernel","Duration","nsecond","1000.5"
 "0","kernel","Memory Bandwidth","Gbyte/second","100.2"
-"""
+""",
+            encoding="utf-8",
+        )
 
-        sections, rules, launch = parse_ncu_csv(ncu_csv_content)
+        sections, rules, launch = parse_ncu_csv(str(csv_path))
 
-        # Should parse successfully
         assert sections is not None or rules is not None
 
-    def test_parse_empty_ncu_csv(self):
-        """Test parsing empty NCU CSV."""
+    def test_parse_empty_ncu_csv(self, tmp_path):
+        """Empty file: parser may return empties or raise."""
         from kernelopt.functions.csv_parser import parse_ncu_csv
 
-        empty_csv = ""
+        csv_path = tmp_path / "empty.csv"
+        csv_path.write_text("", encoding="utf-8")
 
         try:
-            sections, rules, launch = parse_ncu_csv(empty_csv)
-            # May return empty results or raise
+            sections, rules, launch = parse_ncu_csv(str(csv_path))
             assert sections is not None or True
         except Exception:
-            # Empty CSV may raise exception
             pass
 
-    def test_parse_corrupted_ncu_csv(self):
-        """Test parsing corrupted NCU CSV."""
+    def test_parse_corrupted_ncu_csv(self, tmp_path):
+        """Corrupted CSV may raise or return partial data."""
         from kernelopt.functions.csv_parser import parse_ncu_csv
 
-        corrupted_csv = "Not,A,Valid,CSV\nFormat"
+        csv_path = tmp_path / "bad.csv"
+        csv_path.write_text("Not,A,Valid,CSV\nFormat", encoding="utf-8")
 
         try:
-            sections, rules, launch = parse_ncu_csv(corrupted_csv)
-            # May handle gracefully or raise
+            sections, rules, launch = parse_ncu_csv(str(csv_path))
             assert sections is not None or True
         except Exception:
-            # Corrupted CSV may raise exception
             pass
 
-    def test_parse_multiple_kernels_csv(self):
+    def test_parse_multiple_kernels_csv(self, tmp_path):
         """Test parsing NCU CSV with multiple kernels."""
         from kernelopt.functions.csv_parser import parse_ncu_csv
 
-        multi_kernel_csv = """"ID","Kernel Name","Metric Name","Metric Value"
+        csv_path = tmp_path / "multi.csv"
+        csv_path.write_text(
+            """"ID","Kernel Name","Metric Name","Metric Value"
 "0","kernel1","Duration","1000"
 "1","kernel2","Duration","2000"
-"""
+""",
+            encoding="utf-8",
+        )
 
-        sections, rules, launch = parse_ncu_csv(multi_kernel_csv)
+        sections, rules, launch = parse_ncu_csv(str(csv_path))
 
-        # Should handle multiple kernels
         assert sections is not None or rules is not None
 
 

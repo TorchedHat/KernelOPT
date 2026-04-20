@@ -36,16 +36,6 @@ class TestCorrectness:
         assert passed is True
         assert msg != ""
 
-    @pytest.mark.skip(reason="_extract_kernel_function is private/removed - test public API only")
-    def test_extract_kernel_function_triton(self):
-        """Test extracting kernel function from Triton code."""
-        pass
-
-    @pytest.mark.skip(reason="_extract_kernel_function is private/removed - test public API only")
-    def test_extract_kernel_function_cuda(self):
-        """Test extracting kernel function from CUDA code."""
-        pass
-
     def test_correctness_check_invalid_framework(self, test_kernel_path):
         """Test correctness check with invalid framework."""
         from kernelopt.functions.correctness import check_correctness_subprocess
