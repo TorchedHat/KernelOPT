@@ -181,7 +181,6 @@ def check_documentation() -> bool:
     docs = [
         ("README.md", "Main test README"),
         ("fixtures/README.md", "Fixtures documentation"),
-        (".env.example", "Environment configuration template"),
     ]
 
     for file_name, description in docs:

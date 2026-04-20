@@ -450,10 +450,8 @@ pip install -e ".[dev]"      # Development tools (pytest, ruff, mypy)
 cd ..
 
 # 2. Configure environment
-cp .env.example .env
-# Edit .env with your values:
-#   ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
-#   VERTEX_REGION=us-east5
+export ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
+export VERTEX_REGION=us-east5
 
 # 3. Set up authentication
 gcloud auth application-default login
