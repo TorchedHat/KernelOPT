@@ -153,7 +153,7 @@ def run(
         help="Google Cloud project ID for Vertex AI"
     ),
     region: str = typer.Option(
-        "us-east5", "--region", help="Vertex AI region"
+        "us-east5", "--region", envvar="VERTEX_REGION", help="Vertex AI region"
     ),
     planner_model: Optional[str] = typer.Option(
         None, "--planner-model", help="Model for planner agent"
@@ -194,6 +194,18 @@ def run(
     Example:
         kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
     """
+    from kernelopt.config import load_config as _load_config
+    _file_cfg = _load_config().get("vertex", {})
+    if not project_id:
+        project_id = _file_cfg.get("project_id") or ""
+    if (
+        ctx.get_parameter_source("region") not in (
+            ParameterSource.COMMANDLINE, ParameterSource.ENVIRONMENT
+        )
+        and _file_cfg.get("region")
+    ):
+        region = _file_cfg["region"]
+
     from kernelopt.checkpoint import load_checkpoint_file, pipeline_config_from_checkpoint_dict
     from kernelopt.state import PipelineConfig, PipelineState
 
