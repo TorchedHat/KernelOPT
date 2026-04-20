@@ -555,6 +555,90 @@ def kernels(
 
 
 @app.command()
+def setup():
+    """Interactive wizard — configure Vertex AI credentials and verify environment."""
+    import shutil
+    import subprocess as _sp
+
+    from rich.table import Table
+
+    from kernelopt.config import config_path, load_config, save_config
+    from kernelopt.functions.setup import (
+        check_auth,
+        check_gpu,
+        check_ncu,
+        check_vertex_connection,
+    )
+
+    console.print("\n[bold green]kernelopt setup[/]\n")
+    console.print("Configures Vertex AI and verifies your environment.\n")
+
+    existing = load_config().get("vertex", {})
+    default_project = (
+        os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") or existing.get("project_id") or ""
+    )
+    default_region = (
+        os.environ.get("VERTEX_REGION") or existing.get("region") or "us-east5"
+    )
+
+    if default_project:
+        project_id = typer.prompt("Google Cloud project ID", default=default_project)
+    else:
+        project_id = typer.prompt("Google Cloud project ID")
+
+    region = typer.prompt("Vertex AI region", default=default_region)
+
+    path = save_config(project_id, region)
+    console.print(f"\n[green]✓[/] Config saved → [cyan]{path}[/]\n")
+
+    console.print("[bold]Checking authentication...[/]")
+    auth_ok, auth_msg = check_auth()
+    if auth_ok:
+        console.print(f"[green]✓[/] {auth_msg}")
+    else:
+        console.print(f"[yellow]⚠[/] {auth_msg}")
+        if shutil.which("gcloud"):
+            console.print("\nLaunching: gcloud auth application-default login")
+            try:
+                _sp.run(["gcloud", "auth", "application-default", "login"], check=True)
+                auth_ok, auth_msg = check_auth()
+                if auth_ok:
+                    console.print("[green]✓[/] Authenticated")
+                else:
+                    console.print("[red]✗[/] Auth failed after gcloud login")
+            except _sp.CalledProcessError:
+                console.print("[red]✗[/] gcloud auth failed")
+        else:
+            console.print("\nOptions to set up credentials:")
+            console.print("  • Install gcloud: https://cloud.google.com/sdk/docs/install")
+            console.print("    Then run: gcloud auth application-default login")
+            console.print("  • Or set: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json")
+
+    console.print("\n[bold]Verifying environment...[/]\n")
+
+    t = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    t.add_column("Check", style="dim", min_width=22)
+    t.add_column("Status", justify="center", min_width=6)
+    t.add_column("Detail")
+
+    def _row(label: str, ok: bool, detail: str) -> None:
+        t.add_row(label, "[green]✓[/]" if ok else "[red]✗[/]", detail)
+
+    ok, msg = check_gpu()
+    _row("GPU", ok, msg)
+
+    ok, msg = check_ncu()
+    _row("NCU binary", ok, msg)
+
+    if auth_ok:
+        ok, msg = check_vertex_connection(project_id, region)
+        _row("Vertex AI", ok, msg)
+
+    console.print(t)
+    console.print(f"\n[bold green]Ready![/] Run: [cyan]kernelopt run <kernel.py>[/]")
+
+
+@app.command()
 def doctor():
     """Check environment health — config, credentials, GPU, NCU, Vertex AI."""
     from rich.table import Table
