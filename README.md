@@ -627,8 +627,7 @@ All artifact paths below are relative to that **run directory**:
 kernelopt/
 ├── kernelopt/
 │   ├── cli.py                   # Typer CLI entry point
-│   ├── graph.py                 # Imperative pipeline (reference impl)
-│   ├── langgraph_pipeline.py    # LangGraph pipeline (active impl)
+│   ├── langgraph_pipeline.py    # LangGraph optimization pipeline
 │   ├── state.py                 # PipelineConfig, PipelineState, GraphState, PlanCandidate, IterationResult
 │   ├── memory.py                # Bounded experience queue
 │   ├── checkpoint.py            # Resume checkpoints (--memory run dir)

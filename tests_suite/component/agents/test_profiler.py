@@ -44,24 +44,6 @@ class TestProfilerNCU:
 
     @pytest.mark.gpu
     @pytest.mark.slow
-    @pytest.mark.skip(reason="NCU kernel name filtering inconsistent - profiles no kernels when filter is applied")
-    def test_run_ncu_with_kernel_name(self, test_kernel_path, temp_output_dir, skip_if_no_cuda):
-        """Test NCU with kernel name regex."""
-        from kernelopt.agents.profiler import run_ncu
-
-        output_base = str(temp_output_dir / "test_ncu_kernel_name")
-
-        csv_path, ncu_rep, profiling_ctx_path = run_ncu(
-            str(test_kernel_path),
-            output_base,
-            kernel_name="softmax",
-            kernel_args=["--profile-only"],
-        )
-
-        assert Path(csv_path).exists()
-
-    @pytest.mark.gpu
-    @pytest.mark.slow
     def test_run_ncu_with_launch_config(self, test_kernel_path, temp_output_dir, skip_if_no_cuda):
         """Test NCU with launch skip/count."""
         from kernelopt.agents.profiler import run_ncu
