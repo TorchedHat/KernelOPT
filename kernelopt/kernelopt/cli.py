@@ -554,6 +554,64 @@ def kernels(
     console.print(t)
 
 
+@app.command()
+def doctor():
+    """Check environment health — config, credentials, GPU, NCU, Vertex AI."""
+    from rich.table import Table
+
+    from kernelopt.config import config_path, load_config
+    from kernelopt.functions.setup import (
+        check_auth,
+        check_gpu,
+        check_ncu,
+        check_python_version,
+        check_vertex_connection,
+    )
+
+    cfg = load_config().get("vertex", {})
+    project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") or cfg.get("project_id", "")
+    region = os.environ.get("VERTEX_REGION") or cfg.get("region", "")
+
+    t = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    t.add_column("Check", style="dim", min_width=22)
+    t.add_column("Status", justify="center", min_width=6)
+    t.add_column("Detail")
+
+    all_ok = True
+
+    def _row(label: str, ok: bool, detail: str) -> None:
+        nonlocal all_ok
+        if not ok:
+            all_ok = False
+        t.add_row(label, "[green]✓[/]" if ok else "[red]✗[/]", detail)
+
+    cp = config_path()
+    _row("Config file", cp.exists(), str(cp) if cp.exists() else "not found — run: kernelopt setup")
+    _row("project_id", bool(project_id), project_id or "not set — run: kernelopt setup")
+    _row("region", bool(region), region or "not set — run: kernelopt setup")
+
+    ok, msg = check_python_version()
+    _row("Python", ok, msg)
+
+    ok, msg = check_auth()
+    _row("Auth credentials", ok, msg)
+
+    ok, msg = check_gpu()
+    _row("GPU", ok, msg)
+
+    ok, msg = check_ncu()
+    _row("NCU binary", ok, msg)
+
+    if project_id and region:
+        ok, msg = check_vertex_connection(project_id, region)
+        _row("Vertex AI", ok, msg)
+    else:
+        _row("Vertex AI", False, "skipped — project_id or region not set")
+
+    console.print(t)
+    raise typer.Exit(0 if all_ok else 1)
+
+
 def _print_profile(ctx: dict) -> None:
     """Rich-formatted profile summary."""
     from rich.table import Table
