@@ -146,7 +146,7 @@ def main():
         Y_triton = run_flash_attention(Q, K, V)
         Y_torch = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
         
-        if torch.allclose(Y_triton, Y_torch, atol=1e-2, rtol=1e-2):
+        if torch.allclose(Y_triton, Y_torch, atol=1e-3, rtol=1e-3):
             print("✓ Correctness passed")
         else:
             max_err = (Y_triton - Y_torch).abs().max().item()
