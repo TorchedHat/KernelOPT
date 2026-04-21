@@ -56,7 +56,7 @@ def test_has_builtin_self_test_returns_false_for_kernel_without_main():
     assert _has_builtin_self_test(WITHOUT_SELF_TEST) is False
 
 
-def test_has_builtin_self_test_returns_false_for_kernel_without_main():
+def test_has_builtin_self_test_returns_false_for_kernel_only():
     assert _has_builtin_self_test(KERNEL_ONLY) is False
 
 
