@@ -234,3 +234,85 @@ def test_check_correctness_python_kernel_uses_agentic_path():
         )
     mock_agent.assert_called_once()
     assert passed is True
+
+
+# ---------------------------------------------------------------------------
+# TestCudaAgenticCorrectness: matmul_cuda.cu end-to-end (mocked LLM)
+# ---------------------------------------------------------------------------
+
+FIXTURE_DIR = Path(__file__).parent.parent.parent / "fixtures" / "kernels"
+MATMUL_CU = FIXTURE_DIR / "matmul_cuda.cu"
+
+
+class TestCudaAgenticCorrectness:
+    """Exercise the _check_cuda_with_llm_reference path on a real kernel-only fixture."""
+
+    def _make_passing_harness_llm(self):
+        """Mock LLM that returns a harness which exits 0."""
+        from kernelopt.agents.schemas import CudaCorrectnessSpec
+        spec = CudaCorrectnessSpec(
+            test_harness_code="#include<stdio.h>\nint main(){return 0;}",
+        )
+        mock_structured = MagicMock()
+        mock_structured.invoke.return_value = spec
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        return mock_llm
+
+    def _make_failing_harness_llm(self):
+        """Mock LLM that returns a harness which exits 1 with diagnostic output."""
+        from kernelopt.agents.schemas import CudaCorrectnessSpec
+        spec = CudaCorrectnessSpec(
+            test_harness_code=(
+                "#include<stdio.h>\nint main(){"
+                "printf(\"index=0 expected=1.000000 got=2.000000 maxdiff=1.000000\\n\");"
+                "return 1;}"
+            ),
+        )
+        mock_structured = MagicMock()
+        mock_structured.invoke.return_value = spec
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        return mock_llm
+
+    def test_fixture_has_no_main(self):
+        """matmul_cuda.cu must not contain int main() — otherwise it bypasses the agentic path."""
+        source = MATMUL_CU.read_text()
+        assert _has_builtin_self_test(source) is False
+
+    def test_correct_kernel_passes_with_mocked_llm(self):
+        """A correct kernel + LLM harness that exits 0 → (True, ...)."""
+        source = MATMUL_CU.read_text()
+        compile_ok = MagicMock(returncode=0, stdout="", stderr="")
+        run_ok = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("kernelopt.functions.correctness.build_llm", return_value=self._make_passing_harness_llm()), \
+             patch("subprocess.run", side_effect=[compile_ok, run_ok]), \
+             patch("pathlib.Path.unlink"):
+            passed, msg = check_correctness(
+                str(MATMUL_CU), source, "cuda",
+                use_agentic=True, model="unused", project_id=None, region=None,
+            )
+
+        assert passed is True, f"Expected pass, got: {msg}"
+
+    def test_broken_kernel_fails_with_mocked_llm(self):
+        """LLM harness that exits 1 (numerical mismatch) → (False, ...)."""
+        source = MATMUL_CU.read_text()
+        compile_ok = MagicMock(returncode=0, stdout="", stderr="")
+        run_fail = MagicMock(
+            returncode=1,
+            stdout="index=0 expected=1.000000 got=2.000000 maxdiff=1.000000\n",
+            stderr="",
+        )
+
+        with patch("kernelopt.functions.correctness.build_llm", return_value=self._make_failing_harness_llm()), \
+             patch("subprocess.run", side_effect=[compile_ok, run_fail]), \
+             patch("pathlib.Path.unlink"):
+            passed, msg = check_correctness(
+                str(MATMUL_CU), source, "cuda",
+                use_agentic=True, model="unused", project_id=None, region=None,
+            )
+
+        assert passed is False
+        assert "exit 1" in msg or "failed" in msg.lower()
