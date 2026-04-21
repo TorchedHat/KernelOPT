@@ -36,9 +36,6 @@ __global__ void add(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = a[i] + b[i];
 }
-int main() {
-    return 0;
-}
 """
 
 KERNEL_ONLY = """\
@@ -55,7 +52,7 @@ def test_has_builtin_self_test_detects_pass_printf():
     assert _has_builtin_self_test(WITH_PASS_PRINTF) is True
 
 
-def test_has_builtin_self_test_returns_false_for_bare_kernel():
+def test_has_builtin_self_test_returns_false_for_kernel_without_main():
     assert _has_builtin_self_test(WITHOUT_SELF_TEST) is False
 
 
