@@ -157,6 +157,23 @@ def test_check_cuda_with_llm_reference_fail():
     assert passed is False
 
 
+def test_check_cuda_with_llm_reference_passes_on_exit_zero_without_pass_string():
+    """Exit code 0 is sufficient — no 'PASS' string required."""
+    mock_llm = _make_mock_llm_with_spec(
+        "#include<stdio.h>\nint main(){printf(\"All done.\\n\");return 0;}"
+    )
+    compile_ok = MagicMock(returncode=0, stdout="", stderr="")
+    run_ok = MagicMock(returncode=0, stdout="All done.\n", stderr="")
+    with patch("kernelopt.functions.correctness.build_llm", return_value=mock_llm), \
+         patch("subprocess.run", side_effect=[compile_ok, run_ok]), \
+         patch("pathlib.Path.unlink"):
+        passed, msg = _check_cuda_with_llm_reference(
+            cu_source=SIMPLE_CUDA_SOURCE, kernel_path="/tmp/scale.cu",
+            api_key=None, model="unused", project_id=None, region=None,
+        )
+    assert passed is True, f"Expected pass but got: {msg}"
+
+
 def test_check_cuda_with_llm_reference_skip():
     mock_llm = _make_mock_llm_with_spec("", skip=True, skip_reason="custom RNG")
     with patch("kernelopt.functions.correctness.build_llm", return_value=mock_llm):
