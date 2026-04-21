@@ -44,11 +44,13 @@ __global__ void softmax(float* x, int N) {
 """
 
 
-def test_has_builtin_self_test_detects_check_correctness_function():
+def test_has_builtin_self_test_true_when_main_present():
+    # WITH_CHECK_FN has int main() — detection is by main(), not the function name
     assert _has_builtin_self_test(WITH_CHECK_FN) is True
 
 
-def test_has_builtin_self_test_detects_pass_printf():
+def test_has_builtin_self_test_true_for_source_with_main_and_pass_printf():
+    # WITH_PASS_PRINTF has int main() — detection is by main(), not the printf strings
     assert _has_builtin_self_test(WITH_PASS_PRINTF) is True
 
 
