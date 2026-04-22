@@ -238,11 +238,10 @@ def run_ncu(
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=600, env=prof_env
     )
-    # Stream NCU stdout to terminal so profiling progress is visible
     if result.stdout:
-        import sys
-        sys.stdout.write(result.stdout)
-        sys.stdout.flush()
+        from kernelopt.pipeline_ui import emit_profiler_output
+
+        emit_profiler_output(result.stdout)
 
     ncu_rep_path = f"{output_basename}.ncu-rep"
 
@@ -262,12 +261,12 @@ def run_ncu(
             kernel_filter = next(
                 cmd[i + 1] for i, a in enumerate(cmd) if a == "--kernel-name"
             )
-            import sys as _sys
-            _sys.stdout.write(
+            from kernelopt.pipeline_ui import emit_profiler_output
+
+            emit_profiler_output(
                 f"[profiler] --kernel-name {kernel_filter!r} matched 0 kernels — "
                 f"retrying without filter to capture all kernels.\n"
             )
-            _sys.stdout.flush()
             # Strip --kernel-name and its value from the command and retry.
             retry_cmd = [
                 a for i, a in enumerate(cmd)
@@ -277,8 +276,7 @@ def run_ncu(
                 retry_cmd, capture_output=True, text=True, timeout=600, env=prof_env
             )
             if result.stdout:
-                _sys.stdout.write(result.stdout)
-                _sys.stdout.flush()
+                emit_profiler_output(result.stdout)
             if result.returncode != 0:
                 raise RuntimeError(
                     f"NCU profiling failed on retry (exit {result.returncode}):\n"
