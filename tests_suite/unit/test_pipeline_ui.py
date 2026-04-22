@@ -18,11 +18,11 @@ def test_plain_from_rich_string_strips_markup():
     assert out.strip() == "Hello world"
 
 
-def test_pipeline_config_has_hud_tty_default():
+def test_pipeline_config_has_hud_default_off():
     from kernelopt.state import PipelineConfig
 
     c = PipelineConfig()
-    assert c.hud_tty is None
+    assert c.hud is False
 
 
 def test_pipeline_state_has_pre_run_snapshot_default():
