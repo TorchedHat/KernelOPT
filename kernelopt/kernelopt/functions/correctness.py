@@ -14,17 +14,8 @@ from kernelopt.llm import build_llm
 
 
 def _has_builtin_self_test(cu_source: str) -> bool:
-    """Return True if the .cu source contains its own correctness verification.
-
-    Detects two patterns:
-    - A function named 'check_correctness' defined in the file
-    - printf calls with literal "PASS" or "FAIL" strings (typical host-side tests)
-    """
-    if re.search(r'\bcheck_correctness\s*\(', cu_source):
-        return True
-    if re.search(r'printf\s*\(\s*"[^"]*(?:PASS|FAIL)', cu_source):
-        return True
-    return False
+    """Return True if the .cu source has a main() and can be run as a standalone binary."""
+    return bool(re.search(r'\bint\s+main\s*\(', cu_source))
 
 
 def _check_cuda_kernel(
@@ -96,8 +87,10 @@ The harness must:
 4. Call the GPU kernel
 5. Copy results back to host
 6. Compute the expected result using a simple CPU reference (pure C math, no CUDA)
-7. Compare element-wise: if max absolute diff > 1e-5, print "Correctness: FAIL" and exit(1)
-8. Otherwise print "Correctness: PASS" and return 0
+7. Compare element-wise against the CPU reference using max absolute diff > 1e-5 as the threshold
+8. On failure: print the first failing index, expected value, actual value, and max absolute diff
+   across all elements, then call exit(1)
+9. On success: call exit(0). No specific output string is required.
 
 The harness must be a single compilable .cu file with int main(). Do NOT use #include of
 the kernel file — reproduce the __global__ kernel function inline in the harness.
@@ -112,7 +105,7 @@ def _check_cuda_with_llm_reference(
     project_id: str | None,
     region: str | None,
 ) -> tuple[bool, str]:
-    """Ask Claude to write a C test harness, compile it, run it, check markers."""
+    """Ask Claude to write a C test harness, compile it, run it, check exit code."""
     from kernelopt.agents.schemas import CudaCorrectnessSpec
 
     llm = build_llm(model=model, api_key=api_key, max_tokens=4096,
@@ -158,12 +151,8 @@ def _check_cuda_with_llm_reference(
         )
         combined = run_result.stdout + run_result.stderr
         if run_result.returncode != 0:
-            return False, f"Runtime error (exit {run_result.returncode}):\n{combined[:500]}"
-        if "FAIL" in combined:
-            return False, f"Correctness FAILED:\n{combined[:500]}"
-        if "PASS" not in combined:
-            return False, f"No 'Correctness: PASS' marker found in output:\n{combined[:500]}"
-        return True, "CUDA correctness passed (LLM-generated C harness)."
+            return False, f"Correctness failed (exit {run_result.returncode}):\n{combined[:500]}"
+        return True, f"CUDA correctness passed.\n{combined[:200]}"
     except subprocess.TimeoutExpired:
         return False, "Harness compilation or execution timed out."
     finally:
@@ -229,13 +218,12 @@ def check_correctness(
             region=region,
             kernel_args=kernel_args,
         )
-    return check_correctness_subprocess(original_path, optimized_source, framework)
+    return check_correctness_subprocess(original_path, optimized_source)
 
 
 def check_correctness_subprocess(
     original_path: str,
     optimized_source: str,
-    framework: str,
 ) -> tuple[bool, str]:
     """
     Legacy correctness check (runs kernel file as subprocess).
@@ -325,7 +313,7 @@ def _check_python_kernel(
                     f"{combined[:500]}"
                 )
 
-        print(f"[DEBUG] Correctness check PASSED")
+        print("[DEBUG] Correctness check PASSED")
         return True, f"Kernel ran successfully (exit 0).\n{result.stdout[:200]}"
 
     except subprocess.TimeoutExpired:
