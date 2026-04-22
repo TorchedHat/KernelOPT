@@ -9,6 +9,7 @@ Graph:
 
 from __future__ import annotations
 
+import difflib
 import shutil
 import string
 import uuid
@@ -1014,6 +1015,55 @@ def _best_direction_for_latency(
     return "baseline"
 
 
+def _baseline_kernel_text_for_log(state: PipelineState) -> str:
+    """Original kernel source for optimization_log diff (unchanged from run start)."""
+    src = state.kernel_source or ""
+    if src.strip():
+        return src
+    if state.kernel_path:
+        try:
+            return Path(state.kernel_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return ""
+
+
+def _kernel_diff_log_lines(
+    state: PipelineState,
+    ext: str,
+    *,
+    max_diff_chars: int = 800_000,
+) -> list[str]:
+    """Markdown fragment: unified diff best_kernel vs baseline for optimization_log.md."""
+    baseline = _baseline_kernel_text_for_log(state)
+    best = state.best_kernel or ""
+    a = baseline.splitlines()
+    b = best.splitlines()
+    body = "\n".join(
+        difflib.unified_diff(
+            a,
+            b,
+            fromfile="baseline_kernel",
+            tofile="best_kernel",
+            n=3,
+        )
+    )
+    out: list[str] = ["\n## Best kernel vs baseline (diff)\n\n"]
+    if not body.strip():
+        out.append(
+            "_No textual differences between baseline and best kernel "
+            "(or baseline source was unavailable)._ \n\n"
+        )
+        return out
+    if len(body) > max_diff_chars:
+        body = (
+            body[:max_diff_chars]
+            + f"\n\n... (diff truncated; see `best_kernel{ext}` in this output folder.)\n"
+        )
+    out.extend(["```diff\n", body, "\n```\n\n"])
+    return out
+
+
 def _write_final_outputs(
     state: PipelineState,
     output_dir: Path,
@@ -1266,6 +1316,8 @@ def _write_final_outputs(
         f"\nFinal best: {best_ns_display} ns  ({overall_speedup:.4f}×)\n",
         "```\n\n",
     ]
+
+    lines += _kernel_diff_log_lines(state, ext)
 
     # ── Config ──────────────────────────────────────────────────────────────
     cfg = state.config
