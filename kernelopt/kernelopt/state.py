@@ -82,8 +82,8 @@ class PipelineConfig:
     # Runtime
     verbose: bool = False
     agentic_correctness: bool = True  # Use Claude to generate CPU reference tests
-    # Rich Live HUD on a *second* terminal only (--hud-tty / KERNELOPT_HUD_TTY); main tty stays full log
-    hud_tty: str | None = None
+    # Same-terminal HUD (--hud); full stream + NCU text → kernelopt_terminal.log; not in checkpoint
+    hud: bool = False
 
     # Profiler agent
     profile_hints: str = ""
