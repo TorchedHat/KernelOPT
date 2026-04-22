@@ -9,6 +9,8 @@ Graph:
 
 from __future__ import annotations
 
+import difflib
+import shutil
 import string
 import uuid
 from pathlib import Path
@@ -36,11 +38,22 @@ from kernelopt.checkpoint import (
     load_checkpoint_file,
     save_checkpoint,
 )
+from kernelopt.iteration_metric_deltas import (
+    LOG_METRIC_ALTERNATIVES as _LOG_METRIC_ALTERNATIVES,
+    LOG_METRIC_COMPARISON_ROWS,
+    delta_cell as _delta_cell,
+    duration_ns_display as _duration_ns_display,
+    metric_numeric as _metric_numeric,
+    metric_value_str as _m,
+    metric_value_str_any as _m_any,
+)
 from kernelopt.memory import append_items, load_memory, save_memory, select_top_k
 from kernelopt.pipeline_ui import (
+    HUD_TERMINAL_LOG_NAME,
+    get_hud_log_console,
     get_pipeline_ui,
     pipe_print,
-    run_hud_session,
+    run_primary_hud_session,
 )
 from kernelopt.state import (
     GraphState,
@@ -503,6 +516,31 @@ def profile_candidates(state: GraphState) -> dict:
             c.latency_ns = float("inf")
             c.speedup = 0.0
 
+    if ui and getattr(ui, "is_hud_sink", False):
+        try:
+            try:
+                term_cols = max(40, int(shutil.get_terminal_size().columns))
+            except OSError:
+                term_cols = 100
+            _bl = state.get("baseline_latency_ns", float("inf"))
+            try:
+                _bl_f = float(_bl)
+            except (TypeError, ValueError):
+                _bl_f = float("inf")
+            _bl_arg = (
+                _bl_f
+                if _bl_f == _bl_f and 0 < _bl_f < float("inf")
+                else None
+            )
+            ui.set_plan_delta_from_profile(
+                state.get("baseline_profiling_context") or {},
+                candidates,
+                baseline_latency_ns=_bl_arg,
+                terminal_columns=term_cols,
+            )
+        except Exception:
+            pass
+
     return {"candidates": candidates}
 
 
@@ -655,8 +693,8 @@ def select_best_candidate(state: GraphState) -> dict:
         )
         t.add_row(c.direction, speedup_str, correct, "Y" if is_best else "")
 
-    console.print(t)
-    if ui and ui.is_split_hud:
+    (get_hud_log_console() or console).print(t)
+    if ui and ui.is_hud_sink:
         summary_bits = [
             f"{c.plan_letter}: "
             f"{'%.2fx' % c.speedup if c.latency_ns < float('inf') else 'fail'}"
@@ -929,13 +967,17 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     else:
         initial = _build_fresh_initial(state, cfg, ext)
 
-    hud_path = (cfg.hud_tty or "").strip()
-    if hud_path:
-        with run_hud_session(hud_path) as hud:
+    watch_dir = Path(cfg.output_dir)
+    watch_dir.mkdir(parents=True, exist_ok=True)
+    log_path = watch_dir / HUD_TERMINAL_LOG_NAME
+
+    if cfg.hud:
+        with run_primary_hud_session(log_path) as hud:
             if state.pre_run_system_snapshot:
                 hud.set_pre_run_system_snapshot(state.pre_run_system_snapshot)
             hud.seed_from_graph(initial)
             final = graph.invoke(initial)
+        pipe_print(f"\n  [dim]HUD:[/] full terminal stream was appended to [cyan]{log_path}[/]")
     else:
         final = graph.invoke(initial)
 
@@ -962,119 +1004,6 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     return state
 
 
-def _fmt_metric(entry: dict) -> str | None:
-    """Format a single NCU metric dict, or None if unusable."""
-    if not isinstance(entry, dict):
-        return None
-    val = entry.get("value")
-    unit = (entry.get("unit") or "").strip()
-    if val is None or (isinstance(val, float) and val != val):  # NaN
-        return None
-    if isinstance(val, float):
-        return f"{val:.2f} {unit}".strip() if unit else f"{val:.2f}"
-    return f"{val} {unit}".strip() if unit else str(val)
-
-
-def _m(ctx: dict, section: str, metric: str, default: str = "—") -> str:
-    """Safely extract a metric value from a profiling context."""
-    try:
-        entry = ctx["sections"][section][metric]
-        out = _fmt_metric(entry)
-        return out if out is not None else default
-    except (KeyError, TypeError):
-        return default
-
-
-# NCU CSV places some metrics under different sections/names across tool versions.
-_LOG_METRIC_ALTERNATIVES: dict[str, list[tuple[str, str]]] = {
-    "DRAM Throughput (%)": [
-        ("GPU Speed Of Light Throughput", "DRAM Throughput"),
-        ("Memory Workload Analysis", "DRAM Throughput"),
-    ],
-    "IPC Active": [
-        ("Compute Workload Analysis", "Executed Ipc Active"),
-        ("Compute Workload Analysis", "Issued Ipc Active"),
-        ("Instruction Statistics", "IPC Active"),
-    ],
-}
-
-
-def _m_any(ctx: dict, alternatives: list[tuple[str, str]], default: str = "—") -> str:
-    """Like _m but try several (section, metric) pairs (first hit wins)."""
-    for section, metric in alternatives:
-        try:
-            entry = ctx["sections"][section][metric]
-            out = _fmt_metric(entry)
-            if out is not None:
-                return out
-        except (KeyError, TypeError):
-            continue
-    return default
-
-
-def _duration_ns_display(ctx: dict) -> str:
-    """Format kernel duration from profiling context as integer nanoseconds."""
-    from kernelopt.agents.profiler.context_builder import get_latency_ns
-
-    v = get_latency_ns(ctx)
-    if v == float("inf") or v != v:
-        return "—"
-    return f"{v:.0f} ns"
-
-
-def _metric_numeric(
-    ctx: dict,
-    label: str,
-    section: str,
-    metric: str,
-    alts: list[tuple[str, str]] | None,
-) -> float | None:
-    """Parse a comparable float for delta computation; None if missing."""
-    if label == "Duration (ns)":
-        from kernelopt.agents.profiler.context_builder import get_latency_ns
-
-        v = get_latency_ns(ctx)
-        if v == float("inf") or v != v:
-            return None
-        return float(v)
-    if alts:
-        for s, m in alts:
-            try:
-                raw = ctx["sections"][s][m].get("value")
-                if raw is None or (isinstance(raw, float) and raw != raw):
-                    continue
-                return float(raw)
-            except (KeyError, TypeError, ValueError):
-                continue
-        return None
-    try:
-        raw = ctx["sections"][section][metric]["value"]
-        if raw is None or (isinstance(raw, float) and raw != raw):
-            return None
-        return float(raw)
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _delta_cell(label: str, base_v: float | None, cand_v: float | None) -> str:
-    """Human-readable delta vs baseline for one metric row."""
-    if base_v is None or cand_v is None:
-        return "—"
-    d = cand_v - base_v
-    if label == "Duration (ns)":
-        rel_pct = (cand_v / base_v - 1.0) * 100.0 if base_v else 0.0
-        return f"{d:+.0f} ns ({rel_pct:+.1f}%)"
-    if label.endswith("(%)") or "Occupancy" in label:
-        return f"{d:+.2f} pp"
-    if label == "Registers/Thread":
-        return f"{d:+.0f}"
-    if label == "Waves/SM":
-        return f"{d:+.2f}"
-    if label == "IPC Active":
-        return f"{d:+.2f}"
-    return f"{d:+.2f}"
-
-
 def _best_direction_for_latency(
     state: PipelineState, latency_ns: float, tol: float = 0.5
 ) -> str:
@@ -1084,6 +1013,55 @@ def _best_direction_for_latency(
             if c.latency_ns < float("inf") and abs(c.latency_ns - latency_ns) <= tol:
                 return c.direction
     return "baseline"
+
+
+def _baseline_kernel_text_for_log(state: PipelineState) -> str:
+    """Original kernel source for optimization_log diff (unchanged from run start)."""
+    src = state.kernel_source or ""
+    if src.strip():
+        return src
+    if state.kernel_path:
+        try:
+            return Path(state.kernel_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return ""
+
+
+def _kernel_diff_log_lines(
+    state: PipelineState,
+    ext: str,
+    *,
+    max_diff_chars: int = 800_000,
+) -> list[str]:
+    """Markdown fragment: unified diff best_kernel vs baseline for optimization_log.md."""
+    baseline = _baseline_kernel_text_for_log(state)
+    best = state.best_kernel or ""
+    a = baseline.splitlines()
+    b = best.splitlines()
+    body = "\n".join(
+        difflib.unified_diff(
+            a,
+            b,
+            fromfile="baseline_kernel",
+            tofile="best_kernel",
+            n=3,
+        )
+    )
+    out: list[str] = ["\n## Best kernel vs baseline (diff)\n\n"]
+    if not body.strip():
+        out.append(
+            "_No textual differences between baseline and best kernel "
+            "(or baseline source was unavailable)._ \n\n"
+        )
+        return out
+    if len(body) > max_diff_chars:
+        body = (
+            body[:max_diff_chars]
+            + f"\n\n... (diff truncated; see `best_kernel{ext}` in this output folder.)\n"
+        )
+    out.extend(["```diff\n", body, "\n```\n\n"])
+    return out
 
 
 def _write_final_outputs(
@@ -1235,17 +1213,7 @@ def _write_final_outputs(
         # Metric comparison table (only profiled candidates)
         profiled = [c for c in result.candidates if c.profiling_context]
         if profiled:
-            metrics_rows = [
-                ("Duration (ns)", "GPU Speed Of Light Throughput", "Duration"),
-                ("SM Throughput (%)", "GPU Speed Of Light Throughput", "Compute (SM) Throughput"),
-                ("Memory Throughput (%)", "GPU Speed Of Light Throughput", "Memory Throughput"),
-                ("DRAM Throughput (%)", "Memory Workload Analysis", "DRAM Throughput"),
-                ("Achieved Occupancy (%)", "Occupancy", "Achieved Occupancy"),
-                ("Registers/Thread", "Launch Statistics", "Registers Per Thread"),
-                ("Waves/SM", "Launch Statistics", "Waves Per SM"),
-                ("No Eligible (%)", "Scheduler Statistics", "No Eligible"),
-                ("IPC Active", "Instruction Statistics", "IPC Active"),
-            ]
+            metrics_rows = LOG_METRIC_COMPARISON_ROWS
             # Baseline ctx for this iteration (previous best)
             iter_baseline_ctx = baseline_ctx  # simplified — always compare to original
 
@@ -1348,6 +1316,8 @@ def _write_final_outputs(
         f"\nFinal best: {best_ns_display} ns  ({overall_speedup:.4f}×)\n",
         "```\n\n",
     ]
+
+    lines += _kernel_diff_log_lines(state, ext)
 
     # ── Config ──────────────────────────────────────────────────────────────
     cfg = state.config
