@@ -104,9 +104,9 @@ def _resolve_ncu_config(
     # profiles all matching kernels regardless of how many non-matching launches
     # precede the target (e.g. torch.randn before a Triton kernel).
     if pipeline_config.kernel_name:
-        import sys as _sys
-        _sys.stdout.write("[profiler] user bypass — skipping LLM (kernel_name provided)\n")
-        _sys.stdout.flush()
+        from kernelopt.pipeline_ui import emit_profiler_output
+
+        emit_profiler_output("[profiler] user bypass — skipping LLM (kernel_name provided)\n")
 
         # Detect if CUDA file has main() — need application mode for standalone binaries
         replay_mode = pipeline_config.replay_mode
@@ -125,9 +125,9 @@ def _resolve_ncu_config(
         }
 
     # (c) LLM sub-graph
-    import sys as _sys
-    _sys.stdout.write("[profiler] running LLM config-decider...\n")
-    _sys.stdout.flush()
+    from kernelopt.pipeline_ui import emit_profiler_output
+
+    emit_profiler_output("[profiler] running LLM config-decider...\n")
     kernel_source = Path(kernel_path).read_text()
     server = ProfilerToolServer(kernel_path, kernel_source)
     profile_hints = getattr(pipeline_config, "profile_hints", "")

@@ -224,7 +224,7 @@ kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260414_120000_0000
 **Resume behavior:**
 - **Same kernel basename required** (e.g., both `softmax.py`)
 - **Reloads full config** from checkpoint (NCU settings, models, kernel args)
-- **Only T/N/K can be overridden** from CLI (omit to use saved values); **`--hud-tty`** (or **`KERNELOPT_HUD_TTY`**) is always taken from the current shell (display only, not stored in checkpoint)
+- **Only T/N/K can be overridden** from CLI (omit to use saved values); **`--hud`** is always taken from the current shell (not stored in checkpoint)
 - **Continues from last checkpoint stage:**
   - After `after_plans`: Re-uses existing plans (doesn't regenerate)
   - After `after_execute`: Continues with profiling
@@ -511,8 +511,8 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 | `-o`, `--output-dir` | `pipeline_output/` | Output **base** directory for `kernelopt run` (see Outputs) |
 | `--run-subdir` / `--no-run-subdir` | on | **Every** `kernelopt run` creates `run_<timestamp>/` under `-o` (default: on) |
 | `--csv` | — | Skip baseline profiling, use existing NCU CSV |
-| `--memory` | — | **Resume** from checkpoint in run directory. Reloads full config from `pipeline_checkpoint.json` and continues from last completed stage. Only `-T`/`-N`/`-K` and `--hud-tty` can be set from CLI (omit T/N/K to use saved values). See [Pipeline State Management](#pipeline-state-management--checkpointing). |
-| `--hud-tty` | — | **HUD on a second terminal**: device path from `tty` in that window (e.g. `/dev/pts/7`). Status panel only; **main terminal** keeps full NCU + logs. Env: `KERNELOPT_HUD_TTY`. With `--memory`, path is always from this run (not checkpoint). |
+| `--memory` | — | **Resume** from checkpoint in run directory. Reloads full config from `pipeline_checkpoint.json` and continues from last completed stage. Only `-T`/`-N`/`-K` and `--hud` can be set from CLI (omit T/N/K to use saved values). See [Pipeline State Management](#pipeline-state-management--checkpointing). |
+| `--hud` | off | **Same-terminal HUD**: alternate-screen status panel; **NCU + full stream** append to `kernelopt_terminal.log` in the run directory. Press **`t`** (when stdin is a TTY) to toggle between the HUD panel and a short tail of that log. Not stored in checkpoint. |
 | `--kernel-name` | auto | NCU `--kernel-name` regex |
 | `--launch-skip` | 0 | NCU `--launch-skip` |
 | `--launch-count` | — | NCU `--launch-count` |
@@ -526,19 +526,15 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 | `--region` | `us-east5` | Vertex AI region |
 | `--agentic-correctness / --no-agentic-correctness` | on | Use Claude for correctness checks |
 
-### Live HUD (`--hud-tty`)
+### Live HUD (`--hud`)
 
-Nsight Compute and other tools write a lot of lines (`==PROF==`, etc.). Putting a Rich “live” panel on **the same** terminal as NCU output mixes two UIs and is hard to read.
+Nsight Compute writes a lot of lines (`==PROF==`, etc.). With **`--hud`**, kernelopt uses the **same terminal** you started from: a **stationary panel** on the **alternate screen** (so redraws do not flood scrollback), while **stdout/stderr and NCU dumps** append to **`kernelopt_terminal.log`** in the run directory. After the run, your normal shell scrollback returns.
 
-**Design:** the status HUD renders on a **second terminal** only, as **one stationary panel**. That tty switches to the **alternate screen** while the run is active (so redraws replace the same viewport instead of flooding scrollback), then restores your shell view when the run finishes. Log mirroring is **coalesced** (~2 Hz) so the panel does not strobe on chatty output; phase changes still force an immediate refresh. Your **main** window (where you run `kernelopt run`) keeps the normal scrolling log — NCU, Python, warnings, tables. The HUD **System** block repeats the same pre-run snapshot as **System Status** on the main terminal, then refreshes **VRAM / util / temp** from `nvidia-smi` about every second (same spirit as `watch -n1 nvidia-smi`) whenever the HUD redraws, so values track the live GPU.
+- **System** block matches **System Status** on the CLI, with **VRAM / util / temp** refreshed ~1 Hz from `nvidia-smi`.
+- **Recent** lines mirror high-level `pipe_print` messages (coalesced ~2 Hz).
+- Press **`t`** when stdin is a **TTY** to **toggle** between the HUD panel and a **short tail** of `kernelopt_terminal.log` on the main screen (best effort; may not respond while a subprocess blocks stdin).
 
-1. Open **terminal B**, run `tty` and note the path (e.g. `/dev/pts/6`). Leave that window visible (or run `sleep infinity` so it stays open).
-2. In **terminal A** (main):  
-   `kernelopt run your_kernel.py --hud-tty /dev/pts/6`  
-   Or: `export KERNELOPT_HUD_TTY=/dev/pts/6` then run without repeating the flag.
-3. Terminal B shows the compact panel (phase, iteration, best speedup, recent events). Terminal A shows full output.
-
-**Resume:** pass `--hud-tty` again (or set `KERNELOPT_HUD_TTY`); the checkpoint does not store the HUD device path.
+**Resume:** pass `--hud` again if you want it; the checkpoint does not store this flag.
 
 ### Examples
 
@@ -563,11 +559,11 @@ kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260413_120000_0000
 # Resume with different N/K (increase exploration)
 kernelopt run softmax.py -T 5 -N 8 -K 2 --memory pipeline_output/run_20260413_120000_000000/
 
-# HUD on a second terminal (run `tty` in the other window first)
-kernelopt run softmax.py -T 3 -N 4 --hud-tty /dev/pts/6
+# Same-terminal HUD + stream log file
+kernelopt run softmax.py -T 3 -N 4 --hud
 
-# Resume with HUD (path from this shell only)
-kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/ --hud-tty /dev/pts/6
+# Resume with HUD
+kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/ --hud
 
 # ──────────────────────────────────────────────────────────────
 # Other Commands
@@ -616,6 +612,7 @@ All artifact paths below are relative to that **run directory**:
 | `{kernel}_iter{N}_plan{L}_{direction}.{ext}` | Candidate kernel source from iteration N, plan L | After executor phase |
 | `{stem}.csv` / `{stem}.ncu-rep` | Candidate NCU profiling data (only if passed correctness) | After profile phase |
 | `{stem}_profiling_context.json` | Parsed candidate metrics (only if passed correctness) | After profile phase |
+| `kernelopt_terminal.log` | Raw stdout/stderr + NCU text when using **`--hud`** (full stream; HUD panel stays clean) | Throughout the run |
 
 > **Note on Resume:** When using `--memory`, all files continue to update in-place in the existing run directory. The `pipeline_checkpoint.json` is the key file that tracks progress and enables resuming from the last completed stage.
 
@@ -631,7 +628,7 @@ kernelopt/
 │   ├── state.py                 # PipelineConfig, PipelineState, GraphState, PlanCandidate, IterationResult
 │   ├── memory.py                # Bounded experience queue
 │   ├── checkpoint.py            # Resume checkpoints (--memory run dir)
-│   ├── pipeline_ui.py           # Optional HUD on a second TTY (--hud-tty)
+│   ├── pipeline_ui.py           # Optional same-terminal HUD (--hud)
 │   ├── llm.py                   # LLM builder (Anthropic / Vertex AI)
 │   ├── schemas.py               # Shared Pydantic schemas
 │   ├── agents/
