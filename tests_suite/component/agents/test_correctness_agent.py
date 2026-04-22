@@ -29,12 +29,17 @@ class TestCorrectnessBasic:
         """Test detection of built-in self-tests in CUDA kernels."""
         from kernelopt.functions.correctness import _has_builtin_self_test
 
-        # Has check_correctness function
+        # Has int main() — required indicator for a standalone self-test binary
         cuda_with_check = """
 __global__ void kernel(float* x) { x[0] = 1.0f; }
 
 void check_correctness() {
     // Verify results
+}
+
+int main() {
+    check_correctness();
+    return 0;
 }
 """
         assert _has_builtin_self_test(cuda_with_check)
@@ -144,7 +149,6 @@ sys.exit(0)
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=passing_kernel,
-            framework="triton",
         )
 
         # Should pass
@@ -166,7 +170,6 @@ print("FAILED: Correctness check failed!")
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=failing_kernel,
-            framework="triton",
         )
 
         # Should fail (FAILED indicator found)
@@ -188,7 +191,6 @@ raise RuntimeError("Kernel crashed!")
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=crashing_kernel,
-            framework="triton",
         )
 
         # Should fail (RuntimeError detected)
@@ -314,7 +316,6 @@ class TestCorrectnessErrorHandling:
         passed, message = check_correctness_subprocess(
             original_path="/tmp/kernel.txt",
             optimized_source="# code",
-            framework="unknown",
         )
 
         # Should fail with unsupported extension message
@@ -337,7 +338,6 @@ while True:
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=infinite_kernel,
-            framework="triton",
         )
 
         # Should timeout and fail
@@ -407,7 +407,6 @@ class TestCorrectnessEdgeCases:
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source="",
-            framework="triton",
         )
 
         # May pass (empty file runs successfully) or fail
@@ -428,7 +427,6 @@ for i in range(1000):
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=long_output_kernel,
-            framework="triton",
         )
 
         # Should handle long output (may truncate in message)
@@ -449,7 +447,6 @@ print("Test with special chars: ñ, é, 中文, 🚀")
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=special_chars_kernel,
-            framework="triton",
         )
 
         # Should handle unicode characters
