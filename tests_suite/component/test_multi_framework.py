@@ -65,7 +65,6 @@ print("Kernel executed")
         passed, message = check_correctness_subprocess(
             original_path=str(py_file),
             optimized_source=kernel,
-            framework=framework,
         )
 
         # Should pass (no errors)

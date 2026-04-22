@@ -29,27 +29,12 @@ class TestCorrectness:
 
         kernel_source = test_kernel_path.read_text()
         passed, msg = check_correctness_subprocess(
-            str(test_kernel_path), kernel_source, "triton"
+            str(test_kernel_path), kernel_source
         )
 
         # Same kernel should pass correctness
         assert passed is True
         assert msg != ""
-
-    def test_correctness_check_invalid_framework(self, test_kernel_path):
-        """Test correctness check with invalid framework."""
-        from kernelopt.functions.correctness import check_correctness_subprocess
-
-        kernel_source = test_kernel_path.read_text()
-
-        # Invalid framework should be handled
-        passed, msg = check_correctness_subprocess(
-            str(test_kernel_path), kernel_source, "invalid_framework"
-        )
-
-        # Should fail or handle gracefully
-        assert isinstance(passed, bool)
-        assert isinstance(msg, str)
 
 
 class TestSelector:
