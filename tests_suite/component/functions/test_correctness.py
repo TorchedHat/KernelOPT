@@ -36,9 +36,6 @@ __global__ void add(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = a[i] + b[i];
 }
-int main() {
-    return 0;
-}
 """
 
 KERNEL_ONLY = """\
@@ -47,19 +44,21 @@ __global__ void softmax(float* x, int N) {
 """
 
 
-def test_has_builtin_self_test_detects_check_correctness_function():
+def test_has_builtin_self_test_true_when_main_present():
+    # WITH_CHECK_FN has int main() — detection is by main(), not the function name
     assert _has_builtin_self_test(WITH_CHECK_FN) is True
 
 
-def test_has_builtin_self_test_detects_pass_printf():
+def test_has_builtin_self_test_true_for_source_with_main_and_pass_printf():
+    # WITH_PASS_PRINTF has int main() — detection is by main(), not the printf strings
     assert _has_builtin_self_test(WITH_PASS_PRINTF) is True
 
 
-def test_has_builtin_self_test_returns_false_for_bare_kernel():
+def test_has_builtin_self_test_returns_false_for_kernel_without_main():
     assert _has_builtin_self_test(WITHOUT_SELF_TEST) is False
 
 
-def test_has_builtin_self_test_returns_false_for_kernel_without_main():
+def test_has_builtin_self_test_returns_false_for_kernel_only():
     assert _has_builtin_self_test(KERNEL_ONLY) is False
 
 
@@ -160,6 +159,23 @@ def test_check_cuda_with_llm_reference_fail():
     assert passed is False
 
 
+def test_check_cuda_with_llm_reference_passes_on_exit_zero_without_pass_string():
+    """Exit code 0 is sufficient — no 'PASS' string required."""
+    mock_llm = _make_mock_llm_with_spec(
+        "#include<stdio.h>\nint main(){printf(\"All done.\\n\");return 0;}"
+    )
+    compile_ok = MagicMock(returncode=0, stdout="", stderr="")
+    run_ok = MagicMock(returncode=0, stdout="All done.\n", stderr="")
+    with patch("kernelopt.functions.correctness.build_llm", return_value=mock_llm), \
+         patch("subprocess.run", side_effect=[compile_ok, run_ok]), \
+         patch("pathlib.Path.unlink"):
+        passed, msg = _check_cuda_with_llm_reference(
+            cu_source=SIMPLE_CUDA_SOURCE, kernel_path="/tmp/scale.cu",
+            api_key=None, model="unused", project_id=None, region=None,
+        )
+    assert passed is True, f"Expected pass but got: {msg}"
+
+
 def test_check_cuda_with_llm_reference_skip():
     mock_llm = _make_mock_llm_with_spec("", skip=True, skip_reason="custom RNG")
     with patch("kernelopt.functions.correctness.build_llm", return_value=mock_llm):
@@ -220,3 +236,85 @@ def test_check_correctness_python_kernel_uses_agentic_path():
         )
     mock_agent.assert_called_once()
     assert passed is True
+
+
+# ---------------------------------------------------------------------------
+# TestCudaAgenticCorrectness: matmul_cuda.cu end-to-end (mocked LLM)
+# ---------------------------------------------------------------------------
+
+FIXTURE_DIR = Path(__file__).parent.parent.parent / "fixtures" / "kernels"
+MATMUL_CU = FIXTURE_DIR / "matmul_cuda.cu"
+
+
+class TestCudaAgenticCorrectness:
+    """Exercise the _check_cuda_with_llm_reference path on a real kernel-only fixture."""
+
+    def _make_passing_harness_llm(self):
+        """Mock LLM that returns a harness which exits 0."""
+        from kernelopt.agents.schemas import CudaCorrectnessSpec
+        spec = CudaCorrectnessSpec(
+            test_harness_code="#include<stdio.h>\nint main(){return 0;}",
+        )
+        mock_structured = MagicMock()
+        mock_structured.invoke.return_value = spec
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        return mock_llm
+
+    def _make_failing_harness_llm(self):
+        """Mock LLM that returns a harness which exits 1 with diagnostic output."""
+        from kernelopt.agents.schemas import CudaCorrectnessSpec
+        spec = CudaCorrectnessSpec(
+            test_harness_code=(
+                "#include<stdio.h>\nint main(){"
+                "printf(\"index=0 expected=1.000000 got=2.000000 maxdiff=1.000000\\n\");"
+                "return 1;}"
+            ),
+        )
+        mock_structured = MagicMock()
+        mock_structured.invoke.return_value = spec
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_structured
+        return mock_llm
+
+    def test_fixture_has_no_main(self):
+        """matmul_cuda.cu must not contain int main() — otherwise it bypasses the agentic path."""
+        source = MATMUL_CU.read_text()
+        assert _has_builtin_self_test(source) is False
+
+    def test_correct_kernel_passes_with_mocked_llm(self):
+        """A correct kernel + LLM harness that exits 0 → (True, ...)."""
+        source = MATMUL_CU.read_text()
+        compile_ok = MagicMock(returncode=0, stdout="", stderr="")
+        run_ok = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("kernelopt.functions.correctness.build_llm", return_value=self._make_passing_harness_llm()), \
+             patch("subprocess.run", side_effect=[compile_ok, run_ok]), \
+             patch("pathlib.Path.unlink"):
+            passed, msg = check_correctness(
+                str(MATMUL_CU), source, "cuda",
+                use_agentic=True, model="unused", project_id=None, region=None,
+            )
+
+        assert passed is True, f"Expected pass, got: {msg}"
+
+    def test_broken_kernel_fails_with_mocked_llm(self):
+        """LLM harness that exits 1 (numerical mismatch) → (False, ...)."""
+        source = MATMUL_CU.read_text()
+        compile_ok = MagicMock(returncode=0, stdout="", stderr="")
+        run_fail = MagicMock(
+            returncode=1,
+            stdout="index=0 expected=1.000000 got=2.000000 maxdiff=1.000000\n",
+            stderr="",
+        )
+
+        with patch("kernelopt.functions.correctness.build_llm", return_value=self._make_failing_harness_llm()), \
+             patch("subprocess.run", side_effect=[compile_ok, run_fail]), \
+             patch("pathlib.Path.unlink"):
+            passed, msg = check_correctness(
+                str(MATMUL_CU), source, "cuda",
+                use_agentic=True, model="unused", project_id=None, region=None,
+            )
+
+        assert passed is False
+        assert "exit 1" in msg or "failed" in msg.lower()
