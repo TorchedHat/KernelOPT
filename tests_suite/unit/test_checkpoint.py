@@ -365,3 +365,29 @@ class TestCheckpointEdgeCases:
         config = pipeline_config_from_checkpoint_dict(checkpoint_dict)
         assert config.baseline_csv is None
         assert config.api_key is None
+
+
+class TestResumeUserErrors:
+    """Resume with --checkpoint raises KerneloptUserError when state is missing."""
+
+    def test_empty_run_dir_raises_kernelopt_user_error(self, tmp_path):
+        from kernelopt.errors import KerneloptUserError
+        from kernelopt.langgraph_pipeline import run_langgraph_pipeline
+        from kernelopt.state import PipelineConfig, PipelineState
+
+        run_dir = tmp_path / "run_empty"
+        run_dir.mkdir()
+        kernel_file = tmp_path / "k.py"
+        kernel_file.write_text("x = 1\n")
+        cfg = PipelineConfig(output_dir=str(run_dir), kernel_path=str(kernel_file))
+        state = PipelineState(
+            config=cfg,
+            kernel_path=str(kernel_file),
+            kernel_source="x = 1\n",
+            best_kernel="x = 1\n",
+            framework="auto",
+            kernel_basename="k",
+            resume_run_dir=str(run_dir),
+        )
+        with pytest.raises(KerneloptUserError, match="Cannot resume"):
+            run_langgraph_pipeline(state)

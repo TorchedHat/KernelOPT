@@ -71,7 +71,6 @@ print("✓ Correctness passed")
         passed, msg = check_correctness_subprocess(
             "/tmp/baseline.py",
             incorrect_code,
-            "triton",
         )
 
         # Should detect failure
@@ -114,7 +113,6 @@ if __name__ == "__main__":
         passed, msg = check_correctness_subprocess(
             "/tmp/dummy.py",
             minor_diff_code,
-            "triton",
         )
 
         # Small differences should be tolerated

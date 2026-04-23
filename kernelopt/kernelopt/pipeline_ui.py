@@ -259,7 +259,7 @@ class PipelineUI:
         self._refresh(force=True)
 
     def _sync_plan_deltas_from_graph(self, gs: GraphState) -> None:
-        """On --memory resume, rebuild Δ block from last checkpointed iteration."""
+        """On --checkpoint resume, rebuild Δ block from last checkpointed iteration."""
         try:
             from kernelopt.iteration_metric_deltas import (
                 has_profiling_context,
