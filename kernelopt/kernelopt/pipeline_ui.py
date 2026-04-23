@@ -156,6 +156,17 @@ class PipelineUI:
         # Per-plan NCU deltas vs baseline (same metrics as optimization_log.md); HUD-only.
         self._plan_delta_lines: list[str] = []
 
+    # Within one optimization iteration, rough ordering for coarse progress (HUD bar only).
+    _PHASE_INTRA: dict[str, float] = {
+        "Starting": 0.02,
+        "Baseline profiling": 0.06,
+        "Planning": 0.10,
+        "Execute + correctness": 0.28,
+        "Profiling (NCU)": 0.48,
+        "Summarize + memory": 0.74,
+        "Select best": 0.92,
+    }
+
     @staticmethod
     def _hud_terminal_columns() -> int:
         try:
@@ -319,6 +330,36 @@ class PipelineUI:
             )
         except Exception:
             self._plan_delta_lines = []
+
+    def _progress_fraction(self) -> float:
+        """Coarse 0..1 estimate: baseline segment + (iteration + intra-phase) / T."""
+        T = max(self.T, 1)
+        baseline_share = 0.11
+        if self.baseline_ns is None:
+            pulse = (int(time.monotonic() * 6) % 5) / 5.0
+            return min(0.09, 0.02 + pulse * 0.06)
+        intra = self._PHASE_INTRA.get(self.phase, 0.22)
+        core = (self.iteration_0based + intra) / T
+        return min(0.995, baseline_share + (1.0 - baseline_share) * core)
+
+    def _render_run_progress(self) -> Text:
+        """Activity spinner + ASCII bar (HUD only; advances on each paint)."""
+        frac = self._progress_fraction()
+        width = max(8, min(36, self._hud_terminal_columns() - 18))
+        filled = int(frac * width + 1e-9)
+        filled = min(filled, width)
+        bar_body = "#" * filled + "-" * (width - filled)
+        pct = int(round(100 * frac))
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        spin = frames[int(time.monotonic() * 8) % len(frames)]
+        line = Text()
+        line.append("Run ", style="bold dim")
+        line.append(spin, style="bold green")
+        line.append("  [", style="dim")
+        line.append(bar_body, style="cyan")
+        line.append("]  ", style="dim")
+        line.append(f"{pct}%", style="bold white")
+        return line
 
     def _recalc_speedup(self) -> None:
         if (
@@ -539,6 +580,8 @@ class PipelineUI:
         else:
             metrics.append("—", style="dim")
 
+        run_progress = self._render_run_progress()
+
         delta_block: list[RenderableType] = []
         if self._plan_delta_lines:
             delta_block.append(Text(""))
@@ -562,7 +605,9 @@ class PipelineUI:
         if sys_block is not None:
             top.append(sys_block)
             top.append(Text(""))
-        top.extend([sub, iter_line, metrics, *delta_block, Text(""), *event_lines])
+        top.extend(
+            [sub, iter_line, metrics, Text(""), run_progress, *delta_block, Text(""), *event_lines]
+        )
         body = Group(*top)
         return Panel(
             body,
