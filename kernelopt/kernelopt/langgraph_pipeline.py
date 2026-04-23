@@ -406,7 +406,7 @@ def execute_plans(state: GraphState) -> dict:
 
         pipe_print(f"  [dim]Running correctness check...[/]")
         _cc_args = dict(
-            original_kernel_path=kernel_path,
+            original_path=kernel_path,
             optimized_source=optimized_source,
             framework=framework,
             use_agentic=cfg.agentic_correctness,
@@ -526,7 +526,7 @@ def profile_candidates(state: GraphState) -> dict:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
             _prof_args = dict(
                 kernel_path=kernel_file,
-                output_base=output_base,
+                output_basename=output_base,
                 ncu_config=saved_ncu_config,
                 pipeline_config=cfg,
                 kernel_id=kernel_id,
