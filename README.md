@@ -29,14 +29,14 @@ Each iteration runs six phases in a LangGraph pipeline:
 
 **Stopping conditions**: max T iterations reached, 2 consecutive iterations with no improvement, or all plans report low confidence.
 
-**Resume logic**: When using `--memory`, the pipeline detects the last checkpoint stage and continues from there (e.g., if stopped at `after_plans`, it skips re-generating plans and goes straight to execution).
+**Resume logic**: When using `--checkpoint`, the pipeline detects the last checkpoint stage and continues from there (e.g., if stopped at `after_plans`, it skips re-generating plans and goes straight to execution).
 
 ### Complete Flow with Checkpoints
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ START: kernelopt run kernel.py -T 5 -N 4                        │
-│   or: kernelopt run kernel.py --memory <run_dir>/  (resume)    │
+│   or: kernelopt run kernel.py --checkpoint <run_dir>/  (resume)    │
 └──────────────────┬──────────────────────────────────────────────┘
                    │
                    ▼
@@ -54,7 +54,7 @@ Each iteration runs six phases in a LangGraph pipeline:
 │ (1) Profiler Agent: profile_baseline()                          │
 │     - Run NCU on original kernel                                │
 │     - Parse profiling context                                   │
-│     💾 Checkpoint: after_baseline                               │
+│     Checkpoint: after_baseline                                  │
 └──────────────────┬───────────────────────────────────────────────┘
                    │
                    ▼
@@ -73,7 +73,7 @@ Each iteration runs six phases in a LangGraph pipeline:
 │     - N concurrent planner agents                               │
 │     - Each gets diversity hint + memory                         │
 │     - Generate OptimizationPlan (direction, steps, confidence)  │
-│     💾 Checkpoint: after_plans                                  │
+│     Checkpoint: after_plans                                     │
 │     (Resume skips if already at this stage)                     │
 └──────────────────┬───────────────────────────────────────────────┘
                    │
@@ -86,7 +86,7 @@ Each iteration runs six phases in a LangGraph pipeline:
 │     - K attempts per plan                                       │
 │     - Apply optimizations to kernel                             │
 │     - Correctness check (agentic or static)                     │
-│     💾 Checkpoint: after_execute                                │
+│     Checkpoint: after_execute                                   │
 └──────────────────┬───────────────────────────────────────────────┘
                    │
                    ▼
@@ -105,7 +105,7 @@ Each iteration runs six phases in a LangGraph pipeline:
 │ (4) NCU on      │   │ (broken kernel)  │
 │ passing         │   │                  │
 │ candidates      │   │                  │
-│ 💾 after_profile│   │                  │
+│ CP:after_profile│   │                  │
 └────────┬────────┘   └────────┬─────────┘
          │                     │
          └──────────┬──────────┘
@@ -118,8 +118,8 @@ Each iteration runs six phases in a LangGraph pipeline:
 │     - Compare slow/fast kernels (or note failure)               │
 │     - Extract experience_item                                   │
 │     - Update optimization memory (FIFO queue)                   │
-│     💾 Checkpoint: after_summarize                              │
-│     💾 Save: optimization_memory.json                           │
+│     Checkpoint: after_summarize                                 │
+│     Save: optimization_memory.json                              │
 └──────────────────┬───────────────────────────────────────────────┘
                    │
                    ▼
@@ -130,14 +130,14 @@ Each iteration runs six phases in a LangGraph pipeline:
 │     - Pick best candidate from this iteration                   │
 │     - Update best_kernel if improvement                         │
 │     - Update optimization_log.md                                │
-│     💾 Checkpoint: after_select                                 │
-│     💾 Save: best_kernel.{py|cu|hl}                             │
+│     Checkpoint: after_select                                    │
+│     Save: best_kernel.{py|cu|hl}                                │
 └──────────────────┬───────────────────────────────────────────────┘
                    │
                    ▼
        ┌───────────────────────┐
        │ Increment Iteration   │
-       │ 💾 Checkpoint:        │
+       │ Checkpoint:           │
        │    iteration_{N}      │
        └───────────┬───────────┘
                    │
@@ -151,26 +151,26 @@ Each iteration runs six phases in a LangGraph pipeline:
         │                     │
      Continue?              Stop?
         │                     │
-        │  ● Iteration < T    │  ● Max iterations
-        │  ● Improvement      │  ● 2x no improvement
-        │    found            │  ● Low confidence
+        │  - Iteration < T    │  - Max iterations
+        │  - Improvement      │  - 2x no improvement
+        │    found            │  - Low confidence
         │                     │
-        └──► Loop back        └──► Output & Exit
+        +-> Loop back           +-> Output & Exit
              to (2)                │
                                    ▼
                           ┌─────────────────┐
                           │ FINAL OUTPUT    │
                           ├─────────────────┤
-                          │ ✓ best_kernel   │
-                          │ ✓ memory.json   │
-                          │ ✓ checkpoint    │
-                          │ ✓ log.md        │
-                          │ ✓ all artifacts │
+                          │ - best_kernel   │
+                          │ - memory.json   │
+                          │ - checkpoint    │
+                          │ - log.md        │
+                          │ - all artifacts │
                           └─────────────────┘
 ```
 
 **Key Points:**
-- 💾 **Checkpoint saved** after every major stage
+- **Checkpoint saved** after every major stage
 - **Resume**: Load state from `pipeline_checkpoint.json`, jump to last incomplete stage
 - **Fail path**: Correctness failures skip profiling but still generate negative experience
 - **Loop**: Continues until T iterations or stopping condition met
@@ -188,13 +188,13 @@ The pipeline saves checkpoints after each major stage:
 
 ```
 pipeline_checkpoint.json updated after:
-  ✓ Baseline profiling complete
-  ✓ Plans generated (all N plans ready)
-  ✓ Plans executed (before NCU profiling)
-  ✓ Candidates profiled (NCU complete)
-  ✓ Results summarized (memory updated)
-  ✓ Best candidate selected
-  ✓ Each iteration complete
+  - Baseline profiling complete
+  - Plans generated (all N plans ready)
+  - Plans executed (before NCU profiling)
+  - Candidates profiled (NCU complete)
+  - Results summarized (memory updated)
+  - Best candidate selected
+  - Each iteration complete
 ```
 
 **What gets saved:**
@@ -207,7 +207,7 @@ pipeline_checkpoint.json updated after:
 
 ### Resuming from Checkpoint
 
-Use `--memory <run_directory>` to resume a previous run:
+Use `--checkpoint <run_directory>` to resume a previous run:
 
 ```bash
 # Original run (interrupted or completed)
@@ -215,10 +215,10 @@ kernelopt run softmax.py -T 5 -N 4 -K 1
 # Creates: pipeline_output/run_20260414_120000_000000/
 
 # Resume from checkpoint (continues where it left off)
-kernelopt run softmax.py --memory pipeline_output/run_20260414_120000_000000/
+kernelopt run softmax.py --checkpoint pipeline_output/run_20260414_120000_000000/
 
 # Resume with MORE iterations (override T only)
-kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260414_120000_000000/
+kernelopt run softmax.py -T 10 --checkpoint pipeline_output/run_20260414_120000_000000/
 ```
 
 **Resume behavior:**
@@ -330,11 +330,11 @@ When running inside containers (Docker, devcontainers), GPU processes from the h
 ```
 
 **Limitations in containers:**
-- ✅ GPU memory usage per process (accurate)
-- ✅ Total GPU utilization (accurate)
-- ✅ System RAM status (accurate)
-- ❌ Process usernames (shows "host" for processes outside container)
-- ❌ CPU% usage (hidden, not accessible due to PID namespace isolation)
+- GPU memory usage per process (accurate)
+- Total GPU utilization (accurate)
+- System RAM status (accurate)
+- Process usernames: shows `host` for processes outside the container (not accurate per-user)
+- CPU% usage: hidden, not accessible due to PID namespace isolation
 
 **For full process details**, run kernelopt directly on the host system (not in a container).
 
@@ -504,14 +504,14 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-T`, `--iterations` | 5 | Max optimization iterations (omit = default 5; with `--memory` + checkpoint: from checkpoint) |
-| `-N`, `--plans` | 4 | Plans per iteration (omit = default 4; with `--memory` + checkpoint: from checkpoint) |
-| `-K`, `--attempts` | 1 | Executor attempts per plan (omit = default 1; with `--memory` + checkpoint: from checkpoint) |
+| `-T`, `--iterations` | 5 | Max optimization iterations (omit = default 5; when using `--checkpoint`, from saved checkpoint if omitted) |
+| `-N`, `--plans` | 4 | Plans per iteration (omit = default 4; when using `--checkpoint`, from saved checkpoint if omitted) |
+| `-K`, `--attempts` | 1 | Executor attempts per plan (omit = default 1; when using `--checkpoint`, from saved checkpoint if omitted) |
 | `--top-k` | 4 | Max experience items added per iteration |
 | `-o`, `--output-dir` | `pipeline_output/` | Output **base** directory for `kernelopt run` (see Outputs) |
 | `--run-subdir` / `--no-run-subdir` | on | **Every** `kernelopt run` creates `run_<timestamp>/` under `-o` (default: on) |
 | `--csv` | — | Skip baseline profiling, use existing NCU CSV |
-| `--memory` | — | **Resume** from checkpoint in run directory. Reloads full config from `pipeline_checkpoint.json` and continues from last completed stage. Only `-T`/`-N`/`-K` and `--hud` can be set from CLI (omit T/N/K to use saved values). See [Pipeline State Management](#pipeline-state-management--checkpointing). |
+| `--checkpoint` | — | **Resume** from checkpoint in run directory. Reloads full config from `pipeline_checkpoint.json` and continues from last completed stage. Only `-T`/`-N`/`-K` and `--hud` can be set from CLI (omit T/N/K to use saved values). See [Pipeline State Management](#pipeline-state-management--checkpointing). |
 | `--hud` | off | **Same-terminal HUD**: alternate-screen status panel; **NCU + full stream** append to `kernelopt_terminal.log` in the run directory. Press **`t`** (when stdin is a TTY) to toggle between the HUD panel and a short tail of that log. Not stored in checkpoint. |
 | `--kernel-name` | auto | NCU `--kernel-name` regex |
 | `--launch-skip` | 0 | NCU `--launch-skip` |
@@ -551,19 +551,19 @@ kernelopt run my_kernel.cu --csv pipeline_output/run_20260413_120000_000000/base
 
 # Resume from checkpoint (continues where it left off)
 # Use case: Job timeout, interrupted run, incremental tuning
-kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/
+kernelopt run softmax.py --checkpoint pipeline_output/run_20260413_120000_000000/
 
 # Resume and extend iterations (original had -T 3, now run up to 10 total)
-kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260413_120000_000000/
+kernelopt run softmax.py -T 10 --checkpoint pipeline_output/run_20260413_120000_000000/
 
 # Resume with different N/K (increase exploration)
-kernelopt run softmax.py -T 5 -N 8 -K 2 --memory pipeline_output/run_20260413_120000_000000/
+kernelopt run softmax.py -T 5 -N 8 -K 2 --checkpoint pipeline_output/run_20260413_120000_000000/
 
 # Same-terminal HUD + stream log file
 kernelopt run softmax.py -T 3 -N 4 --hud
 
 # Resume with HUD
-kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/ --hud
+kernelopt run softmax.py --checkpoint pipeline_output/run_20260413_120000_000000/ --hud
 
 # ──────────────────────────────────────────────────────────────
 # Other Commands
@@ -593,7 +593,7 @@ kernelopt run big_kernel.py --replay-mode application
 
 `pipeline_output/run_YYYYMMDD_HHMMSS_microseconds/`
 
-**Exception:** When using `--memory` to resume, writes continue in the **same** directory (no new timestamped folder created).
+**Exception:** When using `--checkpoint` to resume, writes continue in the **same** directory (no new timestamped folder created).
 
 Other commands (`profile`, `show`, `plan`, …) are unchanged and do not use this layout.
 
@@ -614,7 +614,7 @@ All artifact paths below are relative to that **run directory**:
 | `{stem}_profiling_context.json` | Parsed candidate metrics (only if passed correctness) | After profile phase |
 | `kernelopt_terminal.log` | Raw stdout/stderr + NCU text when using **`--hud`** (full stream; HUD panel stays clean) | Throughout the run |
 
-> **Note on Resume:** When using `--memory`, all files continue to update in-place in the existing run directory. The `pipeline_checkpoint.json` is the key file that tracks progress and enables resuming from the last completed stage.
+> **Note on Resume:** When using `--checkpoint`, all files continue to update in-place in the existing run directory. The `pipeline_checkpoint.json` is the key file that tracks progress and enables resuming from the last completed stage.
 
 ---
 
@@ -627,7 +627,7 @@ kernelopt/
 │   ├── langgraph_pipeline.py    # LangGraph optimization pipeline
 │   ├── state.py                 # PipelineConfig, PipelineState, GraphState, PlanCandidate, IterationResult
 │   ├── memory.py                # Bounded experience queue
-│   ├── checkpoint.py            # Resume checkpoints (--memory run dir)
+│   ├── checkpoint.py            # Resume checkpoints (--checkpoint run dir)
 │   ├── pipeline_ui.py           # Optional same-terminal HUD (--hud)
 │   ├── llm.py                   # LLM builder (Anthropic / Vertex AI)
 │   ├── schemas.py               # Shared Pydantic schemas

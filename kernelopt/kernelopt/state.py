@@ -125,7 +125,7 @@ class PipelineState:
     # History
     iteration_results: list[IterationResult] = field(default_factory=list)
 
-    # Resume: directory from --memory (prior run output folder)
+    # Resume: directory from --checkpoint (prior run output folder)
     resume_run_dir: str | None = None
 
     # Pre-run metrics from validate_gpu_for_profiling (for HUD; same source as CLI System Status)
