@@ -1,4 +1,6 @@
 # kernelopt/tests/agents/test_planner_prompts.py
+from __future__ import annotations
+
 import pytest
 from langchain_core.messages import HumanMessage
 from kernelopt.agents.planner.prompts import (

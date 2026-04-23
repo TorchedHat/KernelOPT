@@ -3,6 +3,8 @@ Tests for profiler agent tools.
 
 Tests ProfilerToolServer, read_kernel_source, and submit_ncu_config tools.
 """
+from __future__ import annotations
+
 import pytest
 from langchain_core.runnables import RunnableConfig
 

@@ -1,4 +1,6 @@
 # kernelopt/tests/agents/test_executor_tools.py
+from __future__ import annotations
+
 import pytest
 from langchain_core.runnables import RunnableConfig
 from kernelopt.agents.executor.tools import (
