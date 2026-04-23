@@ -7,50 +7,78 @@ and other blocking operations.
 from __future__ import annotations
 
 import time
-import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
 from rich.console import Console
 from rich.live import Live
-from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 _console = Console()
 
-PHASE_STYLES = {
-    "baseline":    ("dots",     "cyan",   "Profiling baseline"),
-    "planning":    ("dots2",    "yellow", "Generating plans"),
-    "executing":   ("dots12",   "green",  "Executing"),
-    "correctness": ("dots8Bit", "blue",   "Checking correctness"),
-    "profiling":   ("dots",     "magenta","Profiling with NCU"),
-    "summarize":   ("dots2",    "yellow", "Summarizing results"),
-    "selecting":   ("dots",     "green",  "Selecting best"),
+_BAR_WIDTH = 8
+_BAR_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "red"]
+
+PHASE_CONFIG = {
+    "baseline":    ("🔬", "cyan",    "Profiling baseline"),
+    "planning":    ("🧠", "yellow",  "Generating plans"),
+    "executing":   ("⚡", "green",   "Executing"),
+    "correctness": ("🔍", "blue",    "Checking correctness"),
+    "profiling":   ("📊", "magenta", "Profiling with NCU"),
+    "summarize":   ("📝", "yellow",  "Summarizing results"),
+    "selecting":   ("🏆", "green",   "Selecting best"),
 }
 
 
-class _ElapsedText:
-    """Renderable that shows spinner + message + live elapsed time."""
+def _bouncing_bar(tick: int, width: int = _BAR_WIDTH) -> Text:
+    """Render a colorful bouncing block bar: [■□□□□□□□] with the filled
+    block sliding left-to-right then right-to-left."""
+    cycle = 2 * (width - 1)
+    pos = tick % cycle
+    if pos >= width:
+        pos = cycle - pos
 
-    def __init__(self, message: str, spinner_name: str, style: str):
+    bar = Text("[")
+    for i in range(width):
+        if i == pos:
+            color = _BAR_COLORS[tick % len(_BAR_COLORS)]
+            bar.append("■", style=f"bold {color}")
+        else:
+            bar.append("□", style="dim")
+    bar.append("]")
+    return bar
+
+
+class _BouncingBarDisplay:
+    """Renderable: emoji + colorful bouncing block bar + message + elapsed time."""
+
+    def __init__(self, message: str, emoji: str, color: str):
         self._message = message
-        self._spinner = Spinner(spinner_name, style=style)
+        self._emoji = emoji
+        self._color = color
         self._start = time.monotonic()
+        self._tick = 0
 
     def __rich_console__(self, console, options):
         elapsed = time.monotonic() - self._start
         mins, secs = divmod(int(elapsed), 60)
-        if mins > 0:
-            time_str = f"{mins}m {secs:02d}s"
-        else:
-            time_str = f"{secs}s"
+        time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
+
+        bar = _bouncing_bar(self._tick)
+        self._tick += 1
 
         table = Table.grid(padding=(0, 1))
         table.add_column(width=2)
+        table.add_column(width=_BAR_WIDTH + 2)
         table.add_column()
         table.add_column(justify="right", style="dim")
-        table.add_row(self._spinner, Text(self._message), Text(f"[{time_str}]"))
+        table.add_row(
+            Text(self._emoji),
+            bar,
+            Text(self._message, style=self._color),
+            Text(f"[{time_str}]"),
+        )
         yield from table.__rich_console__(console, options)
 
 
@@ -61,7 +89,7 @@ def phase_spinner(
     *,
     console: Optional[Console] = None,
 ) -> Iterator[None]:
-    """Context manager that shows an animated spinner for a pipeline phase.
+    """Context manager that shows an animated bouncing bar for a pipeline phase.
 
     Usage::
 
@@ -69,14 +97,14 @@ def phase_spinner(
             plans = run_planner_agent(...)
     """
     c = console or _console
-    spinner_name, style, label = PHASE_STYLES.get(
-        phase, ("dots", "white", phase.capitalize())
+    emoji, color, label = PHASE_CONFIG.get(
+        phase, ("⏳", "white", phase.capitalize())
     )
     message = f"{label} {detail}".strip() if detail else label
 
-    display = _ElapsedText(message, spinner_name, style)
+    display = _BouncingBarDisplay(message, emoji, color)
 
-    with Live(display, console=c, refresh_per_second=4, transient=True):
+    with Live(display, console=c, refresh_per_second=8, transient=True):
         yield
 
     elapsed = time.monotonic() - display._start
