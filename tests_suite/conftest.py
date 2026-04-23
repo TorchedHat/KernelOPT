@@ -32,6 +32,38 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "kernelopt"))
 # Default model for tests (matches README)
 DEFAULT_TEST_MODEL = "claude-sonnet-4@20250514"
 
+
+def _minimal_summarizer_output_dict() -> dict[str, Any]:
+    """Valid ``SummarizerOutput`` payload for mocks (avoids real Vertex on ``with_structured_output``)."""
+    return {
+        "experience_item": {
+            "item_id": "test_item_mock_001",
+            "iteration": 1,
+            "speedup": 1.1,
+            "rewrite_type": "positive",
+            "framework": "triton",
+            "direction": "mock_direction",
+            "profiling_signal": {
+                "ncu_rule_triggered": None,
+                "key_metric_before": {"latency_ns": 100.0},
+                "key_metric_after": {"latency_ns": 90.0},
+            },
+            "strategy_title": "Mock strategy",
+            "strategy_description": "Mock summarizer output for tests.",
+            "slow_pseudocode": "before",
+            "fast_pseudocode": "after",
+            "applicable_when": "testing",
+            "do_not_apply_when": "never",
+            "framework_notes": None,
+        },
+        "memory_update": {
+            "action": "append",
+            "replace_item_id": None,
+            "reason": "Mock append for tests.",
+        },
+    }
+
+
 # Test suite configuration for H200 GPUs
 # These tests are optimized for NVIDIA H200 GPUs with:
 # - 141 GB HBM3 memory
@@ -224,6 +256,25 @@ def patch_build_llm(monkeypatch):
 
             mock_llm = MagicMock()
 
+            def with_structured_output(schema, **kwargs):
+                from kernelopt.agents.schemas import SummarizerOutput
+
+                class _StructuredLlm:
+                    def invoke(self, messages):
+                        if schema is SummarizerOutput or getattr(
+                            schema, "__name__", ""
+                        ) == "SummarizerOutput":
+                            return SummarizerOutput.model_validate(
+                                _minimal_summarizer_output_dict()
+                            )
+                        raise ValueError(
+                            f"patch_build_llm: unsupported structured schema {schema!r}"
+                        )
+
+                return _StructuredLlm()
+
+            mock_llm.with_structured_output = with_structured_output
+
             if use_mock:
                 # Mock that simulates LangGraph agent behavior with tool calls
                 # Uses shared counter to generate different plans for diversity testing
@@ -357,6 +408,12 @@ def optimized_kernel(x_ptr, y_ptr, N, BLOCK_SIZE: tl.constexpr):
             return mock_llm
 
         monkeypatch.setattr(llm_module, "build_llm", patched_build_llm)
+        try:
+            import kernelopt.agents.summarizer as summ_mod
+
+            monkeypatch.setattr(summ_mod, "build_llm", patched_build_llm)
+        except ImportError:
+            pass
 
     return _patch
 

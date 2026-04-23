@@ -35,7 +35,7 @@ app = typer.Typer(
 console = Console()
 
 
-# With --memory + checkpoint, these may not be set on the CLI (config comes from checkpoint).
+# With --checkpoint + pipeline_checkpoint.json, these may not be set on the CLI (config from checkpoint).
 _RESUME_CKPT_FORBIDDEN = frozenset({
     "framework",
     "top_k",
@@ -88,15 +88,15 @@ def run(
     ),
     iterations: Optional[int] = typer.Option(
         None, "-T", "--iterations",
-        help="Max optimization iterations (default 5; with --memory + checkpoint: from checkpoint if omitted)",
+        help="Max optimization iterations (default 5; with --checkpoint: from checkpoint if omitted)",
     ),
     plans: Optional[int] = typer.Option(
         None, "-N", "--plans",
-        help="Plans per iteration (default 4; with --memory + checkpoint: from checkpoint if omitted)",
+        help="Plans per iteration (default 4; with --checkpoint: from checkpoint if omitted)",
     ),
     attempts: Optional[int] = typer.Option(
         None, "-K", "--attempts",
-        help="Executor attempts per plan (default 1; with --memory + checkpoint: from checkpoint if omitted)",
+        help="Executor attempts per plan (default 1; with --checkpoint: from checkpoint if omitted)",
     ),
     top_k: int = typer.Option(
         4, "--top-k", help="Max experience items per iteration"
@@ -112,8 +112,8 @@ def run(
     csv: Optional[Path] = typer.Option(
         None, "--csv", help="Existing baseline NCU CSV (skip baseline profiling)"
     ),
-    memory: Optional[Path] = typer.Option(
-        None, "--memory",
+    checkpoint: Optional[Path] = typer.Option(
+        None, "--checkpoint",
         help="Resume from a prior run directory (pipeline_output/run_…/) with checkpoint or baseline artifacts",
     ),
     kernel_name: Optional[str] = typer.Option(
@@ -180,7 +180,7 @@ def run(
     and selects the best. Outputs best_kernel, optimization_log.md, and
     .ncu-rep files for every candidate. Each kernelopt run uses a new
     run_<timestamp>/ folder under --output-dir unless --no-run-subdir.
-    With --memory and a pipeline_checkpoint.json, NCU/LLM options are taken from the
+    With --checkpoint and a pipeline_checkpoint.json, NCU/LLM options are taken from the
     checkpoint; only -T, -N, -K and --hud may be set (omit T/N/K to use saved values).
 
     Example:
@@ -202,10 +202,10 @@ def run(
     from kernelopt.state import PipelineConfig, PipelineState
 
     ckpt: dict | None = None
-    if memory is not None:
-        run_dir_pre = memory.resolve()
+    if checkpoint is not None:
+        run_dir_pre = checkpoint.resolve()
         if not run_dir_pre.is_dir():
-            console.print(f"[red]Error:[/] --memory must be an existing directory: {run_dir_pre}")
+            console.print(f"[red]Error:[/] --checkpoint must be an existing directory: {run_dir_pre}")
             raise typer.Exit(1)
         ckpt = load_checkpoint_file(run_dir_pre)
         gs_pre = ckpt.get("graph_state") if ckpt else None
@@ -226,11 +226,11 @@ def run(
                     return "--" + name.replace("_", "-")
 
                 console.print(
-                    "[red]Error:[/] With [cyan]--memory[/] and a [cyan]pipeline_checkpoint.json[/], "
+                    "[red]Error:[/] With [cyan]--checkpoint[/] and a [cyan]pipeline_checkpoint.json[/], "
                     "config is loaded from the checkpoint.\n"
                     "  Only these options are allowed on the command line:\n"
                     "    • kernel file (positional)\n"
-                    "    • [cyan]--memory[/] DIR\n"
+                    "    • [cyan]--checkpoint[/] DIR\n"
                     "    • [cyan]-T[/] / [cyan]-N[/] / [cyan]-K[/] (optional overrides)\n"
                     "    • [cyan]--hud[/] (optional; same-terminal HUD + log file)\n"
                     f"  Remove: {', '.join(_flag_label(p) for p in bad)}"
@@ -240,7 +240,7 @@ def run(
             for p in ("output_dir", "run_subdir"):
                 if _cli_set_param(ctx, p):
                     console.print(
-                        "[red]Error:[/] With [cyan]--memory[/], output is the run directory; "
+                        "[red]Error:[/] With [cyan]--checkpoint[/], output is the run directory; "
                         "do not pass [cyan]-o[/] / [cyan]--output-dir[/] or "
                         "[cyan]--run-subdir[/] / [cyan]--no-run-subdir[/]."
                     )
@@ -261,8 +261,8 @@ def run(
             attempts if attempts is not None else 1,
         )
 
-    if memory is not None:
-        run_dir = memory.resolve()
+    if checkpoint is not None:
+        run_dir = checkpoint.resolve()
         resolved_output = run_dir
         gs = ckpt.get("graph_state") if ckpt else None
         saved_cfg_dict = (gs or {}).get("config") if isinstance(gs, dict) else None
@@ -345,7 +345,7 @@ def run(
         framework=run_framework,
         kernel_basename=kernel_basename,
         optimization_memory=[],
-        resume_run_dir=str(resolved_output) if memory is not None else None,
+        resume_run_dir=str(resolved_output) if checkpoint is not None else None,
     )
 
     extra = ""
@@ -381,9 +381,25 @@ def run(
         state.pre_run_system_snapshot = {}
 
     from kernelopt.agents.profiler import get_latency_ns
+    from kernelopt.errors import KerneloptUserError
     from kernelopt.langgraph_pipeline import run_langgraph_pipeline
 
-    final = run_langgraph_pipeline(state)
+    try:
+        final = run_langgraph_pipeline(state)
+    except KerneloptUserError as exc:
+        console.print("[bold red]kernelopt cannot continue[/]")
+        console.print(str(exc))
+        raise typer.Exit(1) from None
+    except Exception as exc:
+        if cfg.hud and not cfg.verbose:
+            console.print("[bold red]Run failed[/]")
+            console.print(str(exc))
+            console.print(
+                "[dim]For a full Python traceback, run without [cyan]--hud[/] "
+                "and/or add [cyan]--verbose[/].[/]"
+            )
+            raise typer.Exit(1) from None
+        raise
 
     baseline_ns = get_latency_ns(final.baseline_profiling_context)
     best_ns = final.best_latency_ns

@@ -117,13 +117,13 @@ after_baseline → after_plans → after_execute → after_profile → after_sum
 
 ```bash
 # Resume from where the run stopped
-kernelopt run softmax.py --memory pipeline_output/run_20260413_120000_000000/
+kernelopt run softmax.py --checkpoint pipeline_output/run_20260413_120000_000000/
 
 # Resume and extend iterations
-kernelopt run softmax.py -T 10 --memory pipeline_output/run_20260413_120000_000000/
+kernelopt run softmax.py -T 10 --checkpoint pipeline_output/run_20260413_120000_000000/
 
 # Resume with increased N/K
-kernelopt run softmax.py -T 5 -N 8 -K 2 --memory pipeline_output/run_20260413_120000_000000/
+kernelopt run softmax.py -T 5 -N 8 -K 2 --checkpoint pipeline_output/run_20260413_120000_000000/
 ```
 
 - Reloads full config from `pipeline_checkpoint.json`; only `-T`/`-N`/`-K` and `--hud` can be overridden
@@ -190,7 +190,7 @@ kernelopt run softmax.py --hud
 | `-o` | `pipeline_output/` | Output base directory |
 | `--run-subdir` / `--no-run-subdir` | on | Create timestamped `run_<timestamp>/` subdirectory |
 | `--csv` | — | Skip baseline profiling; use an existing NCU CSV |
-| `--memory` | — | Resume from a previous run directory |
+| `--checkpoint` | — | Resume from a previous run directory |
 | `--hud` | off | Same-terminal HUD; stream + NCU → `kernelopt_terminal.log`; `t` toggles view |
 | `--kernel-name` | auto | NCU `--kernel-name` regex |
 | `--launch-skip` | 0 | NCU `--launch-skip` |

@@ -33,11 +33,13 @@ from kernelopt.functions.gpu_monitoring import (
     select_gpu,
 )
 from kernelopt.checkpoint import (
+    CHECKPOINT_FILENAME,
     graph_state_from_checkpoint_payload,
     load_baseline_artifacts,
     load_checkpoint_file,
     save_checkpoint,
 )
+from kernelopt.errors import KerneloptUserError
 from kernelopt.iteration_metric_deltas import (
     LOG_METRIC_ALTERNATIVES as _LOG_METRIC_ALTERNATIVES,
     LOG_METRIC_COMPARISON_ROWS,
@@ -68,7 +70,7 @@ PLAN_LETTERS = list(string.ascii_uppercase)
 
 
 def _checkpoint_stage(state: GraphState, updates: dict, stage: str) -> None:
-    """Persist merged state after a pipeline stage (for --memory resume)."""
+    """Persist merged state after a pipeline stage (for --checkpoint resume)."""
     try:
         merged: GraphState = {**state, **updates}  # type: ignore[misc]
         save_checkpoint(Path(str(merged["output_dir"])), merged, stage)
@@ -771,7 +773,7 @@ def should_continue(state: GraphState) -> str:
 # ---------------------------------------------------------------------------
 
 def route_start(state: GraphState) -> str:
-    """Route from START to the first node to run (fresh or --memory resume)."""
+    """Route from START to the first node to run (fresh or --checkpoint resume)."""
     entry = state.get("_entry", "fresh")
     resume_targets = {
         "after_baseline": "generate_plans",
@@ -792,7 +794,7 @@ def continuation_entry(state: GraphState) -> dict:
 
 
 def save_iter_checkpoint(state: GraphState) -> dict:
-    """Persist full graph state between iterations (enables --memory resume)."""
+    """Persist full graph state between iterations (enables --checkpoint resume)."""
     try:
         save_checkpoint(Path(state["output_dir"]), state, "after_iteration")
     except Exception as e:
@@ -902,19 +904,24 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
 
     if resume_path:
         if not resume_path.is_dir():
-            raise FileNotFoundError(f"--memory run directory not found: {resume_path}")
+            raise KerneloptUserError(
+                f"--checkpoint path is not an existing directory:\n{resume_path}"
+            )
         ckpt_raw = load_checkpoint_file(resume_path)
         if ckpt_raw:
             entry = ckpt_raw.get("entry", "after_baseline")
-            initial, _ = graph_state_from_checkpoint_payload(
-                ckpt_raw,
-                resume_path,
-                live_config=cfg,
-                live_kernel_path=state.kernel_path,
-                live_kernel_source=state.kernel_source,
-                live_kernel_basename=state.kernel_basename,
-                live_framework=state.framework,
-            )
+            try:
+                initial, _ = graph_state_from_checkpoint_payload(
+                    ckpt_raw,
+                    resume_path,
+                    live_config=cfg,
+                    live_kernel_path=state.kernel_path,
+                    live_kernel_source=state.kernel_source,
+                    live_kernel_basename=state.kernel_basename,
+                    live_framework=state.framework,
+                )
+            except ValueError as exc:
+                raise KerneloptUserError(str(exc)) from exc
             initial["_entry"] = entry
             pipe_print(
                 f"[bold green]Resuming[/] from [cyan]{resume_path}/[/] "
@@ -923,10 +930,29 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
         else:
             base = load_baseline_artifacts(resume_path)
             if not base:
-                raise FileNotFoundError(
-                    f"No {resume_path / 'pipeline_checkpoint.json'} and no "
-                    f"baseline.csv + baseline_profiling_context.json in {resume_path}"
+                ckpt_path = resume_path / CHECKPOINT_FILENAME
+                has_ckpt_file = ckpt_path.is_file()
+                lines = [
+                    "Cannot resume: this run directory has no usable checkpoint or baseline.",
+                    "",
+                    "Expected one of:",
+                    f"  • {CHECKPOINT_FILENAME} — resume mid-run, or",
+                    "  • baseline.csv and baseline_profiling_context.json — continue after baseline.",
+                    "",
+                    f"Directory: {resume_path}",
+                ]
+                if has_ckpt_file:
+                    lines += [
+                        "",
+                        f"(Found {CHECKPOINT_FILENAME} but it could not be loaded — "
+                        "wrong or missing version field.)",
+                    ]
+                lines.append("")
+                lines.append(
+                    "Omit --checkpoint to start fresh, or pass a pipeline_output/run_* "
+                    "folder produced by kernelopt."
                 )
+                raise KerneloptUserError("\n".join(lines))
             mem_path = resume_path / "optimization_memory.json"
             mem = load_memory(mem_path) if mem_path.is_file() else []
             bctx = base["baseline_profiling_context"]
