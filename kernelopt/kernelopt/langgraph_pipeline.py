@@ -10,6 +10,7 @@ Graph:
 from __future__ import annotations
 
 import difflib
+import json
 import shutil
 import string
 import uuid
@@ -1011,6 +1012,10 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     state.best_kernel = final["best_kernel"]
     state.best_latency_ns = final["best_latency_ns"]
     state.best_ncu_rep = final.get("best_ncu_rep", "")
+    state.baseline_csv = str(final.get("baseline_csv") or state.baseline_csv or "")
+    state.baseline_ncu_rep = str(
+        final.get("baseline_ncu_rep") or state.baseline_ncu_rep or ""
+    )
     state.baseline_profiling_context = final.get("baseline_profiling_context", {})
     state.current_profiling_context = final.get("current_profiling_context", {})
     state.optimization_memory = final.get("optimization_memory", [])
@@ -1090,15 +1095,88 @@ def _kernel_diff_log_lines(
     return out
 
 
+def _write_best_profiling_artifacts(
+    state: PipelineState,
+    output_dir: Path,
+    baseline_latency: float,
+) -> None:
+    """Write stable best_kernel.ncu-rep, best_kernel.csv, best_kernel_profiling_context.json.
+
+    If no candidate beats baseline (within tolerance), copies baseline artifacts.
+    Otherwise copies from the winning candidate's NCU output stem (best_ncu_rep).
+    """
+    tol = 0.5
+    best_ns = state.best_latency_ns
+    best_ns_ok = best_ns == best_ns and 0 < best_ns < float("inf")
+    beats_baseline = best_ns_ok and best_ns + tol < baseline_latency
+
+    dest_rep = output_dir / "best_kernel.ncu-rep"
+    dest_csv = output_dir / "best_kernel.csv"
+    dest_ctx = output_dir / "best_kernel_profiling_context.json"
+
+    if beats_baseline and (state.best_ncu_rep or "").strip():
+        rep_path = Path(state.best_ncu_rep).resolve()
+        if rep_path.is_file():
+            shutil.copy2(rep_path, dest_rep)
+        csv_path = rep_path.with_suffix(".csv")
+        if csv_path.is_file():
+            shutil.copy2(csv_path, dest_csv)
+        ctx = state.current_profiling_context or {}
+        if ctx:
+            dest_ctx.write_text(
+                json.dumps(ctx, indent=2),
+                encoding="utf-8",
+            )
+        return
+
+    # Best equals baseline: use baseline NCU outputs in this run directory (or external CSV).
+    ctx_out = state.baseline_profiling_context or state.current_profiling_context or {}
+
+    csv_src: Path | None = None
+    cfg_csv = (state.config.baseline_csv or "").strip()
+    if cfg_csv and Path(cfg_csv).is_file():
+        csv_src = Path(cfg_csv)
+    else:
+        p = output_dir / "baseline.csv"
+        if p.is_file():
+            csv_src = p
+
+    rep_src: Path | None = None
+    local_rep = output_dir / "baseline.ncu-rep"
+    if local_rep.is_file():
+        rep_src = local_rep
+    else:
+        alt = (state.baseline_ncu_rep or "").strip()
+        if alt:
+            ap = Path(alt)
+            if ap.is_file():
+                rep_src = ap
+
+    if rep_src is not None:
+        shutil.copy2(rep_src, dest_rep)
+    if csv_src is not None:
+        shutil.copy2(csv_src, dest_csv)
+
+    bl_json = output_dir / "baseline_profiling_context.json"
+    if bl_json.is_file():
+        shutil.copy2(bl_json, dest_ctx)
+    elif ctx_out:
+        dest_ctx.write_text(
+            json.dumps(ctx_out, indent=2),
+            encoding="utf-8",
+        )
+
+
 def _write_final_outputs(
     state: PipelineState,
     output_dir: Path,
     ext: str,
     baseline_latency: float,
 ) -> None:
-    """Write best_kernel, optimization_memory.json, and optimization_log.md."""
+    """Write best_kernel, best NCU artifacts, optimization_memory.json, and optimization_log.md."""
     best_path = output_dir / f"best_kernel{ext}"
     best_path.write_text(state.best_kernel)
+    _write_best_profiling_artifacts(state, output_dir, baseline_latency)
 
     save_memory(
         state.optimization_memory,
