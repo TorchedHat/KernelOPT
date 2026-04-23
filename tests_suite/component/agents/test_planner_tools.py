@@ -1,4 +1,6 @@
 # kernelopt/tests/agents/test_planner_tools.py
+from __future__ import annotations
+
 import pytest
 from kernelopt.agents.planner.tools import PlannerToolServer
 

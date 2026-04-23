@@ -1,4 +1,6 @@
 # kernelopt/tests/agents/test_planner_graph.py
+from __future__ import annotations
+
 import json
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage

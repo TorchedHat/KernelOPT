@@ -3,6 +3,8 @@ Tests for profiler LangGraph agent.
 
 Tests routing, tool_node, and profiler_subgraph integration.
 """
+from __future__ import annotations
+
 import pytest
 from unittest.mock import MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage

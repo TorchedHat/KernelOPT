@@ -3,6 +3,8 @@ Tests for profiler context_builder module.
 
 Tests build_profiling_context and get_latency_ns functions.
 """
+from __future__ import annotations
+
 import pytest
 from kernelopt.agents.profiler.context_builder import build_profiling_context, get_latency_ns
 
