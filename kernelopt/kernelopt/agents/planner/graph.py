@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from typing import Annotated
+from typing import Annotated, Optional
 
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -20,7 +20,7 @@ from kernelopt.agents.planner.tools import ALL_TOOLS, _TOOL_MAP
 
 class PlannerState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
-    plan: dict | None
+    plan: Optional[dict]
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ def tool_node(state: PlannerState, config: RunnableConfig) -> dict:
     """
     last = state["messages"][-1]
     tool_messages: list[ToolMessage] = []
-    new_plan: dict | None = None
+    new_plan: Optional[dict] = None
 
     for tc in last.tool_calls:
         name = tc["name"]

@@ -1,4 +1,6 @@
 """GPU hardware specifications for roofline analysis."""
+from __future__ import annotations
+
 
 GPU_SPECS: dict[str, dict] = {
     "H200 SXM5": {

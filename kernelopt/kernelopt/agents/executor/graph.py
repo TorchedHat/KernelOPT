@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import difflib
 import json
-from typing import Annotated
+from typing import Annotated, Optional
 
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -19,7 +19,7 @@ from kernelopt.agents.executor.tools import ALL_TOOLS, _TOOL_MAP
 
 class ExecutorState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
-    kernel_result: dict | None   # set on success or K exhaustion; None until then
+    kernel_result: Optional[dict]
     attempt: int                 # number of submit_kernel calls made so far
 
 
@@ -68,7 +68,7 @@ def tool_node(state: ExecutorState, config: RunnableConfig) -> dict:
     original_kernel: str = config["configurable"]["original_kernel"]
 
     tool_messages: list[ToolMessage] = []
-    new_kernel_result: dict | None = None
+    new_kernel_result: Optional[dict] = None
     new_attempt: int = state.get("attempt", 0)
 
     for tc in last.tool_calls:
