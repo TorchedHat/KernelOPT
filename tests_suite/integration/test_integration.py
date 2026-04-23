@@ -113,7 +113,6 @@ class TestPipelineComponents:
         passed, msg = check_correctness_subprocess(
             str(test_kernel_path),
             optimized_source,
-            "triton",
         )
 
         # Verify integration (may pass or fail, but should execute)
@@ -395,7 +394,6 @@ class TestErrorHandling:
         passed, msg = check_correctness_subprocess(
             "/nonexistent/kernel.py",
             "dummy code",
-            "triton",
         )
 
         assert passed is False
