@@ -1,4 +1,6 @@
 # kernelopt/tests/agents/test_executor_graph.py
+from __future__ import annotations
+
 import pytest
 from unittest.mock import MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage

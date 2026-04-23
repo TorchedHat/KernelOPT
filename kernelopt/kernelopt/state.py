@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 
 @dataclass
@@ -112,7 +112,7 @@ class PipelineState:
     baseline_csv: str = ""
     baseline_ncu_rep: str = ""
     # NCU config determined at baseline; reused for all candidate profiling
-    ncu_config: dict | None = None
+    ncu_config: Optional[dict] = None
 
     # Current iteration state
     current_profiling_context: dict = field(default_factory=dict)
@@ -151,7 +151,7 @@ class GraphState(TypedDict, total=False):
     baseline_ncu_rep: str
     baseline_latency_ns: float
     # NCU config from baseline profiling — reused for all candidates
-    ncu_config: dict | None
+    ncu_config: Optional[dict]
 
     # Current best
     best_kernel: str
