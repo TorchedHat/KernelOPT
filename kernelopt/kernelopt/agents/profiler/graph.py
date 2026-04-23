@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, Optional
 
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -18,7 +18,7 @@ from kernelopt.agents.profiler.tools import ALL_TOOLS, _TOOL_MAP
 
 class ProfilerState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
-    ncu_config: dict | None  # None until submit_ncu_config is called
+    ncu_config: Optional[dict]
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ def tool_node(state: ProfilerState, config: RunnableConfig) -> dict:
     """
     last = state["messages"][-1]
     tool_messages: list[ToolMessage] = []
-    new_ncu_config: dict | None = None
+    new_ncu_config: Optional[dict] = None
 
     for tc in last.tool_calls:
         name = tc["name"]
