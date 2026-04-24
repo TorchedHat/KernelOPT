@@ -380,9 +380,14 @@ def run(
     else:
         state.pre_run_system_snapshot = {}
 
+    import time as _time
+
     from kernelopt.agents.profiler import get_latency_ns
     from kernelopt.errors import KerneloptUserError
     from kernelopt.langgraph_pipeline import run_langgraph_pipeline
+    from kernelopt.progress import print_run_summary
+
+    _run_start = _time.monotonic()
 
     try:
         final = run_langgraph_pipeline(state)
@@ -390,6 +395,16 @@ def run(
         console.print("[bold red]kernelopt cannot continue[/]")
         console.print(str(exc))
         raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        elapsed = _time.monotonic() - _run_start
+        mins, secs = divmod(int(elapsed), 60)
+        console.print(
+            f"\n[yellow]Interrupted[/] after {mins}m {secs:02d}s. "
+            f"Checkpoint saved — resume with:\n"
+            f"  [cyan]kernelopt run {kernel_path.name} "
+            f"--checkpoint {resolved_output}/[/]"
+        )
+        raise typer.Exit(130) from None
     except Exception as exc:
         if cfg.hud and not cfg.verbose:
             console.print("[bold red]Run failed[/]")
@@ -401,20 +416,39 @@ def run(
             raise typer.Exit(1) from None
         raise
 
+    total_elapsed = _time.monotonic() - _run_start
     baseline_ns = get_latency_ns(final.baseline_profiling_context)
     best_ns = final.best_latency_ns
 
-    def _lat_summary(ns: float) -> str:
-        if ns != ns or ns == float("inf"):  # NaN or missing
-            return "?"
-        return f"{ns / 1000:.2f} µs ({ns:.0f} ns)"
+    iteration_results = getattr(final, "iteration_results", None) or []
+    best_direction = ""
+    for result in iteration_results:
+        for c in getattr(result, "candidates", []):
+            if getattr(c, "kept", False):
+                best_direction = c.direction
 
-    console.print(
-        f"\n[bold]Done.[/] "
-        f"Baseline: {_lat_summary(baseline_ns)} -> "
-        f"Best: [green]{_lat_summary(best_ns)}[/]\n"
-        f"Results in [cyan]{resolved_output}/[/]"
-    )
+    if not cfg.hud:
+        print_run_summary(
+            baseline_ns=baseline_ns,
+            best_ns=best_ns,
+            best_direction=best_direction,
+            iteration_results=iteration_results,
+            output_dir=str(resolved_output),
+            total_elapsed=total_elapsed,
+            console=console,
+        )
+    else:
+        def _lat_summary(ns: float) -> str:
+            if ns != ns or ns == float("inf"):
+                return "?"
+            return f"{ns / 1000:.2f} µs ({ns:.0f} ns)"
+
+        console.print(
+            f"\n[bold]Done.[/] "
+            f"Baseline: {_lat_summary(baseline_ns)} -> "
+            f"Best: [green]{_lat_summary(best_ns)}[/]\n"
+            f"Results in [cyan]{resolved_output}/[/]"
+        )
 
 
 @app.command()

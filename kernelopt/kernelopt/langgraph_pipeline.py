@@ -58,6 +58,7 @@ from kernelopt.pipeline_ui import (
     pipe_print,
     run_primary_hud_session,
 )
+from kernelopt.progress import phase_spinner
 from kernelopt.state import (
     GraphState,
     IterationResult,
@@ -68,6 +69,11 @@ from kernelopt.state import (
 
 console = Console()
 PLAN_LETTERS = list(string.ascii_uppercase)
+
+
+def _use_spinners() -> bool:
+    """Show animated spinners only when HUD is off (non-HUD terminal mode)."""
+    return get_pipeline_ui() is None
 
 
 def _checkpoint_stage(state: GraphState, updates: dict, stage: str) -> None:
@@ -139,15 +145,27 @@ def profile_baseline(state: GraphState) -> dict:
     else:
         pipe_print("[bold]Profiling baseline kernel...[/]")
         try:
-            baseline_ctx, ncu_config = run_profiler_agent(
-                kernel_path,
-                str(output_dir / "baseline"),
-                ncu_config=None,
-                pipeline_config=cfg,
-                kernel_id=kernel_id,
-                llm_config=llm_config,
-                binary_path=compiled_binary,
-            )
+            if _use_spinners():
+                with phase_spinner("baseline", Path(kernel_path).name):
+                    baseline_ctx, ncu_config = run_profiler_agent(
+                        kernel_path,
+                        str(output_dir / "baseline"),
+                        ncu_config=None,
+                        pipeline_config=cfg,
+                        kernel_id=kernel_id,
+                        llm_config=llm_config,
+                        binary_path=compiled_binary,
+                    )
+            else:
+                baseline_ctx, ncu_config = run_profiler_agent(
+                    kernel_path,
+                    str(output_dir / "baseline"),
+                    ncu_config=None,
+                    pipeline_config=cfg,
+                    kernel_id=kernel_id,
+                    llm_config=llm_config,
+                    binary_path=compiled_binary,
+                )
         except RuntimeError as e:
             raise RuntimeError(f"Baseline profiling failed: {e}") from e
         ctx_json = str(output_dir / "baseline_profiling_context.json")
@@ -234,7 +252,7 @@ def generate_plans(state: GraphState) -> dict:
         "region": cfg.region,
     }
 
-    plans = run_planner_agent(
+    _plan_args = dict(
         profiling_context=profiling_ctx,
         kernel_source=state["best_kernel"],
         memory=state.get("optimization_memory", []),
@@ -242,6 +260,11 @@ def generate_plans(state: GraphState) -> dict:
         llm_config=llm_config,
         all_tried_directions=all_tried_directions,
     )
+    if _use_spinners():
+        with phase_spinner("planning", f"{cfg.N} optimization plans"):
+            plans = run_planner_agent(**_plan_args)
+    else:
+        plans = run_planner_agent(**_plan_args)
 
     for letter, plan in plans:
         direction = plan.get("direction", "unknown")
@@ -292,9 +315,6 @@ def execute_plans(state: GraphState) -> dict:
 
         pipe_print(f"  [dim]Executing plan {plan_letter} ({direction})...[/]")
 
-        # For .cu kernels: up to K outer attempts (executor + compile).
-        # Each attempt feeds the previous nvcc error back to the executor.
-        # For non-.cu kernels: single executor call (existing behaviour).
         last_compile_err: str | None = None
         optimized_source: str | None = None
         execution_result: dict = {}
@@ -303,8 +323,9 @@ def execute_plans(state: GraphState) -> dict:
         executor_K = 1 if ext == ".cu" else cfg.K
 
         for attempt_idx in range(outer_attempts):
+            _exec_label = f"plan {plan_letter} — {direction}"
             try:
-                optimized_source, execution_result = run_executor_agent(
+                _exec_args = dict(
                     kernel_source=current_kernel,
                     optimization_plan=plan,
                     memory=state.get("optimization_memory", []),
@@ -312,6 +333,11 @@ def execute_plans(state: GraphState) -> dict:
                     llm_config=llm_config,
                     compile_error=last_compile_err,
                 )
+                if _use_spinners():
+                    with phase_spinner("executing", _exec_label):
+                        optimized_source, execution_result = run_executor_agent(**_exec_args)
+                else:
+                    optimized_source, execution_result = run_executor_agent(**_exec_args)
             except Exception as e:
                 pipe_print(f"    [red]Executor failed (plan {plan_letter}): {e}[/]")
                 optimized_source = None
@@ -378,10 +404,11 @@ def execute_plans(state: GraphState) -> dict:
 
         execution_result["correctness"] = "unverified"
 
-        # Correctness check
         pipe_print(f"  [dim]Running correctness check...[/]")
-        passed, msg = check_correctness(
-            kernel_path, optimized_source, framework,
+        _cc_args = dict(
+            original_path=kernel_path,
+            optimized_source=optimized_source,
+            framework=framework,
             use_agentic=cfg.agentic_correctness,
             api_key=cfg.api_key,
             project_id=cfg.project_id,
@@ -389,6 +416,11 @@ def execute_plans(state: GraphState) -> dict:
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
         )
+        if _use_spinners():
+            with phase_spinner("correctness", f"plan {plan_letter}"):
+                passed, msg = check_correctness(**_cc_args)
+        else:
+            passed, msg = check_correctness(**_cc_args)
         execution_result["correctness"] = "passed" if passed else "failed"
 
         status = "[green]passed[/]" if passed else "[red]failed[/]"
@@ -491,15 +523,21 @@ def profile_candidates(state: GraphState) -> dict:
                 continue
 
         try:
-            ctx, _ = run_profiler_agent(
-                kernel_file,
-                output_base,
-                ncu_config=saved_ncu_config,  # full bypass — no LLM call
+            _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
+            _prof_args = dict(
+                kernel_path=kernel_file,
+                output_basename=output_base,
+                ncu_config=saved_ncu_config,
                 pipeline_config=cfg,
                 kernel_id=kernel_id,
                 binary_path=candidate_binary,
                 llm_config=llm_config,
             )
+            if _use_spinners():
+                with phase_spinner("profiling", _prof_label):
+                    ctx, _ = run_profiler_agent(**_prof_args)
+            else:
+                ctx, _ = run_profiler_agent(**_prof_args)
             c.profiling_context = ctx
             c.csv_path = f"{output_base}.csv"
             c.ncu_rep_path = f"{output_base}.ncu-rep"
@@ -565,6 +603,8 @@ def summarize_results(state: GraphState) -> dict:
     if ui:
         ui.set_phase("Summarize + memory", "")
 
+    _show_summarize_spinner = _use_spinners()
+
     summarize_candidates = sorted(
         [c for c in candidates if c.latency_ns < float("inf")],
         key=lambda c: abs(c.speedup - 1.0),
@@ -573,10 +613,9 @@ def summarize_results(state: GraphState) -> dict:
 
     experience_items: list[dict] = []
 
-    # Sequential execution with updated memory for proper deduplication
     for c in summarize_candidates:
         try:
-            item, memory_update = run_summarizer(
+            _sum_args = dict(
                 profiling_before=profiling_before,
                 profiling_after=c.profiling_context,
                 optimization_plan=c.optimization_plan,
@@ -585,13 +624,18 @@ def summarize_results(state: GraphState) -> dict:
                 iteration=iteration + 1,
                 framework=framework,
                 speedup=c.speedup,
-                existing_memory=memory,  # Current state (updated each iteration)
+                existing_memory=memory,
                 execution_result=c.execution_result,
                 api_key=cfg.api_key,
                 model=cfg.summarizer_model or cfg.model,
                 project_id=cfg.project_id,
                 region=cfg.region,
             )
+            if _show_summarize_spinner:
+                with phase_spinner("summarize", f"plan {c.plan_letter}"):
+                    item, memory_update = run_summarizer(**_sum_args)
+            else:
+                item, memory_update = run_summarizer(**_sum_args)
 
             # Apply deduplication immediately
             if memory_update["action"] == "append":
