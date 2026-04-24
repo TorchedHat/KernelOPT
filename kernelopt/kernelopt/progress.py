@@ -41,15 +41,11 @@ class _SpinnerDisplay:
         self._spinner = Spinner(spinner_name, style=style)
         self._msg_text = Text(message, style=style.replace("bold ", ""))
         self._start = time.monotonic()
-        self._grid_template = self._build_grid_template()
-
-    @staticmethod
-    def _build_grid_template() -> Table:
-        table = Table.grid(padding=(0, 1))
-        table.add_column(width=3)
-        table.add_column()
-        table.add_column(justify="right", style="dim")
-        return table
+        self._col_defs = (
+            {"width": 3},
+            {},
+            {"justify": "right", "style": "dim"},
+        )
 
     def __rich_console__(self, console, options):
         elapsed = time.monotonic() - self._start
@@ -57,9 +53,8 @@ class _SpinnerDisplay:
         time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
 
         table = Table.grid(padding=(0, 1))
-        table.add_column(width=3)
-        table.add_column()
-        table.add_column(justify="right", style="dim")
+        for col in self._col_defs:
+            table.add_column(**col)
         table.add_row(self._spinner, self._msg_text, Text(f"[{time_str}]"))
         yield from table.__rich_console__(console, options)
 
