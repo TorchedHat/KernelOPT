@@ -191,6 +191,17 @@ tests_suite/
 │   ├── test_architecture.py   # Design patterns (60+ tests)
 │   └── test_contracts.py      # API stability (70+ tests)
 │
+├── benchmarks/                 # Industry-standard GPU kernel benchmarks
+│   ├── kernelbench/            # KernelBench dataset (270 kernels)
+│   │   ├── level_1/            # 100 basic operation kernels
+│   │   ├── level_2/            # 100 intermediate kernels
+│   │   ├── level_3/            # 50 advanced kernels
+│   │   └── level_4/            # 20 complex kernels
+│   ├── sol_execbench/          # SOL-ExecBench dataset (26 kernels)
+│   │   └── train/              # Real production workloads
+│   ├── download_datasets.py    # Dataset downloader script
+│   └── README.md               # Benchmarks documentation
+│
 ├── utils/                      # GPU utilities
 │   └── gpu_utils.py           # H200 GPU management
 │
@@ -414,6 +425,86 @@ These tests ensure:
 # Run quality tests
 pytest quality/ -v
 ```
+
+---
+
+## 🎯 Benchmarks
+
+**Location:** `benchmarks/`
+
+Industry-standard GPU kernel benchmark datasets for validating and measuring the kernel optimization tool's performance on real-world workloads.
+
+### KernelBench (270 kernels)
+
+**Dataset:** https://huggingface.co/datasets/ScalingIntelligence/KernelBench
+
+Comprehensive benchmark with 270 GPU kernel problems across 4 difficulty levels:
+- **Level 1** (100 kernels): Basic operations (matmul, activations, pooling)
+- **Level 2** (100 kernels): Intermediate operations (convolutions, normalization)
+- **Level 3** (50 kernels): Advanced operations (fused ops, complex reductions)
+- **Level 4** (20 kernels): Complex operations (attention, specialized kernels)
+
+**Operation Categories:**
+- Matrix operations (9 types)
+- Tensor operations (9 types)
+- Activation functions (14 types)
+- Normalization layers (8 types)
+- Pooling operations (6 types)
+- Reduction operations (7 types)
+- Convolution operations (37 types)
+- Cumulative operations (5 types)
+- Loss functions (6 types)
+- Attention & special ops (3 types)
+
+### SOL-ExecBench (26 kernels)
+
+**Dataset:** https://huggingface.co/datasets/nvidia/SOL-ExecBench
+
+Real-world CUDA kernel benchmarks from production HuggingFace models:
+- 26 kernel specifications from text, vision, and speech models
+- Evaluates performance against theoretical hardware "Speed of Light" limits
+- Includes fused operations, GEMM, attention mechanisms
+- Multiple data types: FP32, BF16, FP16, FP8, NVFP4
+
+**Key Features:**
+- Real production workloads (Qwen3-30B, Llama, etc.)
+- Symbolic axis definitions for flexible testing
+- PyTorch reference implementations for correctness validation
+- Multiple workload instantiations per kernel
+
+### Download Benchmarks
+
+```bash
+# Download both datasets
+cd tests_suite/benchmarks
+python download_datasets.py
+
+# This downloads:
+# - KernelBench: 270 kernels (2.3 MB)
+# - SOL-ExecBench: 26 kernels (472 KB)
+```
+
+### Why These Benchmarks Matter
+
+1. **Validation**: Prove optimization strategies work on industry-standard benchmarks
+2. **Coverage**: Test across diverse kernel types (GEMM, attention, fused ops, quantized)
+3. **Performance Baseline**: Compare against theoretical limits (SOL metrics)
+4. **Regression Testing**: Ensure optimizations don't break on edge cases
+5. **Real-World Relevance**: Test on actual production model kernels
+
+### Runtime Estimates
+
+**Single Kernel (T=3, N=4):** ~40-50 minutes
+
+**Full Benchmarks (single GPU):**
+- KernelBench Level 1 (100 kernels): ~75 hours
+- Full KernelBench (270 kernels): ~200 hours
+- SOL-ExecBench (26 kernels): ~20 hours
+
+**Parallel (8× H200 GPUs):**
+- KernelBench Level 1: ~9.4 hours
+- Full KernelBench: ~25 hours
+- SOL-ExecBench: ~2.5 hours
 
 ---
 
