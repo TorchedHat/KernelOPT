@@ -29,14 +29,27 @@ PHASE_STYLES = {
 }
 
 
+def _speedup_key(candidate):
+    """Reusable key function for sorting/maxing candidates by speedup."""
+    return candidate.speedup
+
+
 class _SpinnerDisplay:
     """Renderable: colored braille spinner + message + live elapsed time."""
 
     def __init__(self, message: str, spinner_name: str, style: str):
-        self._message = message
         self._spinner = Spinner(spinner_name, style=style)
-        self._style = style
+        self._msg_text = Text(message, style=style.replace("bold ", ""))
         self._start = time.monotonic()
+        self._grid_template = self._build_grid_template()
+
+    @staticmethod
+    def _build_grid_template() -> Table:
+        table = Table.grid(padding=(0, 1))
+        table.add_column(width=3)
+        table.add_column()
+        table.add_column(justify="right", style="dim")
+        return table
 
     def __rich_console__(self, console, options):
         elapsed = time.monotonic() - self._start
@@ -47,11 +60,7 @@ class _SpinnerDisplay:
         table.add_column(width=3)
         table.add_column()
         table.add_column(justify="right", style="dim")
-        table.add_row(
-            self._spinner,
-            Text(self._message, style=self._style.replace("bold ", "")),
-            Text(f"[{time_str}]"),
-        )
+        table.add_row(self._spinner, self._msg_text, Text(f"[{time_str}]"))
         yield from table.__rich_console__(console, options)
 
 
@@ -73,6 +82,7 @@ def phase_spinner(
     spinner_name, style, label = PHASE_STYLES.get(
         phase, ("dots", "white", phase.capitalize())
     )
+    color = style.replace("bold ", "")
     message = f"{label} {detail}".strip() if detail else label
 
     display = _SpinnerDisplay(message, spinner_name, style)
@@ -83,7 +93,6 @@ def phase_spinner(
     elapsed = time.monotonic() - display._start
     mins, secs = divmod(int(elapsed), 60)
     time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
-    color = style.replace("bold ", "")
     c.print(f"  [green]✓[/] [{color}]{message}[/]  [dim]\\[{time_str}][/]")
 
 
@@ -116,8 +125,6 @@ def print_run_summary(
     baseline_ns: float,
     best_ns: float,
     best_direction: str,
-    iterations_completed: int,
-    iterations_total: int,
     iteration_results: list,
     output_dir: str,
     total_elapsed: float,
@@ -151,7 +158,7 @@ def print_run_summary(
 
     for i, result in enumerate(iteration_results):
         candidates = getattr(result, "candidates", [])
-        kept = [c for c in candidates if getattr(c, "kept", False)]
+        kept = [cand for cand in candidates if getattr(cand, "kept", False)]
         if kept:
             k = kept[0]
             c.print(
@@ -159,11 +166,11 @@ def print_run_summary(
                 f"{k.direction}"
             )
         else:
-            best_c = max(candidates, key=lambda x: x.speedup, default=None)
-            if best_c and best_c.speedup > 0:
+            best_cand = max(candidates, key=_speedup_key, default=None)
+            if best_cand and best_cand.speedup > 0:
                 c.print(
                     f"    Iter {i + 1}: [dim]no improvement[/] "
-                    f"(best candidate {best_c.speedup:.2f}x)"
+                    f"(best candidate {best_cand.speedup:.2f}x)"
                 )
             else:
                 c.print(f"    Iter {i + 1}: [dim]no valid candidates[/]")

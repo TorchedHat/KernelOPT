@@ -432,8 +432,6 @@ def run(
             baseline_ns=baseline_ns,
             best_ns=best_ns,
             best_direction=best_direction,
-            iterations_completed=len(iteration_results),
-            iterations_total=cfg.T,
             iteration_results=iteration_results,
             output_dir=str(resolved_output),
             total_elapsed=total_elapsed,
