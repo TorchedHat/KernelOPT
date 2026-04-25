@@ -488,6 +488,33 @@ source .env
 
 **Why?** You haven't run `kernelopt setup` yet, or `ANTHROPIC_VERTEX_PROJECT_ID` is not set. Run `kernelopt setup` to configure credentials, or set the env var manually.
 
+### GPU Selection (`CUDA_VISIBLE_DEVICES`)
+
+`CUDA_VISIBLE_DEVICES` is a standard CUDA environment variable that controls which GPU(s) are visible to your program. kernelopt (and NCU) will only see and use the GPUs you specify.
+
+**Why use it?** On multi-GPU machines, NCU profiling requires exclusive access to a GPU. Setting `CUDA_VISIBLE_DEVICES` ensures kernelopt uses a specific GPU and avoids interfering with other users or processes on shared machines.
+
+```bash
+# Use only GPU 0
+CUDA_VISIBLE_DEVICES=0 kernelopt run softmax.py -T 3 -N 4
+
+# Use only GPU 2 (e.g., if GPUs 0 and 1 are busy)
+CUDA_VISIBLE_DEVICES=2 kernelopt run softmax.py -T 3 -N 4
+
+# Use GPUs 0 and 1 (for multi-GPU workloads)
+CUDA_VISIBLE_DEVICES=0,1 kernelopt run softmax.py -T 3 -N 4
+```
+
+**How to check which GPUs are available:**
+
+```bash
+nvidia-smi  # shows all GPUs with utilization and memory usage
+```
+
+Pick a GPU with low utilization and enough free memory. For kernelopt, a single GPU is sufficient — most kernel profiling targets one GPU at a time.
+
+**Tip:** If you don't set `CUDA_VISIBLE_DEVICES`, kernelopt will use GPU 0 by default. On shared machines, always set it explicitly to avoid conflicts.
+
 ---
 
 ## CLI
