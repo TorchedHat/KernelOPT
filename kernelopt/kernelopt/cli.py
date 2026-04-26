@@ -164,6 +164,7 @@ def run(
         None, "--profiler-model", help="Model for profiler agent config-decider"
     ),
     verbose: bool = typer.Option(False, help="Verbose output"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug prints (profiler config, correctness subprocess)"),
     hud: bool = typer.Option(
         False,
         "--hud",
@@ -304,6 +305,7 @@ def run(
                 kernel_path=str(kernel_path),
                 baseline_csv=str(csv) if csv else None,
                 verbose=verbose,
+                debug=debug,
                 agentic_correctness=agentic_correctness,
             )
     else:
@@ -332,6 +334,7 @@ def run(
             kernel_path=str(kernel_path),
             baseline_csv=str(csv) if csv else None,
             verbose=verbose,
+            debug=debug,
             agentic_correctness=agentic_correctness,
         )
 
