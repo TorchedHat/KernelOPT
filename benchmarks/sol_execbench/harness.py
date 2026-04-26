@@ -96,22 +96,39 @@ class BaselineResult:
     error: str = ""
 
 
-def list_problems(root: Optional[Path] = None) -> list[dict]:
-    """List all SOL-ExecBench problems with metadata."""
+def list_problems(root: Optional[Path] = None, configs: Optional[list[str]] = None) -> list[dict]:
+    """List all SOL-ExecBench problems with metadata.
+
+    Searches for problems in both the old layout (train/) and the
+    new multi-config layout (FlashInfer-Bench/train/, L1/train/, etc.).
+    """
     root = root or DATA_ROOT
+    if configs is None:
+        configs = ["FlashInfer-Bench", "L1", "L2", "Quant"]
+
     problems = []
-    train_dir = root / "train"
-    if not train_dir.is_dir():
-        return problems
-    for json_path in sorted(train_dir.glob("kernel_*.json")):
-        raw = json.loads(json_path.read_text())
-        name = raw.get("name", json_path.stem)
-        problems.append({
-            "problem_id": json_path.stem,
-            "name": name,
-            "category": _categorize(name),
-            "path": str(json_path),
-        })
+    search_dirs = []
+
+    for config in configs:
+        cfg_train = root / config / "train"
+        if cfg_train.is_dir():
+            search_dirs.append((config, cfg_train))
+
+    old_train = root / "train"
+    if old_train.is_dir() and not search_dirs:
+        search_dirs.append(("FlashInfer-Bench", old_train))
+
+    for config_name, train_dir in search_dirs:
+        for json_path in sorted(train_dir.glob("kernel_*.json")):
+            raw = json.loads(json_path.read_text())
+            name = raw.get("name", json_path.stem)
+            problems.append({
+                "problem_id": f"{config_name}/{json_path.stem}",
+                "name": name,
+                "category": _categorize(name),
+                "config": config_name,
+                "path": str(json_path),
+            })
     return problems
 
 
