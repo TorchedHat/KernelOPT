@@ -113,7 +113,8 @@ def _resolve_ncu_config(
         if kernel_path.endswith(".cu"):
             kernel_source = Path(kernel_path).read_text()
             if "int main(" in kernel_source or "void main(" in kernel_source:
-                print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
+                if pipeline_config.debug:
+                    print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
                 replay_mode = "application"
 
         return {
@@ -158,17 +159,19 @@ def _resolve_ncu_config(
         # Force kernel_name to be empty for Triton/Helion frameworks.
         # JIT-compiled kernels have mangled names that don't match Python function names.
         if framework in ("triton", "helion"):
-            print(f"[DEBUG] Detected {framework} kernel, forcing kernel_name='' (was: {llm_result.get('kernel_name')})")
+            if pipeline_config.debug:
+                print(f"[DEBUG] Detected {framework} kernel, forcing kernel_name='' (was: {llm_result.get('kernel_name')})")
             llm_result = {**llm_result, "kernel_name": ""}
 
         # Force application mode for CUDA files with main() — kernel mode doesn't work with standalone binaries.
         if framework == "cuda" and kernel_path.endswith(".cu"):
             kernel_source = Path(kernel_path).read_text()
             if "int main(" in kernel_source or "void main(" in kernel_source:
-                print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application' (was: {llm_result.get('replay_mode')})")
+                if pipeline_config.debug:
+                    print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application' (was: {llm_result.get('replay_mode')})")
                 llm_result = {**llm_result, "replay_mode": "application"}
 
-        print(f"[DEBUG] Final LLM config: {llm_result}")
+        emit_profiler_output(f"[profiler] LLM config: {llm_result}\n")
         return llm_result
 
     # Fallback — deterministic extraction if LLM never called submit_ncu_config.
@@ -181,7 +184,8 @@ def _resolve_ncu_config(
     if framework == "cuda" and kernel_path.endswith(".cu"):
         kernel_source = Path(kernel_path).read_text()
         if "int main(" in kernel_source or "void main(" in kernel_source:
-            print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
+            if pipeline_config.debug:
+                print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
             replay_mode = "application"
 
     fallback_config = {
@@ -191,7 +195,8 @@ def _resolve_ncu_config(
         "kernel_args": list(pipeline_config.kernel_args),
         "replay_mode": replay_mode,
     }
-    print(f"[DEBUG] Using fallback config (LLM didn't call submit_ncu_config): {fallback_config}")
+    if pipeline_config.debug:
+        print(f"[DEBUG] Using fallback config (LLM didn't call submit_ncu_config): {fallback_config}")
     return fallback_config
 
 

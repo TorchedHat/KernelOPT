@@ -415,6 +415,7 @@ def execute_plans(state: GraphState) -> dict:
             region=cfg.region,
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
+            debug=cfg.debug,
         )
         if _use_spinners():
             with phase_spinner("correctness", f"plan {plan_letter}"):

@@ -81,6 +81,7 @@ class PipelineConfig:
 
     # Runtime
     verbose: bool = False
+    debug: bool = False
     agentic_correctness: bool = True  # Use Claude to generate CPU reference tests
     # Same-terminal HUD (--hud); full stream + NCU text → kernelopt_terminal.log; not in checkpoint
     hud: bool = False
