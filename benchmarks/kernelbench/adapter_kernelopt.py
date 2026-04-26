@@ -1,0 +1,177 @@
+"""kernelopt adapter for KernelBench problems.
+
+Wraps a naive Triton kernel (Track A) or drives end-to-end generation +
+optimization (Track B), invokes `kernelopt run`, and collects results
+into the per-problem JSON schema.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Optional
+
+
+def _detect_kernel_name(kernel_source: str) -> Optional[str]:
+    """Extract the @triton.jit kernel function name from source."""
+    match = re.search(r"@triton\.jit\s*\ndef\s+(\w+)", kernel_source)
+    return match.group(1) if match else None
+
+
+def _parse_optimization_memory(mem_path: Path) -> list[dict]:
+    """Parse optimization_memory.json to extract per-iteration strategies."""
+    if not mem_path.exists():
+        return []
+    items = json.loads(mem_path.read_text())
+    iterations = []
+    for item in items:
+        iterations.append({
+            "direction": item.get("direction", "unknown"),
+            "summary": item.get("strategy_description", ""),
+            "speedup": item.get("speedup", 0.0),
+            "rewrite_type": item.get("rewrite_type", ""),
+        })
+    return iterations
+
+
+def _parse_optimization_log(log_path: Path) -> dict:
+    """Extract key metrics from optimization_log.md."""
+    if not log_path.exists():
+        return {}
+    text = log_path.read_text()
+    info = {}
+    for line in text.split("\n"):
+        if "Baseline:" in line and "ns" in line:
+            match = re.search(r"(\d[\d,]*)\s*ns", line.replace(",", ""))
+            if match:
+                info["baseline_ns"] = float(match.group(1))
+        if "Best:" in line and "ns" in line:
+            match = re.search(r"(\d[\d,]*)\s*ns", line.replace(",", ""))
+            if match:
+                info["best_ns"] = float(match.group(1))
+        if "Overall speedup" in line:
+            match = re.search(r"([\d.]+)x", line)
+            if match:
+                info["speedup"] = float(match.group(1))
+    return info
+
+
+def run_kernelopt(
+    kernel_path: str,
+    output_dir: str,
+    *,
+    T: int = 5,
+    N: int = 4,
+    K: int = 1,
+    kernel_name: Optional[str] = None,
+    kernel_args: str = "--profile-only",
+    gpu_id: int = 0,
+    timeout: int = 900,
+) -> dict:
+    """Run kernelopt on a kernel file and collect results.
+
+    Returns the per-problem result dict matching the schema in the plan.
+    """
+    kernel_path = Path(kernel_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if kernel_name is None:
+        source = kernel_path.read_text()
+        kernel_name = _detect_kernel_name(source)
+
+    cmd = [
+        "kernelopt", "run", str(kernel_path),
+        "-T", str(T), "-N", str(N), "-K", str(K),
+        "-o", str(output_dir), "--no-run-subdir",
+    ]
+    if kernel_name:
+        cmd.extend(["--kernel-name", kernel_name])
+    if kernel_args:
+        cmd.extend(["--kernel-args", kernel_args])
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        wall_clock = time.monotonic() - start
+        stdout = proc.stdout
+        stderr = proc.stderr
+        success = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        wall_clock = timeout
+        stdout = ""
+        stderr = "TIMEOUT"
+        success = False
+
+    result = {
+        "tool": "kernelopt",
+        "success": success,
+        "wall_clock_s": round(wall_clock, 1),
+        "stdout": stdout[-2000:] if stdout else "",
+        "stderr": stderr[-1000:] if stderr else "",
+    }
+
+    best_kernel_py = output_dir / "best_kernel.py"
+    if best_kernel_py.exists():
+        result["best_kernel_path"] = str(best_kernel_py)
+        result["best_kernel_source"] = best_kernel_py.read_text()
+
+    mem_path = output_dir / "optimization_memory.json"
+    result["iterations"] = _parse_optimization_memory(mem_path)
+
+    log_path = output_dir / "optimization_log.md"
+    log_info = _parse_optimization_log(log_path)
+    result.update(log_info)
+
+    return result
+
+
+def run_kernelopt_track_a(
+    naive_kernel_path: str,
+    problem_id: str,
+    results_dir: str,
+    *,
+    T: int = 5,
+    N: int = 4,
+    K: int = 1,
+    gpu_id: int = 0,
+) -> dict:
+    """Track A: optimize a given naive kernel with kernelopt."""
+    out_dir = Path(results_dir) / "kernelopt" / "track_a" / problem_id
+    result = run_kernelopt(
+        naive_kernel_path, str(out_dir),
+        T=T, N=N, K=K, gpu_id=gpu_id,
+    )
+    result["problem_id"] = problem_id
+    result["track"] = "A"
+    return result
+
+
+def run_kernelopt_track_b(
+    problem_py_path: str,
+    naive_kernel_path: str,
+    problem_id: str,
+    results_dir: str,
+    *,
+    T: int = 5,
+    N: int = 4,
+    K: int = 1,
+    gpu_id: int = 0,
+) -> dict:
+    """Track B: end-to-end (start from naive kernel generated by adapter, optimize)."""
+    out_dir = Path(results_dir) / "kernelopt" / "track_b" / problem_id
+    result = run_kernelopt(
+        naive_kernel_path, str(out_dir),
+        T=T, N=N, K=K, gpu_id=gpu_id,
+    )
+    result["problem_id"] = problem_id
+    result["track"] = "B"
+    return result
