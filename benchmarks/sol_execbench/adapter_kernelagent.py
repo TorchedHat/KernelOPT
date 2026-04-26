@@ -150,7 +150,7 @@ def run_kernelagent_sol(
     strategy: str = "beam_search",
     max_rounds: int = 5,
     gpu_id: int = 0,
-    timeout: int = 900,
+    timeout: int | None = None,
 ) -> dict:
     """Run KernelAgent on a SOL-ExecBench problem for one workload."""
     problem = load_problem(problem_path)
@@ -175,14 +175,10 @@ def run_kernelagent_sol(
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     start = time.monotonic()
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              env=env, cwd=str(KERNELAGENT_ROOT))
-        wall_clock = time.monotonic() - start
-        success = proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        wall_clock = timeout
-        success = False
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                          env=env, cwd=str(KERNELAGENT_ROOT))
+    wall_clock = time.monotonic() - start
+    success = proc.returncode == 0
 
     result = {
         "tool": "kernelagent",
