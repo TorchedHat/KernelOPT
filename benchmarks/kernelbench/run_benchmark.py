@@ -98,6 +98,13 @@ def _save_result(result: dict, results_dir: str) -> None:
     out.write_text(json.dumps(serializable, indent=2, default=str))
 
 
+def _measure_one_baseline(prob_meta: dict, gpu_id: int):
+    """Top-level function for ProcessPoolExecutor (must be picklable)."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    prob = load_problem(prob_meta["path"])
+    return measure_baselines(prob)
+
+
 def run_baselines(
     problems: list[dict],
     output_path: str,
@@ -107,16 +114,11 @@ def run_baselines(
     print(f"Measuring baselines for {len(problems)} problems on GPUs {gpus}...")
     results = []
 
-    def _measure_one(prob_meta, gpu_id):
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        prob = load_problem(prob_meta["path"])
-        return measure_baselines(prob)
-
     with ProcessPoolExecutor(max_workers=len(gpus)) as pool:
         futures = {}
         for i, prob in enumerate(problems):
             gpu = gpus[i % len(gpus)]
-            f = pool.submit(_measure_one, prob, gpu)
+            f = pool.submit(_measure_one_baseline, prob, gpu)
             futures[f] = prob
 
         for f in as_completed(futures):
