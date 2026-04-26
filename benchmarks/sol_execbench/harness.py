@@ -19,7 +19,7 @@ from typing import Any, Optional
 import torch
 
 DATA_ROOT = Path(__file__).resolve().parent.parent.parent / "tests_suite" / "benchmarks" / "sol_execbench"
-SAFETENSORS_ROOT = Path(__file__).resolve().parent / "data"
+SAFETENSORS_ROOT = Path(__file__).resolve().parent
 
 WARMUP_REPS = 25
 TIMING_REPS = 100
