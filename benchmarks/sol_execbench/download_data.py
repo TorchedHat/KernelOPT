@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from benchmarks.sol_execbench.harness import (
+    DATA_ROOT,
     list_problems,
     load_problem,
     needs_safetensors,
