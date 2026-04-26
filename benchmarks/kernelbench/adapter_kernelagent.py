@@ -121,7 +121,7 @@ def run_kernelagent(
     strategy: str = "beam_search",
     max_rounds: int = 5,
     gpu_id: int = 0,
-    timeout: int = 900,
+    timeout: int | None = None,
 ) -> dict:
     """Run KernelAgent optimization on a problem and collect results."""
     work = _create_problem_dir(problem_py_path, naive_kernel_path, work_dir)
@@ -137,20 +137,14 @@ def run_kernelagent(
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     start = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env,
-            cwd=str(KERNELAGENT_ROOT),
-        )
-        wall_clock = time.monotonic() - start
-        success = proc.returncode == 0
-        stdout = proc.stdout
-        stderr = proc.stderr
-    except subprocess.TimeoutExpired:
-        wall_clock = timeout
-        success = False
-        stdout = ""
-        stderr = "TIMEOUT"
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, env=env,
+        cwd=str(KERNELAGENT_ROOT),
+    )
+    wall_clock = time.monotonic() - start
+    success = proc.returncode == 0
+    stdout = proc.stdout
+    stderr = proc.stderr
 
     result = {
         "tool": "kernelagent",

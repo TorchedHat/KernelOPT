@@ -69,7 +69,7 @@ def run_kernelopt(
     kernel_name: Optional[str] = None,
     kernel_args: str = "--profile-only",
     gpu_id: int = 0,
-    timeout: int = 900,
+    timeout: int | None = None,
 ) -> dict:
     """Run kernelopt on a kernel file and collect results.
 
@@ -97,19 +97,13 @@ def run_kernelopt(
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     start = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env,
-        )
-        wall_clock = time.monotonic() - start
-        stdout = proc.stdout
-        stderr = proc.stderr
-        success = proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        wall_clock = timeout
-        stdout = ""
-        stderr = "TIMEOUT"
-        success = False
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, env=env,
+    )
+    wall_clock = time.monotonic() - start
+    stdout = proc.stdout
+    stderr = proc.stderr
+    success = proc.returncode == 0
 
     result = {
         "tool": "kernelopt",

@@ -61,7 +61,7 @@ def run_kernelopt_sol(
     N: int = 4,
     K: int = 1,
     gpu_id: int = 0,
-    timeout: int = 900,
+    timeout: int | None = None,
     replay_mode: str = "kernel",
 ) -> dict:
     """Run kernelopt on a wrapped SOL-ExecBench kernel for one workload."""
@@ -88,13 +88,9 @@ def run_kernelopt_sol(
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     start = time.monotonic()
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        wall_clock = time.monotonic() - start
-        success = proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        wall_clock = timeout
-        success = False
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    wall_clock = time.monotonic() - start
+    success = proc.returncode == 0
 
     wl_out = out_dir / f"wl{workload_idx}"
     result = {
