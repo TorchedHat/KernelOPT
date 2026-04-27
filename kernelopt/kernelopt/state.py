@@ -63,7 +63,7 @@ class PipelineConfig:
     kernel_args: list[str] = field(default_factory=list)  # args passed to kernel program
 
     # LLM options (defaults, used when per-agent options are not set)
-    model: str = "claude-sonnet-4@20250514"
+    model: str = "claude-sonnet-4-6"
     api_key: str | None = None
     project_id: str = ""
     region: str = "us-east5"

@@ -87,7 +87,7 @@ def run_correctness_agent(
     kernel_path: str,
     framework: str,
     api_key: str | None = None,
-    model: str = "claude-sonnet-4@20250514",
+    model: str = "claude-sonnet-4-6",
     project_id: str | None = None,
     region: str | None = None,
     kernel_args: list[str] | None = None,

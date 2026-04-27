@@ -546,7 +546,7 @@ kernelopt kernels <ncu.csv>         # list all kernels in an NCU CSV
 | `--replay-mode` | `kernel` | `kernel` or `application` |
 | `--kernel-args` | — | Extra args forwarded to the kernel program |
 | `--debug` | off | Print internal debug info: LLM profiler config, framework detection, NCU overrides |
-| `--model` | `claude-sonnet-4@20250514` | Default model for all agents |
+| `--model` | `claude-sonnet-4-6` | Default model for all agents |
 | `--planner-model` | — | Model override for the planner |
 | `--executor-model` | — | Model override for the executor |
 | `--summarizer-model` | — | Model override for the summarizer |
