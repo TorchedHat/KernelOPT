@@ -138,7 +138,7 @@ def run(
         None, "--api-key", help="API key (not needed for Vertex AI)"
     ),
     model: str = typer.Option(
-        "claude-sonnet-4@20250514", help="Default model name (used when per-agent models not set)"
+        "claude-sonnet-4-6", help="Default model name (used when per-agent models not set)"
     ),
     project_id: Optional[str] = typer.Option(
         None, "--project-id", envvar="ANTHROPIC_VERTEX_PROJECT_ID",
@@ -550,7 +550,7 @@ def plan(
     api_key: Optional[str] = typer.Option(
         None, envvar="ANTHROPIC_API_KEY"
     ),
-    model: str = typer.Option("claude-sonnet-4@20250514"),
+    model: str = typer.Option("claude-sonnet-4-6"),
     project_id: Optional[str] = typer.Option(
         None, "--project-id", envvar="ANTHROPIC_VERTEX_PROJECT_ID",
         help="Google Cloud project ID for Vertex AI"

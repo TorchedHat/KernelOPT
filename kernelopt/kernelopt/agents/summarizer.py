@@ -114,7 +114,7 @@ def run_summarizer(
     existing_memory: list[dict] | None = None,
     execution_result: dict | None = None,
     api_key: str | None = None,
-    model: str = "claude-sonnet-4@20250514",
+    model: str = "claude-sonnet-4-6",
     project_id: str | None = None,
     region: str | None = None,
 ) -> tuple[dict, dict]:

@@ -9,7 +9,7 @@ from functools import cached_property
 from langchain_core.language_models.chat_models import BaseChatModel
 
 
-DEFAULT_MODEL = "claude-sonnet-4@20250514"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_PROJECT_ID = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
 DEFAULT_REGION = "us-east5"
 
