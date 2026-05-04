@@ -697,3 +697,21 @@ kernelopt/
 
 ---
 
+## Benchmark: Official Triton Tutorial Kernels (H200 SXM)
+
+| Kernel | Size | PyTorch Eager (µs) | torch.compile (µs) | Triton Baseline (µs) | kernelopt (µs) | Speedup | vs Eager | vs Compile | Strategy | Mem SOL% |
+|--------|------|-------------------|-------------------|---------------------|----------------|---------|----------|------------|----------|----------|
+| **vector-add** | 2²⁰ | 6.0 | 34.6 | 2.66 | **1.98** | **1.34×** | **3.03×** | **17.47×** | reduce_num_warps + pad_to_block_multiple | 1.6% |
+| **fused-softmax** | 1823×781 | 7.2 | 27.3 | 5.25 | **4.96** | **1.06×** | **1.45×** | **5.50×** | fma_fusion + warp_tuning | 27.3% |
+| matrix-multiplication | 512×512 fp16 | 11.5 | 35.5 | 6.56 | 6.56 | 1.00× | 1.75× | 5.41× | — | 2.8% |
+| low-memory-dropout | 4096² | 49.5 | 57.3 | 2.27 | 2.27 | 1.00× | 21.81× | 25.24× | — | 0.4% |
+| layer-norm | 4096×1024 | 15.2 | 29.8 | 2.40 | 2.40 | 1.00× | 6.33× | 12.42× | — | 0.7% |
+| fused-attention | B4·H32·S1024·D64 | 125.2 | 125.7 | 58.98 | 58.98 | 1.00× | 2.12× | 2.13× | — (near HW limit) | 90.3% |
+| extern-functions | 98432 | 7.0 | 26.8 | 2.66 | 2.66 | 1.00× | 2.63× | 10.08× | — | 4.3% |
+| grouped-gemm | 4×64² fp16 | 39.4 | 75.0 | 6.98 | 6.98 | 1.00× | 5.64× | 10.74× | — | 6.7% |
+| persistent-matmul | 2048² fp16 | 24.8 | 28.8 | 2.78 | 2.78 | 1.00× | 8.92× | 10.36× | — | 0.5% |
+
+**Config:** T=5 iter, N=4 plans/iter, Claude Sonnet 4.6, NCU `--set full`, NVIDIA H200 SXM (CC 9.0). Unmodified Triton v3.4.0 tutorial kernels — kernelopt achieved up to 1.34× on already-optimized official examples via iterative NCU-guided profiling and LLM-driven code rewrites. "Speedup" = kernelopt vs Triton baseline; "vs Eager" / "vs Compile" = kernelopt vs PyTorch eager / torch.compile.
+
+---
+
