@@ -99,14 +99,32 @@ def extract_cuda_defines(source: str) -> list[dict]:
 def extract_helion_params(source: str) -> list[dict]:
     """Extract tunable parameters from Helion kernels.
 
-    Helion kernels may have explicit block size parameters passed to the kernel
-    or set via helion configuration. Looks for common patterns.
+    Helion uses hl.register_block_size() to declare tunable block sizes.
+    These are resolved by Helion's compiler, not passed as Python constants.
+    We extract them so the autotuner can sweep via Helion's config API.
+
+    Also detects explicit integer block_size assignments.
     """
     params = []
-    # Look for block_size variables assigned before kernel launch
+
+    # Pattern 1: hl.register_block_size(dim) -- Helion's native tuning API
+    for m in re.finditer(r'(\w+)\s*=\s*hl\.register_block_size\((\w+)\)', source):
+        var_name = m.group(1)  # e.g. "block_size_m"
+        dim_name = m.group(2)  # e.g. "m"
+        params.append({
+            "kernel": "@helion.kernel",
+            "param": var_name,
+            "default": None,
+            "helion_dim": dim_name,
+            "type": "register_block_size",
+        })
+
+    # Pattern 2: explicit integer block_size assignments
     for m in re.finditer(r'(\w*block_size\w*)\s*=\s*(\d+)', source, re.IGNORECASE):
         name, value = m.group(1), int(m.group(2))
-        params.append({"kernel": "@helion.kernel", "param": name, "default": value})
+        if not any(p["param"] == name for p in params):
+            params.append({"kernel": "@helion.kernel", "param": name, "default": value})
+
     return params
 
 
