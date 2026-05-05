@@ -406,15 +406,13 @@ if __name__ == "__main__":
     # Find the wrapper function (non-jit, non-class, non-private callable)
     _wrapper = None
     _skip = {"get_inputs", "get_init_inputs", "torch", "triton", "tl", "benchmark",
-             "is_hip", "is_cdna", "is_cuda", "is_hopper", "is_blackwell",
-             "supports_tma", "supports_ws", "num_sms", "device_blas_name",
-             "get_cuda_autotune_config", "get_hip_autotune_config", "get_autotune_config",
-             "keep", "prune_invalid_configs", "supports_host_descriptor",
-             "leaky_relu", "naive_softmax", "supports_block_scaling",
              "module", "cuda_source", "cpp_source", "load_inline"}
+    # Also skip any name that looks like a utility/config function (heuristic)
+    _skip_prefixes = ("is_", "has_", "get_", "supports_", "check_", "test_",
+                      "validate_", "setup_", "init_", "config_")
     import types as _types
     for _n, _obj in sorted(globals().items()):
-        if _n.startswith("_") or _n in _skip:
+        if _n.startswith("_") or _n in _skip or any(_n.startswith(p) for p in _skip_prefixes):
             continue
         if isinstance(_obj, type):
             continue
@@ -467,32 +465,68 @@ if __name__ == "__main__":
 """)
 
 
-_CUDA_BENCH_MAIN = textwrap.dedent("""\
+def _build_cuda_bench_main(kernel_source: str) -> str:
+    """Build a generic CUDA benchmark main() for kernels without one.
 
-// --- Autotuner benchmark harness (appended) ---
+    Detects the extern "C" entry point signature and generates matching
+    allocations + a benchmark loop. Falls back to a minimal stub if the
+    signature can't be parsed.
+    """
+    # Find extern "C" wrapper: extern "C" void solve(const float* in, float* out, int N)
+    extern_match = re.search(
+        r'extern\s+"C"\s+void\s+(\w+)\s*\(([^)]*)\)',
+        kernel_source,
+    )
+
+    if extern_match:
+        fn_name = extern_match.group(1)
+        params_str = extern_match.group(2)
+
+        # Parse parameter list to generate allocations
+        alloc_lines = []
+        call_args = []
+        free_lines = []
+        param_idx = 0
+
+        for param in params_str.split(","):
+            param = param.strip()
+            if not param:
+                continue
+
+            if "int" in param and "*" not in param:
+                # Scalar int param (like N)
+                var = param.split()[-1].strip()
+                alloc_lines.append(f"    int {var} = 4096;")
+                call_args.append(var)
+            elif "float*" in param or "float *" in param:
+                var = f"d_{param_idx}"
+                alloc_lines.append(f"    float* {var}; cudaMalloc(&{var}, 4096 * sizeof(float));")
+                free_lines.append(f"    cudaFree({var});")
+                call_args.append(var)
+                param_idx += 1
+            elif "double*" in param or "double *" in param:
+                var = f"d_{param_idx}"
+                alloc_lines.append(f"    double* {var}; cudaMalloc(&{var}, 4096 * sizeof(double));")
+                free_lines.append(f"    cudaFree({var});")
+                call_args.append(var)
+                param_idx += 1
+            else:
+                call_args.append("0")
+
+        call_str = ", ".join(call_args)
+        allocs = "\n".join(alloc_lines)
+        frees = "\n".join(free_lines)
+
+        return textwrap.dedent(f"""\
+
+// --- Autotuner benchmark harness (auto-generated) ---
 #include <stdio.h>
 #include <stdlib.h>
-int main() {
-    int N = 512;
-    size_t bytes = N * N * sizeof(float);
-    float *dA, *dB, *dC;
-    cudaMalloc(&dA, bytes);
-    cudaMalloc(&dB, bytes);
-    cudaMalloc(&dC, bytes);
-
-    // Init with ones
-    float *hA = (float*)malloc(bytes);
-    for (int i = 0; i < N*N; i++) hA[i] = 1.0f;
-    cudaMemcpy(dA, hA, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, hA, bytes, cudaMemcpyHostToDevice);
-    free(hA);
-
-    // Find launch config from extern "C" wrapper or use direct kernel launch
-    dim3 block(TILE_SIZE < 33 ? TILE_SIZE : 16, TILE_SIZE < 33 ? TILE_SIZE : 16);
-    dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+int main() {{
+{allocs}
 
     // Warmup
-    for (int i = 0; i < 5; i++) matmul_kernel<<<grid, block>>>(dA, dB, dC, N);
+    for (int i = 0; i < 5; i++) {fn_name}({call_str});
     cudaDeviceSynchronize();
 
     // Benchmark
@@ -500,17 +534,20 @@ int main() {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
-    for (int i = 0; i < 100; i++) matmul_kernel<<<grid, block>>>(dA, dB, dC, N);
+    for (int i = 0; i < 100; i++) {fn_name}({call_str});
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("AUTOTUNE_RESULT:{\\\"time_ms\\\": %.4f}\\n", ms / 100.0f);
+    printf("AUTOTUNE_RESULT:{{\\"time_ms\\": %.4f}}\\n", ms / 100.0f);
 
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+{frees}
     return 0;
-}
+}}
 """)
+
+    # Fallback: can't parse extern "C", skip benchmark harness
+    return ""
 
 
 def _parse_cuda_timing(stdout: str) -> float | None:
@@ -574,10 +611,14 @@ def _run_autotune_cuda(
     for i, cfg in enumerate(configs):
         patched = apply_best_config(kernel_source, cfg)
 
-        # If no main(), append a generic benchmark harness
-        if not has_main and kernel_names:
-            patched += _CUDA_BENCH_MAIN.replace("matmul_kernel", kernel_names[0])
-        # If has main() with --benchmark flag, we'll run it with --benchmark
+        # If no main(), generate a benchmark harness from the extern "C" signature
+        if not has_main:
+            harness = _build_cuda_bench_main(patched)
+            if not harness:
+                if debug:
+                    print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> SKIP (no main and can't generate harness)")
+                continue
+            patched += harness
 
         cu_path = tempfile.mktemp(suffix=".cu", prefix="autotune_cuda_")
         bin_path = cu_path.replace(".cu", "")
