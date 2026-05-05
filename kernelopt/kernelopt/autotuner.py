@@ -440,6 +440,164 @@ if __name__ == "__main__":
 """)
 
 
+_CUDA_BENCH_MAIN = textwrap.dedent("""\
+
+// --- Autotuner benchmark harness (appended) ---
+#include <stdio.h>
+#include <stdlib.h>
+int main() {
+    int N = 512;
+    size_t bytes = N * N * sizeof(float);
+    float *dA, *dB, *dC;
+    cudaMalloc(&dA, bytes);
+    cudaMalloc(&dB, bytes);
+    cudaMalloc(&dC, bytes);
+
+    // Init with ones
+    float *hA = (float*)malloc(bytes);
+    for (int i = 0; i < N*N; i++) hA[i] = 1.0f;
+    cudaMemcpy(dA, hA, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, hA, bytes, cudaMemcpyHostToDevice);
+    free(hA);
+
+    // Find launch config from extern "C" wrapper or use direct kernel launch
+    dim3 block(TILE_SIZE < 33 ? TILE_SIZE : 16, TILE_SIZE < 33 ? TILE_SIZE : 16);
+    dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+
+    // Warmup
+    for (int i = 0; i < 5; i++) matmul_kernel<<<grid, block>>>(dA, dB, dC, N);
+    cudaDeviceSynchronize();
+
+    // Benchmark
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    for (int i = 0; i < 100; i++) matmul_kernel<<<grid, block>>>(dA, dB, dC, N);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("AUTOTUNE_RESULT:{\\\"time_ms\\\": %.4f}\\n", ms / 100.0f);
+
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    return 0;
+}
+""")
+
+
+def _run_autotune_cuda(
+    kernel_source: str,
+    params: list[dict],
+    configs: list[dict],
+    *,
+    gpu_id: int = 0,
+    timeout: int = 60,
+    debug: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Autotune a CUDA .cu kernel by compiling with nvcc for each config."""
+    import os
+
+    best_config = None
+    best_time = float("inf")
+    default_time = None
+    tested = 0
+
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # Check if source has a main() -- if not, we need to append one
+    has_main = "int main(" in kernel_source or "void main(" in kernel_source
+    # Detect kernel function name for the harness
+    kernel_names = re.findall(r'__global__\s+void\s+(\w+)', kernel_source)
+
+    for i, cfg in enumerate(configs):
+        patched = apply_best_config(kernel_source, cfg)
+
+        # If no main(), append a benchmark harness (only works for matmul-style kernels)
+        if not has_main and kernel_names:
+            patched += _CUDA_BENCH_MAIN.replace("matmul_kernel", kernel_names[0])
+
+        cu_path = tempfile.mktemp(suffix=".cu", prefix="autotune_cuda_")
+        bin_path = cu_path.replace(".cu", "")
+
+        Path(cu_path).write_text(patched)
+
+        try:
+            # Compile
+            comp = subprocess.run(
+                ["nvcc", "-O2", "-Wno-deprecated-gpu-targets", "-o", bin_path, cu_path],
+                capture_output=True, text=True, timeout=30, env=env,
+            )
+            if comp.returncode != 0:
+                if debug:
+                    print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> COMPILE FAILED ({comp.stderr[:100]})")
+                continue
+
+            # Run
+            result = subprocess.run(
+                [bin_path], capture_output=True, text=True, timeout=timeout, env=env,
+            )
+            tested += 1
+
+            for line in result.stdout.splitlines():
+                if line.startswith("AUTOTUNE_RESULT:"):
+                    import json
+                    data = json.loads(line[len("AUTOTUNE_RESULT:"):])
+                    if "time_ms" in data:
+                        ms = data["time_ms"]
+
+                        is_default = all(
+                            cfg.get(p["param"]) == p["default"]
+                            for p in params
+                            if p["default"] is not None and p["param"] in cfg
+                        )
+                        if is_default and default_time is None:
+                            default_time = ms
+
+                        if ms < best_time:
+                            best_time = ms
+                            best_config = cfg
+
+                        if debug:
+                            print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> {ms:.4f} ms")
+                    break
+            else:
+                if debug:
+                    print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> NO RESULT")
+
+        except subprocess.TimeoutExpired:
+            if debug:
+                print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> TIMEOUT")
+        finally:
+            Path(cu_path).unlink(missing_ok=True)
+            Path(bin_path).unlink(missing_ok=True)
+
+    if best_config is None:
+        return kernel_source, {
+            "best_config": {},
+            "best_time_ms": None,
+            "configs_tested": tested,
+            "speedup": 1.0,
+            "skipped": "all configs failed",
+        }
+
+    best_source = apply_best_config(kernel_source, best_config)
+    speedup = default_time / best_time if default_time and best_time > 0 else 1.0
+
+    if debug:
+        print(f"[autotuner] Best: {best_config} -> {best_time:.4f} ms"
+              + (f" (default: {default_time:.4f} ms, speedup: {speedup:.2f}x)" if default_time else ""))
+
+    return best_source, {
+        "best_config": best_config,
+        "best_time_ms": round(best_time, 4),
+        "default_time_ms": round(default_time, 4) if default_time else None,
+        "configs_tested": tested,
+        "speedup": round(speedup, 4),
+    }
+
+
 def run_autotune(
     kernel_source: str,
     *,
@@ -484,8 +642,13 @@ def run_autotune(
     if debug:
         print(f"[autotuner] Generated {len(configs)} configs to benchmark")
 
-    # If source has get_inputs(), strip __main__ and add our harness.
-    # Otherwise, keep the original file structure (tutorial kernels run as-is).
+    is_cuda_cu = framework == "cuda" or "#define" in kernel_source and "__global__" in kernel_source
+
+    # For .cu files: compile with nvcc; for Python: subprocess with benchmark harness
+    if is_cuda_cu:
+        return _run_autotune_cuda(kernel_source, params, configs, gpu_id=gpu_id, timeout=timeout, debug=debug)
+
+    # Python path (Triton / inline CUDA / Helion)
     has_get_inputs = "def get_inputs" in kernel_source
     if has_get_inputs:
         source_for_bench = _strip_main_block(kernel_source) + _BENCH_HARNESS
