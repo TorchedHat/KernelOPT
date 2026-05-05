@@ -608,16 +608,20 @@ def _run_autotune_cuda(
     best_time = float("inf")
     default_time = None
     tested = 0
+    consecutive_failures = 0
+    max_consecutive_failures = 5
 
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    # Check if source has a main() -- if not, we need to append one
     has_main = "int main(" in kernel_source or "void main(" in kernel_source
-    # Detect kernel function name for the harness
     kernel_names = re.findall(r'__global__\s+void\s+(\w+)', kernel_source)
 
     for i, cfg in enumerate(configs):
+        if consecutive_failures >= max_consecutive_failures and best_config is None:
+            if debug:
+                print(f"[autotuner] Aborting: {consecutive_failures} consecutive failures")
+            break
         patched = apply_best_config(kernel_source, cfg)
 
         # If no main(), generate a benchmark harness from the extern "C" signature
@@ -712,14 +716,14 @@ def run_autotune(
     *,
     framework: str = "auto",
     gpu_id: int = 0,
-    timeout: int = 60,
+    timeout: int = 30,
     debug: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Run the full autotuning pipeline on a GPU kernel source.
 
     Supports Triton (tl.constexpr), CUDA (#define macros), and Helion kernels.
     Each config is written to a temp file with a benchmark harness appended,
-    then executed as a subprocess.
+    then executed as a subprocess. Aborts early if first 5 configs all fail.
 
     Returns (best_source, metadata).
     """
@@ -768,11 +772,18 @@ def run_autotune(
     best_time = float("inf")
     default_time = None
     tested = 0
+    consecutive_failures = 0
+    max_consecutive_failures = 5  # abort early if first N configs all fail
 
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     for i, cfg in enumerate(configs):
+        if consecutive_failures >= max_consecutive_failures and best_config is None:
+            if debug:
+                print(f"[autotuner] Aborting: {consecutive_failures} consecutive failures, no successful config yet")
+            break
+
         patched_with_bench = apply_best_config(source_for_bench, cfg)
 
         with tempfile.NamedTemporaryFile(
@@ -807,20 +818,26 @@ def run_autotune(
                             best_time = ms
                             best_config = cfg
 
+                        consecutive_failures = 0  # reset on success
                         if debug:
                             print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> {ms:.4f} ms")
-                    elif debug:
-                        print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> FAILED ({data.get('error', '?')})")
+                    else:
+                        consecutive_failures += 1
+                        if debug:
+                            print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> FAILED ({data.get('error', '?')})")
                     break
             else:
+                consecutive_failures += 1
                 if debug:
                     err = result.stderr[:150] if result.returncode != 0 else "no AUTOTUNE_RESULT line"
                     print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> FAILED ({err})")
 
         except subprocess.TimeoutExpired:
+            consecutive_failures += 1
             if debug:
                 print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> TIMEOUT")
         except Exception as e:
+            consecutive_failures += 1
             if debug:
                 print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> ERROR ({e})")
         finally:
