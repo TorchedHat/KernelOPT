@@ -229,18 +229,27 @@ def generate_config_grid(
 
         if "BLOCK" in name_upper or "SIZE" in name_upper:
             lo, hi = block_range
-            vals = []
+            vals = set()
             v = lo
             while v <= hi:
-                vals.append(v)
+                vals.add(v)
                 v *= 2
-            param_values[name] = vals
+            # Always include the LLM's original value so we never miss it
+            if default is not None and default >= 1:
+                vals.add(int(default))
+            param_values[name] = sorted(vals)
 
         elif "WARP" in name_upper or name_upper == "NUM_WARPS":
-            param_values[name] = warp_options
+            vals = set(warp_options)
+            if default is not None and default >= 1:
+                vals.add(int(default))
+            param_values[name] = sorted(vals)
 
         elif "STAGE" in name_upper or name_upper == "NUM_STAGES":
-            param_values[name] = stage_options
+            vals = set(stage_options)
+            if default is not None and default >= 1:
+                vals.add(int(default))
+            param_values[name] = sorted(vals)
 
         elif default is not None:
             vals = set()
