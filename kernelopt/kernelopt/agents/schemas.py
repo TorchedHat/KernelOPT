@@ -199,15 +199,28 @@ class ExperienceItem(BaseModel):
 
 
 class TestInput(BaseModel):
-    """Specification for one input tensor passed to the kernel wrapper."""
-    shape: list[int] = Field(..., description="Tensor shape, e.g. [4096, 1024]")
-    dtype: str = Field(..., description="PyTorch dtype: 'float32', 'float16', 'bfloat16', 'int32', 'int64'")
+    """Specification for one input passed to the kernel wrapper.
+
+    Supports two kinds:
+      - "tensor" (default): generates a PyTorch tensor from shape/dtype/distribution.
+      - "scalar": passes a Python float/int/bool directly (e.g. scaling factors, dims).
+    """
+    kind: str = Field(
+        "tensor",
+        description="'tensor' for a PyTorch tensor, 'scalar' for a Python float/int/bool"
+    )
+    # --- Tensor fields (used when kind="tensor") ---
+    shape: list[int] | None = Field(None, description="Tensor shape, e.g. [4096, 1024]. Required for kind='tensor'.")
+    dtype: str | None = Field(None, description="PyTorch dtype: 'float32', 'float16', 'bfloat16', 'int32', 'int64'. Required for kind='tensor'.")
     distribution: str = Field(
         "randn",
         description="'randn' (normal), 'rand' (uniform 0-1), 'randint', 'ones', 'zeros'"
     )
     low: float | None = Field(None, description="Lower bound for randint")
     high: float | None = Field(None, description="Upper bound for randint")
+    # --- Scalar fields (used when kind="scalar") ---
+    value: float | int | bool | None = Field(None, description="The scalar value to pass (e.g. 1.0, 3, True). Required for kind='scalar'.")
+    scalar_dtype: str | None = Field(None, description="'float', 'int', or 'bool'. Defaults to 'float'.")
 
 
 class CorrectnessSpec(BaseModel):
