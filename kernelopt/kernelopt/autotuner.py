@@ -1,8 +1,9 @@
-"""Decoupled autotuner for Triton kernels.
+"""Decoupled autotuner for GPU kernels (Triton, CUDA, Helion).
 
-Extracts tunable `tl.constexpr` parameters from a Triton kernel, generates a
-configuration grid, benchmarks each config, and returns the source with the
-best config baked in.
+Extracts tunable parameters from GPU kernels and sweeps a configuration grid:
+  - Triton: `tl.constexpr` parameters (BLOCK_SIZE, num_warps, num_stages)
+  - CUDA:   `#define` macros (TILE_SIZE, BLOCK_DIM, etc.) and dim3 configs
+  - Helion: block size parameters (when explicitly parameterized)
 
 The LLM designs the kernel *algorithm*; this module tunes the *parameters*.
 """
@@ -70,6 +71,95 @@ def _find_constexpr_default(source: str, kernel_name: str, param_name: str) -> i
     if m:
         return int(m.group(1))
     return None
+
+
+def extract_cuda_defines(source: str) -> list[dict]:
+    """Extract tunable #define macros from CUDA source.
+
+    Looks for patterns like:
+      #define TILE_SIZE 16
+      #define BLOCK_DIM_X 256
+      #define NUM_THREADS 128
+
+    Only extracts defines with numeric integer values and names suggesting
+    they're tunable GPU parameters (TILE, BLOCK, THREAD, WARP, UNROLL).
+    """
+    tunable_patterns = re.compile(
+        r'(?:TILE|BLOCK|THREAD|WARP|UNROLL|NUM_THREADS|SHARED)',
+        re.IGNORECASE,
+    )
+    params = []
+    for m in re.finditer(r'#define\s+(\w+)\s+(\d+)', source):
+        name, value = m.group(1), int(m.group(2))
+        if tunable_patterns.search(name):
+            params.append({"kernel": "__global__", "param": name, "default": value})
+    return params
+
+
+def extract_helion_params(source: str) -> list[dict]:
+    """Extract tunable parameters from Helion kernels.
+
+    Helion kernels may have explicit block size parameters passed to the kernel
+    or set via helion configuration. Looks for common patterns.
+    """
+    params = []
+    # Look for block_size variables assigned before kernel launch
+    for m in re.finditer(r'(\w*block_size\w*)\s*=\s*(\d+)', source, re.IGNORECASE):
+        name, value = m.group(1), int(m.group(2))
+        params.append({"kernel": "@helion.kernel", "param": name, "default": value})
+    return params
+
+
+def extract_python_gpu_params(source: str) -> list[dict]:
+    """Extract tunable GPU parameters from Python variable assignments.
+
+    Catches patterns like:
+      TILE_SIZE = 16
+      BLOCK_DIM = 256
+      NUM_WARPS = 4
+
+    These are common in inline CUDA (load_inline) and custom kernel wrappers.
+    """
+    tunable_patterns = re.compile(
+        r'(?:TILE|BLOCK|THREAD|WARP|UNROLL|NUM_THREADS|SHARED|NUM_WARPS|NUM_STAGES)',
+        re.IGNORECASE,
+    )
+    params = []
+    # Match top-level assignments: NAME = integer
+    for m in re.finditer(r'^(\w+)\s*=\s*(\d+)\s*$', source, re.MULTILINE):
+        name, value = m.group(1), int(m.group(2))
+        if tunable_patterns.search(name):
+            params.append({"kernel": "module", "param": name, "default": value})
+    return params
+
+
+def extract_tunable_params(source: str, framework: str = "auto") -> list[dict]:
+    """Extract tunable parameters from any supported framework.
+
+    Auto-detects framework if not specified. Merges results from
+    framework-specific extractors.
+    """
+    if framework == "auto":
+        if "@triton.jit" in source or "tl.constexpr" in source:
+            framework = "triton"
+        elif "__global__" in source and "#define" in source:
+            framework = "cuda"
+        elif "@helion.kernel" in source or "@hl.kernel" in source:
+            framework = "helion"
+        elif "load_inline" in source or "cpp_extension" in source:
+            framework = "inline_cuda"
+        else:
+            framework = "triton"
+
+    if framework == "triton":
+        return extract_constexpr_params(source)
+    elif framework == "cuda":
+        return extract_cuda_defines(source)
+    elif framework == "inline_cuda":
+        return extract_python_gpu_params(source)
+    elif framework == "helion":
+        return extract_helion_params(source)
+    return []
 
 
 def generate_config_grid(
@@ -230,14 +320,20 @@ def _build_benchmark_script(
 def apply_best_config(source: str, best_config: dict[str, int]) -> str:
     """Patch the kernel source to use the best config's values.
 
-    Replaces keyword arguments in kernel launch calls:
-      kernel[grid](..., BLOCK_SIZE=old_val, ...) -> BLOCK_SIZE=new_val
-    Also patches top-level variable assignments:
-      BLOCK_SIZE = old_val -> BLOCK_SIZE = new_val
+    Handles:
+      - Triton: keyword args in kernel launches (BLOCK_SIZE=old -> BLOCK_SIZE=new)
+      - CUDA: #define macros (#define TILE_SIZE old -> #define TILE_SIZE new)
+      - Python variable assignments (BLOCK_SIZE = old -> BLOCK_SIZE = new)
     """
     patched = source
     for param_name, value in best_config.items():
-        # Replace keyword arguments in function/kernel calls
+        # CUDA #define macros
+        patched = re.sub(
+            rf'(#define\s+{param_name}\s+)\d+',
+            rf'\g<1>{value}',
+            patched,
+        )
+        # Python keyword arguments and variable assignments
         patched = re.sub(
             rf'({param_name}\s*=\s*)\d+',
             rf'\g<1>{value}',
@@ -269,16 +365,21 @@ if __name__ == "__main__":
              "supports_tma", "supports_ws", "num_sms", "device_blas_name",
              "get_cuda_autotune_config", "get_hip_autotune_config", "get_autotune_config",
              "keep", "prune_invalid_configs", "supports_host_descriptor",
-             "leaky_relu", "naive_softmax", "supports_block_scaling"}
+             "leaky_relu", "naive_softmax", "supports_block_scaling",
+             "module", "cuda_source", "cpp_source", "load_inline"}
+    import types as _types
     for _n, _obj in sorted(globals().items()):
         if _n.startswith("_") or _n in _skip:
             continue
         if isinstance(_obj, type):
             continue
-        if callable(_obj) and not hasattr(_obj, "fn"):
-            _wrapper = _obj
-            _wrapper_name = _n
-            break
+        if not isinstance(_obj, (_types.FunctionType, _types.BuiltinFunctionType)):
+            continue
+        if hasattr(_obj, "fn"):  # skip Triton JIT kernels
+            continue
+        _wrapper = _obj
+        _wrapper_name = _n
+        break
 
     if _wrapper is None:
         print("AUTOTUNE_RESULT:" + json.dumps({"error": "no wrapper found"}))
@@ -324,27 +425,29 @@ if __name__ == "__main__":
 def run_autotune(
     kernel_source: str,
     *,
+    framework: str = "auto",
     gpu_id: int = 0,
     timeout: int = 60,
     debug: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    """Run the full autotuning pipeline on a Triton kernel source.
+    """Run the full autotuning pipeline on a GPU kernel source.
 
+    Supports Triton (tl.constexpr), CUDA (#define macros), and Helion kernels.
     Each config is written to a temp file with a benchmark harness appended,
-    then executed as a subprocess (avoids Triton JIT inspect.getsource issues).
+    then executed as a subprocess.
 
     Returns (best_source, metadata).
     """
     import os
 
-    params = extract_constexpr_params(kernel_source)
+    params = extract_tunable_params(kernel_source, framework)
     if not params:
         return kernel_source, {
             "best_config": {},
             "best_time_ms": None,
             "configs_tested": 0,
             "speedup": 1.0,
-            "skipped": "no tl.constexpr parameters found",
+            "skipped": "no tunable parameters found",
         }
 
     if debug:

@@ -483,15 +483,11 @@ def autotune_candidates(state: GraphState) -> dict:
     grid of configs via wall-clock benchmarking, and replaces the candidate source
     with the best-performing config. Zero LLM calls -- purely mechanical search.
     """
-    from kernelopt.autotuner import extract_constexpr_params, run_autotune
+    from kernelopt.autotuner import extract_tunable_params, run_autotune
 
     cfg = state["config"]
     candidates = list(state["candidates"])
     framework = state["framework"]
-
-    if framework not in ("triton", "helion"):
-        pipe_print("  [dim]Skipping autotuning (non-Triton framework)[/]")
-        return {"candidates": candidates}
 
     tuned_candidates = []
     for c in candidates:
@@ -499,7 +495,7 @@ def autotune_candidates(state: GraphState) -> dict:
             tuned_candidates.append(c)
             continue
 
-        params = extract_constexpr_params(c.optimized_kernel)
+        params = extract_tunable_params(c.optimized_kernel, framework)
         if not params:
             pipe_print(f"    Plan {c.plan_letter}: no constexpr params to tune")
             tuned_candidates.append(c)
@@ -512,11 +508,13 @@ def autotune_candidates(state: GraphState) -> dict:
             with phase_spinner("autotuning", f"plan {c.plan_letter}"):
                 tuned_source, meta = run_autotune(
                     c.optimized_kernel,
+                    framework=framework,
                     debug=cfg.debug,
                 )
         else:
             tuned_source, meta = run_autotune(
                 c.optimized_kernel,
+                framework=framework,
                 debug=cfg.debug,
             )
 
