@@ -425,10 +425,10 @@ def run(
 
     iteration_results = getattr(final, "iteration_results", None) or []
     best_direction = ""
+    # Find the direction of the overall best candidate
     for result in iteration_results:
-        for c in getattr(result, "candidates", []):
-            if getattr(c, "kept", False):
-                best_direction = c.direction
+        if result.improved and result.best_candidate:
+            best_direction = result.best_candidate.direction
 
     if not cfg.hud:
         print_run_summary(

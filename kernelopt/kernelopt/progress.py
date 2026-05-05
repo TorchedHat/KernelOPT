@@ -152,15 +152,15 @@ def print_run_summary(
     c.print()
 
     for i, result in enumerate(iteration_results):
-        candidates = getattr(result, "candidates", [])
-        kept = [cand for cand in candidates if getattr(cand, "kept", False)]
-        if kept:
-            k = kept[0]
+        # Check if this iteration improved the overall best
+        if result.improved and result.best_candidate:
             c.print(
-                f"    Iter {i + 1}: [green]{k.speedup:.2f}x[/] — "
-                f"{k.direction}"
+                f"    Iter {i + 1}: [green]improved to {result.best_candidate.speedup:.2f}x[/] — "
+                f"{result.best_candidate.direction}"
             )
         else:
+            # No improvement - show best candidate from this iteration
+            candidates = getattr(result, "candidates", [])
             best_cand = max(candidates, key=_speedup_key, default=None)
             if best_cand and best_cand.speedup > 0:
                 c.print(
