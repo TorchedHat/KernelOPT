@@ -2,8 +2,8 @@
 
 Extracts tunable parameters from GPU kernels and sweeps a configuration grid:
   - Triton: `tl.constexpr` parameters (BLOCK_SIZE, num_warps, num_stages)
-  - CUDA:   `#define` macros (TILE_SIZE, BLOCK_DIM, etc.) and dim3 configs
-  - Helion: block size parameters (when explicitly parameterized)
+  - CUDA:   `#define` macros, template parameters, and dim3 configs
+  - Helion: detects `hl.register_block_size()` -- defers to Helion's native autotuner
 
 The LLM designs the kernel *algorithm*; this module tunes the *parameters*.
 """
@@ -74,25 +74,45 @@ def _find_constexpr_default(source: str, kernel_name: str, param_name: str) -> i
 
 
 def extract_cuda_defines(source: str) -> list[dict]:
-    """Extract tunable #define macros from CUDA source.
+    """Extract tunable parameters from CUDA source.
 
-    Looks for patterns like:
-      #define TILE_SIZE 16
-      #define BLOCK_DIM_X 256
-      #define NUM_THREADS 128
+    Detects:
+      - #define macros: #define TILE_SIZE 16
+      - Template defaults: template<int BLOCK_SIZE = 256>
+      - constexpr constants: constexpr int THREADS_PER_BLOCK = 1024
 
-    Only extracts defines with numeric integer values and names suggesting
-    they're tunable GPU parameters (TILE, BLOCK, THREAD, WARP, UNROLL).
+    Only extracts values with names suggesting GPU parameters.
     """
     tunable_patterns = re.compile(
-        r'(?:TILE|BLOCK|THREAD|WARP|UNROLL|NUM_THREADS|SHARED)',
+        r'(?:TILE|BLOCK|THREAD|UNROLL|NUM_THREADS|SHARED)',
         re.IGNORECASE,
     )
+    # Hardware constants that should never be tuned
+    skip_names = {"WARP_SIZE", "warp_size"}
     params = []
+    seen = set()
+
+    # Pattern 1: #define macros
     for m in re.finditer(r'#define\s+(\w+)\s+(\d+)', source):
         name, value = m.group(1), int(m.group(2))
-        if tunable_patterns.search(name):
+        if tunable_patterns.search(name) and name not in seen and name not in skip_names:
             params.append({"kernel": "__global__", "param": name, "default": value})
+            seen.add(name)
+
+    # Pattern 2: template defaults  e.g.  template<int BLOCK_SIZE = 256>
+    for m in re.finditer(r'template\s*<[^>]*int\s+(\w+)\s*=\s*(\d+)', source):
+        name, value = m.group(1), int(m.group(2))
+        if tunable_patterns.search(name) and name not in seen and name not in skip_names:
+            params.append({"kernel": "__global__", "param": name, "default": value})
+            seen.add(name)
+
+    # Pattern 3: constexpr int  e.g.  constexpr int THREADS_PER_BLOCK = 1024;
+    for m in re.finditer(r'constexpr\s+int\s+(\w+)\s*=\s*(\d+)', source):
+        name, value = m.group(1), int(m.group(2))
+        if tunable_patterns.search(name) and name not in seen and name not in skip_names:
+            params.append({"kernel": "__global__", "param": name, "default": value})
+            seen.add(name)
+
     return params
 
 
@@ -339,9 +359,10 @@ def apply_best_config(source: str, best_config: dict[str, int]) -> str:
     """Patch the kernel source to use the best config's values.
 
     Handles:
-      - Triton: keyword args in kernel launches (BLOCK_SIZE=old -> BLOCK_SIZE=new)
-      - CUDA: #define macros (#define TILE_SIZE old -> #define TILE_SIZE new)
-      - Python variable assignments (BLOCK_SIZE = old -> BLOCK_SIZE = new)
+      - CUDA #define macros: #define TILE_SIZE 16 -> #define TILE_SIZE 32
+      - C++ template defaults: template<int BLOCK_SIZE = 256> -> = 512
+      - C++ constexpr: constexpr int X = 1024 -> constexpr int X = 512
+      - Python/Triton keyword args and assignments: BLOCK_SIZE=128 -> BLOCK_SIZE=256
     """
     patched = source
     for param_name, value in best_config.items():
@@ -351,7 +372,13 @@ def apply_best_config(source: str, best_config: dict[str, int]) -> str:
             rf'\g<1>{value}',
             patched,
         )
-        # Python keyword arguments and variable assignments
+        # C++ template defaults: int PARAM = old -> int PARAM = new
+        patched = re.sub(
+            rf'(int\s+{param_name}\s*=\s*)\d+',
+            rf'\g<1>{value}',
+            patched,
+        )
+        # Python/Triton keyword arguments and variable assignments
         patched = re.sub(
             rf'({param_name}\s*=\s*)\d+',
             rf'\g<1>{value}',
@@ -486,6 +513,39 @@ int main() {
 """)
 
 
+def _parse_cuda_timing(stdout: str) -> float | None:
+    """Extract timing from various CUDA benchmark output formats.
+
+    Supports:
+      - AUTOTUNE_RESULT:{"time_ms": 0.1234}
+      - Avg latency: 12.345 us
+      - avg_time=0.1234 ms
+      - Time: 0.1234 ms
+    """
+    import json as _json
+
+    for line in stdout.splitlines():
+        if line.startswith("AUTOTUNE_RESULT:"):
+            try:
+                data = _json.loads(line[len("AUTOTUNE_RESULT:"):])
+                if "time_ms" in data:
+                    return data["time_ms"]
+            except _json.JSONDecodeError:
+                pass
+
+        m = re.search(r'[Aa]vg[_ ](?:latency|time)[=:]\s*([\d.]+)\s*(us|ms)', line)
+        if m:
+            val = float(m.group(1))
+            unit = m.group(2)
+            return val / 1000.0 if unit == "us" else val
+
+        m = re.search(r'[Tt]ime[=:]\s*([\d.]+)\s*ms', line)
+        if m:
+            return float(m.group(1))
+
+    return None
+
+
 def _run_autotune_cuda(
     kernel_source: str,
     params: list[dict],
@@ -514,9 +574,10 @@ def _run_autotune_cuda(
     for i, cfg in enumerate(configs):
         patched = apply_best_config(kernel_source, cfg)
 
-        # If no main(), append a benchmark harness (only works for matmul-style kernels)
+        # If no main(), append a generic benchmark harness
         if not has_main and kernel_names:
             patched += _CUDA_BENCH_MAIN.replace("matmul_kernel", kernel_names[0])
+        # If has main() with --benchmark flag, we'll run it with --benchmark
 
         cu_path = tempfile.mktemp(suffix=".cu", prefix="autotune_cuda_")
         bin_path = cu_path.replace(".cu", "")
@@ -534,37 +595,35 @@ def _run_autotune_cuda(
                     print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> COMPILE FAILED ({comp.stderr[:100]})")
                 continue
 
-            # Run
+            # Run -- use --benchmark flag if the source supports it
+            run_cmd = [bin_path]
+            if "--benchmark" in kernel_source:
+                run_cmd.append("--benchmark")
             result = subprocess.run(
-                [bin_path], capture_output=True, text=True, timeout=timeout, env=env,
+                run_cmd, capture_output=True, text=True, timeout=timeout, env=env,
             )
             tested += 1
 
-            for line in result.stdout.splitlines():
-                if line.startswith("AUTOTUNE_RESULT:"):
-                    import json
-                    data = json.loads(line[len("AUTOTUNE_RESULT:"):])
-                    if "time_ms" in data:
-                        ms = data["time_ms"]
+            ms = _parse_cuda_timing(result.stdout)
+            if ms is not None:
+                tested += 1
+                is_default = all(
+                    cfg.get(p["param"]) == p["default"]
+                    for p in params
+                    if p["default"] is not None and p["param"] in cfg
+                )
+                if is_default and default_time is None:
+                    default_time = ms
 
-                        is_default = all(
-                            cfg.get(p["param"]) == p["default"]
-                            for p in params
-                            if p["default"] is not None and p["param"] in cfg
-                        )
-                        if is_default and default_time is None:
-                            default_time = ms
+                if ms < best_time:
+                    best_time = ms
+                    best_config = cfg
 
-                        if ms < best_time:
-                            best_time = ms
-                            best_config = cfg
-
-                        if debug:
-                            print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> {ms:.4f} ms")
-                    break
+                if debug:
+                    print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> {ms:.4f} ms")
             else:
                 if debug:
-                    print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> NO RESULT")
+                    print(f"[autotuner] Config {i+1}/{len(configs)}: {cfg} -> NO TIMING")
 
         except subprocess.TimeoutExpired:
             if debug:
