@@ -119,10 +119,10 @@ def _clean_triton_kernel(raw_kernel: str) -> tuple[str, str, list[str]]:
 
     body = "\n".join(cleaned)
 
-    fn_match = re.search(r"def\s+(\w+)\s*\(([^)]+)\)", body)
+    fn_match = re.search(r"def\s+(\w+)\s*\((.*?)\)", body, re.DOTALL)
     if fn_match:
         kernel_name = fn_match.group(1)
-        params = [p.strip().split(":")[0].strip() for p in fn_match.group(2).split(",")]
+        params = [p.strip().split(":")[0].strip() for p in fn_match.group(2).split(",") if p.strip()]
 
     body = _replace_triton_helpers(body)
 
@@ -135,13 +135,23 @@ def _replace_triton_helpers(source: str) -> str:
         (r'triton_helpers\.promote_to_tensor\(([^)]+)\)', r'\1'),
         (r'triton_helpers\.maximum\(([^,]+),\s*([^)]+)\)', r'tl.maximum(\1, \2)'),
         (r'triton_helpers\.minimum\(([^,]+),\s*([^)]+)\)', r'tl.minimum(\1, \2)'),
+        (r'triton_helpers\.device_assert\([^)]*\)', ''),
         (r'libdevice\.sqrt\(([^)]+)\)', r'tl.sqrt(\1)'),
+        (r'libdevice\.rsqrt\(([^)]+)\)', r'tl.math.rsqrt(\1)'),
         (r'libdevice\.exp\(([^)]+)\)', r'tl.exp(\1)'),
         (r'libdevice\.log\(([^)]+)\)', r'tl.log(\1)'),
         (r'libdevice\.abs\(([^)]+)\)', r'tl.abs(\1)'),
+        (r'libdevice\.sin\(([^)]+)\)', r'tl.sin(\1)'),
+        (r'libdevice\.cos\(([^)]+)\)', r'tl.cos(\1)'),
+        (r'libdevice\.tanh\(([^)]+)\)', r'tl.math.tanh(\1)'),
+        (r'libdevice\.pow\(([^,]+),\s*([^)]+)\)', r'tl.math.pow(\1, \2)'),
         (r'tl_math\.exp\(([^)]+)\)', r'tl.exp(\1)'),
         (r'tl_math\.log\(([^)]+)\)', r'tl.log(\1)'),
         (r'tl_math\.abs\(([^)]+)\)', r'tl.abs(\1)'),
+        (r'tl_math\.sqrt\(([^)]+)\)', r'tl.sqrt(\1)'),
+        (r'tl_math\.sin\(([^)]+)\)', r'tl.sin(\1)'),
+        (r'tl_math\.cos\(([^)]+)\)', r'tl.cos(\1)'),
+        (r'tl_math\.tanh\(([^)]+)\)', r'tl.math.tanh(\1)'),
     ]
     for pat, repl in replacements:
         source = re.sub(pat, repl, source)
@@ -226,7 +236,7 @@ def _extract_constexpr_params(kernel_body: str) -> list[str]:
     Only looks at the ``def func_name(...)`` line, not the body, to avoid
     picking up local aliases like ``RBLOCK: tl.constexpr = R0_BLOCK``.
     """
-    sig_match = re.search(r'def\s+\w+\s*\(([^)]+)\)', kernel_body)
+    sig_match = re.search(r'def\s+\w+\s*\((.*?)\)', kernel_body, re.DOTALL)
     if not sig_match:
         return []
     sig = sig_match.group(1)
@@ -248,81 +258,108 @@ _CONSTEXPR_DEFAULTS = {
 }
 
 
-def _convert_run_to_launch(
-    source: str, kernel_name: str, constexpr_params: list[str] | None = None
+def _find_all_run_kernel_names(source: str) -> list[str]:
+    """Find all kernel names that have ``.run()`` calls in the source."""
+    return list(dict.fromkeys(re.findall(r'(\w+)\.run\(', source)))
+
+
+def _find_matching_paren(s: str, start: int) -> int:
+    """Find the index of the closing ')' that matches the '(' at *start*."""
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == '(':
+            depth += 1
+        elif s[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _build_launch_replacement(
+    indent: str,
+    raw_args: str,
+    kname: str,
+    constexpr_params: list[str],
 ) -> str:
-    """Convert ``kernel.run(args..., stream=s)`` to ``kernel[grid](args...)``."""
+    """Build a ``kernel[grid](...)`` launch from raw ``.run()`` arguments."""
+    args_list = [a.strip() for a in raw_args.split(",") if a.strip()]
+
+    kernel_args = []
+    for a in args_list:
+        if a.startswith("stream=") or a.startswith("grid="):
+            continue
+        kernel_args.append(a)
+
+    ptr_args = []
+    scalar_args = []
+    for a in kernel_args:
+        if re.match(r'^(buf|arg|in_|out_|primals_|tangents_)', a):
+            ptr_args.append(a)
+        else:
+            scalar_args.append(a)
+
+    numel_arg = scalar_args[0] if scalar_args else "1"
+
+    constexpr_assigns = []
+    constexpr_kwargs = []
+    for p in constexpr_params:
+        default = _CONSTEXPR_DEFAULTS.get(p, 128)
+        constexpr_assigns.append(f"{indent}{p} = {default}")
+        constexpr_kwargs.append(f"{p}={p}")
+
+    if not constexpr_params:
+        constexpr_assigns.append(f"{indent}XBLOCK = 1024")
+        constexpr_kwargs.append("XBLOCK=XBLOCK")
+
+    if "XBLOCK" in constexpr_params or not constexpr_params:
+        xblock_name = "XBLOCK"
+    elif "BLOCK_M" in constexpr_params:
+        xblock_name = "BLOCK_M"
+    else:
+        xblock_name = constexpr_params[0] if constexpr_params else "XBLOCK"
+
+    parts = list(constexpr_assigns)
+    parts.append(f"{indent}grid = (triton.cdiv({numel_arg}, {xblock_name}),)")
+    all_args = ", ".join(ptr_args + scalar_args + constexpr_kwargs)
+    parts.append(f"{indent}{kname}[grid]({all_args})")
+    return "\n".join(parts)
+
+
+def _convert_run_to_launch(
+    source: str,
+    kernel_name: str,
+    constexpr_params: list[str] | None = None,
+) -> str:
+    """Convert ``kernel.run(args..., stream=s)`` to ``kernel[grid](args...)``.
+
+    Handles multi-line ``.run()`` calls via balanced-parenthesis matching and
+    converts all kernel ``.run()`` calls found in the source, not just the
+    primary *kernel_name*.
+    """
     if constexpr_params is None:
         constexpr_params = []
 
-    run_pattern = re.compile(
-        rf'\s*{re.escape(kernel_name)}\.run\(([^)]+)\)'
-    )
+    all_kernel_names = _find_all_run_kernel_names(source)
+    if kernel_name not in all_kernel_names:
+        all_kernel_names.insert(0, kernel_name)
 
-    lines = source.split("\n")
-    new_lines = []
-    for line in lines:
-        m = run_pattern.search(line)
-        if m:
-            indent = line[:len(line) - len(line.lstrip())]
-            raw_args = m.group(1)
-            args_list = [a.strip() for a in raw_args.split(",")]
+    for kname in all_kernel_names:
+        params = constexpr_params if kname == kernel_name else []
+        pattern = re.compile(rf'(\s*){re.escape(kname)}\.run\(')
+        matches = list(pattern.finditer(source))
+        for m in reversed(matches):
+            indent = m.group(1)
+            open_paren = m.end() - 1
+            close_paren = _find_matching_paren(source, open_paren)
+            if close_paren == -1:
+                continue
+            raw_args = source[open_paren + 1 : close_paren]
+            raw_args = " ".join(raw_args.split())
+            replacement = _build_launch_replacement(indent, raw_args, kname, params)
+            source = source[:m.start()] + replacement + source[close_paren + 1:]
 
-            kernel_args = []
-            for a in args_list:
-                if a.startswith("stream=") or a.startswith("grid="):
-                    continue
-                kernel_args.append(a)
-
-            ptr_args = []
-            scalar_args = []
-            for a in kernel_args:
-                if a.startswith("buf") or a.startswith("arg") or a.startswith("in_") or a.startswith("out_"):
-                    ptr_args.append(a)
-                else:
-                    scalar_args.append(a)
-
-            numel_arg = scalar_args[0] if scalar_args else "1"
-
-            constexpr_assigns = []
-            constexpr_kwargs = []
-            for p in constexpr_params:
-                default = _CONSTEXPR_DEFAULTS.get(p, 128)
-                if isinstance(default, bool):
-                    constexpr_assigns.append(f"{indent}{p} = {default}")
-                elif isinstance(default, str):
-                    constexpr_assigns.append(f"{indent}{p} = {default}")
-                else:
-                    constexpr_assigns.append(f"{indent}{p} = {default}")
-                constexpr_kwargs.append(f"{p}={p}")
-
-            if not constexpr_params:
-                constexpr_assigns.append(f"{indent}XBLOCK = 1024")
-                constexpr_kwargs.append("XBLOCK=XBLOCK")
-
-            grid_arg = numel_arg
-            if "XBLOCK" in constexpr_params or not constexpr_params:
-                xblock_name = "XBLOCK"
-            elif "BLOCK_M" in constexpr_params:
-                xblock_name = "BLOCK_M"
-            else:
-                xblock_name = constexpr_params[0] if constexpr_params else "XBLOCK"
-
-            for assign in constexpr_assigns:
-                new_lines.append(assign)
-
-            new_lines.append(
-                f"{indent}grid = (triton.cdiv({grid_arg}, {xblock_name}),)"
-            )
-
-            all_args = ", ".join(ptr_args + scalar_args + constexpr_kwargs)
-            new_lines.append(
-                f"{indent}{kernel_name}[grid]({all_args})"
-            )
-        else:
-            new_lines.append(line)
-
-    return "\n".join(new_lines)
+    return source
 
 
 def _fallback_launch_wrapper(inductor_source: str, kernel_name: str) -> str:
@@ -351,8 +388,8 @@ def _build_get_inputs(benchmark_source: str) -> str:
         r"(\w+)\s*=\s*rand_strided\(\s*"
         r"\(([^)]*)\)\s*,\s*"
         r"\(([^)]*)\)\s*,\s*"
-        r"device='([^']*)'\s*,\s*"
-        r"dtype=([^\s,)]+)"
+        r"device\s*=\s*['\"]?([^'\",\s]+)['\"]?\s*,\s*"
+        r"dtype\s*=\s*([^\s,)]+)"
     )
     matches = pattern.findall(benchmark_source)
 

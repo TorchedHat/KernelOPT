@@ -95,9 +95,23 @@ def _build_driver_script(
             print("ERROR: unknown pattern", file=sys.stderr)
             sys.exit(1)
 
+        graph_break_count = 0
+        graph_breaks = []
+        try:
+            callable_fn = compiled if pattern == "kernelbench" else compiled
+            explanation = torch._dynamo.explain(callable_fn)(*inputs)
+            graph_break_count = explanation.graph_break_count
+            if graph_break_count > 0:
+                for reason in explanation.break_reasons:
+                    graph_breaks.append(str(reason))
+        except Exception as _explain_err:
+            graph_breaks = [f"explain() failed: {{_explain_err}}"]
+
         out = {{
             "num_sources": len(sources),
             "sources": list(sources),
+            "graph_break_count": graph_break_count,
+            "graph_breaks": graph_breaks,
         }}
         with open({output_json!r}, "w") as f:
             json.dump(out, f)
@@ -168,16 +182,20 @@ def extract_triton_from_pytorch(
 
         results = []
         for src in data["sources"]:
-            triton_kernels = _extract_triton_jit_blocks(src)
+            triton_kernel_blocks = _extract_triton_jit_blocks(src)
+            triton_kernels = [b["source"] for b in triton_kernel_blocks]
             call_source = _extract_function(src, "call")
             benchmark_source = _extract_function(src, "benchmark_compiled_module")
 
             results.append({
                 "inductor_source": src,
                 "triton_kernels": triton_kernels,
+                "triton_kernel_blocks": triton_kernel_blocks,
                 "call_source": call_source,
                 "benchmark_source": benchmark_source,
                 "pattern": pattern,
+                "graph_break_count": data.get("graph_break_count", 0),
+                "graph_breaks": data.get("graph_breaks", []),
             })
 
         return results
@@ -194,30 +212,43 @@ def extract_triton_from_pytorch(
                 pass
 
 
-def _extract_triton_jit_blocks(inductor_source: str) -> list[str]:
+def _extract_triton_jit_blocks(inductor_source: str) -> list[dict[str, Any]]:
     """Extract all @triton.jit kernel source blocks from Inductor output.
 
-    Inductor wraps them in ``async_compile.triton('name', '''...''')`` calls.
-    We extract the triple-quoted content and strip inductor-specific imports/decorators.
+    Inductor wraps them in ``async_compile.triton('name', '''...''')`` or
+    ``async_compile.triton_template('name', '''...''')`` calls.
+
+    Returns list of dicts with keys: source, name, is_template.
     """
-    pattern = re.compile(
-        r"async_compile\.triton\(\s*'[^']+'\s*,\s*'''(.*?)'''\s*,",
-        re.DOTALL,
-    )
-    blocks = pattern.findall(inductor_source)
+    results: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
 
-    if not blocks:
-        pattern2 = re.compile(
-            r"async_compile\.triton\(\s*'[^']+'\s*,\s*\"\"\"(.*?)\"\"\"\s*,",
-            re.DOTALL,
-        )
-        blocks = pattern2.findall(inductor_source)
+    patterns = [
+        (r"async_compile\.triton\(\s*'([^']+)'\s*,\s*'''(.*?)'''\s*,", False),
+        (r'async_compile\.triton\(\s*\'([^\']+)\'\s*,\s*"""(.*?)"""\s*,', False),
+        (r"async_compile\.triton_template\(\s*'([^']+)'\s*,\s*'''(.*?)'''\s*,", True),
+        (r'async_compile\.triton_template\(\s*\'([^\']+)\'\s*,\s*"""(.*?)"""\s*,', True),
+    ]
 
-    return blocks
+    for pat, is_template in patterns:
+        for m in re.finditer(pat, inductor_source, re.DOTALL):
+            name = m.group(1)
+            if name not in seen_names:
+                seen_names.add(name)
+                results.append({
+                    "source": m.group(2),
+                    "name": name,
+                    "is_template": is_template,
+                })
+
+    return results
 
 
 def _extract_function(source: str, func_name: str) -> str:
-    """Extract a top-level function definition from source by name."""
+    """Extract a top-level function definition from source by name.
+
+    Handles multi-line function signatures like ``def call(\\n    arg1,\\n):``.
+    """
     lines = source.split("\n")
     start = None
     for i, line in enumerate(lines):
@@ -228,12 +259,26 @@ def _extract_function(source: str, func_name: str) -> str:
         return ""
 
     func_lines = [lines[start]]
-    for i in range(start + 1, len(lines)):
+
+    # Phase 1: consume the full signature (may span multiple lines)
+    sig_complete = bool(re.search(r'\)\s*(->\s*\S+\s*)?:\s*(#.*)?$', lines[start]))
+    body_start = start + 1
+    if not sig_complete:
+        for i in range(start + 1, len(lines)):
+            func_lines.append(lines[i])
+            if re.search(r'\)\s*(->\s*\S+\s*)?:\s*(#.*)?$', lines[i]):
+                body_start = i + 1
+                break
+        else:
+            body_start = len(func_lines) + start
+
+    # Phase 2: consume the indented body
+    for i in range(body_start, len(lines)):
         line = lines[i]
         if line.strip() == "":
             func_lines.append(line)
             continue
-        if line[0] not in (" ", "\t") and line.strip() != "":
+        if line[0] not in (" ", "\t"):
             break
         func_lines.append(line)
 

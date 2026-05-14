@@ -173,6 +173,8 @@ def check_correctness(
     kernel_args: list[str] | None = None,
     binary_path: str | None = None,
     debug: bool = False,
+    pytorch_reference_source: str | None = None,
+    pytorch_reference_path: str | None = None,
 ) -> tuple[bool, str]:
     """
     Verify an optimized kernel is correct.
@@ -183,12 +185,16 @@ def check_correctness(
       - Else → run binary, check exit code only
 
     For Python kernels (Triton / Helion):
+      - If pytorch_reference_source is provided → compare against PyTorch directly (no LLM)
       - use_agentic=True  → Claude generates CPU reference + torch.allclose
       - use_agentic=False → subprocess (exit code + failure markers)
 
     Args:
         binary_path: Pre-compiled binary path for .cu kernels. When provided,
                      the run step skips nvcc. Ignored for Python kernels.
+        pytorch_reference_source: Original PyTorch source for synthesized kernels.
+                     When provided, bypasses LLM and uses PyTorch as the reference.
+        pytorch_reference_path: Path to the original PyTorch file.
     """
     ext = Path(original_path).suffix
 
@@ -218,6 +224,8 @@ def check_correctness(
             project_id=project_id,
             region=region,
             kernel_args=kernel_args,
+            pytorch_reference_source=pytorch_reference_source,
+            pytorch_reference_path=pytorch_reference_path,
         )
     return check_correctness_subprocess(original_path, optimized_source, debug=debug)
 
