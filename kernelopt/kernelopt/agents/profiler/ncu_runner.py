@@ -15,7 +15,7 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
     """Parse the kernel source to detect framework and list all GPU kernel function names.
 
     Returns (framework, kernel_names).
-    framework: "triton" | "helion" | "cuda" | "unknown"
+    framework: "triton" | "helion" | "cuda" | "pytorch" | "unknown"
     kernel_names: suitable for --kernel-name flag (exact or regex pattern)
     """
     path = Path(kernel_path)
@@ -27,7 +27,12 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
             tree = ast.parse(source)
         except (OSError, SyntaxError):
             return "unknown", []
-        return _extract_python_kernels(tree)
+        framework, names = _extract_python_kernels(tree)
+        if framework != "unknown":
+            return framework, names
+        if _is_pytorch_source(source, tree):
+            return "pytorch", []
+        return "unknown", []
 
     elif ext == ".cu":
         try:
@@ -66,6 +71,35 @@ def _extract_cuda_kernels(source: str) -> tuple[str, list[str]]:
     if names:
         return "cuda", names
     return "unknown", []
+
+
+def _is_pytorch_source(source: str, tree: ast.AST) -> bool:
+    """Detect whether a Python file is a PyTorch module/function (not already Triton/Helion).
+
+    Checks for KernelBench pattern (class Model(nn.Module) + get_inputs),
+    SOL-ExecBench pattern (def run() with torch), or generic nn.Module.
+    """
+    has_nn_module = bool(re.search(
+        r'class\s+\w+\s*\(\s*(?:nn\.Module|torch\.nn\.Module)\s*\)', source
+    ))
+    has_get_inputs = "def get_inputs(" in source
+    has_torch_import = "import torch" in source
+
+    if has_nn_module and has_get_inputs:
+        return True
+
+    if has_nn_module and has_torch_import:
+        return True
+
+    has_run_fn = bool(re.search(r'def\s+run\s*\(', source))
+    has_torch_no_grad = "@torch.no_grad" in source
+    if has_run_fn and has_torch_import and has_torch_no_grad:
+        return True
+
+    if has_run_fn and has_get_inputs and has_torch_import:
+        return True
+
+    return False
 
 
 def _detect_framework_from_name(kernel_name: str) -> str:
