@@ -173,5 +173,9 @@ class GraphState(TypedDict, total=False):
     # History
     iteration_results: list[IterationResult]
 
+    # Synthesis (Feature 4): original PyTorch source when input was auto-converted
+    _original_pytorch_path: Optional[str]
+    _original_pytorch_source: Optional[str]
+
     # Internal: LangGraph entry routing (fresh | after_baseline | after_iteration)
     _entry: str
