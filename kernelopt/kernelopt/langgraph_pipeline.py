@@ -2,9 +2,14 @@
 LangGraph-based optimization pipeline.
 
 Graph:
-  profile_baseline → generate_plans → execute_plans → profile_candidates
-       → summarize_results → select_best → increment_iteration
+  [maybe_synthesize] → profile_baseline → generate_plans → execute_plans
+       → autotune_candidates → profile_candidates → summarize_results
+       → select_best → increment_iteration
        → {should_continue: continue → generate_plans | stop → END}
+
+maybe_synthesize runs only when framework=="pytorch" (auto-detected).
+It converts PyTorch input to Triton via torch.compile, then the rest
+of the pipeline proceeds on the synthesized Triton kernel.
 """
 
 from __future__ import annotations
@@ -416,6 +421,8 @@ def execute_plans(state: GraphState) -> dict:
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
             debug=cfg.debug,
+            pytorch_reference_source=state.get("_original_pytorch_source"),
+            pytorch_reference_path=state.get("_original_pytorch_path"),
         )
         if _use_spinners():
             with phase_spinner("correctness", f"plan {plan_letter}"):
@@ -831,6 +838,10 @@ def route_start(state: GraphState) -> str:
     }
     if entry in resume_targets:
         return resume_targets[entry]
+
+    framework = state.get("framework", "")
+    if framework == "pytorch":
+        return "maybe_synthesize"
     return "profile_baseline"
 
 
@@ -849,6 +860,126 @@ def save_iter_checkpoint(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 0 (conditional): Synthesize Triton from PyTorch via torch.compile
+# ---------------------------------------------------------------------------
+
+def _select_best_kernel(
+    kernel_blocks: list[dict],
+    user_kernel_name: str | None = None,
+) -> tuple[int, str]:
+    """Select the most promising kernel from Inductor output.
+
+    Returns (index_into_kernel_blocks, reason_string).
+    """
+    if len(kernel_blocks) <= 1:
+        return 0, "only kernel"
+
+    if user_kernel_name:
+        for i, block in enumerate(kernel_blocks):
+            if block["name"] == user_kernel_name:
+                return i, f"user-specified '{user_kernel_name}'"
+
+    templates = [(i, b) for i, b in enumerate(kernel_blocks) if b.get("is_template")]
+    if templates:
+        best_idx = max(templates, key=lambda x: len(x[1]["source"]))[0]
+        return best_idx, "template kernel (GEMM from max_autotune)"
+
+    best_idx = max(range(len(kernel_blocks)), key=lambda i: len(kernel_blocks[i]["source"]))
+    return best_idx, f"largest kernel ({len(kernel_blocks[best_idx]['source'])} chars)"
+
+
+def maybe_synthesize(state: GraphState) -> dict:
+    """If input is PyTorch, convert to Triton via torch.compile.
+
+    Transparent to the rest of the pipeline -- after this node,
+    kernel_path points to a Triton .py file regardless of input format.
+    No-op when framework is not "pytorch".
+    """
+    framework = state.get("framework", "")
+    if framework != "pytorch":
+        return {}
+
+    from kernelopt.synthesis import extract_triton_from_pytorch, wrap_inductor_output
+    from kernelopt.synthesis.compile_extract import SynthesisError
+
+    cfg = state["config"]
+    kernel_path = state["kernel_path"]
+    output_dir = state["output_dir"]
+
+    pipe_print("[bold]Detected PyTorch input — synthesizing Triton via torch.compile...[/]")
+
+    original_source = Path(kernel_path).read_text()
+
+    try:
+        results = extract_triton_from_pytorch(kernel_path)
+    except SynthesisError as e:
+        raise RuntimeError(f"PyTorch synthesis failed: {e}") from e
+
+    if not results or not results[0]["triton_kernels"]:
+        raise RuntimeError(
+            "torch.compile produced no Triton kernels for this input. "
+            "The operations may be delegated to cuBLAS/cuDNN library calls. "
+            "Consider providing a Triton kernel directly."
+        )
+
+    primary = results[0]
+    kernel_blocks = primary.get("triton_kernel_blocks", [])
+
+    if kernel_blocks:
+        selected_idx, selection_reason = _select_best_kernel(
+            kernel_blocks,
+            user_kernel_name=getattr(cfg, "kernel_name", None),
+        )
+        triton_kernel = kernel_blocks[selected_idx]["source"]
+        selected_name = kernel_blocks[selected_idx]["name"]
+    else:
+        triton_kernel = primary["triton_kernels"][0]
+        selected_name = "kernel_0"
+        selection_reason = "only kernel"
+
+    wrapped_source = wrap_inductor_output(
+        triton_kernel_source=triton_kernel,
+        call_source=primary["call_source"],
+        benchmark_source=primary["benchmark_source"],
+        original_pytorch_source=original_source,
+        inductor_source=primary["inductor_source"],
+    )
+
+    synth_dir = Path(output_dir) / "synthesis"
+    synth_dir.mkdir(parents=True, exist_ok=True)
+
+    wrapped_path = synth_dir / "synthesized_triton.py"
+    wrapped_path.write_text(wrapped_source)
+
+    (synth_dir / "original_pytorch.py").write_text(original_source)
+    (synth_dir / "raw_inductor_output.py").write_text(primary["inductor_source"])
+
+    n_kernels = len(kernel_blocks) or len(primary["triton_kernels"])
+    pipe_print(f"  Synthesized {n_kernels} kernel(s), selected: [green]{selected_name}[/] ({selection_reason})")
+    pipe_print(f"  Output: [green]{wrapped_path}[/]")
+
+    graph_break_count = primary.get("graph_break_count", 0)
+    if graph_break_count > 0:
+        pipe_print(
+            f"  [yellow]Warning: {graph_break_count} graph break(s) detected. "
+            f"Optimization covers only one subgraph.[/]"
+        )
+        for reason in primary.get("graph_breaks", [])[:3]:
+            pipe_print(f"    [dim]{reason}[/]")
+
+    return {
+        "kernel_path": str(wrapped_path),
+        "kernel_source": wrapped_source,
+        "best_kernel": wrapped_source,
+        "kernel_basename": "synthesized_triton",
+        "framework": "triton",
+        "ext": ".py",
+        "_original_pytorch_path": kernel_path,
+        "_original_pytorch_source": original_source,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
 
@@ -856,6 +987,7 @@ def build_graph():
     """Build and compile the LangGraph optimization pipeline."""
     graph = StateGraph(GraphState)
 
+    graph.add_node("maybe_synthesize", maybe_synthesize)
     graph.add_node("profile_baseline", profile_baseline)
     graph.add_node("generate_plans", generate_plans)
     graph.add_node("execute_plans", execute_plans)
@@ -870,6 +1002,7 @@ def build_graph():
         START,
         route_start,
         {
+            "maybe_synthesize": "maybe_synthesize",
             "profile_baseline": "profile_baseline",
             "generate_plans": "generate_plans",
             "execute_plans": "execute_plans",
@@ -879,6 +1012,7 @@ def build_graph():
             "continuation_entry": "continuation_entry",
         },
     )
+    graph.add_edge("maybe_synthesize", "profile_baseline")
     graph.add_edge("profile_baseline", "generate_plans")
     graph.add_conditional_edges(
         "continuation_entry",

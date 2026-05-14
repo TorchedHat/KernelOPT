@@ -82,6 +82,111 @@ def _make_tensor(inp, device: str) -> torch.Tensor:
     return torch.randn(inp.shape, dtype=dtype, device=device)
 
 
+def _check_against_pytorch_reference(
+    kernel_source: str,
+    kernel_path: str,
+    pytorch_source: str,
+    pytorch_path: str | None,
+) -> tuple[bool, str]:
+    """Compare a synthesized Triton kernel against the original PyTorch code.
+
+    No LLM call needed — the PyTorch model IS the reference.
+    """
+    triton_tmp = None
+    pytorch_tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False, dir='/tmp',
+            prefix='synth_triton_opt_',
+        ) as f:
+            f.write(kernel_source)
+            triton_tmp = f.name
+
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False, dir='/tmp',
+            prefix='synth_pytorch_ref_',
+        ) as f:
+            f.write(pytorch_source)
+            pytorch_tmp = f.name
+
+        triton_spec = importlib.util.spec_from_file_location("_synth_triton", triton_tmp)
+        triton_mod = types.ModuleType("_synth_triton")
+        triton_spec.loader.exec_module(triton_mod)
+
+        kernel_fn = getattr(triton_mod, "kernel_function", None)
+        triton_get_inputs = getattr(triton_mod, "get_inputs", None)
+        if kernel_fn is None:
+            return False, "Synthesized kernel missing kernel_function()"
+        if triton_get_inputs is None:
+            return False, "Synthesized kernel missing get_inputs()"
+
+        pytorch_spec = importlib.util.spec_from_file_location("_pytorch_ref", pytorch_tmp)
+        pytorch_mod = types.ModuleType("_pytorch_ref")
+        pytorch_spec.loader.exec_module(pytorch_mod)
+
+        model_cls = getattr(pytorch_mod, "Model", None)
+        run_fn = getattr(pytorch_mod, "run", None)
+        if model_cls is None and run_fn is None:
+            return False, "PyTorch reference has no Model class or run() function"
+
+        get_init = getattr(pytorch_mod, "get_init_inputs", lambda: [])
+        pytorch_get_inputs = getattr(pytorch_mod, "get_inputs", None)
+
+        if model_cls is not None:
+            model = model_cls(*get_init()).cuda().eval()
+            ref_callable = model
+        else:
+            ref_callable = run_fn
+
+        seeds = [0, 42, 1337]
+        failures: list[str] = []
+
+        for seed in seeds:
+            torch.manual_seed(seed)
+
+            if pytorch_get_inputs:
+                raw_inputs = pytorch_get_inputs()
+                ref_inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in raw_inputs]
+            else:
+                ref_inputs = triton_get_inputs()
+
+            with torch.no_grad():
+                ref_out = ref_callable(*ref_inputs)
+
+            torch.manual_seed(seed)
+            triton_inputs = triton_get_inputs()
+            triton_out = kernel_fn(*triton_inputs)
+
+            if isinstance(ref_out, (tuple, list)):
+                ref_out = ref_out[0]
+            if isinstance(triton_out, (tuple, list)):
+                triton_out = triton_out[0]
+
+            ref_f = ref_out.cpu().float()
+            triton_f = triton_out.cpu().float()
+
+            atol, rtol = 1e-3, 1e-3
+            passed = torch.allclose(triton_f, ref_f, atol=atol, rtol=rtol)
+            max_diff = (triton_f - ref_f).abs().max().item()
+            print(f"[correctness/pytorch-ref] seed={seed} passed={passed} max_diff={max_diff:.3e}")
+
+            if not passed:
+                failures.append(f"seed={seed}: max_diff={max_diff:.3e} > atol={atol}")
+
+        if failures:
+            return False, "PyTorch reference correctness FAILED:\n" + "\n".join(failures)
+        return True, f"PyTorch reference correctness passed (3 seeds, atol={atol}, rtol={rtol})"
+
+    except Exception as e:
+        import traceback
+        return False, f"PyTorch reference check error: {e}\n{traceback.format_exc()}"
+    finally:
+        if triton_tmp:
+            Path(triton_tmp).unlink(missing_ok=True)
+        if pytorch_tmp:
+            Path(pytorch_tmp).unlink(missing_ok=True)
+
+
 def run_correctness_agent(
     kernel_source: str,
     kernel_path: str,
@@ -91,11 +196,16 @@ def run_correctness_agent(
     project_id: str | None = None,
     region: str | None = None,
     kernel_args: list[str] | None = None,
+    pytorch_reference_source: str | None = None,
+    pytorch_reference_path: str | None = None,
 ) -> tuple[bool, str]:
     """
     Verify an optimized kernel against a CPU reference.
 
-    Flow:
+    When pytorch_reference_source is provided (synthesized kernels), the original
+    PyTorch code is used directly as the reference — no LLM call needed.
+
+    Otherwise:
       1. LLM returns a CorrectnessSpec (structured JSON):
            wrapper_function, reference_code, test_inputs, atol, rtol
       2. Python loads the optimized kernel via importlib (exact file path —
@@ -105,6 +215,13 @@ def run_correctness_agent(
          compare with torch.allclose.
       5. Return (passed, message).
     """
+    if pytorch_reference_source is not None:
+        return _check_against_pytorch_reference(
+            kernel_source=kernel_source,
+            kernel_path=kernel_path,
+            pytorch_source=pytorch_reference_source,
+            pytorch_path=pytorch_reference_path,
+        )
     from kernelopt.agents.schemas import CorrectnessSpec
 
     llm = build_llm(
