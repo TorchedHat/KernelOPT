@@ -30,6 +30,8 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
         framework, names = _extract_python_kernels(tree)
         if framework != "unknown":
             return framework, names
+        if _is_inductor_output(source):
+            return "triton", []
         if _is_pytorch_source(source, tree):
             return "pytorch", []
         return "unknown", []
@@ -71,6 +73,15 @@ def _extract_cuda_kernels(source: str) -> tuple[str, list[str]]:
     if names:
         return "cuda", names
     return "unknown", []
+
+
+def _is_inductor_output(source: str) -> bool:
+    """Detect torch.compile / Inductor-generated output.
+
+    These files have Triton kernels compiled via ``async_compile.triton(...)``
+    rather than module-level ``@triton.jit`` decorators.
+    """
+    return "async_compile.triton(" in source or "async_compile = AsyncCompile()" in source
 
 
 def _is_pytorch_source(source: str, tree: ast.AST) -> bool:
