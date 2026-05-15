@@ -152,14 +152,25 @@ def _extract_get_inputs(inductor_source: str) -> str:
     var_names = []
     for var_name, shape, _stride, device, dtype in matches:
         shape_clean = shape.strip().rstrip(",").strip()
-        if "," not in shape_clean:
+        if not shape_clean:
+            shape_str = "()"
+        elif "," not in shape_clean:
             shape_str = f"({shape_clean},)"
         else:
             shape_str = f"({shape_clean})"
 
         dtype_clean = dtype.strip()
 
-        if any(t in dtype_clean for t in ["int64", "int32", "int16", "int8", "uint8"]):
+        if shape_str == "()":
+            if any(t in dtype_clean for t in ["int", "uint", "bool"]):
+                input_lines.append(
+                    f"    {var_name} = torch.tensor(1, dtype={dtype_clean}, device='{device}')"
+                )
+            else:
+                input_lines.append(
+                    f"    {var_name} = torch.tensor(0.1, dtype={dtype_clean}, device='{device}')"
+                )
+        elif any(t in dtype_clean for t in ["int64", "int32", "int16", "int8", "uint8"]):
             input_lines.append(
                 f"    {var_name} = torch.randint(0, 10, {shape_str}, dtype={dtype_clean}, device='{device}')"
             )
