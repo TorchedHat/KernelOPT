@@ -22,6 +22,30 @@ class SynthesisError(Exception):
     """Raised when torch.compile extraction fails."""
 
 
+def _find_python() -> str:
+    """Find the best Python for running torch.compile.
+
+    Prefers the Python that has the newest torch installed, since
+    Inductor's codegen may use syntax features from newer Python versions.
+    Falls back to sys.executable.
+    """
+    import shutil
+
+    for candidate in ("python3.11", "python3.12", "python3.10", "python3"):
+        path = shutil.which(candidate)
+        if path:
+            try:
+                r = subprocess.run(
+                    [path, "-c", "import torch; print(torch.__version__)"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return path
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    return sys.executable
+
+
 def _detect_pytorch_pattern(source: str) -> str:
     """Classify which PyTorch input pattern the source matches.
 
@@ -142,14 +166,17 @@ def extract_triton_from_pytorch(
     driver_code = _build_driver_script(pytorch_file, output_json, pattern)
     Path(driver_path).write_text(driver_code)
 
+    python = _find_python()
+
     try:
-        result = subprocess.run(
-            [sys.executable, driver_path],
+        run_kwargs = dict(
             capture_output=True,
             text=True,
-            timeout=timeout,
             env={**__import__("os").environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
+        if timeout:
+            run_kwargs["timeout"] = timeout
+        result = subprocess.run([python, driver_path], **run_kwargs)
 
         if result.returncode != 0:
             stderr_tail = result.stderr[-2000:] if result.stderr else "(no stderr)"
