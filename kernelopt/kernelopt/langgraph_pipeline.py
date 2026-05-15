@@ -869,8 +869,14 @@ def maybe_synthesize(state: GraphState) -> dict:
     No-op when framework is not "pytorch".
     """
     framework = state.get("framework", "")
-    if framework != "pytorch":
+    if framework not in ("pytorch", "auto", ""):
         return {}
+
+    if framework in ("auto", ""):
+        from kernelopt.agents.profiler.ncu_runner import extract_kernel_info
+        detected, _ = extract_kernel_info(state["kernel_path"])
+        if detected != "pytorch":
+            return {}
 
     from kernelopt.synthesis import extract_triton_from_pytorch, wrap_inductor_output
     from kernelopt.synthesis.compile_extract import SynthesisError
@@ -887,22 +893,17 @@ def maybe_synthesize(state: GraphState) -> dict:
     except SynthesisError as e:
         raise RuntimeError(f"PyTorch synthesis failed: {e}") from e
 
-    if not results or not results[0]["triton_kernels"]:
+    if not results:
         raise RuntimeError(
-            "torch.compile produced no Triton kernels for this input. "
-            "The operations may be delegated to cuBLAS/cuDNN library calls. "
-            "Consider providing a Triton kernel directly."
+            "torch.compile produced no output for this input."
         )
 
     primary = results[0]
-    triton_kernel = primary["triton_kernels"][0]
 
     wrapped_source = wrap_inductor_output(
-        triton_kernel_source=triton_kernel,
-        call_source=primary["call_source"],
-        benchmark_source=primary["benchmark_source"],
-        original_pytorch_source=original_source,
         inductor_source=primary["inductor_source"],
+        original_pytorch_source=original_source,
+        triton_kernel_sources=primary["triton_kernels"],
     )
 
     synth_dir = Path(output_dir) / "synthesis"
@@ -914,12 +915,13 @@ def maybe_synthesize(state: GraphState) -> dict:
     (synth_dir / "original_pytorch.py").write_text(original_source)
     (synth_dir / "raw_inductor_output.py").write_text(primary["inductor_source"])
 
-    pipe_print(f"  Synthesized Triton kernel: [green]{wrapped_path}[/]")
-    if len(primary["triton_kernels"]) > 1:
-        pipe_print(
-            f"  [dim]({len(primary['triton_kernels'])} kernels generated, "
-            f"using the first one)[/]"
-        )
+    n_kernels = len(primary["triton_kernels"])
+    has_extern = "extern_kernels" in primary["inductor_source"]
+    pipe_print(
+        f"  Synthesized: [green]{wrapped_path}[/] "
+        f"({n_kernels} Triton kernel{'s' if n_kernels != 1 else ''}"
+        f"{', + extern_kernels' if has_extern else ''})"
+    )
 
     return {
         "kernel_path": str(wrapped_path),
