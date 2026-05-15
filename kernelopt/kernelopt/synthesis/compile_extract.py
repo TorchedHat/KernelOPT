@@ -131,7 +131,7 @@ def _build_driver_script(
 def extract_triton_from_pytorch(
     pytorch_file: str,
     *,
-    timeout: int = 180,
+    timeout: int | None = None,
 ) -> list[dict[str, Any]]:
     """Run torch.compile on a PyTorch file and extract generated Triton code.
 
