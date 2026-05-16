@@ -536,12 +536,17 @@ def execute_plans(state: GraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 def autotune_candidates(state: GraphState) -> dict:
-    """For Triton candidates that passed correctness, autotune tl.constexpr params.
+    """Placeholder for decoupled autotuning (Feature 1 -- not yet validated).
 
-    Extracts tunable parameters (BLOCK_SIZE, num_warps, num_stages), sweeps a
-    grid of configs via wall-clock benchmarking, and replaces the candidate source
-    with the best-performing config. Zero LLM calls -- purely mechanical search.
+    When enabled, this node extracts tunable tl.constexpr parameters and sweeps
+    a grid of configs via wall-clock benchmarking. Currently a pass-through
+    to isolate Feature 4 testing from unvalidated Feature 1 changes.
     """
+    return {"candidates": list(state["candidates"])}
+
+
+def _autotune_candidates_impl(state: GraphState) -> dict:
+    """Feature 1 implementation (disabled pending validation)."""
     from kernelopt.autotuner import extract_tunable_params, run_autotune
 
     cfg = state["config"]
