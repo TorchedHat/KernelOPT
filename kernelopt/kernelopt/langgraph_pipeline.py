@@ -349,6 +349,18 @@ def analyze_strategy(state: GraphState) -> dict:
 
     pipe_print("  Analyzing optimization strategy...")
 
+    # Query memory bank for past experiences with similar kernels
+    from kernelopt.memory_bank import MemoryBank, classify_kernel_structure, get_hardware_info
+    bank = MemoryBank()
+    kernel_struct = classify_kernel_structure(kernel_source, profiling_ctx)
+    hw_info = get_hardware_info()
+    past_failures = bank.get_failures(kernel_struct, hw_info)
+    past_successes = bank.get_successes(kernel_struct, hw_info)
+    memory_context = bank.format_for_llm(past_failures + past_successes)
+
+    if past_failures:
+        pipe_print(f"  [dim]Memory bank: {len(past_failures)} relevant failures, {len(past_successes)} successes[/]")
+
     try:
         llm = build_llm(**llm_config)
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -356,8 +368,10 @@ def analyze_strategy(state: GraphState) -> dict:
         user_msg = (
             f"## Multi-kernel profile\n{multi_kernel_summary}\n\n"
             f"## Kernel source (first 200 lines)\n```python\n{kernel_source[:8000]}\n```\n\n"
-            f"Decide the optimization strategy. Return ONLY the JSON object."
         )
+        if memory_context:
+            user_msg += f"\n{memory_context}\n\n"
+        user_msg += "Decide the optimization strategy. Return ONLY the JSON object."
 
         response = llm.invoke([
             SystemMessage(content=_STRATEGY_SYSTEM_PROMPT),
@@ -952,6 +966,40 @@ def summarize_results(state: GraphState) -> dict:
     top_items = select_top_k(experience_items, cfg.TopK, cfg.t_pos, cfg.t_neg)
     if top_items:
         memory = append_items(memory, top_items, cfg.ExpN)
+
+    # Write to persistent memory bank (cross-run learning)
+    try:
+        from kernelopt.memory_bank import (
+            MemoryBank, MemoryEntry, classify_kernel_structure, get_hardware_info,
+        )
+        bank = MemoryBank()
+        kernel_struct = classify_kernel_structure(current_kernel, profiling_before)
+        hw_info = get_hardware_info()
+        strategy = state.get("optimization_strategy", {})
+
+        for c in candidates:
+            if not c.direction:
+                continue
+            entry = MemoryEntry(
+                kernel_structure=kernel_struct,
+                hardware=hw_info,
+                strategy={
+                    "type": strategy.get("strategy_type", "optimize_kernel"),
+                    "direction": c.direction,
+                },
+                outcome="success" if c.correctness_passed and c.speedup > 1.0 else (
+                    "failure" if not c.correctness_passed else "degradation"
+                ),
+                speedup=c.speedup if c.speedup > 0 else 0.0,
+                failure_reason=c.correctness_message[:200] if not c.correctness_passed else "",
+                optimization_insight=(
+                    next((it.get("insight", "") for it in top_items if it.get("direction") == c.direction), "")
+                    if top_items else ""
+                ),
+            )
+            bank.add(entry)
+    except Exception as e:
+        pipe_print(f"  [dim]Memory bank write failed: {e}[/]")
 
     out = {"optimization_memory": memory}
     _checkpoint_stage(state, out, "after_summarize")
