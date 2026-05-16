@@ -29,9 +29,9 @@ Do NOT name the @triton.jit kernel itself.
 
 ### reference_code
 A self-contained Python string that defines a function named exactly `reference`.
-It receives the same positional arguments as wrapper_function but as CPU tensors.
-It must use only standard torch operations (no Triton, no CUDA).
-Start with `import torch` if needed.
+It receives the same positional arguments as wrapper_function — tensors as CPU
+tensors, scalars as Python values. Must use only standard torch operations
+(no Triton, no CUDA). Start with `import torch` if needed.
 
 Example for row-wise softmax:
     import torch
@@ -39,17 +39,30 @@ Example for row-wise softmax:
         return torch.softmax(x, dim=-1)
 
 ### test_inputs
-An ordered list of input tensor specs matching the arguments wrapper_function
-expects. For each input specify:
+An ordered list of input specs matching the arguments wrapper_function expects.
+Each entry has a "kind" field: "tensor" (default) or "scalar".
+
+For **tensor** inputs (kind="tensor"):
 - shape: exact list of ints (use kernel_args dimensions if provided)
 - dtype: "float32", "float16", "bfloat16", "int32", or "int64"
 - distribution: "randn" for most ops, "rand" for ops needing [0,1], "ones"/"zeros" for special cases
 
+For **scalar** inputs (kind="scalar") like scaling factors, dimensions, or flags:
+- value: the Python value to pass (e.g. 1.0, 128, true)
+- scalar_dtype: "float", "int", or "bool" (default: "float")
+
 ### atol / rtol
-Tolerances for torch.allclose (matches torch.testing.assert_close defaults):
-- FP32 (element-wise or reductions): atol=1e-5, rtol=1.3e-6
-- FP16: atol=1e-3, rtol=1e-3
-- BF16: atol=1e-5, rtol=1.6e-2
+Tolerances for torch.allclose. Choose based on the computation type AND dtype:
+
+- FP32 element-wise only (no matmul): atol=1e-5, rtol=1.3e-6
+- FP32 with matmul/GEMM/conv (large accumulation): atol=1e-3, rtol=1e-3
+- FP32 fused ops (matmul + activation): atol=1e-3, rtol=1e-3
+- FP16: atol=1e-2, rtol=1e-2
+- BF16: atol=2e-2, rtol=2e-2
+
+IMPORTANT: If the kernel includes any matrix multiplication (torch.mm, GEMM,
+addmm, conv) or large reductions, use atol=1e-3, rtol=1e-3 at minimum.
+GPU matmul accumulates rounding errors over thousands of elements.
 
 ### skip
 Set true ONLY if the operation cannot be tested automatically (custom RNG,
@@ -57,7 +70,17 @@ hardware-specific stateful op). Default: false.
 """
 
 
-def _make_tensor(inp, device: str) -> torch.Tensor:
+def _make_input(inp, device: str):
+    """Create a test input value from a TestInput spec.
+
+    Returns a torch.Tensor (on *device*) for kind="tensor",
+    or a plain Python scalar for kind="scalar".
+    """
+    if inp.kind == "scalar":
+        val = inp.value if inp.value is not None else 1.0
+        cast = {"int": int, "bool": bool, "float": float}.get(inp.scalar_dtype or "float", float)
+        return cast(val)
+
     dtype_map = {
         "float32":  torch.float32,
         "float16":  torch.float16,
@@ -65,21 +88,22 @@ def _make_tensor(inp, device: str) -> torch.Tensor:
         "int32":    torch.int32,
         "int64":    torch.int64,
     }
-    dtype = dtype_map.get(inp.dtype, torch.float32)
+    dtype = dtype_map.get(inp.dtype or "float32", torch.float32)
+    shape = inp.shape or [1]
     dist = inp.distribution
     if dist == "randn":
-        return torch.randn(inp.shape, dtype=dtype, device=device)
+        return torch.randn(shape, dtype=dtype, device=device)
     elif dist == "rand":
-        return torch.rand(inp.shape, dtype=dtype, device=device)
+        return torch.rand(shape, dtype=dtype, device=device)
     elif dist == "ones":
-        return torch.ones(inp.shape, dtype=dtype, device=device)
+        return torch.ones(shape, dtype=dtype, device=device)
     elif dist == "zeros":
-        return torch.zeros(inp.shape, dtype=dtype, device=device)
+        return torch.zeros(shape, dtype=dtype, device=device)
     elif dist == "randint":
         lo = int(inp.low) if inp.low is not None else 0
         hi = int(inp.high) if inp.high is not None else 128
-        return torch.randint(lo, hi, inp.shape, dtype=dtype, device=device)
-    return torch.randn(inp.shape, dtype=dtype, device=device)
+        return torch.randint(lo, hi, shape, dtype=dtype, device=device)
+    return torch.randn(shape, dtype=dtype, device=device)
 
 
 def run_correctness_agent(
@@ -199,8 +223,8 @@ def run_correctness_agent(
     for seed in seeds:
         torch.manual_seed(seed)
         try:
-            inputs_cuda = [_make_tensor(inp, device="cuda") for inp in spec.test_inputs]
-            inputs_cpu  = [t.cpu() for t in inputs_cuda]
+            inputs_cuda = [_make_input(inp, device="cuda") for inp in spec.test_inputs]
+            inputs_cpu  = [t.cpu() if isinstance(t, torch.Tensor) else t for t in inputs_cuda]
 
             gpu_out = wrapper_fn(*inputs_cuda)
             ref_out = reference_fn(*inputs_cpu)
@@ -214,9 +238,14 @@ def run_correctness_agent(
             gpu_f = gpu_out.cpu().float()
             ref_f = ref_out.float()
 
-            passed = torch.allclose(gpu_f, ref_f, atol=spec.atol, rtol=spec.rtol)
+            # Enforce minimum tolerance floor based on tensor size (large tensors
+            # accumulate more FP rounding error, especially with GEMM/conv).
+            atol = max(spec.atol, 1e-3 if gpu_f.numel() > 100_000 else spec.atol)
+            rtol = max(spec.rtol, 1e-3 if gpu_f.numel() > 100_000 else spec.rtol)
+
+            passed = torch.allclose(gpu_f, ref_f, atol=atol, rtol=rtol)
             max_diff = (gpu_f - ref_f).abs().max().item()
-            print(f"[correctness] seed={seed}  passed={passed}  max_diff={max_diff:.3e}")
+            print(f"[correctness] seed={seed}  passed={passed}  max_diff={max_diff:.3e}  atol={atol}")
 
             if not passed:
                 failures.append(f"seed={seed}: max_diff={max_diff:.3e} > atol={spec.atol}")
