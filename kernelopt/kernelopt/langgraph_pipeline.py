@@ -190,8 +190,9 @@ def profile_baseline(state: GraphState) -> dict:
                     marker = "[bold cyan]→[/]" if is_target else "  "
                     dur_us = k["duration_ns"] / 1000
                     name = k["kernel_name"][:55]
-                    lib = " [dim](library)[/]" if k.get("is_library") else ""
-                    pipe_print(f"  {marker} [{k['kernel_id']}] {dur_us:>10.2f} µs  {name}{lib}")
+                    kind = k.get("kind", "")
+                    tag = f" [dim]({kind})[/]" if kind and kind != "user" else ""
+                    pipe_print(f"  {marker} [{k['kernel_id']}] {dur_us:>10.2f} µs  {name}{tag}")
                 if len(all_kernels) > 8:
                     pipe_print(f"    ... and {len(all_kernels) - 8} more")
 
