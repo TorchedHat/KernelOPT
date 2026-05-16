@@ -18,8 +18,20 @@ Use your tools to understand the context:
   search_memory(query)     — check past experience for relevant patterns
 
 When you have implemented the change, call submit_kernel(kernel_source, change_summary).
-  kernel_source  — the complete modified file with ONLY the plan's change applied
+  kernel_source  — the COMPLETE modified file including ALL of:
+    - import statements (import torch, import triton, import triton.language as tl, etc.)
+    - @triton.jit kernel function(s)
+    - kernel_function(*inputs) wrapper that does the FULL computation
+    - get_inputs() that returns properly shaped tensors
+    - if __name__ == "__main__" block with --profile-only support
   change_summary — one sentence describing what changed
+
+IMPORTANT:
+- The submitted file must be self-contained and executable with: python file.py --profile-only
+- kernel_function must include the ENTIRE computation (including torch.mm for GEMM if present)
+- If the plan says to fuse operations, kernel_function should call the fused Triton kernel
+  instead of separate torch.mm + Triton calls
+- NEVER omit imports — always include import torch, import triton, import triton.language as tl
 
 If submit_kernel returns a validation error, diagnose what went wrong and resubmit.
 """
