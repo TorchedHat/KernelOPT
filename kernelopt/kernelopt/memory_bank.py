@@ -135,10 +135,12 @@ def get_hardware_info() -> dict:
         import torch
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(0)
+            shmem = getattr(props, "shared_memory_per_block_optin",
+                            getattr(props, "shared_memory_per_block", 0))
             return {
                 "gpu": props.name,
                 "cc": f"{props.major}.{props.minor}",
-                "shared_memory_kb": props.max_shared_memory_size_per_block_optin // 1024,
+                "shared_memory_kb": shmem // 1024,
                 "sm_count": props.multi_processor_count,
             }
     except Exception:
