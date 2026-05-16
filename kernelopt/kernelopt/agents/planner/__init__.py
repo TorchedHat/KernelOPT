@@ -57,18 +57,24 @@ def run_planner_agent(
     plan_guidance = strategy.get("plan_guidance", [])
 
     def run_one(i: int) -> tuple[str, dict] | None:
+        strategy_prefix = ""
+        if strategy_type in ("fuse", "rewrite_and_fuse"):
+            strategy_prefix = (
+                f"OVERALL STRATEGY: {strategy_type} — {strategy.get('reasoning', '')} "
+                f"Bottleneck: {strategy.get('primary_target', 'unknown')}. "
+            )
+
         if strategy_type in ("fuse", "rewrite_and_fuse") and i == 0:
             hint = (
-                f"STRATEGY: {strategy_type}. "
-                f"{strategy.get('reasoning', '')} "
-                f"You MUST propose a plan that fuses or rewrites kernels. "
-                f"The dominant bottleneck is: {strategy.get('primary_target', 'unknown')}. "
+                f"{strategy_prefix}"
+                f"You MUST propose a plan that fuses or rewrites kernels into Triton. "
                 f"Fusion opportunity: {strategy.get('fusion_opportunity', 'see multi_kernel_summary')}."
             )
         elif plan_guidance and i < len(plan_guidance):
-            hint = plan_guidance[i]
+            hint = f"{strategy_prefix}{plan_guidance[i]}"
         else:
-            hint = build_diversity_hint(i, sorted_rules)
+            ncu_hint = build_diversity_hint(i, sorted_rules)
+            hint = f"{strategy_prefix}{ncu_hint}" if strategy_prefix else ncu_hint
         initial_msg = build_initial_message(hint, all_tried_directions)
 
         config = RunnableConfig(
