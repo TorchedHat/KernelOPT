@@ -351,6 +351,7 @@ def analyze_strategy(state: GraphState) -> dict:
 
     # Query memory bank for past experiences with similar kernels
     from kernelopt.memory_bank import MemoryBank, classify_kernel_structure, get_hardware_info
+    from kernelopt.reference_kernels import get_relevant_references
     bank = MemoryBank()
     kernel_struct = classify_kernel_structure(kernel_source, profiling_ctx)
     hw_info = get_hardware_info()
@@ -358,8 +359,19 @@ def analyze_strategy(state: GraphState) -> dict:
     past_successes = bank.get_successes(kernel_struct, hw_info)
     memory_context = bank.format_for_llm(past_failures + past_successes)
 
-    if past_failures:
-        pipe_print(f"  [dim]Memory bank: {len(past_failures)} relevant failures, {len(past_successes)} successes[/]")
+    # Get reference kernel examples for this kernel type
+    references = get_relevant_references(kernel_struct)
+    if references:
+        ref_context = "\n\n## Reference kernel examples (from Triton official tutorials):\n"
+        for name, code in references[:2]:
+            ref_context += f"\n### {name}\n```python\n{code[:1000]}\n```\n"
+        memory_context = (memory_context + ref_context) if memory_context else ref_context
+
+    if past_failures or references:
+        pipe_print(
+            f"  [dim]Memory bank: {len(past_failures)} failures, "
+            f"{len(past_successes)} successes, {len(references)} reference kernels[/]"
+        )
 
     try:
         llm = build_llm(**llm_config)
@@ -980,6 +992,7 @@ def summarize_results(state: GraphState) -> dict:
         for c in candidates:
             if not c.direction:
                 continue
+            is_success = c.correctness_passed and c.speedup > 1.0
             entry = MemoryEntry(
                 kernel_structure=kernel_struct,
                 hardware=hw_info,
@@ -987,7 +1000,7 @@ def summarize_results(state: GraphState) -> dict:
                     "type": strategy.get("strategy_type", "optimize_kernel"),
                     "direction": c.direction,
                 },
-                outcome="success" if c.correctness_passed and c.speedup > 1.0 else (
+                outcome="success" if is_success else (
                     "failure" if not c.correctness_passed else "degradation"
                 ),
                 speedup=c.speedup if c.speedup > 0 else 0.0,
@@ -996,6 +1009,7 @@ def summarize_results(state: GraphState) -> dict:
                     next((it.get("insight", "") for it in top_items if it.get("direction") == c.direction), "")
                     if top_items else ""
                 ),
+                code_pattern=c.optimized_kernel[:500] if is_success else "",
             )
             bank.add(entry)
     except Exception as e:

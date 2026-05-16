@@ -245,6 +245,8 @@ class MemoryBank:
                 lines.append(f"Speedup: {e.speedup:.2f}x")
                 if e.optimization_insight:
                     lines.append(f"Insight: {e.optimization_insight}")
+                if e.code_pattern:
+                    lines.append(f"Code pattern:\n```python\n{e.code_pattern}\n```")
             else:
                 lines.append(f"Failure: {e.failure_reason}")
                 if e.constraint:
