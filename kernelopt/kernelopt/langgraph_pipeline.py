@@ -478,6 +478,77 @@ def execute_plans(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 3.5: Autotune constexpr parameters for valid candidates (Triton only)
+# ---------------------------------------------------------------------------
+
+def autotune_candidates(state: GraphState) -> dict:
+    """For Triton candidates that passed correctness, autotune tl.constexpr params.
+
+    Extracts tunable parameters (BLOCK_SIZE, num_warps, num_stages), sweeps a
+    grid of configs via wall-clock benchmarking, and replaces the candidate source
+    with the best-performing config. Zero LLM calls -- purely mechanical search.
+    """
+    from kernelopt.autotuner import extract_tunable_params, run_autotune
+
+    cfg = state["config"]
+    candidates = list(state["candidates"])
+    framework = state["framework"]
+
+    tuned_candidates = []
+    for c in candidates:
+        if not c.correctness_passed:
+            tuned_candidates.append(c)
+            continue
+
+        params = extract_tunable_params(c.optimized_kernel, framework)
+        if not params:
+            pipe_print(f"    Plan {c.plan_letter}: no constexpr params to tune")
+            tuned_candidates.append(c)
+            continue
+
+        param_names = [p["param"] for p in params]
+        pipe_print(f"    Plan {c.plan_letter}: autotuning {len(params)} params ({', '.join(param_names)})...")
+
+        if _use_spinners():
+            with phase_spinner("autotuning", f"plan {c.plan_letter}"):
+                tuned_source, meta = run_autotune(
+                    c.optimized_kernel,
+                    framework=framework,
+                    debug=cfg.debug,
+                )
+        else:
+            tuned_source, meta = run_autotune(
+                c.optimized_kernel,
+                framework=framework,
+                debug=cfg.debug,
+            )
+
+        if meta.get("speedup", 1.0) > 1.0:
+            pipe_print(
+                f"    Plan {c.plan_letter}: autotuned {meta['configs_tested']} configs → "
+                f"{meta['speedup']:.2f}x speedup ({meta.get('best_config', {})})"
+            )
+            c = PlanCandidate(
+                plan_id=c.plan_id,
+                plan_letter=c.plan_letter,
+                direction=c.direction,
+                optimization_plan=c.optimization_plan,
+                optimized_kernel=tuned_source,
+                execution_result={**c.execution_result, "autotuned": True, "autotune_meta": meta},
+                correctness_passed=c.correctness_passed,
+                correctness_message=c.correctness_message,
+                compiled_binary_path=c.compiled_binary_path,
+            )
+        else:
+            skip_reason = meta.get("skipped", f"{meta['configs_tested']} configs, no improvement")
+            pipe_print(f"    Plan {c.plan_letter}: autotuning found no improvement ({skip_reason})")
+
+        tuned_candidates.append(c)
+
+    return {"candidates": tuned_candidates}
+
+
+# ---------------------------------------------------------------------------
 # Node 4: Profile valid candidates with NCU
 # ---------------------------------------------------------------------------
 
@@ -924,14 +995,12 @@ def maybe_synthesize(state: GraphState) -> dict:
             f"{', + extern_kernels' if has_extern else ''})"
         )
 
-        # Extract clean kernel source for the LLM (planner/executor see this, not the Inductor file)
-        clean_kernel_source = wrapped_source
-        if primary["triton_kernels"]:
-            from kernelopt.synthesis.wrap_kernel import _clean_for_llm
-            clean_parts = []
-            for ks in primary["triton_kernels"]:
-                clean_parts.append(_clean_for_llm(ks))
-            clean_kernel_source = "\n\n".join(clean_parts)
+        # Build a complete standalone Triton file for the LLM to read/modify
+        from kernelopt.synthesis.wrap_kernel import build_standalone_kernel
+        standalone_kernel = build_standalone_kernel(
+            triton_kernel_sources=primary["triton_kernels"],
+            inductor_source=primary["inductor_source"],
+        )
 
         return {
             "kernel_path": str(wrapped_path),
@@ -939,7 +1008,7 @@ def maybe_synthesize(state: GraphState) -> dict:
             "kernel_basename": "synthesized_triton",
             "framework": "triton",
             "ext": ".py",
-            "best_kernel": clean_kernel_source,
+            "best_kernel": standalone_kernel,
             "_original_pytorch_path": kernel_path,
             "_original_pytorch_source": original_source,
         }
@@ -967,6 +1036,7 @@ def build_graph():
     graph.add_node("profile_baseline", profile_baseline)
     graph.add_node("generate_plans", generate_plans)
     graph.add_node("execute_plans", execute_plans)
+    graph.add_node("autotune_candidates", autotune_candidates)
     graph.add_node("profile_candidates", profile_candidates)
     graph.add_node("summarize_results", summarize_results)
     graph.add_node("select_best", select_best_candidate)
@@ -996,7 +1066,8 @@ def build_graph():
         {"continue": "generate_plans", "stop": END},
     )
     graph.add_edge("generate_plans", "execute_plans")
-    graph.add_edge("execute_plans", "profile_candidates")
+    graph.add_edge("execute_plans", "autotune_candidates")
+    graph.add_edge("autotune_candidates", "profile_candidates")
     graph.add_edge("profile_candidates", "summarize_results")
     graph.add_edge("summarize_results", "select_best")
     graph.add_edge("select_best", "increment_iteration")
