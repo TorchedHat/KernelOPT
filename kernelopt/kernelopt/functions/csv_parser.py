@@ -101,18 +101,21 @@ def find_bottleneck_kernel(filepath: str) -> tuple[int, list[dict]]:
     if not all_kernels:
         return 0, []
 
-    # Prefer the most expensive OPTIMIZABLE kernel (Triton/CUDA user kernels).
-    # Library kernels (cuBLAS, cuDNN, PyTorch internals) can't be rewritten.
-    _LIBRARY_PATTERNS = ("cublas", "xmma_gemm", "cutlass", "cudnn", "at::", "void at::")
+    # Classify kernels for the planner's context (but do NOT filter).
+    # The planner decides the optimization strategy -- it may choose to
+    # rewrite a library call as Triton, fuse it with adjacent kernels, etc.
+    _LIBRARY_PATTERNS = ("cublas", "xmma_gemm", "cutlass", "cudnn", "cufft")
+    _RUNTIME_PATTERNS = ("at::", "void at::", "distribution_elementwise")
     for k in all_kernels:
-        name = k["kernel_name"].lower()
-        is_library = any(p in name for p in _LIBRARY_PATTERNS)
-        k["is_library"] = is_library
+        name_lower = k["kernel_name"].lower()
+        if any(p in name_lower for p in _RUNTIME_PATTERNS):
+            k["kind"] = "runtime"
+        elif any(p in name_lower for p in _LIBRARY_PATTERNS):
+            k["kind"] = "library"
+        else:
+            k["kind"] = "user"
 
-    optimizable = [k for k in all_kernels if not k["is_library"]]
-    if optimizable:
-        return optimizable[0]["kernel_id"], all_kernels
-
+    # Return the most expensive kernel overall as the bottleneck.
     return all_kernels[0]["kernel_id"], all_kernels
 
 
