@@ -196,13 +196,34 @@ def profile_baseline(state: GraphState) -> dict:
                 if len(all_kernels) > 8:
                     pipe_print(f"    ... and {len(all_kernels) - 8} more")
 
-            if bottleneck_id != kernel_id and all_kernels:
-                kernel_id = bottleneck_id
-                bottleneck_name = all_kernels[0]["kernel_name"][:50]
-                pipe_print(
-                    f"  [bold]Bottleneck kernel: "
-                    f"ID={kernel_id} ({bottleneck_name})[/]"
-                )
+            if all_kernels and len(all_kernels) > 1:
+                # For synthesized multi-kernel files, the baseline latency should
+                # be for the kernel that matches what candidates will produce.
+                # Candidates are standalone Triton files, so baseline latency
+                # should be the Triton kernel's latency (for apples-to-apples comparison).
+                # The planner still sees ALL kernels (including library calls) for strategy.
+                is_synth = bool(state.get("_original_pytorch_path"))
+                if is_synth:
+                    user_kernels = [k for k in all_kernels if k.get("kind") == "user"]
+                    if user_kernels:
+                        kernel_id = user_kernels[0]["kernel_id"]
+                        pipe_print(
+                            f"  [bold]Baseline target: "
+                            f"ID={kernel_id} ({user_kernels[0]['kernel_name'][:50]})[/]"
+                        )
+                    else:
+                        kernel_id = bottleneck_id
+                        pipe_print(
+                            f"  [bold]Bottleneck: "
+                            f"ID={kernel_id} ({all_kernels[0]['kernel_name'][:50]})[/]"
+                        )
+                else:
+                    kernel_id = bottleneck_id
+                    pipe_print(
+                        f"  [bold]Bottleneck: "
+                        f"ID={kernel_id} ({all_kernels[0]['kernel_name'][:50]})[/]"
+                    )
+
                 sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
                 baseline_ctx = build_profiling_context(
                     sections, rules, launch, kernel_path, kernel_id=kernel_id
@@ -595,9 +616,10 @@ def profile_candidates(state: GraphState) -> dict:
     ext = state["ext"]
     iteration = state.get("iteration", 0)
     kernel_basename = state["kernel_basename"]
-    kernel_id = state.get("kernel_id", 0)
+    baseline_kernel_id = state.get("kernel_id", 0)
     best_latency = state["best_latency_ns"]
     saved_ncu_config = state.get("ncu_config")  # reuse baseline config — full bypass
+    is_synthesized = bool(state.get("_original_pytorch_path"))
 
     llm_config = {
         "model": cfg.profiler_model or cfg.model,
@@ -634,12 +656,19 @@ def profile_candidates(state: GraphState) -> dict:
 
         try:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
+            # For synthesized files, candidates are standalone Triton kernels
+            # (single kernel, kernel_id=0), NOT the multi-kernel Inductor baseline.
+            # The saved ncu_config from baseline may have wrong launch_skip/count
+            # for standalone files, so use fresh config for candidates.
+            candidate_kernel_id = 0 if is_synthesized else baseline_kernel_id
+            candidate_ncu_config = None if is_synthesized else saved_ncu_config
+
             _prof_args = dict(
                 kernel_path=kernel_file,
                 output_basename=output_base,
-                ncu_config=saved_ncu_config,
+                ncu_config=candidate_ncu_config,
                 pipeline_config=cfg,
-                kernel_id=kernel_id,
+                kernel_id=candidate_kernel_id,
                 binary_path=candidate_binary,
                 llm_config=llm_config,
             )
