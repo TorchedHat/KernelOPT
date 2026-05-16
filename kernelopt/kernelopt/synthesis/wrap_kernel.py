@@ -161,35 +161,9 @@ def build_standalone_kernel(
 
     if kernel_parts:
         first_kernel = kernel_parts[0]
-        import re
-        fn_match = re.search(r'def\s+(\w+)\s*\(([^)]+)\)', first_kernel)
-        if fn_match:
-            kernel_name = fn_match.group(1)
-            params_raw = fn_match.group(2)
-            params = [p.strip().split(":")[0].strip() for p in params_raw.split(",")]
-            ptr_params = [p for p in params if not p[0].isupper()]
-            constexpr_params = [p for p in params if p[0].isupper()]
-
-            numel_params = [p for p in ptr_params if "numel" in p.lower() or p.startswith("x") and "index" not in p.lower()]
-            if not numel_params:
-                numel_params = ptr_params[-1:]
-
-            wrapper_lines = [
-                f"def kernel_function(*args):",
-                f'    """Launch the Triton kernel."""',
-            ]
-            for i, p in enumerate(ptr_params):
-                wrapper_lines.append(f"    {p} = args[{i}]")
-
-            grid_param = numel_params[0] if numel_params else "1"
-            xblock = constexpr_params[0] if constexpr_params else "XBLOCK"
-            wrapper_lines.append(f"    grid = (triton.cdiv({grid_param}, 1024),)")
-            kwargs = ", ".join(f"{p}=1024" for p in constexpr_params) if constexpr_params else "XBLOCK=1024"
-            args_str = ", ".join(ptr_params)
-            wrapper_lines.append(f"    {kernel_name}[grid]({args_str}, {kwargs})")
-            wrapper_code = "\n".join(wrapper_lines)
-        else:
-            wrapper_code = "def kernel_function(*args):\n    pass"
+        wrapper_code, kernel_get_inputs = _build_standalone_wrapper(first_kernel)
+        if kernel_get_inputs:
+            get_inputs_code = kernel_get_inputs
     else:
         wrapper_code = "def kernel_function(*args):\n    pass"
 
@@ -211,6 +185,103 @@ def build_standalone_kernel(
 
     parts = imports + [""] + kernel_parts + ["", wrapper_code, "", get_inputs_code, ""] + main_block + [""]
     return "\n".join(parts)
+
+
+def _build_standalone_wrapper(kernel_source: str) -> tuple[str, str | None]:
+    """Build kernel_function() wrapper and matching get_inputs() for a @triton.jit kernel.
+
+    Analyses the kernel signature to determine:
+      - Pointer params (in_ptr*, out_ptr*, in_out_ptr*) -> tensor arguments
+      - Scalar params (xnumel, rnumel, etc.) -> integer arguments
+      - Constexpr params (XBLOCK, RBLOCK, etc.) -> compile-time constants
+
+    For in-place kernels (in_out_ptr*), returns the modified tensor.
+    For output kernels (out_ptr*), allocates output tensor and returns it.
+
+    Returns (wrapper_code, get_inputs_code_or_None).
+    """
+    fn_match = re.search(r'def\s+(\w+)\s*\(([^)]+)\)', kernel_source)
+    if not fn_match:
+        return "def kernel_function(*args):\n    pass", None
+
+    kernel_name = fn_match.group(1)
+    params_raw = fn_match.group(2)
+    params = [p.strip().split(":")[0].strip() for p in params_raw.split(",")]
+
+    ptr_params = []
+    scalar_params = []
+    constexpr_params = []
+
+    for p in params:
+        if p[0].isupper():
+            constexpr_params.append(p)
+        elif "ptr" in p or p.startswith("in_") or p.startswith("out_"):
+            ptr_params.append(p)
+        elif "numel" in p.lower() or p in ("n_elements", "n"):
+            scalar_params.append(p)
+        elif p[0].islower():
+            scalar_params.append(p)
+        else:
+            scalar_params.append(p)
+
+    in_ptrs = [p for p in ptr_params if p.startswith("in_ptr")]
+    out_ptrs = [p for p in ptr_params if p.startswith("out_ptr")]
+    inout_ptrs = [p for p in ptr_params if p.startswith("in_out_ptr")]
+    all_ptrs = in_ptrs + out_ptrs + inout_ptrs
+
+    # Build wrapper
+    lines = ["def kernel_function(*args):", '    """Launch the Triton kernel."""']
+
+    # Unpack pointer args from input
+    input_idx = 0
+    for p in inout_ptrs + in_ptrs:
+        lines.append(f"    {p} = args[{input_idx}]")
+        input_idx += 1
+
+    # For output-only pointers, allocate based on the first input's shape
+    if out_ptrs and (inout_ptrs or in_ptrs):
+        ref = (inout_ptrs + in_ptrs)[0]
+        for p in out_ptrs:
+            lines.append(f"    {p} = torch.empty_like({ref})")
+
+    # Scalar args (numel etc.) -- derive from first tensor
+    for p in scalar_params:
+        if "numel" in p.lower():
+            ref = (inout_ptrs + in_ptrs + out_ptrs)[0] if ptr_params else "args[0]"
+            lines.append(f"    {p} = {ref}.numel()")
+        else:
+            lines.append(f"    {p} = args[{input_idx}]")
+            input_idx += 1
+
+    # Grid and launch
+    grid_numel = scalar_params[0] if scalar_params else f"({(inout_ptrs + in_ptrs)[0]}.numel() if {(inout_ptrs + in_ptrs)} else 1)"
+    if not scalar_params and (inout_ptrs or in_ptrs):
+        grid_numel = f"{(inout_ptrs + in_ptrs)[0]}.numel()"
+
+    constexpr_defaults = {p: 1024 for p in constexpr_params}
+    constexpr_kwargs = ", ".join(f"{p}={v}" for p, v in constexpr_defaults.items())
+    all_args = ", ".join(ptr_params + scalar_params)
+
+    lines.append(f"    grid = (triton.cdiv({grid_numel}, {constexpr_defaults.get(constexpr_params[0], 1024) if constexpr_params else 1024}),)")
+    lines.append(f"    {kernel_name}[grid]({all_args}, {constexpr_kwargs})")
+
+    # Return statement
+    if inout_ptrs:
+        lines.append(f"    return {inout_ptrs[0]}")
+    elif out_ptrs:
+        lines.append(f"    return {out_ptrs[0]}")
+
+    wrapper_code = "\n".join(lines)
+
+    # Build matching get_inputs() based on the kernel's actual params
+    gi_lines = ["def get_inputs():"]
+    shape = "(1024, 8192)"
+    for p in inout_ptrs + in_ptrs:
+        gi_lines.append(f"    {p} = torch.randn({shape}, device='cuda', dtype=torch.float32)")
+    gi_lines.append(f"    return [{', '.join(inout_ptrs + in_ptrs)}]")
+    get_inputs_code = "\n".join(gi_lines)
+
+    return wrapper_code, get_inputs_code
 
 
 def _extract_get_inputs(inductor_source: str) -> str:
