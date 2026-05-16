@@ -130,6 +130,89 @@ def _clean_for_llm(raw_kernel: str) -> str:
     return body
 
 
+def build_standalone_kernel(
+    triton_kernel_sources: list[str],
+    inductor_source: str,
+) -> str:
+    """Build a complete standalone Triton file for the LLM to read and modify.
+
+    This is what the planner/executor see as ``best_kernel``. It has:
+      - proper imports
+      - clean @triton.jit kernel(s)
+      - kernel_function() wrapper
+      - get_inputs()
+      - __main__ with --profile-only
+
+    Unlike the Inductor file (which uses async_compile), this is plain Triton
+    that the LLM can read, modify, and submit as a complete file.
+    """
+    imports = [
+        "import torch",
+        "import triton",
+        "import triton.language as tl",
+        "from triton.language.extra import libdevice",
+    ]
+
+    kernel_parts = []
+    for ks in triton_kernel_sources:
+        kernel_parts.append(_clean_for_llm(ks))
+
+    get_inputs_code = _extract_get_inputs(inductor_source)
+
+    if kernel_parts:
+        first_kernel = kernel_parts[0]
+        import re
+        fn_match = re.search(r'def\s+(\w+)\s*\(([^)]+)\)', first_kernel)
+        if fn_match:
+            kernel_name = fn_match.group(1)
+            params_raw = fn_match.group(2)
+            params = [p.strip().split(":")[0].strip() for p in params_raw.split(",")]
+            ptr_params = [p for p in params if not p[0].isupper()]
+            constexpr_params = [p for p in params if p[0].isupper()]
+
+            numel_params = [p for p in ptr_params if "numel" in p.lower() or p.startswith("x") and "index" not in p.lower()]
+            if not numel_params:
+                numel_params = ptr_params[-1:]
+
+            wrapper_lines = [
+                f"def kernel_function(*args):",
+                f'    """Launch the Triton kernel."""',
+            ]
+            for i, p in enumerate(ptr_params):
+                wrapper_lines.append(f"    {p} = args[{i}]")
+
+            grid_param = numel_params[0] if numel_params else "1"
+            xblock = constexpr_params[0] if constexpr_params else "XBLOCK"
+            wrapper_lines.append(f"    grid = (triton.cdiv({grid_param}, 1024),)")
+            kwargs = ", ".join(f"{p}=1024" for p in constexpr_params) if constexpr_params else "XBLOCK=1024"
+            args_str = ", ".join(ptr_params)
+            wrapper_lines.append(f"    {kernel_name}[grid]({args_str}, {kwargs})")
+            wrapper_code = "\n".join(wrapper_lines)
+        else:
+            wrapper_code = "def kernel_function(*args):\n    pass"
+    else:
+        wrapper_code = "def kernel_function(*args):\n    pass"
+
+    main_block = [
+        'if __name__ == "__main__":',
+        "    import argparse",
+        "    parser = argparse.ArgumentParser()",
+        '    parser.add_argument("--profile-only", action="store_true")',
+        "    args = parser.parse_args()",
+        "    inputs = get_inputs()",
+        "    if args.profile_only:",
+        "        kernel_function(*inputs)",
+        "        torch.cuda.synchronize()",
+        "    else:",
+        "        kernel_function(*inputs)",
+        "        torch.cuda.synchronize()",
+        '        print("Kernel executed successfully.")',
+    ]
+
+    parts = imports + [""] + kernel_parts + ["", wrapper_code, "", get_inputs_code, ""] + main_block + [""]
+    return "\n".join(parts)
+
+
 def _extract_get_inputs(inductor_source: str) -> str:
     """Build get_inputs() from Inductor's benchmark_compiled_module().
 
