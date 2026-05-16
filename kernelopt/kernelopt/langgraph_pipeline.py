@@ -196,16 +196,30 @@ def profile_baseline(state: GraphState) -> dict:
                 if len(all_kernels) > 8:
                     pipe_print(f"    ... and {len(all_kernels) - 8} more")
 
-            if bottleneck_id != kernel_id and all_kernels:
-                kernel_id = bottleneck_id
-                pipe_print(
-                    f"  [bold]Auto-selected bottleneck kernel: "
-                    f"ID={kernel_id} ({all_kernels[0]['kernel_name'][:50]})[/]"
-                )
-                sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
-                baseline_ctx = build_profiling_context(
-                    sections, rules, launch, kernel_path, kernel_id=kernel_id
-                )
+            if all_kernels and len(all_kernels) > 1:
+                # The overall bottleneck may be a library call (cuBLAS GEMM).
+                # For profiling, we need the kernel that matches what the LLM
+                # will actually optimize. Select the most expensive user kernel
+                # for NCU metrics; store the full list so the planner sees
+                # the complete picture and can propose fusion if beneficial.
+                user_kernels = [k for k in all_kernels if k.get("kind") == "user"]
+                if user_kernels:
+                    target_id = user_kernels[0]["kernel_id"]
+                    target_name = user_kernels[0]["kernel_name"][:50]
+                else:
+                    target_id = bottleneck_id
+                    target_name = all_kernels[0]["kernel_name"][:50]
+
+                if target_id != kernel_id:
+                    kernel_id = target_id
+                    pipe_print(
+                        f"  [bold]Profiling target kernel: "
+                        f"ID={kernel_id} ({target_name})[/]"
+                    )
+                    sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
+                    baseline_ctx = build_profiling_context(
+                        sections, rules, launch, kernel_path, kernel_id=kernel_id
+                    )
 
     latency = get_latency_ns(baseline_ctx)
     framework = state["framework"]
