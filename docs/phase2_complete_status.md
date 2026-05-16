@@ -124,70 +124,82 @@ Iter 3: no improvement
 
 ### Objective
 
-Three-way comparison on KB L1+L2 (200 problems):
+Full benchmark on ALL 531 problems (KB L1-L4 + SOL all splits):
 
 ```
 Path A: PyTorch -> torch.compile -> Triton (Inductor) -> kernelopt optimize
+        (for problems where synthesis succeeds -- 377/531 = 71%)
+Path A': PyTorch -> kernelopt optimize directly (fallback for 154 problems)
 Path B: PyTorch eager baseline (wall-clock do_bench)
 Path C: torch.compile baseline (Inductor, no LLM optimization)
 ```
+
+Both paths go through the FULL kpt pipeline. The only difference is whether
+synthesis succeeded (Path A) or fell back to raw PyTorch (Path A').
 
 ### Execution Strategy
 
 **Phase 1: First pass (populates memory bank)**
 
-Run `kernelopt run` on all 200 KB L1+L2 problems:
+Run `kernelopt run` on ALL 531 problems:
 - Config: T=3, N=3, K=1, model=claude-sonnet-4-6
-- 8 GPUs in parallel (25 problems per GPU)
+- 8 GPUs in parallel (~66 problems per GPU)
 - Memory bank starts EMPTY, grows organically
-- Estimated time: ~25 problems × 15min/problem / 8 GPUs ≈ 50 min
+- Estimated time: ~66 problems × 15min/problem / 1 GPU = ~16 hours per GPU
+- With 8 GPUs: ~16 hours total
 
 Script: write a batch runner that runs `kernelopt run` sequentially per GPU,
 collecting results in a JSON file per problem.
 
 **Phase 2: Second pass (benefits from memory bank)**
 
-Rerun all 200 problems WITH the populated memory bank:
-- Strategy analysis now has past failures/successes
-- Planner sees relevant code patterns
+Rerun ALL 531 problems WITH the populated memory bank:
+- Strategy analysis now has past failures/successes from Phase 1
+- Planner sees relevant code patterns and reference kernels
 - Should produce better results than Phase 1
 
 **Phase 3: Collect and analyze results**
 
 For each problem, record:
-- problem_id, kernel_type, n_triton_kernels, has_extern
-- baseline_latency_ns (Triton user kernel)
-- best_latency_ns (after optimization)
-- speedup (baseline / best)
-- strategy_type (what strategy was chosen)
-- plans_tried (how many plans, how many passed correctness)
+- problem_id, dataset (KB L1/L2/L3/L4/SOL), kernel_type
+- synthesis_status (pass/fail -- which path was taken)
+- n_triton_kernels, has_extern_kernels
+- baseline_latency_ns, best_latency_ns, speedup
+- strategy_type, plans_tried, correctness_pass_rate
 - best_direction (what optimization worked)
+- memory_bank_entries_added
 
 Aggregate metrics:
-- Median speedup across all problems
-- % of problems where kpt achieved >1.0x
-- % of problems where kpt achieved >1.2x
-- Average compile time (torch.compile)
-- Average optimization time per problem
+- Median speedup (synthesized vs fallback, overall)
+- % of problems where kpt achieved >1.0x, >1.2x, >1.5x
+- Synthesis path vs fallback path comparison
+- Per-dataset breakdown
+- Memory bank growth curve
+- LLM call count and cost
 
-**Phase 4: Compare against KernelAgent (if possible)**
+**Phase 4: Compare against KernelAgent**
 
-Run KernelAgent on the same 200 problems for direct comparison.
+Run KernelAgent on the same problems for direct comparison.
 
 ### GPU Allocation
 
 ```
-GPU 0: reserved (interactive)
-GPU 1: reserved
-GPU 2-7: benchmark (6 GPUs × ~33 problems each)
+GPU 0: KB L1 (100 problems)
+GPU 1: KB L2 (100 problems)
+GPU 2: KB L3 + L4 (70 problems)
+GPU 3: SOL train + FlashInfer (52 problems)
+GPU 4: SOL L1 first half (47 problems)
+GPU 5: SOL L1 second half (47 problems)
+GPU 6: SOL L2 (82 problems)
+GPU 7: SOL Quant (33 problems)
 ```
 
 ### Output
 
 - `eval_benchmark_results/phase1/` -- first pass results + populated memory bank
-- `eval_benchmark_results/phase2/` -- second pass results
-- `~/.kernelopt/memory_bank.json` -- starter bank to ship
-- `docs/benchmark_results.md` -- analysis and comparison
+- `eval_benchmark_results/phase2/` -- second pass results (with memory)
+- `~/.kernelopt/memory_bank.json` -- starter bank to ship with tool
+- `docs/benchmark_results.md` -- full analysis and comparison tables
 
 ---
 
