@@ -646,7 +646,7 @@ def profile_candidates(state: GraphState) -> dict:
     baseline_kernel_id = state.get("kernel_id", 0)
     best_latency = state["best_latency_ns"]
     saved_ncu_config = state.get("ncu_config")  # reuse baseline config — full bypass
-    is_synthesized = bool(state.get("_original_pytorch_path"))
+    is_multi_kernel = baseline_kernel_id != 0 or bool(state.get("_original_pytorch_path"))
 
     llm_config = {
         "model": cfg.profiler_model or cfg.model,
@@ -686,7 +686,7 @@ def profile_candidates(state: GraphState) -> dict:
             # For synthesized files with full computation, candidates also have
             # multiple kernels (GEMM + Triton + RNG). Use fresh NCU config
             # (not baseline's) and discover the user kernel after profiling.
-            candidate_ncu_config = None if is_synthesized else saved_ncu_config
+            candidate_ncu_config = None if is_multi_kernel else saved_ncu_config
 
             _prof_args = dict(
                 kernel_path=kernel_file,
@@ -707,7 +707,7 @@ def profile_candidates(state: GraphState) -> dict:
 
             # For multi-kernel candidates, find the user Triton kernel's latency
             # (same logic as baseline bottleneck discovery)
-            if is_synthesized and Path(c.csv_path).exists():
+            if is_multi_kernel and Path(c.csv_path).exists():
                 from kernelopt.functions.csv_parser import find_bottleneck_kernel, parse_ncu_csv
                 cand_kid, cand_kernels = find_bottleneck_kernel(c.csv_path)
                 user_kernels = [k for k in cand_kernels if k.get("kind") == "user"]
