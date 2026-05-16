@@ -52,8 +52,23 @@ def run_planner_agent(
         reverse=True,
     )
 
+    strategy = profiling_context.get("optimization_strategy", {})
+    strategy_type = strategy.get("strategy_type", "optimize_kernel")
+    plan_guidance = strategy.get("plan_guidance", [])
+
     def run_one(i: int) -> tuple[str, dict] | None:
-        hint = build_diversity_hint(i, sorted_rules)
+        if strategy_type in ("fuse", "rewrite_and_fuse") and i == 0:
+            hint = (
+                f"STRATEGY: {strategy_type}. "
+                f"{strategy.get('reasoning', '')} "
+                f"You MUST propose a plan that fuses or rewrites kernels. "
+                f"The dominant bottleneck is: {strategy.get('primary_target', 'unknown')}. "
+                f"Fusion opportunity: {strategy.get('fusion_opportunity', 'see multi_kernel_summary')}."
+            )
+        elif plan_guidance and i < len(plan_guidance):
+            hint = plan_guidance[i]
+        else:
+            hint = build_diversity_hint(i, sorted_rules)
         initial_msg = build_initial_message(hint, all_tried_directions)
 
         config = RunnableConfig(
