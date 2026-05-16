@@ -613,7 +613,9 @@ def _autotune_candidates_impl(state: GraphState) -> dict:
 
 def profile_candidates(state: GraphState) -> dict:
     """Run NCU on each candidate that passed correctness."""
-    from kernelopt.agents.profiler import get_latency_ns, run_profiler_agent
+    from kernelopt.agents.profiler import (
+        build_profiling_context, get_latency_ns, run_profiler_agent,
+    )
 
     cfg = state["config"]
     candidates = list(state["candidates"])
@@ -661,11 +663,9 @@ def profile_candidates(state: GraphState) -> dict:
 
         try:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
-            # For synthesized files, candidates are standalone Triton kernels
-            # (single kernel, kernel_id=0), NOT the multi-kernel Inductor baseline.
-            # The saved ncu_config from baseline may have wrong launch_skip/count
-            # for standalone files, so use fresh config for candidates.
-            candidate_kernel_id = 0 if is_synthesized else baseline_kernel_id
+            # For synthesized files with full computation, candidates also have
+            # multiple kernels (GEMM + Triton + RNG). Use fresh NCU config
+            # (not baseline's) and discover the user kernel after profiling.
             candidate_ncu_config = None if is_synthesized else saved_ncu_config
 
             _prof_args = dict(
@@ -673,7 +673,7 @@ def profile_candidates(state: GraphState) -> dict:
                 output_basename=output_base,
                 ncu_config=candidate_ncu_config,
                 pipeline_config=cfg,
-                kernel_id=candidate_kernel_id,
+                kernel_id=0,
                 binary_path=candidate_binary,
                 llm_config=llm_config,
             )
@@ -682,9 +682,24 @@ def profile_candidates(state: GraphState) -> dict:
                     ctx, _ = run_profiler_agent(**_prof_args)
             else:
                 ctx, _ = run_profiler_agent(**_prof_args)
-            c.profiling_context = ctx
             c.csv_path = f"{output_base}.csv"
             c.ncu_rep_path = f"{output_base}.ncu-rep"
+
+            # For multi-kernel candidates, find the user Triton kernel's latency
+            # (same logic as baseline bottleneck discovery)
+            if is_synthesized and Path(c.csv_path).exists():
+                from kernelopt.functions.csv_parser import find_bottleneck_kernel, parse_ncu_csv
+                cand_kid, cand_kernels = find_bottleneck_kernel(c.csv_path)
+                user_kernels = [k for k in cand_kernels if k.get("kind") == "user"]
+                if user_kernels:
+                    cand_kid = user_kernels[0]["kernel_id"]
+                if cand_kid != 0:
+                    sections, rules, launch = parse_ncu_csv(c.csv_path, cand_kid)
+                    ctx = build_profiling_context(
+                        sections, rules, launch, kernel_file, kernel_id=cand_kid
+                    )
+
+            c.profiling_context = ctx
             c.latency_ns = get_latency_ns(ctx)
             c.speedup = (
                 round(best_latency / c.latency_ns, 4)
