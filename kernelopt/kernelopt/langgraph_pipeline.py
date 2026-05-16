@@ -2,7 +2,7 @@
 LangGraph-based optimization pipeline.
 
 Graph:
-  [maybe_synthesize] → profile_baseline → generate_plans → execute_plans
+  [maybe_synthesize] → profile_baseline → analyze_strategy → generate_plans → execute_plans
        → autotune_candidates → profile_candidates → summarize_results
        → select_best → increment_iteration
        → {should_continue: continue → generate_plans | stop → END}
@@ -284,6 +284,112 @@ def profile_baseline(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 1.5: Strategy Analysis (two-phase planning)
+# ---------------------------------------------------------------------------
+
+_STRATEGY_SYSTEM_PROMPT = """\
+You are the Strategy Analyst in a GPU kernel optimization pipeline.
+
+Given a kernel's multi-kernel profile and source code, decide the HIGH-LEVEL
+optimization strategy. You do NOT write code — you decide WHAT to optimize.
+
+Return a JSON object with:
+{
+  "strategy_type": "fuse" | "optimize_kernel" | "rewrite_and_fuse",
+  "reasoning": "one paragraph explaining why",
+  "primary_target": "description of what to optimize",
+  "fusion_opportunity": "specific fusion description or null",
+  "plan_guidance": ["guidance string for plan A", "for plan B", "for plan C"]
+}
+
+Strategy types:
+- "fuse": Multiple kernels should be fused into one. The dominant cost is
+  a library call (cuBLAS GEMM, cuDNN conv) that can be rewritten as Triton
+  and fused with adjacent operations to eliminate intermediate memory traffic.
+- "optimize_kernel": The Triton kernel IS the bottleneck. Optimize tile sizes,
+  memory access patterns, occupancy, or algorithmic improvements.
+- "rewrite_and_fuse": The computation involves library calls AND Triton kernels.
+  At least one plan should attempt fusion, others can optimize the Triton kernel.
+"""
+
+
+def analyze_strategy(state: GraphState) -> dict:
+    """Phase 1: Decide the macro optimization strategy before generating plans.
+
+    For multi-kernel files: one LLM call to analyze the kernel landscape and
+    decide whether to fuse, optimize, or rewrite. The strategy guides all N
+    planners in Phase 2.
+
+    For single-kernel files: pass-through (strategy = optimize_kernel).
+    """
+    profiling_ctx = state.get("current_profiling_context", {})
+    multi_kernel_summary = profiling_ctx.get("multi_kernel_summary", "")
+
+    if not multi_kernel_summary or "single kernel" in multi_kernel_summary.lower():
+        return {"optimization_strategy": {
+            "strategy_type": "optimize_kernel",
+            "reasoning": "Single kernel file — optimize the kernel directly.",
+            "primary_target": "the kernel",
+            "fusion_opportunity": None,
+            "plan_guidance": [],
+        }}
+
+    kernel_source = state.get("best_kernel", "")
+
+    from kernelopt.llm import build_llm
+    import json as _json
+
+    cfg = state["config"]
+    llm_config = {
+        "model": cfg.planner_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
+
+    pipe_print("  Analyzing optimization strategy...")
+
+    try:
+        llm = build_llm(**llm_config)
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        user_msg = (
+            f"## Multi-kernel profile\n{multi_kernel_summary}\n\n"
+            f"## Kernel source (first 200 lines)\n```python\n{kernel_source[:8000]}\n```\n\n"
+            f"Decide the optimization strategy. Return ONLY the JSON object."
+        )
+
+        response = llm.invoke([
+            SystemMessage(content=_STRATEGY_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+
+        text = response.content.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        strategy = _json.loads(text)
+        pipe_print(
+            f"  Strategy: [bold]{strategy.get('strategy_type', '?')}[/] — "
+            f"{strategy.get('reasoning', '')[:80]}"
+        )
+        return {"optimization_strategy": strategy}
+
+    except Exception as e:
+        pipe_print(f"  [yellow]Strategy analysis failed: {e}. Defaulting to optimize_kernel.[/]")
+        return {"optimization_strategy": {
+            "strategy_type": "rewrite_and_fuse",
+            "reasoning": f"Strategy analysis failed ({e}). Defaulting to hybrid approach.",
+            "primary_target": "the dominant kernel",
+            "fusion_opportunity": multi_kernel_summary.split("\n")[0] if multi_kernel_summary else None,
+            "plan_guidance": [],
+        }}
+
+
+# ---------------------------------------------------------------------------
 # Node 2: Generate N optimization plans (concurrent for TorchServe batching)
 # ---------------------------------------------------------------------------
 
@@ -330,6 +436,11 @@ def generate_plans(state: GraphState) -> dict:
         "project_id": cfg.project_id,
         "region": cfg.region,
     }
+
+    # Inject strategy context into profiling context for the planner
+    strategy = state.get("optimization_strategy", {})
+    if strategy:
+        profiling_ctx = {**profiling_ctx, "optimization_strategy": strategy}
 
     _plan_args = dict(
         profiling_context=profiling_ctx,
@@ -1136,6 +1247,7 @@ def build_graph():
 
     graph.add_node("maybe_synthesize", maybe_synthesize)
     graph.add_node("profile_baseline", profile_baseline)
+    graph.add_node("analyze_strategy", analyze_strategy)
     graph.add_node("generate_plans", generate_plans)
     graph.add_node("execute_plans", execute_plans)
     graph.add_node("autotune_candidates", autotune_candidates)
@@ -1161,7 +1273,8 @@ def build_graph():
         },
     )
     graph.add_edge("maybe_synthesize", "profile_baseline")
-    graph.add_edge("profile_baseline", "generate_plans")
+    graph.add_edge("profile_baseline", "analyze_strategy")
+    graph.add_edge("analyze_strategy", "generate_plans")
     graph.add_conditional_edges(
         "continuation_entry",
         should_continue,

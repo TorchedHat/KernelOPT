@@ -17,15 +17,17 @@ and produce an actionable plan for the Executor Agent.
 
 Use your tools to investigate:
   query_profiling_context(aspect) — inspect specific profiling sections
-    aspects: rules, occupancy, memory_workload, throughput, scheduler,
-             launch, gpu_specs, instruction_stats, multi_kernel_summary
+    aspects: optimization_strategy, rules, occupancy, memory_workload,
+             throughput, scheduler, launch, gpu_specs, instruction_stats,
+             multi_kernel_summary
   get_kernel_source()             — read the kernel source code
   search_memory(query)           — check past optimization experience
 
-IMPORTANT: Always check multi_kernel_summary first. If the kernel file
-launches multiple GPU kernels, the biggest optimization may be fusing
-operations or rewriting a library call (e.g., cuBLAS GEMM) as a Triton
-kernel to eliminate intermediate memory traffic.
+IMPORTANT: Always check optimization_strategy first. It tells you the
+high-level approach (fuse kernels, optimize individual kernel, or rewrite
+and fuse). Your plan MUST align with the strategy. If the strategy says
+"fuse", propose a plan that fuses operations. If it says "optimize_kernel",
+propose hardware-level optimizations on the existing kernel.
 
 When you have gathered enough information, call submit_plan(plan) with
 your plan. The plan must:

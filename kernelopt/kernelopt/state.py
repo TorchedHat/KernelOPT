@@ -173,6 +173,9 @@ class GraphState(TypedDict, total=False):
     # History
     iteration_results: list[IterationResult]
 
+    # Strategy analysis (two-phase planning)
+    optimization_strategy: Optional[dict]
+
     # Synthesis (Feature 4): original PyTorch source when input was auto-converted
     _original_pytorch_path: Optional[str]
     _original_pytorch_source: Optional[str]
