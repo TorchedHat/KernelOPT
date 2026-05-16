@@ -229,6 +229,26 @@ def profile_baseline(state: GraphState) -> dict:
                     sections, rules, launch, kernel_path, kernel_id=kernel_id
                 )
 
+                # Inject multi-kernel summary into profiling context so the planner
+                # knows about ALL kernels (including the cuBLAS GEMM bottleneck).
+                if all_kernels and len(all_kernels) > 1:
+                    kernel_summary = []
+                    for k in all_kernels:
+                        dur_us = k["duration_ns"] / 1000
+                        kind = k.get("kind", "user")
+                        kernel_summary.append(
+                            f"  [{k['kernel_id']}] {dur_us:>10.2f} µs  {k['kernel_name'][:60]}  ({kind})"
+                        )
+                    baseline_ctx["multi_kernel_summary"] = (
+                        f"This file launches {len(all_kernels)} GPU kernels. "
+                        f"The bottleneck is kernel [{all_kernels[0]['kernel_id']}] "
+                        f"({all_kernels[0]['kernel_name'][:40]}) at "
+                        f"{all_kernels[0]['duration_ns']/1000:.1f} µs "
+                        f"({all_kernels[0].get('kind','user')}). "
+                        f"Consider fusing operations or rewriting library calls as Triton.\n"
+                        + "\n".join(kernel_summary)
+                    )
+
     latency = get_latency_ns(baseline_ctx)
     framework = state["framework"]
     if framework == "auto":

@@ -17,8 +17,15 @@ and produce an actionable plan for the Executor Agent.
 
 Use your tools to investigate:
   query_profiling_context(aspect) — inspect specific profiling sections
+    aspects: rules, occupancy, memory_workload, throughput, scheduler,
+             launch, gpu_specs, instruction_stats, multi_kernel_summary
   get_kernel_source()             — read the kernel source code
   search_memory(query)           — check past optimization experience
+
+IMPORTANT: Always check multi_kernel_summary first. If the kernel file
+launches multiple GPU kernels, the biggest optimization may be fusing
+operations or rewriting a library call (e.g., cuBLAS GEMM) as a Triton
+kernel to eliminate intermediate memory traffic.
 
 When you have gathered enough information, call submit_plan(plan) with
 your plan. The plan must:
@@ -27,6 +34,13 @@ your plan. The plan must:
 - Be implementable in one focused diff by the Executor Agent
 - Include enough detail in step.change and step.implementation_hints
   that the Executor does not need to re-read profiling data
+
+Optimization strategies to consider (in priority order):
+1. Fuse adjacent kernels to eliminate intermediate memory read/write
+2. Rewrite a library call (torch.mm, extern_kernels) as Triton for fusion
+3. Improve memory access patterns (coalescing, L2 compression)
+4. Adjust tile sizes (XBLOCK, YBLOCK) for better occupancy
+5. Reduce register pressure or branch divergence
 """
 
 
