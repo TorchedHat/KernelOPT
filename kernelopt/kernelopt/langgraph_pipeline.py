@@ -840,6 +840,11 @@ def route_start(state: GraphState) -> str:
     framework = state.get("framework", "")
     if framework == "pytorch":
         return "maybe_synthesize"
+    if framework in ("auto", ""):
+        from kernelopt.agents.profiler.ncu_runner import extract_kernel_info
+        detected, _ = extract_kernel_info(state["kernel_path"])
+        if detected == "pytorch":
+            return "maybe_synthesize"
     return "profile_baseline"
 
 
@@ -890,48 +895,64 @@ def maybe_synthesize(state: GraphState) -> dict:
 
     try:
         results = extract_triton_from_pytorch(kernel_path)
-    except SynthesisError as e:
-        raise RuntimeError(f"PyTorch synthesis failed: {e}") from e
 
-    if not results:
-        raise RuntimeError(
-            "torch.compile produced no output for this input."
+        if not results:
+            raise SynthesisError("torch.compile produced no output for this input.")
+
+        primary = results[0]
+
+        wrapped_source = wrap_inductor_output(
+            inductor_source=primary["inductor_source"],
+            original_pytorch_source=original_source,
+            triton_kernel_sources=primary["triton_kernels"],
         )
 
-    primary = results[0]
+        synth_dir = Path(output_dir) / "synthesis"
+        synth_dir.mkdir(parents=True, exist_ok=True)
 
-    wrapped_source = wrap_inductor_output(
-        inductor_source=primary["inductor_source"],
-        original_pytorch_source=original_source,
-        triton_kernel_sources=primary["triton_kernels"],
-    )
+        wrapped_path = synth_dir / "synthesized_triton.py"
+        wrapped_path.write_text(wrapped_source)
 
-    synth_dir = Path(output_dir) / "synthesis"
-    synth_dir.mkdir(parents=True, exist_ok=True)
+        (synth_dir / "original_pytorch.py").write_text(original_source)
+        (synth_dir / "raw_inductor_output.py").write_text(primary["inductor_source"])
 
-    wrapped_path = synth_dir / "synthesized_triton.py"
-    wrapped_path.write_text(wrapped_source)
+        n_kernels = len(primary["triton_kernels"])
+        has_extern = "extern_kernels" in primary["inductor_source"]
+        pipe_print(
+            f"  Synthesized: [green]{wrapped_path}[/] "
+            f"({n_kernels} Triton kernel{'s' if n_kernels != 1 else ''}"
+            f"{', + extern_kernels' if has_extern else ''})"
+        )
 
-    (synth_dir / "original_pytorch.py").write_text(original_source)
-    (synth_dir / "raw_inductor_output.py").write_text(primary["inductor_source"])
+        # Extract clean kernel source for the LLM (planner/executor see this, not the Inductor file)
+        clean_kernel_source = wrapped_source
+        if primary["triton_kernels"]:
+            from kernelopt.synthesis.wrap_kernel import _clean_for_llm
+            clean_parts = []
+            for ks in primary["triton_kernels"]:
+                clean_parts.append(_clean_for_llm(ks))
+            clean_kernel_source = "\n\n".join(clean_parts)
 
-    n_kernels = len(primary["triton_kernels"])
-    has_extern = "extern_kernels" in primary["inductor_source"]
-    pipe_print(
-        f"  Synthesized: [green]{wrapped_path}[/] "
-        f"({n_kernels} Triton kernel{'s' if n_kernels != 1 else ''}"
-        f"{', + extern_kernels' if has_extern else ''})"
-    )
+        return {
+            "kernel_path": str(wrapped_path),
+            "kernel_source": wrapped_source,
+            "kernel_basename": "synthesized_triton",
+            "framework": "triton",
+            "ext": ".py",
+            "best_kernel": clean_kernel_source,
+            "_original_pytorch_path": kernel_path,
+            "_original_pytorch_source": original_source,
+        }
 
-    return {
-        "kernel_path": str(wrapped_path),
-        "kernel_source": wrapped_source,
-        "kernel_basename": "synthesized_triton",
-        "framework": "triton",
-        "ext": ".py",
-        "_original_pytorch_path": kernel_path,
-        "_original_pytorch_source": original_source,
-    }
+    except (SynthesisError, Exception) as e:
+        pipe_print(
+            f"  [yellow]Synthesis failed:[/] {e}\n"
+            f"  [dim]Continuing with original PyTorch file (no conversion)[/]"
+        )
+        return {
+            "_original_pytorch_path": kernel_path,
+            "_original_pytorch_source": original_source,
+        }
 
 
 # ---------------------------------------------------------------------------
