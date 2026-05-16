@@ -78,17 +78,17 @@ def find_bottleneck_kernel(filepath: str) -> tuple[int, list[dict]]:
                     "duration_ns": 0.0,
                 }
 
-            if kid in kernel_durations and metric_name == "gpu__time_duration.sum":
+            if kid in kernel_durations and metric_name in ("Duration", "gpu__time_duration.sum"):
                 raw = row.get("Metric Value", "0")
                 val = _parse_number(raw)
                 if isinstance(val, (int, float)):
                     unit = row.get("Metric Unit", "").strip().lower()
                     ns = val
-                    if "usecond" in unit or "µs" in unit:
+                    if unit in ("us", "µs") or "usecond" in unit:
                         ns = val * 1000
-                    elif "msecond" in unit or "ms" in unit:
+                    elif unit == "ms" or "msecond" in unit:
                         ns = val * 1_000_000
-                    elif "second" in unit and "nsecond" not in unit:
+                    elif unit == "s" or ("second" in unit and "nsecond" not in unit and "usecond" not in unit and "msecond" not in unit):
                         ns = val * 1_000_000_000
                     kernel_durations[kid]["duration_ns"] = ns
 
@@ -100,6 +100,18 @@ def find_bottleneck_kernel(filepath: str) -> tuple[int, list[dict]]:
 
     if not all_kernels:
         return 0, []
+
+    # Prefer the most expensive OPTIMIZABLE kernel (Triton/CUDA user kernels).
+    # Library kernels (cuBLAS, cuDNN, PyTorch internals) can't be rewritten.
+    _LIBRARY_PATTERNS = ("cublas", "xmma_gemm", "cutlass", "cudnn", "at::", "void at::")
+    for k in all_kernels:
+        name = k["kernel_name"].lower()
+        is_library = any(p in name for p in _LIBRARY_PATTERNS)
+        k["is_library"] = is_library
+
+    optimizable = [k for k in all_kernels if not k["is_library"]]
+    if optimizable:
+        return optimizable[0]["kernel_id"], all_kernels
 
     return all_kernels[0]["kernel_id"], all_kernels
 

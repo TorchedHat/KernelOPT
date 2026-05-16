@@ -162,12 +162,11 @@ def _resolve_ncu_config(
         # Force kernel_name to be empty for Triton/Helion frameworks.
         # JIT-compiled kernels have mangled names that don't match Python function names.
         if framework in ("triton", "helion"):
-            overrides = {"kernel_name": ""}
-            # Application replay mode re-runs the entire Python process per NCU pass.
-            # With Triton/Helion JIT, each pass triggers recompilation, causing hangs
-            # or mismatched kernel binaries across passes. Kernel replay is the only
-            # technically correct mode for JIT-compiled kernels.
-            # Respects explicit user override via --replay-mode.
+            overrides = {
+                "kernel_name": "",
+                "launch_skip": 0,
+                "launch_count": None,
+            }
             if pipeline_config.replay_mode == "kernel":
                 overrides["replay_mode"] = "kernel"
             if pipeline_config.debug:

@@ -185,13 +185,15 @@ def profile_baseline(state: GraphState) -> dict:
             bottleneck_id, all_kernels = find_bottleneck_kernel(csv_path)
             if all_kernels and len(all_kernels) > 1:
                 pipe_print(f"  [dim]Multi-kernel file: {len(all_kernels)} kernels detected[/]")
-                for k in all_kernels[:5]:
-                    marker = "[bold cyan]→[/]" if k["kernel_id"] == bottleneck_id else "  "
+                for k in all_kernels[:8]:
+                    is_target = k["kernel_id"] == bottleneck_id
+                    marker = "[bold cyan]→[/]" if is_target else "  "
                     dur_us = k["duration_ns"] / 1000
-                    name = k["kernel_name"][:60]
-                    pipe_print(f"  {marker} [{k['kernel_id']}] {dur_us:>10.2f} µs  {name}")
-                if len(all_kernels) > 5:
-                    pipe_print(f"    ... and {len(all_kernels) - 5} more")
+                    name = k["kernel_name"][:55]
+                    lib = " [dim](library)[/]" if k.get("is_library") else ""
+                    pipe_print(f"  {marker} [{k['kernel_id']}] {dur_us:>10.2f} µs  {name}{lib}")
+                if len(all_kernels) > 8:
+                    pipe_print(f"    ... and {len(all_kernels) - 8} more")
 
             if bottleneck_id != kernel_id and all_kernels:
                 kernel_id = bottleneck_id
