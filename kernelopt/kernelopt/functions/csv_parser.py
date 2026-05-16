@@ -42,6 +42,68 @@ def list_kernels(filepath: str) -> list[tuple[int, str]]:
     return sorted(kernels.items())
 
 
+def find_bottleneck_kernel(filepath: str) -> tuple[int, list[dict]]:
+    """Discover the most expensive kernel in a multi-kernel NCU CSV.
+
+    Scans all kernel_ids, extracts duration for each, and returns the
+    kernel_id with the highest duration (the bottleneck).
+
+    Args:
+        filepath: Path to NCU CSV with potentially multiple kernel_ids.
+
+    Returns:
+        (bottleneck_kernel_id, all_kernels) where all_kernels is a list of
+        dicts: [{"kernel_id": int, "kernel_name": str, "duration_ns": float}]
+        sorted by duration descending.
+    """
+    path = Path(filepath)
+    kernel_durations: dict[int, dict] = {}
+
+    _DURATION_METRICS = {
+        "gpu__time_duration.sum",
+        "sm__cycles_elapsed.avg.per_second",
+    }
+
+    with path.open(encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            kid = int(row.get("ID", "0"))
+            kname = row.get("Kernel Name", "")
+            metric_name = row.get("Metric Name", "").strip()
+
+            if kid not in kernel_durations and kname:
+                kernel_durations[kid] = {
+                    "kernel_id": kid,
+                    "kernel_name": kname,
+                    "duration_ns": 0.0,
+                }
+
+            if kid in kernel_durations and metric_name == "gpu__time_duration.sum":
+                raw = row.get("Metric Value", "0")
+                val = _parse_number(raw)
+                if isinstance(val, (int, float)):
+                    unit = row.get("Metric Unit", "").strip().lower()
+                    ns = val
+                    if "usecond" in unit or "µs" in unit:
+                        ns = val * 1000
+                    elif "msecond" in unit or "ms" in unit:
+                        ns = val * 1_000_000
+                    elif "second" in unit and "nsecond" not in unit:
+                        ns = val * 1_000_000_000
+                    kernel_durations[kid]["duration_ns"] = ns
+
+    all_kernels = sorted(
+        kernel_durations.values(),
+        key=lambda k: k["duration_ns"],
+        reverse=True,
+    )
+
+    if not all_kernels:
+        return 0, []
+
+    return all_kernels[0]["kernel_id"], all_kernels
+
+
 def parse_ncu_csv(
     filepath: str, kernel_id: int = 0
 ) -> tuple[dict, list, dict]:

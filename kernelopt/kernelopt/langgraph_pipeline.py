@@ -109,13 +109,14 @@ def profile_baseline(state: GraphState) -> dict:
         get_latency_ns,
         run_profiler_agent,
     )
-    from kernelopt.functions.csv_parser import parse_ncu_csv
+    from kernelopt.functions.csv_parser import parse_ncu_csv, find_bottleneck_kernel
 
     cfg = state["config"]
     output_dir = Path(state["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = state["kernel_path"]
     kernel_id = state.get("kernel_id", 0)
+    auto_kernel_id = (kernel_id == 0 and not cfg.kernel_name)
 
     ui = get_pipeline_ui()
     if ui:
@@ -176,6 +177,33 @@ def profile_baseline(state: GraphState) -> dict:
         ctx_json = str(output_dir / "baseline_profiling_context.json")
         pipe_print(f"  [dim]Profiling context: {ctx_json}[/]")
 
+        # Multi-kernel bottleneck discovery: if kernel_id was auto (0) and
+        # the CSV has multiple kernels, find the most expensive one and
+        # re-parse the context for that kernel.
+        csv_path = str(output_dir / "baseline.csv")
+        if auto_kernel_id and Path(csv_path).exists():
+            bottleneck_id, all_kernels = find_bottleneck_kernel(csv_path)
+            if all_kernels and len(all_kernels) > 1:
+                pipe_print(f"  [dim]Multi-kernel file: {len(all_kernels)} kernels detected[/]")
+                for k in all_kernels[:5]:
+                    marker = "[bold cyan]→[/]" if k["kernel_id"] == bottleneck_id else "  "
+                    dur_us = k["duration_ns"] / 1000
+                    name = k["kernel_name"][:60]
+                    pipe_print(f"  {marker} [{k['kernel_id']}] {dur_us:>10.2f} µs  {name}")
+                if len(all_kernels) > 5:
+                    pipe_print(f"    ... and {len(all_kernels) - 5} more")
+
+            if bottleneck_id != kernel_id and all_kernels:
+                kernel_id = bottleneck_id
+                pipe_print(
+                    f"  [bold]Auto-selected bottleneck kernel: "
+                    f"ID={kernel_id} ({all_kernels[0]['kernel_name'][:50]})[/]"
+                )
+                sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
+                baseline_ctx = build_profiling_context(
+                    sections, rules, launch, kernel_path, kernel_id=kernel_id
+                )
+
     latency = get_latency_ns(baseline_ctx)
     framework = state["framework"]
     if framework == "auto":
@@ -204,6 +232,7 @@ def profile_baseline(state: GraphState) -> dict:
         "current_profiling_context": baseline_ctx,
         "framework": framework,
         "ncu_config": ncu_config,
+        "kernel_id": kernel_id,
     }
     _checkpoint_stage(state, out, "after_baseline")
     return out
