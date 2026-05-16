@@ -134,17 +134,19 @@ def build_standalone_kernel(
     triton_kernel_sources: list[str],
     inductor_source: str,
 ) -> str:
-    """Build a complete standalone Triton file for the LLM to read and modify.
+    """Build a complete standalone file for the LLM to read, modify, and submit.
 
-    This is what the planner/executor see as ``best_kernel``. It has:
-      - proper imports
+    This is what the planner/executor see as ``best_kernel``. It includes the
+    FULL computation (not just the Triton kernel in isolation):
+      - imports
       - clean @triton.jit kernel(s)
-      - kernel_function() wrapper
-      - get_inputs()
+      - kernel_function(*inputs) that does the ENTIRE computation
+        (PyTorch ops for GEMM/conv + Triton for fused elementwise)
+      - get_inputs() matching the full computation's args
       - __main__ with --profile-only
 
-    Unlike the Inductor file (which uses async_compile), this is plain Triton
-    that the LLM can read, modify, and submit as a complete file.
+    The LLM can optimize any part: fuse GEMM+activation into one Triton kernel,
+    rewrite library calls as Triton, or just tweak the existing Triton kernel.
     """
     imports = [
         "import torch",
@@ -157,15 +159,9 @@ def build_standalone_kernel(
     for ks in triton_kernel_sources:
         kernel_parts.append(_clean_for_llm(ks))
 
+    call_source = _extract_function_from_source(inductor_source, "call")
+    wrapper_code = _translate_call_to_kernel_function(call_source, kernel_parts, inductor_source)
     get_inputs_code = _extract_get_inputs(inductor_source)
-
-    if kernel_parts:
-        first_kernel = kernel_parts[0]
-        wrapper_code, kernel_get_inputs = _build_standalone_wrapper(first_kernel)
-        if kernel_get_inputs:
-            get_inputs_code = kernel_get_inputs
-    else:
-        wrapper_code = "def kernel_function(*args):\n    pass"
 
     main_block = [
         'if __name__ == "__main__":',
@@ -185,6 +181,172 @@ def build_standalone_kernel(
 
     parts = imports + [""] + kernel_parts + ["", wrapper_code, "", get_inputs_code, ""] + main_block + [""]
     return "\n".join(parts)
+
+
+def _extract_function_from_source(source: str, func_name: str) -> str:
+    """Extract a function definition from source by name."""
+    lines = source.split("\n")
+    start = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if re.match(rf"def\s+{func_name}\s*\(", stripped):
+            start = i
+            break
+    if start is None:
+        return ""
+    func_lines = [lines[start]]
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() == "":
+            func_lines.append(line)
+            continue
+        if line[0] not in (" ", "\t") and line.strip() != "":
+            break
+        func_lines.append(line)
+    while func_lines and func_lines[-1].strip() == "":
+        func_lines.pop()
+    return "\n".join(func_lines)
+
+
+def _translate_call_to_kernel_function(
+    call_source: str,
+    kernel_parts: list[str],
+    inductor_source: str,
+) -> str:
+    """Translate Inductor's call(args) to a clean kernel_function(*inputs).
+
+    Converts:
+      - extern_kernels.mm(a, b, out=c) -> c = torch.mm(a, b)
+      - extern_kernels.addmm(bias, a, b, out=c) -> c = torch.addmm(bias, a, b)
+      - extern_kernels.convolution(...) -> torch.nn.functional.conv2d(...)
+      - empty_strided_cuda(shape, stride, dtype) -> torch.empty(shape, dtype=dtype, device='cuda')
+      - kernel.run(ptrs, numel, stream=s) -> kernel[grid](ptrs, numel, XBLOCK=1024)
+      - reinterpret_tensor(t, shape, stride, offset) -> t.view(shape) or t.as_strided(...)
+      - assert_size_stride, del statements -> removed
+      - get_raw_stream(0) -> removed (not needed for direct launch)
+    """
+    if not call_source:
+        if kernel_parts:
+            return _build_standalone_wrapper(kernel_parts[0])[0]
+        return "def kernel_function(*inputs):\n    pass"
+
+    lines = call_source.split("\n")
+    out = []
+    kernel_names = set()
+
+    for kp in kernel_parts:
+        m = re.search(r'def\s+(\w+)\s*\(', kp)
+        if m:
+            kernel_names.add(m.group(1))
+
+    for line in lines:
+        stripped = line.strip()
+
+        if re.match(r'def\s+call\s*\(', stripped):
+            out.append("def kernel_function(*inputs):")
+            out.append("    args = list(inputs)")
+            continue
+
+        if stripped.startswith("args.clear()"):
+            continue
+        if stripped.startswith("assert_size_stride("):
+            continue
+        if stripped.startswith("assert_alignment("):
+            continue
+        if re.match(r'\s*del\s+\w+', stripped):
+            continue
+        if "torch.cuda._DeviceGuard" in stripped:
+            continue
+        if "torch.cuda.set_device" in stripped:
+            continue
+        if "get_raw_stream" in stripped:
+            continue
+
+        # Dedent lines that were inside 'with torch.cuda._DeviceGuard' block
+        if line.startswith("            "):
+            line = "    " + line.lstrip()
+        elif line.startswith("        ") and not line.startswith("        #"):
+            line = "    " + line.lstrip()
+
+        indent = line[:len(line) - len(line.lstrip())]
+        if not indent and stripped and not stripped.startswith("#"):
+            indent = "    "
+
+        # extern_kernels.mm(a, b, out=c) -> c = torch.mm(a, b)
+        m = re.match(r'\s*extern_kernels\.mm\((.+?),\s*(.+?),\s*out=(\w+)\)', stripped)
+        if m:
+            a, b, c = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+            b = re.sub(r'reinterpret_tensor\((\w+),\s*\([^)]+\),\s*\([^)]+\),\s*\d+\)', r'\1.T', b)
+            out.append(f"{indent}{c} = torch.mm({a}, {b})")
+            continue
+
+        # extern_kernels.addmm(bias, a, b, out=c) -> c = torch.addmm(bias, a, b)
+        m = re.match(r'\s*extern_kernels\.addmm\((.+?),\s*(.+?),\s*(.+?),\s*out=(\w+)\)', stripped)
+        if m:
+            bias, a, b, c = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+            b = re.sub(r'reinterpret_tensor\((\w+),\s*\([^)]+\),\s*\([^)]+\),\s*\d+\)', r'\1.T', b)
+            bias = re.sub(r'reinterpret_tensor\((\w+),\s*\([^)]+\),\s*\([^)]+\),\s*\d+\)', r'\1', bias)
+            out.append(f"{indent}{c} = torch.addmm({bias}, {a}, {b})")
+            continue
+
+        # extern_kernels.convolution(...) -> torch.nn.functional.conv2d(...)
+        m = re.match(r'\s*(\w+)\s*=\s*extern_kernels\.convolution\((.+)\)', stripped)
+        if m:
+            var = m.group(1)
+            args_str = m.group(2)
+            out.append(f"{indent}{var} = torch.ops.aten.convolution({args_str})")
+            continue
+
+        # empty_strided_cuda(shape, stride, dtype) -> torch.empty(shape, dtype, device='cuda')
+        m = re.search(r'empty_strided_cuda\((\([^)]*\)),\s*\([^)]*\),\s*([^)]+)\)', stripped)
+        if m:
+            shape, dtype = m.group(1), m.group(2).strip()
+            line = re.sub(
+                r'empty_strided_cuda\((\([^)]*\)),\s*\([^)]*\),\s*([^)]+)\)',
+                f"torch.empty({shape}, dtype={dtype}, device='cuda')",
+                line,
+            )
+
+        # kernel.run(args, stream=s) -> kernel[grid](args, XBLOCK=1024)
+        for kname in kernel_names:
+            pattern = rf'{kname}\.run\(([^)]+)\)'
+            m = re.search(pattern, stripped)
+            if m:
+                raw_args = m.group(1)
+                args_list = [a.strip() for a in raw_args.split(",")]
+                clean_args = [a for a in args_list if not a.startswith("stream=")]
+                numel = clean_args[-1] if clean_args else "1"
+                ptr_args = clean_args[:-1]
+                all_a = ", ".join(ptr_args + [numel])
+                line = f"{indent}grid = (triton.cdiv({numel}, 1024),)"
+                out.append(line)
+                out.append(f"{indent}{kname}[grid]({all_a}, XBLOCK=1024)")
+                break
+        else:
+            # buf1 = buf0; del buf0  -- handle buffer reuse
+            m = re.match(r'\s*(\w+)\s*=\s*(\w+)\s*;\s*del\s+\w+\s*#.*', stripped)
+            if m:
+                out.append(f"{indent}{m.group(1)} = {m.group(2)}")
+                continue
+
+            # reinterpret_tensor in non-extern context
+            line = re.sub(
+                r'reinterpret_tensor\((\w+),\s*(\([^)]+\)),\s*\([^)]+\),\s*\d+\)',
+                r'\1.reshape(\2)',
+                line,
+            )
+
+            out.append(line)
+            continue
+
+        # If we processed a kernel.run, skip the original line
+        continue
+
+    # Fix return to not be a tuple
+    result = "\n".join(out)
+    result = re.sub(r'return\s*\(([^,]+),?\s*\)', r'return \1', result)
+
+    return result
 
 
 def _build_standalone_wrapper(kernel_source: str) -> tuple[str, str | None]:
