@@ -621,6 +621,18 @@ def generate_plans(state: GraphState) -> dict:
 # Node 3: Execute each plan (K attempts) + correctness gate
 # ---------------------------------------------------------------------------
 
+def _find_original_pytorch(output_dir: str) -> str | None:
+    """Find the original PyTorch source saved during synthesis.
+
+    Falls back to checking the synthesis directory when the state variable
+    _original_pytorch_path is not persisted (e.g., after checkpoint restore).
+    """
+    synth_path = Path(output_dir) / "synthesis" / "original_pytorch.py"
+    if synth_path.exists():
+        return str(synth_path)
+    return None
+
+
 def execute_plans(state: GraphState) -> dict:
     """Apply each plan to produce optimized kernels and check correctness."""
     cfg = state["config"]
@@ -754,7 +766,10 @@ def execute_plans(state: GraphState) -> dict:
             region=cfg.region,
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
-            original_pytorch_path=state.get("_original_pytorch_path"),
+            original_pytorch_path=(
+                state.get("_original_pytorch_path")
+                or _find_original_pytorch(state.get("output_dir", ""))
+            ),
             debug=cfg.debug,
         )
         if _use_spinners():

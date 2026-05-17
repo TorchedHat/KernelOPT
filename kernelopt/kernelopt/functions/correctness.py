@@ -208,20 +208,20 @@ for seed in seeds:
     inputs = get_inputs()
 
     # Run original PyTorch
-    orig_fn = getattr(mod1, "kernel_function", None) or getattr(mod1, "call", None)
     if hasattr(mod1, "Model") and hasattr(mod1, "get_init_inputs"):
         model = mod1.Model(*mod1.get_init_inputs()).cuda().eval()
         with torch.no_grad():
             ref_out = model(*[t.cuda() if isinstance(t, torch.Tensor) else t for t in inputs])
-    elif orig_fn:
+    else:
+        orig_fn = getattr(mod1, "kernel_function", None) or getattr(mod1, "run", None) or getattr(mod1, "call", None)
+        if orig_fn is None:
+            print(json.dumps({{"passed": False, "error": "no callable found in original"}}))
+            sys.exit(0)
         with torch.no_grad():
             ref_out = orig_fn(*inputs)
-    else:
-        print(json.dumps({{"passed": False, "error": "no callable found in original"}}))
-        sys.exit(0)
 
     # Run optimized kernel
-    opt_fn = getattr(mod2, "kernel_function", None) or getattr(mod2, "call", None)
+    opt_fn = getattr(mod2, "kernel_function", None) or getattr(mod2, "run", None) or getattr(mod2, "call", None)
     if opt_fn is None:
         print(json.dumps({{"passed": False, "error": "no kernel_function in optimized"}}))
         sys.exit(0)
