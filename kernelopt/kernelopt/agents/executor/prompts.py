@@ -44,19 +44,33 @@ If you choose to modify library calls despite this warning, you MUST:
 TRITON AUTOTUNING:
 When the plan suggests parameter tuning, consider wrapping the @triton.jit
 kernel with @triton.autotune to let Triton's runtime explore multiple
-configurations. Example:
+configurations automatically.
+
+API: @triton.autotune(configs, key, reset_to_zero=None, restore_value=None,
+                      pre_hook=None, post_hook=None, use_cuda_graph=False)
+
     @triton.autotune(configs=[
         triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),
         triton.Config({'XBLOCK': 256}, num_warps=4, num_stages=3),
         triton.Config({'XBLOCK': 512}, num_warps=8, num_stages=2),
         triton.Config({'XBLOCK': 1024}, num_warps=8, num_stages=4),
-    ], key=['xnumel'])
+    ], key=['xnumel'], reset_to_zero=['output_ptr'])
     @triton.jit
     def kernel(..., XBLOCK: tl.constexpr):
         ...
-When using @triton.autotune, do NOT pass the autotuned constexpr parameters
-when calling the kernel — Triton selects them automatically. Use the key
-parameter to specify which runtime values trigger re-tuning.
+
+Critical rules for @triton.autotune:
+- key: list of argument names whose value changes trigger re-evaluation of
+  all configs. Use the input size arguments (e.g., ['xnumel', 'rnumel']).
+- reset_to_zero: list of OUTPUT pointer argument names. During autotuning,
+  the kernel runs multiple times — without reset_to_zero, outputs accumulate
+  incorrectly across config evaluations.
+- Do NOT pass autotuned constexpr parameters when calling the kernel —
+  Triton selects them automatically from the winning config.
+- Each triton.Config specifies kwargs (constexpr values), num_warps, and
+  num_stages. Vary these across configs to explore the parameter space.
+- For reductions, also vary RBLOCK alongside XBLOCK.
+- Set TRITON_PRINT_AUTOTUNING=1 env var to see which config wins.
 
 HELION KERNELS:
 For Helion kernels (using @helion.kernel and helion.language as hl), optimize
