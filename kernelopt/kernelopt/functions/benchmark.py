@@ -1,105 +1,78 @@
 """Wall-clock benchmarking for end-to-end kernel performance measurement.
 
-Measures the full computation (all GPU kernels including library calls)
-using CUDA Events timing. This is the primary speedup metric — NCU
-remains for per-kernel hardware diagnosis.
+Uses triton.testing.do_bench for GPU timing — the same method used by
+KernelAgent, KernelSkill, AccelOpt, and the Triton tutorials themselves.
 
-Design:
-  - Runs the kernel file as a subprocess to avoid polluting the parent's
-    CUDA context (important for EXCLUSIVE_PROCESS GPU mode).
-  - Uses CUDA Events (not CPU timers) for accurate GPU timing.
-  - Reports median of 100 runs after 25 warmup iterations.
-  - Works for any framework: Triton, CUDA, PyTorch.
+Loads the kernel module, finds the callable + inputs, and benchmarks
+inline (no subprocess). This avoids the fragility of subprocess-based
+benchmarking (import failures, missing kernel_function, etc.).
 """
 from __future__ import annotations
 
-import json
-import os
-import subprocess
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
-WARMUP_REPS = 25
-TIMING_REPS = 100
+
+def _find_callable_and_inputs(module):
+    """Find the benchmark-able function and input generator in a kernel module.
+
+    Searches for common patterns across all kernel types:
+    - Inductor synthesized: kernel_function + get_inputs
+    - Triton tutorials: add/softmax_kernel/matmul + inline test data
+    - Helion kernels: kernel_function + get_inputs
+    - SOL kernels: run + get_inputs
+    """
+    fn = (
+        getattr(module, "kernel_function", None)
+        or getattr(module, "call", None)
+        or getattr(module, "run", None)
+    )
+    get_inputs = getattr(module, "get_inputs", None)
+    return fn, get_inputs
 
 
 def benchmark_kernel(
     kernel_path: str,
     gpu_id: int | None = None,
-    warmup: int = WARMUP_REPS,
-    reps: int = TIMING_REPS,
-    timeout: int = 120,
+    warmup: int = 25,
+    rep: int = 100,
 ) -> dict:
-    """Benchmark a kernel file end-to-end using CUDA Events in a subprocess.
+    """Benchmark a kernel file end-to-end using triton.testing.do_bench.
 
-    Returns dict with keys: median_ms, min_ms, max_ms, error.
-    The subprocess isolation ensures we don't hold a CUDA context in the
-    parent process (critical for EXCLUSIVE_PROCESS GPU mode and cascade
-    prevention).
+    Loads the module inline (same process), finds the callable and inputs,
+    and measures wall-clock GPU time. Returns dict with median_ms or error.
     """
-    script = f"""\
-import json, sys, os, torch
+    try:
+        import torch
+        from triton.testing import do_bench
+    except ImportError:
+        return {"median_ms": -1, "error": "torch or triton not available"}
 
-torch.cuda.set_device(0)
-kernel_path = sys.argv[1]
-
-import importlib.util
-spec = importlib.util.spec_from_file_location("_bench_mod", kernel_path)
-mod = importlib.util.module_from_spec(spec)
-sys.modules["_bench_mod"] = mod
-spec.loader.exec_module(mod)
-
-fn = getattr(mod, "kernel_function", None) or getattr(mod, "call", None)
-get_inputs = getattr(mod, "get_inputs", None)
-
-if fn is None or get_inputs is None:
-    print(json.dumps({{"error": "kernel_function or get_inputs not found", "median_ms": -1}}))
-    sys.exit(0)
-
-try:
-    inputs = get_inputs()
-    with torch.no_grad():
-        for _ in range({warmup}):
-            fn(*inputs)
-        torch.cuda.synchronize()
-
-        times = []
-        for _ in range({reps}):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            fn(*inputs)
-            end.record()
-            torch.cuda.synchronize()
-            times.append(start.elapsed_time(end))
-
-        times.sort()
-        median_ms = times[len(times) // 2]
-        print(json.dumps({{"median_ms": median_ms, "min_ms": times[0], "max_ms": times[-1]}}))
-except Exception as e:
-    print(json.dumps({{"error": str(e)[:300], "median_ms": -1}}))
-"""
-
-    env = os.environ.copy()
     if gpu_id is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        import os
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", script, str(kernel_path)],
-            capture_output=True, text=True,
-            timeout=timeout, env=env,
-        )
-        if proc.returncode == 0:
-            for line in proc.stdout.strip().split("\n"):
-                line = line.strip()
-                if line.startswith("{"):
-                    return json.loads(line)
-        return {
-            "median_ms": -1,
-            "error": f"exit={proc.returncode}: {(proc.stderr or '')[-200:]}",
-        }
-    except subprocess.TimeoutExpired:
-        return {"median_ms": -1, "error": f"benchmark timeout ({timeout}s)"}
+        mod_name = f"_bench_{Path(kernel_path).stem}_{id(kernel_path)}"
+        spec = importlib.util.spec_from_file_location(mod_name, str(kernel_path))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        spec.loader.exec_module(module)
     except Exception as e:
-        return {"median_ms": -1, "error": str(e)[:200]}
+        return {"median_ms": -1, "error": f"import failed: {str(e)[:200]}"}
+
+    fn, get_inputs = _find_callable_and_inputs(module)
+
+    if fn is None or get_inputs is None:
+        return {"median_ms": -1, "error": "no callable or get_inputs found"}
+
+    try:
+        inputs = get_inputs()
+        with torch.no_grad():
+            bench_fn = lambda: fn(*inputs)
+            median_ms = do_bench(bench_fn, warmup=warmup, rep=rep)
+        return {"median_ms": float(median_ms)}
+    except Exception as e:
+        return {"median_ms": -1, "error": f"benchmark failed: {str(e)[:200]}"}
