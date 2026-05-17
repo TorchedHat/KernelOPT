@@ -25,6 +25,7 @@ def run_executor_agent(
     llm_config: dict,
     llm_override=None,
     compile_error: str | None = None,
+    correctness_error: str | None = None,
 ) -> tuple[str, dict]:
     """Run the executor sub-graph to apply one optimization plan.
 
@@ -36,8 +37,9 @@ def run_executor_agent(
         llm_config:         Dict with keys model, api_key, project_id, region.
         llm_override:       Optional pre-built LLM (used in tests to avoid API calls).
         compile_error:      nvcc error from a previous compile attempt, or None.
+        correctness_error:  Correctness failure message from a previous attempt, or None.
                             When set, the initial message includes the error so the
-                            LLM can fix the specific issue.
+                            LLM can fix the numerical bug.
 
     Returns:
         (optimized_kernel_source, execution_result) — drop-in for old run_executor().
@@ -46,7 +48,11 @@ def run_executor_agent(
     plan_id = optimization_plan.get("plan_id", "")
 
     server = ExecutorToolServer(kernel_source, optimization_plan, memory)
-    initial_msg = build_initial_message(plan_direction, K, compile_error=compile_error)
+    initial_msg = build_initial_message(
+        plan_direction, K,
+        compile_error=compile_error,
+        correctness_error=correctness_error,
+    )
 
     config = RunnableConfig(
         configurable={

@@ -45,12 +45,15 @@ your plan. The plan must:
   that the Executor does not need to re-read profiling data
 
 Optimization strategies to consider (in priority order):
-1. Adjust tile sizes (XBLOCK, YBLOCK, num_warps, num_stages) for better occupancy
-2. Improve memory access patterns (coalescing, vectorized loads, L2 compression)
-3. Reduce register pressure or branch divergence
-4. Change eviction policies and cache hints
-5. Fuse adjacent @triton.jit pointwise kernels (NOT library call fusion)
-6. Precision optimization (FP32 → BF16/FP16 where safe for stores/intermediates)
+1. Add @triton.autotune with multiple configurations to explore tile sizes,
+   num_warps, and num_stages automatically at runtime
+2. Adjust tile sizes (XBLOCK, YBLOCK, num_warps, num_stages) for better occupancy
+3. Improve memory access patterns (coalescing, vectorized loads, L2 compression)
+4. Reduce register pressure or branch divergence
+5. Change eviction policies and cache hints
+6. Fuse adjacent @triton.jit pointwise kernels (NOT library call fusion)
+7. Precision optimization (FP32 → BF16/FP16 where safe for stores/intermediates)
+8. Algorithmic improvements (single-pass reductions, loop reordering, tiling)
 """
 
 

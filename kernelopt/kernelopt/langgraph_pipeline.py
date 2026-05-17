@@ -239,13 +239,31 @@ def profile_baseline(state: GraphState) -> dict:
                         kernel_summary.append(
                             f"  [{k['kernel_id']}] {dur_us:>10.2f} µs  {k['kernel_name'][:60]}  ({kind})"
                         )
+                    user_kernel_count = sum(1 for k in all_kernels if k.get("kind") == "user")
+                    if user_kernel_count == 0:
+                        guidance = (
+                            "No user @triton.jit kernels found — computation is entirely "
+                            "library calls. Optimization scope is very limited."
+                        )
+                    elif user_kernel_count == 1:
+                        guidance = (
+                            "Focus optimization on the single @triton.jit user kernel. "
+                            "Library calls (cuBLAS, cuDNN) are already hardware-optimized."
+                        )
+                    else:
+                        guidance = (
+                            f"{user_kernel_count} @triton.jit user kernels found. "
+                            "Consider fusing adjacent user kernels or optimizing the "
+                            "most expensive one."
+                        )
+
                     baseline_ctx["multi_kernel_summary"] = (
                         f"This file launches {len(all_kernels)} GPU kernels. "
                         f"The bottleneck is kernel [{all_kernels[0]['kernel_id']}] "
                         f"({all_kernels[0]['kernel_name'][:40]}) at "
                         f"{all_kernels[0]['duration_ns']/1000:.1f} µs "
                         f"({all_kernels[0].get('kind','user')}). "
-                        f"Consider fusing operations or rewriting library calls as Triton.\n"
+                        f"{guidance}\n"
                         + "\n".join(kernel_summary)
                     )
 
@@ -443,6 +461,25 @@ def analyze_strategy(state: GraphState) -> dict:
         }}
 
     kernel_source = state.get("best_kernel", "")
+
+    # If there are no @triton.jit kernels in the source, optimization scope
+    # is extremely limited (computation is entirely library calls).
+    if "@triton.jit" not in kernel_source and "No user @triton.jit" in multi_kernel_summary:
+        pipe_print("  [yellow]No @triton.jit kernels — computation is all library calls. "
+                   "Limited optimization scope.[/]")
+        return {"optimization_strategy": {
+            "strategy_type": "tune_parameters",
+            "reasoning": "No user @triton.jit kernels found. The computation is entirely "
+                         "library calls (cuBLAS/cuDNN). Only minor parameter tuning of the "
+                         "computation graph may help.",
+            "primary_target": "launch parameters and memory layout",
+            "fusion_opportunity": None,
+            "plan_guidance": [
+                "Check if batch dimensions or tensor layouts can be improved",
+                "Look for redundant memory copies or suboptimal strides",
+            ],
+            "ncu_tier": ncu_tier,
+        }}
 
     from kernelopt.llm import build_llm
     import json as _json
@@ -658,6 +695,7 @@ def execute_plans(state: GraphState) -> dict:
         optimized_source: str | None = None
         execution_result: dict = {}
         compiled_binary: str | None = None
+        correctness_retried = False
         outer_attempts = cfg.K if ext == ".cu" else 1
         executor_K = 1 if ext == ".cu" else cfg.K
 
@@ -766,6 +804,36 @@ def execute_plans(state: GraphState) -> dict:
 
         status = "[green]passed[/]" if passed else "[red]failed[/]"
         pipe_print(f"    Plan {plan_letter}: correctness {status}")
+
+        if not passed and cfg.K > 1 and not correctness_retried:
+            # Error-guided retry: feed the correctness error back to the
+            # executor so it can fix the bug rather than abandoning the plan.
+            pipe_print(f"    [yellow]Correctness failed — retrying with error feedback...[/]")
+            correctness_retried = True
+            try:
+                _retry_args = dict(
+                    kernel_source=current_kernel,
+                    optimization_plan=plan,
+                    memory=state.get("optimization_memory", []),
+                    K=1,
+                    llm_config=llm_config,
+                    correctness_error=msg[:500],
+                )
+                if _use_spinners():
+                    with phase_spinner("retry", f"plan {plan_letter}"):
+                        optimized_source, execution_result = run_executor_agent(**_retry_args)
+                else:
+                    optimized_source, execution_result = run_executor_agent(**_retry_args)
+
+                if optimized_source and execution_result.get("ready_for_profiling"):
+                    kernel_file = str(output_dir / f"{file_stem}_retry{ext}")
+                    Path(kernel_file).write_text(optimized_source)
+                    passed, msg = check_correctness(**{**_cc_args, "optimized_source": optimized_source})
+                    if passed:
+                        pipe_print(f"    [green]Retry succeeded![/]")
+                        execution_result["correctness"] = "passed"
+            except Exception as e:
+                pipe_print(f"    [dim]Retry failed: {e}[/]")
 
         if not passed:
             pipe_print(f"    [dim]Failure: {msg[:300]}[/]")

@@ -41,6 +41,23 @@ If you choose to modify library calls despite this warning, you MUST:
 - Demonstrate clear reasoning why the library call is suboptimal
 - Keep the original call as a fallback path
 
+TRITON AUTOTUNING:
+When the plan suggests parameter tuning, consider wrapping the @triton.jit
+kernel with @triton.autotune to let Triton's runtime explore multiple
+configurations. Example:
+    @triton.autotune(configs=[
+        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 256}, num_warps=4, num_stages=3),
+        triton.Config({'XBLOCK': 512}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 1024}, num_warps=8, num_stages=4),
+    ], key=['xnumel'])
+    @triton.jit
+    def kernel(..., XBLOCK: tl.constexpr):
+        ...
+When using @triton.autotune, do NOT pass the autotuned constexpr parameters
+when calling the kernel — Triton selects them automatically. Use the key
+parameter to specify which runtime values trigger re-tuning.
+
 IMPORTANT:
 - The submitted file must be self-contained and executable with: python file.py --profile-only
 - kernel_function must include the ENTIRE computation unchanged except for the
@@ -56,6 +73,7 @@ def build_initial_message(
     plan_direction: str,
     K: int,
     compile_error: str | None = None,
+    correctness_error: str | None = None,
 ) -> HumanMessage:
     """Build the opening human message for the executor sub-graph."""
     content = (
@@ -69,5 +87,17 @@ def build_initial_message(
             f"The kernel you produced in the previous attempt was rejected by nvcc:\n\n"
             f"```\n{compile_error}\n```\n\n"
             f"Fix the compilation error in your new implementation."
+        )
+    if correctness_error:
+        content += (
+            f"\n\n## Previous attempt failed correctness\n"
+            f"Your prior optimization produced wrong results:\n\n"
+            f"```\n{correctness_error}\n```\n\n"
+            f"Fix the numerical issue. Common causes:\n"
+            f"- Wrong accumulation order or precision (use float32 accumulators)\n"
+            f"- Off-by-one in mask or index calculations\n"
+            f"- Missing boundary checks for edge tiles\n"
+            f"- Incorrect reduction across threads/warps\n"
+            f"Preserve the same algorithm but fix the implementation bug."
         )
     return HumanMessage(content=content)
