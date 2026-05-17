@@ -159,13 +159,17 @@ def _resolve_ncu_config(
         if pipeline_config.replay_mode != "kernel":
             llm_result = {**llm_result, "replay_mode": pipeline_config.replay_mode}
 
-        # Force kernel_name to be empty for Triton/Helion frameworks.
-        # JIT-compiled kernels have mangled names that don't match Python function names.
+        # For Triton/Helion: JIT-compiled kernel names are mangled at runtime,
+        # so kernel_name filtering by Python function name won't match.
+        # Override kernel_name to empty (profile all kernel names), but KEEP
+        # the LLM's launch_skip and launch_count — it may have correctly
+        # determined that only certain launches should be profiled (e.g., for
+        # files with built-in benchmark suites that launch thousands of kernels).
         if framework in ("triton", "helion"):
             overrides = {
                 "kernel_name": "",
-                "launch_skip": 0,
-                "launch_count": None,
+                "launch_skip": llm_result.get("launch_skip", 0),
+                "launch_count": llm_result.get("launch_count"),
             }
             if pipeline_config.replay_mode == "kernel":
                 overrides["replay_mode"] = "kernel"
