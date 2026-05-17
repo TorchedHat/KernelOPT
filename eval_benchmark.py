@@ -590,13 +590,21 @@ def _parse_kpt_results(kpt_output: Path, result: dict) -> None:
                 result["speedup"] = round(
                     result["baseline_latency_ns"] / result["best_latency_ns"], 3
                 )
-            if result["eager_ns"] > 0 and result["best_latency_ns"] > 0:
+            # Wall-clock comparisons: use best_wall_ms (full computation)
+            # not best_latency_ns (NCU single kernel) for apples-to-apples
+            best_wall_ns = gs.get("best_wall_ms", -1)
+            if best_wall_ns > 0:
+                best_wall_ns = best_wall_ns * 1e6  # ms to ns
+            result["best_wall_ms"] = gs.get("best_wall_ms", -1)
+            result["baseline_wall_ms"] = gs.get("baseline_wall_ms", -1)
+
+            if result["eager_ns"] > 0 and best_wall_ns > 0:
                 result["speedup_vs_eager"] = round(
-                    result["eager_ns"] / result["best_latency_ns"], 3
+                    result["eager_ns"] / best_wall_ns, 3
                 )
-            if result["compile_ns"] > 0 and result["best_latency_ns"] > 0:
+            if result["compile_ns"] > 0 and best_wall_ns > 0:
                 result["speedup_vs_compile"] = round(
-                    result["compile_ns"] / result["best_latency_ns"], 3
+                    result["compile_ns"] / best_wall_ns, 3
                 )
 
             bpc = gs.get("baseline_profiling_context", {})
