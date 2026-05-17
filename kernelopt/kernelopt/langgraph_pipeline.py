@@ -308,10 +308,13 @@ You are the Strategy Analyst in a GPU kernel optimization pipeline.
 Given a kernel's multi-kernel profile and source code, decide the HIGH-LEVEL
 optimization strategy. You do NOT write code — you decide WHAT to optimize.
 
-CRITICAL CONSTRAINT: Library calls (extern_kernels.mm, cuBLAS GEMM,
-extern_kernels.convolution, cuDNN) MUST NOT be replaced or rewritten as
-hand-written Triton. They are already hardware-optimized. The optimization
-scope is LIMITED to @triton.jit kernel functions and their parameters.
+IMPORTANT GUIDANCE: Library calls (extern_kernels.mm, cuBLAS GEMM,
+extern_kernels.convolution, cuDNN) are already hardware-optimized by NVIDIA.
+Focus primarily on @triton.jit kernel functions and their parameters —
+this is where real acceleration happens. Rewriting library calls as Triton
+is extremely difficult and has a very low success rate. Only recommend it
+if strong NCU evidence shows the library call is suboptimal for this
+specific workload size and hardware.
 
 Return a JSON object with:
 {

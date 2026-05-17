@@ -239,15 +239,27 @@ class MemoryBank:
             emb_path = self.path.with_suffix(".embeddings.npy")
             np.save(str(emb_path), self._embeddings)
 
+    # Embedding models in priority order, selected for code/technical content
+    # retrieval on CPU. Override with KERNELOPT_EMBED_MODEL env var.
+    EMBED_MODELS = [
+        "codefuse-ai/F2LLM-v2-330M",
+        "ibm-granite/granite-embedding-311m-multilingual-r2",
+        "jinaai/jina-embeddings-v3",
+        "nomic-ai/nomic-embed-text-v1.5",
+        "sentence-transformers/all-mpnet-base-v2",
+        "sentence-transformers/all-MiniLM-L6-v2",
+    ]
+
     def _get_embed_model(self):
-        """Lazy-load sentence-transformers model."""
+        """Lazy-load sentence-transformers model.
+
+        Tries models in priority order (best for code retrieval first).
+        Falls back gracefully if a model can't be loaded.
+        Override with KERNELOPT_EMBED_MODEL env var for a specific model.
+        """
         if self._embed_model is None:
             try:
                 from sentence_transformers import SentenceTransformer
-                self._embed_model = SentenceTransformer(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    device="cpu",
-                )
             except ImportError:
                 logger.warning(
                     "sentence-transformers not installed. "
@@ -255,6 +267,28 @@ class MemoryBank:
                     "pip install sentence-transformers"
                 )
                 return None
+
+            override = os.environ.get("KERNELOPT_EMBED_MODEL")
+            candidates = [override] if override else self.EMBED_MODELS
+
+            for model_name in candidates:
+                try:
+                    self._embed_model = SentenceTransformer(
+                        model_name,
+                        device="cpu",
+                        trust_remote_code=True,
+                    )
+                    logger.info(f"Loaded embedding model: {model_name}")
+                    break
+                except Exception as e:
+                    logger.debug(f"Could not load {model_name}: {e}")
+                    continue
+
+            if self._embed_model is None:
+                logger.warning(
+                    f"No embedding model could be loaded from: {candidates}. "
+                    f"Semantic retrieval disabled."
+                )
         return self._embed_model
 
     def _embed_entry(self, entry: MemoryEntry) -> np.ndarray | None:

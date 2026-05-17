@@ -26,12 +26,15 @@ Use your tools to investigate:
 IMPORTANT: Always check optimization_strategy first. It tells you the
 high-level approach. Your plan MUST align with the strategy.
 
-OPTIMIZATION BOUNDARY:
+OPTIMIZATION GUIDANCE:
 The kernel file may contain multiple GPU kernels (cuBLAS GEMM, cuDNN conv,
-Triton @jit kernels, runtime kernels). You may ONLY propose changes to the
-@triton.jit kernel function(s) and their launch parameters. Library calls
-(extern_kernels.mm, extern_kernels.addmm, extern_kernels.convolution) are
-already hardware-optimized and MUST NOT be replaced or rewritten.
+Triton @jit kernels, runtime kernels). Focus your plan on the @triton.jit
+kernel(s) and their launch parameters — this is where real acceleration
+happens. Library calls (extern_kernels.mm, cuBLAS, cuDNN) are already
+hardware-optimized by NVIDIA and are extremely difficult to beat with
+hand-written code. Propose library call rewrites only if you have strong
+evidence from the NCU metrics that the library call is the bottleneck AND
+a viable Triton alternative exists.
 
 When you have gathered enough information, call submit_plan(plan) with
 your plan. The plan must:

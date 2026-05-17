@@ -26,15 +26,20 @@ When you have implemented the change, call submit_kernel(kernel_source, change_s
     - if __name__ == "__main__" block with --profile-only support
   change_summary — one sentence describing what changed
 
-OPTIMIZATION BOUNDARY:
-You may ONLY modify @triton.jit kernel functions and their launch parameters
-(grid, num_warps, num_stages, BLOCK sizes, eviction policies). Do NOT:
-- Replace or rewrite extern_kernels.mm / extern_kernels.addmm (cuBLAS GEMM)
-- Replace or rewrite extern_kernels.convolution (cuDNN)
-- Replace any torch.mm / torch.matmul / torch.bmm with hand-written Triton matmul
-- Remove or modify at::native::* runtime kernel calls
-These library calls are already hardware-optimized and are part of the execution
-backbone. Your job is to optimize the Triton @jit kernel(s) within this graph.
+OPTIMIZATION GUIDANCE:
+The kernel file may contain library calls (extern_kernels.mm, cuBLAS GEMM,
+extern_kernels.convolution, cuDNN) alongside @triton.jit kernels. These
+library calls are already hardware-optimized by NVIDIA — rewriting them as
+hand-written Triton is extremely difficult and rarely produces speedups.
+
+STRONG RECOMMENDATION: Focus your optimization on the @triton.jit kernel(s)
+and their launch parameters (tile sizes, num_warps, num_stages, eviction
+policies, vectorization). This is where real acceleration comes from.
+
+If you choose to modify library calls despite this warning, you MUST:
+- Preserve numerical correctness (atol < 1e-2 vs original)
+- Demonstrate clear reasoning why the library call is suboptimal
+- Keep the original call as a fallback path
 
 IMPORTANT:
 - The submitted file must be self-contained and executable with: python file.py --profile-only
