@@ -693,75 +693,8 @@ def execute_plans(state: GraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 def autotune_candidates(state: GraphState) -> dict:
-    """Placeholder for decoupled autotuning (Feature 1 -- not yet validated).
-
-    When enabled, this node extracts tunable tl.constexpr parameters and sweeps
-    a grid of configs via wall-clock benchmarking. Currently a pass-through
-    to isolate Feature 4 testing from unvalidated Feature 1 changes.
-    """
+    """Pass-through node. Feature 1 (autotuner) will be enabled separately."""
     return {"candidates": list(state["candidates"])}
-
-
-def _autotune_candidates_impl(state: GraphState) -> dict:
-    """Feature 1 implementation (disabled pending validation)."""
-    from kernelopt.autotuner import extract_tunable_params, run_autotune
-
-    cfg = state["config"]
-    candidates = list(state["candidates"])
-    framework = state["framework"]
-
-    tuned_candidates = []
-    for c in candidates:
-        if not c.correctness_passed:
-            tuned_candidates.append(c)
-            continue
-
-        params = extract_tunable_params(c.optimized_kernel, framework)
-        if not params:
-            pipe_print(f"    Plan {c.plan_letter}: no constexpr params to tune")
-            tuned_candidates.append(c)
-            continue
-
-        param_names = [p["param"] for p in params]
-        pipe_print(f"    Plan {c.plan_letter}: autotuning {len(params)} params ({', '.join(param_names)})...")
-
-        if _use_spinners():
-            with phase_spinner("autotuning", f"plan {c.plan_letter}"):
-                tuned_source, meta = run_autotune(
-                    c.optimized_kernel,
-                    framework=framework,
-                    debug=cfg.debug,
-                )
-        else:
-            tuned_source, meta = run_autotune(
-                c.optimized_kernel,
-                framework=framework,
-                debug=cfg.debug,
-            )
-
-        if meta.get("speedup", 1.0) > 1.0:
-            pipe_print(
-                f"    Plan {c.plan_letter}: autotuned {meta['configs_tested']} configs → "
-                f"{meta['speedup']:.2f}x speedup ({meta.get('best_config', {})})"
-            )
-            c = PlanCandidate(
-                plan_id=c.plan_id,
-                plan_letter=c.plan_letter,
-                direction=c.direction,
-                optimization_plan=c.optimization_plan,
-                optimized_kernel=tuned_source,
-                execution_result={**c.execution_result, "autotuned": True, "autotune_meta": meta},
-                correctness_passed=c.correctness_passed,
-                correctness_message=c.correctness_message,
-                compiled_binary_path=c.compiled_binary_path,
-            )
-        else:
-            skip_reason = meta.get("skipped", f"{meta['configs_tested']} configs, no improvement")
-            pipe_print(f"    Plan {c.plan_letter}: autotuning found no improvement ({skip_reason})")
-
-        tuned_candidates.append(c)
-
-    return {"candidates": tuned_candidates}
 
 
 # ---------------------------------------------------------------------------

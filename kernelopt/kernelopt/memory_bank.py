@@ -152,7 +152,9 @@ class MemoryBank:
     """Persistent cross-run optimization memory."""
 
     def __init__(self, path: str | Path | None = None):
-        self.path = Path(path) if path else DEFAULT_BANK_PATH
+        self.path = Path(path) if path else Path(
+            os.environ.get("KERNELOPT_MEMORY_BANK", str(DEFAULT_BANK_PATH))
+        )
         self.entries: list[MemoryEntry] = []
         self._load()
 
