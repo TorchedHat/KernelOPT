@@ -54,6 +54,14 @@ Optimization strategies to consider (in priority order):
 6. Fuse adjacent @triton.jit pointwise kernels (NOT library call fusion)
 7. Precision optimization (FP32 → BF16/FP16 where safe for stores/intermediates)
 8. Algorithmic improvements (single-pass reductions, loop reordering, tiling)
+
+For Helion kernels (@helion.kernel with hl.tile loops):
+1. Adjust block_sizes in helion.Config for each hl.tile dimension
+2. Change loop_orders to reorder nested hl.tile loops for memory locality
+3. Set indexing='block_ptr' for TMA-based memory access
+4. Set l2_grouping for L2 cache tile grouping
+5. Adjust num_warps and num_stages in the Config
+6. Remove config entirely to let Helion autotune (@helion.kernel())
 """
 
 

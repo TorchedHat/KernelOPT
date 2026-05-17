@@ -58,6 +58,28 @@ When using @triton.autotune, do NOT pass the autotuned constexpr parameters
 when calling the kernel — Triton selects them automatically. Use the key
 parameter to specify which runtime values trigger re-tuning.
 
+HELION KERNELS:
+For Helion kernels (using @helion.kernel and helion.language as hl), optimize
+by modifying the helion.Config parameters:
+    @helion.kernel(config=helion.Config(
+        block_sizes=[...],    # Tile sizes for each hl.tile dimension
+        num_warps=4,          # Warps per CTA
+        num_stages=3,         # Pipeline stages
+        loop_orders=[...],    # Reorder loop dimensions for locality
+        indexing='block_ptr', # Use TMA block pointers for better bandwidth
+        l2_grouping=32,       # Group tiles for L2 cache reuse
+    ))
+Key Helion optimization strategies:
+- Adjust block_sizes: larger tiles improve data reuse but increase register pressure
+- Use loop_orders to reorder nested hl.tile loops for better memory access
+- Set indexing='block_ptr' for TMA-based loads (requires 16-byte alignment)
+- Set l2_grouping to group adjacent tile blocks for L2 cache hits
+- Use hl.zeros/hl.full for explicit accumulator initialization
+- Helion fuses all operations inside hl.tile loops automatically — focus
+  on tile sizes and loop structure, not operation-level fusion
+- To enable Helion autotuning, remove the config parameter entirely:
+  @helion.kernel() will search for optimal parameters automatically
+
 IMPORTANT:
 - The submitted file must be self-contained and executable with: python file.py --profile-only
 - kernel_function must include the ENTIRE computation unchanged except for the
