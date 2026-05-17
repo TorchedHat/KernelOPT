@@ -32,7 +32,7 @@
 | **Planning** | Single-phase: LLM reads NCU metrics, proposes plan | Two-phase: Strategy Analysis (macro) -> Plan Generation (micro) | Strategy-level reasoning before detail-level planning |
 | **Memory** | Static RAG database (7 code samples, hand-curated) | Dynamic memory bank (grows from every run) + Triton tutorial references | Self-improving: learns from successes AND failures |
 | **Search** | Beam search (top-N kernels x M bottlenecks) | N parallel plans per iteration, diversity via NCU rules + strategy | Strategy-guided diversity |
-| **Autotuning** | LLM embeds @triton.autotune | Decoupled autotuner (Feature 1, mechanical grid search) | LLM picks algorithm, autotuner picks hardware params |
+| **Autotuning** | LLM embeds @triton.autotune | PLANNED: Helion-style LFBO/Bayesian search (Feature 1, not yet validated) | Will use learned search, not brute-force grid or hardcoded regex |
 | **Architecture** | Custom multiprocessing | LangGraph with checkpoint/resume | Recoverable, inspectable pipeline |
 
 **Novelty over KernelAgent**: Compiler-first synthesis + two-phase planning + dynamic memory bank + multi-kernel awareness.
@@ -142,6 +142,22 @@ No other tool auto-detects and handles PyTorch + Triton + CUDA + Helion.
 No other tool handles synthesis failure gracefully.
 - KernelAgent: fails if LLM can't write Triton
 - **kernelopt: synthesis failure -> continues with original file, pipeline runs regardless**
+
+### 7. Autotuning Strategy (PLANNED -- Feature 1)
+Current status: DISABLED (pass-through node). Plan:
+- NOT brute-force grid search or hardcoded regex parameter extraction
+- Inspired by Helion's LFBO (Learned Field-of-view Bayesian Optimization):
+  - Machine learning to filter candidate configurations intelligently
+  - Explores block sizes, loop orders, warps, stages, unrolling
+  - Reduces search space by 25-36% vs exhaustive search
+- Unlike Triton's @triton.autotune (static config list):
+  - Dynamic configuration space based on kernel structure
+  - Learned priors from memory bank (past successful configs)
+  - Hardware-aware constraints (shared memory limits, register pressure)
+- Will integrate with memory bank: successful configs stored, retrieved for similar kernels
+- KernelAgent: LLM guesses autotune configs (unreliable)
+- AutoKernel: no autotuning
+- **kernelopt: learned Bayesian search with memory-informed priors (planned)**
 
 ---
 
