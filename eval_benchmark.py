@@ -500,6 +500,8 @@ def run_kernelopt_problem(
         result["eager_ns"] = baselines.get("eager_ns", -1)
         result["compile_ns"] = baselines.get("compile_ns", -1)
     # For triton tutorials: no eager/compile baselines (standalone Triton files)
+    else:
+        baselines = {}
     if baselines.get("error"):
         result["error"] = f"baseline: {baselines['error']} | "
 
