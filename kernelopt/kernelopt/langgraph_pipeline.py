@@ -277,7 +277,8 @@ def profile_baseline(state: GraphState) -> dict:
     # computation including library calls (cuBLAS GEMM, cuDNN, etc.).
     from kernelopt.functions.benchmark import benchmark_kernel
     bench_result = benchmark_kernel(kernel_path)
-    baseline_wall_ms = bench_result.get("median_ms", -1)
+    _bw = bench_result.get("median_ms", -1)
+    baseline_wall_ms = _bw if _bw > 0 else float("inf")
     if baseline_wall_ms > 0:
         pipe_print(
             f"  Baseline: [cyan]{latency:.0f} ns[/] (NCU)  "
@@ -987,7 +988,8 @@ def profile_candidates(state: GraphState) -> dict:
             # Wall-clock benchmark: end-to-end timing including all kernels
             from kernelopt.functions.benchmark import benchmark_kernel
             bench = benchmark_kernel(kernel_file)
-            c.wall_ms = bench.get("median_ms", float("inf"))
+            _bench_ms = bench.get("median_ms", -1)
+            c.wall_ms = _bench_ms if _bench_ms > 0 else float("inf")
             baseline_wms = state.get("baseline_wall_ms", -1)
             if baseline_wms > 0 and c.wall_ms > 0:
                 c.wall_speedup = round(baseline_wms / c.wall_ms, 4)
