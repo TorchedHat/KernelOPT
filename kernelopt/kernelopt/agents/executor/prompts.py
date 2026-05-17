@@ -26,12 +26,22 @@ When you have implemented the change, call submit_kernel(kernel_source, change_s
     - if __name__ == "__main__" block with --profile-only support
   change_summary — one sentence describing what changed
 
+OPTIMIZATION BOUNDARY:
+You may ONLY modify @triton.jit kernel functions and their launch parameters
+(grid, num_warps, num_stages, BLOCK sizes, eviction policies). Do NOT:
+- Replace or rewrite extern_kernels.mm / extern_kernels.addmm (cuBLAS GEMM)
+- Replace or rewrite extern_kernels.convolution (cuDNN)
+- Replace any torch.mm / torch.matmul / torch.bmm with hand-written Triton matmul
+- Remove or modify at::native::* runtime kernel calls
+These library calls are already hardware-optimized and are part of the execution
+backbone. Your job is to optimize the Triton @jit kernel(s) within this graph.
+
 IMPORTANT:
 - The submitted file must be self-contained and executable with: python file.py --profile-only
-- kernel_function must include the ENTIRE computation (including torch.mm for GEMM if present)
-- If the plan says to fuse operations, kernel_function should call the fused Triton kernel
-  instead of separate torch.mm + Triton calls
+- kernel_function must include the ENTIRE computation unchanged except for the
+  @triton.jit kernel modifications
 - NEVER omit imports — always include import torch, import triton, import triton.language as tl
+- Preserve ALL extern_kernels calls exactly as they appear in the original
 
 If submit_kernel returns a validation error, diagnose what went wrong and resubmit.
 """

@@ -29,7 +29,9 @@ class PlanCandidate:
     csv_path: str = ""
     ncu_rep_path: str = ""
     latency_ns: float = float("inf")
+    wall_ms: float = float("inf")           # wall-clock end-to-end timing
     speedup: float = 1.0
+    wall_speedup: float = 1.0               # primary speedup metric (wall-clock)
 
 
 @dataclass
@@ -106,6 +108,7 @@ class PipelineState:
     # Current best
     best_kernel: str = ""
     best_latency_ns: float = float("inf")
+    best_wall_ms: float = float("inf")       # wall-clock end-to-end (primary speedup metric)
     best_ncu_rep: str = ""
 
     # Baseline profiling
@@ -151,12 +154,14 @@ class GraphState(TypedDict, total=False):
     baseline_csv: str
     baseline_ncu_rep: str
     baseline_latency_ns: float
+    baseline_wall_ms: float              # wall-clock end-to-end timing
     # NCU config from baseline profiling — reused for all candidates
     ncu_config: Optional[dict]
 
     # Current best
     best_kernel: str
     best_latency_ns: float
+    best_wall_ms: float                  # wall-clock end-to-end (primary speedup metric)
     best_ncu_rep: str
     current_profiling_context: dict
 

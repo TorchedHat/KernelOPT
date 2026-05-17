@@ -24,25 +24,30 @@ Use your tools to investigate:
   search_memory(query)           — check past optimization experience
 
 IMPORTANT: Always check optimization_strategy first. It tells you the
-high-level approach (fuse kernels, optimize individual kernel, or rewrite
-and fuse). Your plan MUST align with the strategy. If the strategy says
-"fuse", propose a plan that fuses operations. If it says "optimize_kernel",
-propose hardware-level optimizations on the existing kernel.
+high-level approach. Your plan MUST align with the strategy.
+
+OPTIMIZATION BOUNDARY:
+The kernel file may contain multiple GPU kernels (cuBLAS GEMM, cuDNN conv,
+Triton @jit kernels, runtime kernels). You may ONLY propose changes to the
+@triton.jit kernel function(s) and their launch parameters. Library calls
+(extern_kernels.mm, extern_kernels.addmm, extern_kernels.convolution) are
+already hardware-optimized and MUST NOT be replaced or rewritten.
 
 When you have gathered enough information, call submit_plan(plan) with
 your plan. The plan must:
-- Target a specific, measurable bottleneck backed by metric values
+- Target a specific, measurable bottleneck in the @triton.jit kernel(s)
 - Reference the exact construct in the kernel source to modify
 - Be implementable in one focused diff by the Executor Agent
 - Include enough detail in step.change and step.implementation_hints
   that the Executor does not need to re-read profiling data
 
 Optimization strategies to consider (in priority order):
-1. Fuse adjacent kernels to eliminate intermediate memory read/write
-2. Rewrite a library call (torch.mm, extern_kernels) as Triton for fusion
-3. Improve memory access patterns (coalescing, L2 compression)
-4. Adjust tile sizes (XBLOCK, YBLOCK) for better occupancy
-5. Reduce register pressure or branch divergence
+1. Adjust tile sizes (XBLOCK, YBLOCK, num_warps, num_stages) for better occupancy
+2. Improve memory access patterns (coalescing, vectorized loads, L2 compression)
+3. Reduce register pressure or branch divergence
+4. Change eviction policies and cache hints
+5. Fuse adjacent @triton.jit pointwise kernels (NOT library call fusion)
+6. Precision optimization (FP32 → BF16/FP16 where safe for stores/intermediates)
 """
 
 

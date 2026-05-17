@@ -160,6 +160,120 @@ def _check_cuda_with_llm_reference(
         harness_bin.unlink(missing_ok=True)
 
 
+def check_correctness_against_pytorch(
+    original_pytorch_path: str,
+    optimized_source: str,
+    optimized_kernel_path: str,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+    debug: bool = False,
+) -> tuple[bool, str]:
+    """Verify an optimized kernel against the original PyTorch program.
+
+    This is the compiler-first correctness approach: the original PyTorch
+    source IS the specification. We run both, compare outputs.
+
+    Used for synthesized kernels where _original_pytorch_path is available.
+    """
+    import json
+
+    script = f"""\
+import json, sys, os, torch, importlib.util
+
+torch.cuda.set_device(0)
+seeds = [0, 42, 1337]
+failures = []
+
+for seed in seeds:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    # Load original PyTorch module
+    spec1 = importlib.util.spec_from_file_location("_orig", "{original_pytorch_path}")
+    mod1 = importlib.util.module_from_spec(spec1)
+    sys.modules["_orig"] = mod1
+    spec1.loader.exec_module(mod1)
+
+    # Load optimized kernel module
+    spec2 = importlib.util.spec_from_file_location("_opt", "{optimized_kernel_path}")
+    mod2 = importlib.util.module_from_spec(spec2)
+    sys.modules["_opt"] = mod2
+    spec2.loader.exec_module(mod2)
+
+    get_inputs = getattr(mod1, "get_inputs", None) or getattr(mod2, "get_inputs", None)
+    if get_inputs is None:
+        print(json.dumps({{"passed": False, "error": "no get_inputs found"}}))
+        sys.exit(0)
+
+    inputs = get_inputs()
+
+    # Run original PyTorch
+    orig_fn = getattr(mod1, "kernel_function", None) or getattr(mod1, "call", None)
+    if hasattr(mod1, "Model") and hasattr(mod1, "get_init_inputs"):
+        model = mod1.Model(*mod1.get_init_inputs()).cuda().eval()
+        with torch.no_grad():
+            ref_out = model(*[t.cuda() if isinstance(t, torch.Tensor) else t for t in inputs])
+    elif orig_fn:
+        with torch.no_grad():
+            ref_out = orig_fn(*inputs)
+    else:
+        print(json.dumps({{"passed": False, "error": "no callable found in original"}}))
+        sys.exit(0)
+
+    # Run optimized kernel
+    opt_fn = getattr(mod2, "kernel_function", None) or getattr(mod2, "call", None)
+    if opt_fn is None:
+        print(json.dumps({{"passed": False, "error": "no kernel_function in optimized"}}))
+        sys.exit(0)
+
+    with torch.no_grad():
+        opt_out = opt_fn(*inputs)
+
+    # Compare
+    if isinstance(ref_out, (tuple, list)):
+        ref_out = ref_out[0]
+    if isinstance(opt_out, (tuple, list)):
+        opt_out = opt_out[0]
+
+    ref_f = ref_out.float().cpu()
+    opt_f = opt_out.float().cpu()
+    max_diff = (ref_f - opt_f).abs().max().item()
+    passed = torch.allclose(ref_f, opt_f, atol={atol}, rtol={rtol})
+
+    if not passed:
+        failures.append(f"seed={{seed}}: max_diff={{max_diff:.3e}} > atol={atol}")
+
+if failures:
+    print(json.dumps({{"passed": False, "failures": failures}}))
+else:
+    print(json.dumps({{"passed": True, "message": "Correctness passed (3 seeds, PyTorch reference)"}}))
+"""
+
+    try:
+        # Write optimized source to the expected path
+        Path(optimized_kernel_path).write_text(optimized_source)
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode == 0:
+            import json as _json
+            for line in proc.stdout.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("{"):
+                    result = _json.loads(line)
+                    if result.get("passed"):
+                        return True, result.get("message", "Passed")
+                    failures = result.get("failures", [result.get("error", "unknown")])
+                    return False, "Correctness FAILED:\n" + "\n".join(failures)
+        return False, f"Correctness subprocess failed (exit {proc.returncode}): {(proc.stderr or '')[-300:]}"
+    except subprocess.TimeoutExpired:
+        return False, "Correctness check timed out (120s)"
+    except Exception as e:
+        return False, f"Correctness check error: {e}"
+
+
 def check_correctness(
     original_path: str,
     optimized_source: str,
@@ -172,6 +286,7 @@ def check_correctness(
     region: str | None = None,
     kernel_args: list[str] | None = None,
     binary_path: str | None = None,
+    original_pytorch_path: str | None = None,
     debug: bool = False,
 ) -> tuple[bool, str]:
     """
@@ -207,6 +322,17 @@ def check_correctness(
         return _check_cuda_kernel(original_path, optimized_source, binary_path=binary_path)
 
     # Python kernels (Triton / Helion)
+    # Compiler-first correctness: if we have the original PyTorch source,
+    # use it as ground truth instead of asking the LLM to generate a reference.
+    if original_pytorch_path and Path(original_pytorch_path).exists():
+        opt_tmp = Path(tempfile.mktemp(suffix=".py", prefix="kpt_correctness_"))
+        return check_correctness_against_pytorch(
+            original_pytorch_path=original_pytorch_path,
+            optimized_source=optimized_source,
+            optimized_kernel_path=str(opt_tmp),
+            debug=debug,
+        )
+
     if use_agentic:
         from kernelopt.agents.correctness import run_correctness_agent
         return run_correctness_agent(

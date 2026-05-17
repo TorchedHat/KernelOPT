@@ -254,10 +254,23 @@ def profile_baseline(state: GraphState) -> dict:
     if framework == "auto":
         framework = baseline_ctx["framework_hint"]
 
-    pipe_print(
-        f"  Baseline: [cyan]{latency:.0f} ns[/]  "
-        f"Framework: [green]{framework}[/]"
-    )
+    # Dual metric: wall-clock do_bench for end-to-end speedup measurement.
+    # NCU latency above is per-kernel diagnosis; wall-clock captures the full
+    # computation including library calls (cuBLAS GEMM, cuDNN, etc.).
+    from kernelopt.functions.benchmark import benchmark_kernel
+    bench_result = benchmark_kernel(kernel_path)
+    baseline_wall_ms = bench_result.get("median_ms", -1)
+    if baseline_wall_ms > 0:
+        pipe_print(
+            f"  Baseline: [cyan]{latency:.0f} ns[/] (NCU)  "
+            f"[cyan]{baseline_wall_ms:.3f} ms[/] (wall-clock)  "
+            f"Framework: [green]{framework}[/]"
+        )
+    else:
+        pipe_print(
+            f"  Baseline: [cyan]{latency:.0f} ns[/]  "
+            f"Framework: [green]{framework}[/]"
+        )
 
     ui_done = get_pipeline_ui()
     if ui_done:
@@ -273,7 +286,9 @@ def profile_baseline(state: GraphState) -> dict:
         "baseline_csv": cfg.baseline_csv or str(output_dir / "baseline.csv"),
         "baseline_ncu_rep": str(output_dir / "baseline.ncu-rep"),
         "baseline_latency_ns": latency,
+        "baseline_wall_ms": baseline_wall_ms,
         "best_latency_ns": latency,
+        "best_wall_ms": baseline_wall_ms,
         "current_profiling_context": baseline_ctx,
         "framework": framework,
         "ncu_config": ncu_config,
@@ -293,24 +308,110 @@ You are the Strategy Analyst in a GPU kernel optimization pipeline.
 Given a kernel's multi-kernel profile and source code, decide the HIGH-LEVEL
 optimization strategy. You do NOT write code — you decide WHAT to optimize.
 
+CRITICAL CONSTRAINT: Library calls (extern_kernels.mm, cuBLAS GEMM,
+extern_kernels.convolution, cuDNN) MUST NOT be replaced or rewritten as
+hand-written Triton. They are already hardware-optimized. The optimization
+scope is LIMITED to @triton.jit kernel functions and their parameters.
+
 Return a JSON object with:
 {
-  "strategy_type": "fuse" | "optimize_kernel" | "rewrite_and_fuse",
+  "strategy_type": "optimize_kernel" | "fuse_pointwise" | "tune_parameters",
   "reasoning": "one paragraph explaining why",
-  "primary_target": "description of what to optimize",
-  "fusion_opportunity": "specific fusion description or null",
+  "primary_target": "description of what to optimize in the @triton.jit kernel(s)",
+  "fusion_opportunity": "specific pointwise fusion description or null",
   "plan_guidance": ["guidance string for plan A", "for plan B", "for plan C"]
 }
 
 Strategy types:
-- "fuse": Multiple kernels should be fused into one. The dominant cost is
-  a library call (cuBLAS GEMM, cuDNN conv) that can be rewritten as Triton
-  and fused with adjacent operations to eliminate intermediate memory traffic.
-- "optimize_kernel": The Triton kernel IS the bottleneck. Optimize tile sizes,
-  memory access patterns, occupancy, or algorithmic improvements.
-- "rewrite_and_fuse": The computation involves library calls AND Triton kernels.
-  At least one plan should attempt fusion, others can optimize the Triton kernel.
+- "optimize_kernel": The Triton kernel has inefficiencies. Optimize tile sizes,
+  memory access patterns, occupancy, vectorization, or precision.
+- "fuse_pointwise": Multiple Triton pointwise kernels can be fused into one to
+  eliminate intermediate memory traffic. Do NOT fuse with library calls.
+- "tune_parameters": The Triton kernel is already well-structured. Focus on
+  constexpr parameters (XBLOCK, num_warps, num_stages, eviction policies).
 """
+
+
+def _compute_ncu_tier(profiling_ctx: dict) -> dict:
+    """Derive optimization tier from NCU SOL% and occupancy metrics.
+
+    Returns a dict with strategy_type, reasoning, and recommended approaches
+    based on whether the kernel is memory-bound, compute-bound, or underutilized.
+    """
+    throughput = profiling_ctx.get("GPU Speed Of Light Throughput", {})
+    mem_section = profiling_ctx.get("Memory Workload Analysis", {})
+
+    mem_sol_str = throughput.get("Memory [%]", throughput.get("DRAM [%]", "0"))
+    compute_sol_str = throughput.get("Compute (SM) [%]", throughput.get("SM [%]", "0"))
+
+    try:
+        mem_sol = float(str(mem_sol_str).replace("%", "").strip())
+    except (ValueError, TypeError):
+        mem_sol = 0.0
+    try:
+        compute_sol = float(str(compute_sol_str).replace("%", "").strip())
+    except (ValueError, TypeError):
+        compute_sol = 0.0
+
+    if mem_sol > 80 or compute_sol > 80:
+        return {
+            "tier": 0,
+            "tier_name": "near_optimal",
+            "strategy_type": "tune_parameters",
+            "reasoning": f"Kernel is near hardware limits (Memory SOL: {mem_sol:.0f}%, Compute SOL: {compute_sol:.0f}%). "
+                         f"Only minor parameter tuning may help.",
+            "primary_target": "constexpr parameters (tile sizes, num_warps)",
+            "plan_guidance": [
+                "Try different XBLOCK/RBLOCK values to find the sweet spot for this specific workload size",
+                "Experiment with num_warps (2, 4, 8) and num_stages",
+                "Try eviction_policy hints on loads/stores",
+            ],
+        }
+    elif mem_sol > compute_sol:
+        return {
+            "tier": 1,
+            "tier_name": "memory_bound",
+            "strategy_type": "optimize_kernel",
+            "reasoning": f"Kernel is memory-bound (Memory SOL: {mem_sol:.0f}% > Compute SOL: {compute_sol:.0f}%). "
+                         f"Focus on reducing memory traffic and improving access patterns.",
+            "primary_target": "memory access patterns and data movement",
+            "plan_guidance": [
+                "Improve memory coalescing in loads/stores",
+                "Add vectorized loads (float4) to increase bandwidth utilization",
+                "Use L2 compression hints (eviction_policy) to reduce memory traffic",
+                "Increase tile sizes to improve L2 cache hit rate",
+            ],
+        }
+    elif compute_sol > mem_sol:
+        return {
+            "tier": 2,
+            "tier_name": "compute_bound",
+            "strategy_type": "optimize_kernel",
+            "reasoning": f"Kernel is compute-bound (Compute SOL: {compute_sol:.0f}% > Memory SOL: {mem_sol:.0f}%). "
+                         f"Focus on reducing instruction count and improving occupancy.",
+            "primary_target": "computation efficiency and occupancy",
+            "plan_guidance": [
+                "Reduce register pressure to increase occupancy",
+                "Eliminate branch divergence",
+                "Use BF16/FP16 for intermediate computations where precision allows",
+                "Reduce unnecessary operations (common subexpression elimination)",
+            ],
+        }
+    else:
+        return {
+            "tier": 3,
+            "tier_name": "underutilized",
+            "strategy_type": "optimize_kernel",
+            "reasoning": f"Kernel is underutilized (Memory SOL: {mem_sol:.0f}%, Compute SOL: {compute_sol:.0f}%). "
+                         f"Significant room for improvement in both memory and compute.",
+            "primary_target": "overall kernel efficiency",
+            "plan_guidance": [
+                "Increase tile sizes to improve parallelism and cache utilization",
+                "Fuse adjacent pointwise operations to eliminate intermediate buffers",
+                "Add vectorized loads and stores",
+                "Consider register tiling for compute-intensive sections",
+            ],
+        }
 
 
 def analyze_strategy(state: GraphState) -> dict:
@@ -325,13 +426,17 @@ def analyze_strategy(state: GraphState) -> dict:
     profiling_ctx = state.get("current_profiling_context", {})
     multi_kernel_summary = profiling_ctx.get("multi_kernel_summary", "")
 
+    # Derive optimization tier from NCU metrics
+    ncu_tier = _compute_ncu_tier(profiling_ctx)
+
     if not multi_kernel_summary or "single kernel" in multi_kernel_summary.lower():
         return {"optimization_strategy": {
-            "strategy_type": "optimize_kernel",
-            "reasoning": "Single kernel file — optimize the kernel directly.",
-            "primary_target": "the kernel",
+            "strategy_type": ncu_tier.get("strategy_type", "optimize_kernel"),
+            "reasoning": ncu_tier.get("reasoning", "Single kernel file — optimize the kernel directly."),
+            "primary_target": ncu_tier.get("primary_target", "the kernel"),
             "fusion_opportunity": None,
-            "plan_guidance": [],
+            "plan_guidance": ncu_tier.get("plan_guidance", []),
+            "ncu_tier": ncu_tier,
         }}
 
     kernel_source = state.get("best_kernel", "")
@@ -359,6 +464,15 @@ def analyze_strategy(state: GraphState) -> dict:
     past_successes = bank.get_successes(kernel_struct, hw_info)
     memory_context = bank.format_for_llm(past_failures + past_successes)
 
+    constraint_context = bank.format_constraints_for_llm()
+    if constraint_context:
+        memory_context = (memory_context + "\n\n" + constraint_context) if memory_context else constraint_context
+
+    templates = bank.get_templates(kernel_source, multi_kernel_summary)
+    if templates:
+        template_context = bank.format_for_llm(templates, max_entries=2)
+        memory_context = (memory_context + "\n\n" + template_context) if memory_context else template_context
+
     # Get reference kernel examples for this kernel type
     references = get_relevant_references(kernel_struct)
     if references:
@@ -377,8 +491,14 @@ def analyze_strategy(state: GraphState) -> dict:
         llm = build_llm(**llm_config)
         from langchain_core.messages import HumanMessage, SystemMessage
 
+        tier_context = (
+            f"## NCU-Guided Optimization Tier\n"
+            f"Tier {ncu_tier['tier']} ({ncu_tier['tier_name']}): {ncu_tier['reasoning']}\n"
+            f"Recommended approaches: {', '.join(ncu_tier.get('plan_guidance', []))}\n\n"
+        )
         user_msg = (
             f"## Multi-kernel profile\n{multi_kernel_summary}\n\n"
+            f"{tier_context}"
             f"## Kernel source (first 200 lines)\n```python\n{kernel_source[:8000]}\n```\n\n"
         )
         if memory_context:
@@ -631,6 +751,7 @@ def execute_plans(state: GraphState) -> dict:
             region=cfg.region,
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
+            original_pytorch_path=state.get("_original_pytorch_path"),
             debug=cfg.debug,
         )
         if _use_spinners():
@@ -788,9 +909,21 @@ def profile_candidates(state: GraphState) -> dict:
                 round(best_latency / c.latency_ns, 4)
                 if c.latency_ns > 0 else 0.0
             )
+
+            # Wall-clock benchmark: end-to-end timing including all kernels
+            from kernelopt.functions.benchmark import benchmark_kernel
+            bench = benchmark_kernel(kernel_file)
+            c.wall_ms = bench.get("median_ms", float("inf"))
+            baseline_wms = state.get("baseline_wall_ms", -1)
+            if baseline_wms > 0 and c.wall_ms > 0:
+                c.wall_speedup = round(baseline_wms / c.wall_ms, 4)
+            else:
+                c.wall_speedup = 0.0
+
             pipe_print(
                 f"    Plan {c.plan_letter} ({c.direction}): "
-                f"{c.latency_ns:.0f} ns -> {c.speedup:.2f}x"
+                f"NCU {c.latency_ns:.0f} ns ({c.speedup:.2f}x)  "
+                f"wall {c.wall_ms:.3f} ms ({c.wall_speedup:.2f}x)"
             )
         except Exception as e:
             pipe_print(
@@ -969,17 +1102,34 @@ def select_best_candidate(state: GraphState) -> dict:
         candidates=candidates,
     )
 
+    best_wall_ms = state.get("best_wall_ms", float("inf"))
+
     improved = False
     if candidates:
-        best_c = min(candidates, key=lambda c: c.latency_ns)
-        if best_c.latency_ns < best_latency:
-            best_kernel = best_c.optimized_kernel
-            best_latency = best_c.latency_ns
-            best_ncu_rep = best_c.ncu_rep_path
-            current_ctx = best_c.profiling_context
-            iter_result.best_candidate = best_c
-            iter_result.improved = True
-            improved = True
+        # Primary metric: wall-clock end-to-end timing.
+        # Fall back to NCU latency if wall-clock is unavailable.
+        candidates_with_wall = [c for c in candidates if c.wall_ms < float("inf")]
+        if candidates_with_wall:
+            best_c = min(candidates_with_wall, key=lambda c: c.wall_ms)
+            if best_wall_ms > 0 and best_c.wall_ms < best_wall_ms:
+                best_kernel = best_c.optimized_kernel
+                best_latency = best_c.latency_ns
+                best_wall_ms = best_c.wall_ms
+                best_ncu_rep = best_c.ncu_rep_path
+                current_ctx = best_c.profiling_context
+                iter_result.best_candidate = best_c
+                iter_result.improved = True
+                improved = True
+        else:
+            best_c = min(candidates, key=lambda c: c.latency_ns)
+            if best_c.latency_ns < best_latency:
+                best_kernel = best_c.optimized_kernel
+                best_latency = best_c.latency_ns
+                best_ncu_rep = best_c.ncu_rep_path
+                current_ctx = best_c.profiling_context
+                iter_result.best_candidate = best_c
+                iter_result.improved = True
+                improved = True
 
     if improved:
         no_improvement_streak = 0
@@ -1038,6 +1188,7 @@ def select_best_candidate(state: GraphState) -> dict:
     out = {
         "best_kernel": best_kernel,
         "best_latency_ns": best_latency,
+        "best_wall_ms": best_wall_ms,
         "best_ncu_rep": best_ncu_rep,
         "current_profiling_context": current_ctx,
         "no_improvement_streak": no_improvement_streak,
