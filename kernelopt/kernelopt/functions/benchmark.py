@@ -1,8 +1,12 @@
-"""Wall-clock benchmarking utility for eval_benchmark.py comparisons.
+"""Wall-clock benchmarking for GPU kernel performance measurement.
 
-NOT used inside the kernelopt pipeline. The pipeline uses NCU for kernel
-performance measurement. This module provides wall-clock timing for
-eval_benchmark.py's vs-eager and vs-compile comparison tables.
+Provides wall-clock timing using triton.testing.do_bench (CUDA Events
+based, median of multiple runs). Used for end-to-end comparison tables
+(vs PyTorch eager, vs torch.compile) and standalone kernel benchmarking.
+
+The kernelopt optimization pipeline uses NCU for per-kernel hardware
+analysis and optimization selection. This module complements NCU with
+end-to-end wall-clock timing that captures the full computation.
 """
 from __future__ import annotations
 
