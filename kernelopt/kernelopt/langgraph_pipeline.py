@@ -3,7 +3,7 @@ LangGraph-based optimization pipeline.
 
 Graph:
   [maybe_synthesize] → profile_baseline → analyze_strategy → generate_plans → execute_plans
-       → autotune_candidates → profile_candidates → summarize_results
+       → profile_candidates → summarize_results
        → select_best → increment_iteration
        → {should_continue: continue → generate_plans | stop → END}
 
@@ -689,13 +689,6 @@ def execute_plans(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Node 3.5: Autotune constexpr parameters for valid candidates (Triton only)
-# ---------------------------------------------------------------------------
-
-def autotune_candidates(state: GraphState) -> dict:
-    """Pass-through node. Feature 1 (autotuner) will be enabled separately."""
-    return {"candidates": list(state["candidates"])}
-
 
 # ---------------------------------------------------------------------------
 # Node 4: Profile valid candidates with NCU
@@ -1245,7 +1238,6 @@ def build_graph():
     graph.add_node("analyze_strategy", analyze_strategy)
     graph.add_node("generate_plans", generate_plans)
     graph.add_node("execute_plans", execute_plans)
-    graph.add_node("autotune_candidates", autotune_candidates)
     graph.add_node("profile_candidates", profile_candidates)
     graph.add_node("summarize_results", summarize_results)
     graph.add_node("select_best", select_best_candidate)
@@ -1276,8 +1268,7 @@ def build_graph():
         {"continue": "generate_plans", "stop": END},
     )
     graph.add_edge("generate_plans", "execute_plans")
-    graph.add_edge("execute_plans", "autotune_candidates")
-    graph.add_edge("autotune_candidates", "profile_candidates")
+    graph.add_edge("execute_plans", "profile_candidates")
     graph.add_edge("profile_candidates", "summarize_results")
     graph.add_edge("summarize_results", "select_best")
     graph.add_edge("select_best", "increment_iteration")
