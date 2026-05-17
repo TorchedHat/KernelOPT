@@ -51,6 +51,8 @@ if _CUDA_BIN not in os.environ.get("PATH", ""):
 # Problem discovery
 # ---------------------------------------------------------------------------
 
+BENCH_TRITON_TUTORIALS = PROJ_ROOT / "triton_officialdockernels"
+
 ASSIGNMENT_MAP = {
     "kb_l1": ("kernelbench", 1, None, None),
     "kb_l2": ("kernelbench", 2, None, None),
@@ -62,6 +64,7 @@ ASSIGNMENT_MAP = {
     "sol_l1_hi": ("sol", "L1", 47, 93),
     "sol_l2": ("sol", "L2", None, None),
     "sol_quant": ("sol", "Quant", None, None),
+    "triton_tutorials": ("triton_tutorials", None, None, None),
 }
 
 
@@ -112,6 +115,19 @@ def discover_problems(assignments: list[str]) -> list[dict]:
                     "bench_type": "sol",
                     "path": str(json_path),
                     "split": split,
+                })
+        elif bench_type == "triton_tutorials":
+            if not BENCH_TRITON_TUTORIALS.exists():
+                print(f"WARNING: {BENCH_TRITON_TUTORIALS} does not exist, skipping")
+                continue
+            for py_path in sorted(BENCH_TRITON_TUTORIALS.glob("*.py")):
+                if py_path.suffix != ".py" or py_path.name.endswith(".bak"):
+                    continue
+                problems.append({
+                    "problem_id": f"triton_{py_path.stem}",
+                    "dataset": "triton_tutorials",
+                    "bench_type": "triton",
+                    "path": str(py_path),
                 })
 
     return problems
@@ -474,13 +490,16 @@ def run_kernelopt_problem(
     else:
         kernel_path = problem["path"]
 
-    # Measure baselines
+    # Measure baselines (skip for standalone Triton — they ARE the baseline)
     if problem["bench_type"] == "kernelbench":
         baselines = measure_baselines_kb(kernel_path, gpu_id)
-    else:
+        result["eager_ns"] = baselines.get("eager_ns", -1)
+        result["compile_ns"] = baselines.get("compile_ns", -1)
+    elif problem["bench_type"] == "sol":
         baselines = measure_baselines_sol(problem["path"], gpu_id)
-    result["eager_ns"] = baselines.get("eager_ns", -1)
-    result["compile_ns"] = baselines.get("compile_ns", -1)
+        result["eager_ns"] = baselines.get("eager_ns", -1)
+        result["compile_ns"] = baselines.get("compile_ns", -1)
+    # For triton tutorials: no eager/compile baselines (standalone Triton files)
     if baselines.get("error"):
         result["error"] = f"baseline: {baselines['error']} | "
 
