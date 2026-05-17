@@ -590,22 +590,10 @@ def _parse_kpt_results(kpt_output: Path, result: dict) -> None:
                 result["speedup"] = round(
                     result["baseline_latency_ns"] / result["best_latency_ns"], 3
                 )
-            # Wall-clock comparisons: use best_wall_ms (full computation)
-            # not best_latency_ns (NCU single kernel) for apples-to-apples
-            best_wall_ns = gs.get("best_wall_ms", -1)
-            if best_wall_ns > 0:
-                best_wall_ns = best_wall_ns * 1e6  # ms to ns
-            result["best_wall_ms"] = gs.get("best_wall_ms", -1)
-            result["baseline_wall_ms"] = gs.get("baseline_wall_ms", -1)
-
-            if result["eager_ns"] > 0 and best_wall_ns > 0:
-                result["speedup_vs_eager"] = round(
-                    result["eager_ns"] / best_wall_ns, 3
-                )
-            if result["compile_ns"] > 0 and best_wall_ns > 0:
-                result["speedup_vs_compile"] = round(
-                    result["compile_ns"] / best_wall_ns, 3
-                )
+            # eager_ns and compile_ns are wall-clock measurements (full computation)
+            # baseline_latency_ns and best_latency_ns are NCU measurements (single kernel)
+            # These are different measurement types — not directly comparable as ratios.
+            # We store them as separate columns for the comparison table.
 
             bpc = gs.get("baseline_profiling_context", {})
             result["multi_kernel_summary"] = bpc.get("multi_kernel_summary", "")[:200]
