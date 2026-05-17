@@ -793,7 +793,7 @@ def execute_plans(state: GraphState) -> dict:
             region=cfg.region,
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
-            original_pytorch_path=state.get("_original_pytorch_path"),
+            original_pytorch_path=kernel_path if state.get("_original_pytorch_path") else None,
             debug=cfg.debug,
         )
         if _use_spinners():

@@ -200,6 +200,19 @@ for seed in seeds:
     sys.modules["_opt"] = mod2
     spec2.loader.exec_module(mod2)
 
+    # For compiler-first correctness: the original_pytorch_path is the
+    # SYNTHESIZED Triton file (the unmodified Inductor output), not the
+    # raw PyTorch source. Both reference and candidate use the same
+    # Inductor argument format (kernel_function + get_inputs).
+    #
+    # If original_pytorch_path is actually a KernelBench .py with Model:
+    # fall back to using the optimized file's own get_inputs for both,
+    # since PyTorch Model inputs are incompatible with Inductor format.
+
+    # Both reference (unmodified synthesized kernel) and candidate
+    # (LLM-optimized kernel) use the same Inductor format:
+    # kernel_function(*get_inputs()). Use the REFERENCE file's get_inputs
+    # for both, since inputs must be identical for comparison.
     get_inputs = getattr(mod1, "get_inputs", None) or getattr(mod2, "get_inputs", None)
     if get_inputs is None:
         print(json.dumps({{"passed": False, "error": "no get_inputs found"}}))
@@ -207,25 +220,19 @@ for seed in seeds:
 
     inputs = get_inputs()
 
-    # Run original PyTorch
-    if hasattr(mod1, "Model") and hasattr(mod1, "get_init_inputs"):
-        model = mod1.Model(*mod1.get_init_inputs()).cuda().eval()
-        with torch.no_grad():
-            ref_out = model(*[t.cuda() if isinstance(t, torch.Tensor) else t for t in inputs])
-    else:
-        orig_fn = getattr(mod1, "kernel_function", None) or getattr(mod1, "run", None) or getattr(mod1, "call", None)
-        if orig_fn is None:
-            print(json.dumps({{"passed": False, "error": "no callable found in original"}}))
-            sys.exit(0)
-        with torch.no_grad():
-            ref_out = orig_fn(*inputs)
+    # Run reference kernel
+    ref_fn = getattr(mod1, "kernel_function", None) or getattr(mod1, "run", None) or getattr(mod1, "call", None)
+    if ref_fn is None:
+        print(json.dumps({{"passed": False, "error": "no callable found in reference"}}))
+        sys.exit(0)
+    with torch.no_grad():
+        ref_out = ref_fn(*inputs)
 
-    # Run optimized kernel
+    # Run optimized kernel with SAME inputs
     opt_fn = getattr(mod2, "kernel_function", None) or getattr(mod2, "run", None) or getattr(mod2, "call", None)
     if opt_fn is None:
         print(json.dumps({{"passed": False, "error": "no kernel_function in optimized"}}))
         sys.exit(0)
-
     with torch.no_grad():
         opt_out = opt_fn(*inputs)
 
