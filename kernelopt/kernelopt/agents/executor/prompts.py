@@ -60,25 +60,39 @@ parameter to specify which runtime values trigger re-tuning.
 
 HELION KERNELS:
 For Helion kernels (using @helion.kernel and helion.language as hl), optimize
-by modifying the helion.Config parameters:
+by modifying the helion.Config parameters. Helion compiles to Triton and
+autotunes over a large search space including indexing methods, grid mappings,
+loop reordering, pipelining, and tile sizes.
+
+Full Config parameters:
     @helion.kernel(config=helion.Config(
-        block_sizes=[...],    # Tile sizes for each hl.tile dimension
-        num_warps=4,          # Warps per CTA
-        num_stages=3,         # Pipeline stages
-        loop_orders=[...],    # Reorder loop dimensions for locality
-        indexing='block_ptr', # Use TMA block pointers for better bandwidth
-        l2_grouping=32,       # Group tiles for L2 cache reuse
+        block_sizes=[64, 64, 32],       # Tile sizes for each hl.tile dimension
+        num_warps=8,                     # Warps per CTA
+        num_stages=6,                    # Pipeline stages for software pipelining
+        loop_orders=[[0, 1]],            # Reorder loop dimensions for locality
+        indexing='block_ptr',            # 'pointer' | 'block_ptr' | 'tensor_descriptor'
+        l2_groupings=[4],                # Group tiles for L2 cache reuse
+        pid_type='flat',                 # 'flat' | 'persistent_blocked'
+        range_unroll_factors=[0, 1],     # Unrolling for inner loops
+        range_warp_specializes=[None, False],  # Warp specialization per loop
+        range_num_stages=[0, 3],         # Per-loop pipeline stages
+        range_multi_buffers=[None, False],     # Multi-buffering per loop
+        range_flattens=[None, None],     # Loop flattening
     ))
+
 Key Helion optimization strategies:
-- Adjust block_sizes: larger tiles improve data reuse but increase register pressure
-- Use loop_orders to reorder nested hl.tile loops for better memory access
-- Set indexing='block_ptr' for TMA-based loads (requires 16-byte alignment)
-- Set l2_grouping to group adjacent tile blocks for L2 cache hits
-- Use hl.zeros/hl.full for explicit accumulator initialization
-- Helion fuses all operations inside hl.tile loops automatically — focus
-  on tile sizes and loop structure, not operation-level fusion
-- To enable Helion autotuning, remove the config parameter entirely:
-  @helion.kernel() will search for optimal parameters automatically
+- block_sizes: larger tiles improve data reuse but increase register/shmem pressure
+- loop_orders: reorder nested hl.tile loops for better memory access patterns
+- indexing: 'block_ptr' for TMA loads, 'tensor_descriptor' for newest GPUs
+- pid_type: 'persistent_blocked' for persistent kernels (better for small problems)
+- l2_groupings: group adjacent tile blocks for L2 cache hit rate
+- range_num_stages: pipeline specific loops independently (not just outer loop)
+- Helion fuses all PyTorch ops inside hl.tile loops automatically — focus on
+  tile sizes and loop structure, not operation-level fusion
+- To enable Helion autotuning (searches ~1500 configs in ~10 min), remove the
+  config parameter: @helion.kernel() triggers DifferentialEvolutionSearch
+- For lightweight tuning, provide multiple configs:
+  @helion.kernel(configs=[helion.Config(...), helion.Config(...)])
 
 IMPORTANT:
 - The submitted file must be self-contained and executable with: python file.py --profile-only
