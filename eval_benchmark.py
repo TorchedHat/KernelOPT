@@ -686,6 +686,7 @@ def main():
     wall_start = time.monotonic()
     successes = sum(1 for r in all_results if r.get("status") == "pass")
     failures = sum(1 for r in all_results if r.get("status") != "pass")
+    consecutive_cascade = 0
 
     for i, problem in enumerate(remaining, 1):
         pid = problem["problem_id"]
@@ -714,6 +715,26 @@ def main():
                 "error": f"{type(e).__name__}: {str(e)[:300]}\n{traceback.format_exc()[-200:]}",
                 "wall_time_s": 0,
             }
+
+        # Detect CUDA cascade: a crash poisons the GPU driver for all
+        # subsequent subprocesses. When we see 2 consecutive cascade errors,
+        # re-exec ourselves so the OS gives us a fresh driver handle.
+        is_cascade = "reported at some other API call" in result.get("error", "")
+        if is_cascade:
+            consecutive_cascade += 1
+        else:
+            consecutive_cascade = 0
+
+        if consecutive_cascade >= 1:
+            print(f"\n  *** CUDA cascade detected ({consecutive_cascade} in a row). "
+                  f"Re-launching with fresh process... ***\n")
+            # Save current results first
+            all_results.append(result)
+            results_file.write_text(json.dumps(all_results, indent=2, default=str))
+            indiv = output_base / f"result_{pid.replace('/', '_')}.json"
+            indiv.write_text(json.dumps(result, indent=2, default=str))
+            # Re-exec: replaces this process with a fresh one
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
         # Print summary
         status = result.get("status", "?")
