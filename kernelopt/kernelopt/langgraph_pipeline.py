@@ -272,24 +272,10 @@ def profile_baseline(state: GraphState) -> dict:
     if framework == "auto":
         framework = baseline_ctx["framework_hint"]
 
-    # Dual metric: wall-clock do_bench for end-to-end speedup measurement.
-    # NCU latency above is per-kernel diagnosis; wall-clock captures the full
-    # computation including library calls (cuBLAS GEMM, cuDNN, etc.).
-    from kernelopt.functions.benchmark import benchmark_kernel
-    bench_result = benchmark_kernel(kernel_path)
-    _bw = bench_result.get("median_ms", -1)
-    baseline_wall_ms = _bw if _bw > 0 else float("inf")
-    if baseline_wall_ms > 0:
-        pipe_print(
-            f"  Baseline: [cyan]{latency:.0f} ns[/] (NCU)  "
-            f"[cyan]{baseline_wall_ms:.3f} ms[/] (wall-clock)  "
-            f"Framework: [green]{framework}[/]"
-        )
-    else:
-        pipe_print(
-            f"  Baseline: [cyan]{latency:.0f} ns[/]  "
-            f"Framework: [green]{framework}[/]"
-        )
+    pipe_print(
+        f"  Baseline: [cyan]{latency:.0f} ns[/]  "
+        f"Framework: [green]{framework}[/]"
+    )
 
     ui_done = get_pipeline_ui()
     if ui_done:
@@ -305,9 +291,7 @@ def profile_baseline(state: GraphState) -> dict:
         "baseline_csv": cfg.baseline_csv or str(output_dir / "baseline.csv"),
         "baseline_ncu_rep": str(output_dir / "baseline.ncu-rep"),
         "baseline_latency_ns": latency,
-        "baseline_wall_ms": baseline_wall_ms,
         "best_latency_ns": latency,
-        "best_wall_ms": baseline_wall_ms,
         "current_profiling_context": baseline_ctx,
         "framework": framework,
         "ncu_config": ncu_config,
@@ -985,21 +969,9 @@ def profile_candidates(state: GraphState) -> dict:
                 if c.latency_ns > 0 else 0.0
             )
 
-            # Wall-clock benchmark: end-to-end timing including all kernels
-            from kernelopt.functions.benchmark import benchmark_kernel
-            bench = benchmark_kernel(kernel_file)
-            _bench_ms = bench.get("median_ms", -1)
-            c.wall_ms = _bench_ms if _bench_ms > 0 else float("inf")
-            baseline_wms = state.get("baseline_wall_ms", -1)
-            if baseline_wms > 0 and c.wall_ms > 0:
-                c.wall_speedup = round(baseline_wms / c.wall_ms, 4)
-            else:
-                c.wall_speedup = 0.0
-
             pipe_print(
                 f"    Plan {c.plan_letter} ({c.direction}): "
-                f"NCU {c.latency_ns:.0f} ns ({c.speedup:.2f}x)  "
-                f"wall {c.wall_ms:.3f} ms ({c.wall_speedup:.2f}x)"
+                f"{c.latency_ns:.0f} ns ({c.speedup:.2f}x)"
             )
         except Exception as e:
             pipe_print(
@@ -1178,34 +1150,17 @@ def select_best_candidate(state: GraphState) -> dict:
         candidates=candidates,
     )
 
-    best_wall_ms = state.get("best_wall_ms", float("inf"))
-
     improved = False
     if candidates:
-        # Primary metric: wall-clock end-to-end timing.
-        # Fall back to NCU latency if wall-clock is unavailable.
-        candidates_with_wall = [c for c in candidates if c.wall_ms < float("inf")]
-        if candidates_with_wall:
-            best_c = min(candidates_with_wall, key=lambda c: c.wall_ms)
-            if best_wall_ms > 0 and best_c.wall_ms < best_wall_ms:
-                best_kernel = best_c.optimized_kernel
-                best_latency = best_c.latency_ns
-                best_wall_ms = best_c.wall_ms
-                best_ncu_rep = best_c.ncu_rep_path
-                current_ctx = best_c.profiling_context
-                iter_result.best_candidate = best_c
-                iter_result.improved = True
-                improved = True
-        else:
-            best_c = min(candidates, key=lambda c: c.latency_ns)
-            if best_c.latency_ns < best_latency:
-                best_kernel = best_c.optimized_kernel
-                best_latency = best_c.latency_ns
-                best_ncu_rep = best_c.ncu_rep_path
-                current_ctx = best_c.profiling_context
-                iter_result.best_candidate = best_c
-                iter_result.improved = True
-                improved = True
+        best_c = min(candidates, key=lambda c: c.latency_ns)
+        if best_c.latency_ns < best_latency:
+            best_kernel = best_c.optimized_kernel
+            best_latency = best_c.latency_ns
+            best_ncu_rep = best_c.ncu_rep_path
+            current_ctx = best_c.profiling_context
+            iter_result.best_candidate = best_c
+            iter_result.improved = True
+            improved = True
 
     if improved:
         no_improvement_streak = 0
@@ -1264,7 +1219,6 @@ def select_best_candidate(state: GraphState) -> dict:
     out = {
         "best_kernel": best_kernel,
         "best_latency_ns": best_latency,
-        "best_wall_ms": best_wall_ms,
         "best_ncu_rep": best_ncu_rep,
         "current_profiling_context": current_ctx,
         "no_improvement_streak": no_improvement_streak,
