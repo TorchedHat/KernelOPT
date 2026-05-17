@@ -938,10 +938,13 @@ def profile_candidates(state: GraphState) -> dict:
 
         try:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
-            # For synthesized files with full computation, candidates also have
-            # multiple kernels (GEMM + Triton + RNG). Use fresh NCU config
-            # (not baseline's) and discover the user kernel after profiling.
-            candidate_ncu_config = None if is_multi_kernel else saved_ncu_config
+            # Candidates may have different launch patterns than baseline:
+            # - Multi-kernel files (synthesized): different kernel count/order
+            # - @triton.autotune candidates: warmup launches before real kernel
+            # Use fresh NCU config (LLM re-analyzes the candidate source) to
+            # avoid stale launch_skip/launch_count from baseline.
+            has_autotune = "@triton.autotune" in c.optimized_kernel
+            candidate_ncu_config = None if (is_multi_kernel or has_autotune) else saved_ncu_config
 
             _prof_args = dict(
                 kernel_path=kernel_file,
