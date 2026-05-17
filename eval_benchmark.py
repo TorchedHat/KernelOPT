@@ -52,6 +52,7 @@ if _CUDA_BIN not in os.environ.get("PATH", ""):
 # ---------------------------------------------------------------------------
 
 BENCH_TRITON_TUTORIALS = PROJ_ROOT / "triton_officialdockernels"
+BENCH_HELION_TUTORIALS = PROJ_ROOT / "helion_tutorials"
 
 ASSIGNMENT_MAP = {
     "kb_l1": ("kernelbench", 1, None, None),
@@ -65,6 +66,7 @@ ASSIGNMENT_MAP = {
     "sol_l2": ("sol", "L2", None, None),
     "sol_quant": ("sol", "Quant", None, None),
     "triton_tutorials": ("triton_tutorials", None, None, None),
+    "helion_tutorials": ("helion_tutorials", None, None, None),
 }
 
 
@@ -127,6 +129,19 @@ def discover_problems(assignments: list[str]) -> list[dict]:
                     "problem_id": f"triton_{py_path.stem}",
                     "dataset": "triton_tutorials",
                     "bench_type": "triton",
+                    "path": str(py_path),
+                })
+        elif bench_type == "helion_tutorials":
+            if not BENCH_HELION_TUTORIALS.exists():
+                print(f"WARNING: {BENCH_HELION_TUTORIALS} does not exist, skipping")
+                continue
+            for py_path in sorted(BENCH_HELION_TUTORIALS.glob("*.py")):
+                if py_path.suffix != ".py":
+                    continue
+                problems.append({
+                    "problem_id": f"helion_{py_path.stem}",
+                    "dataset": "helion_tutorials",
+                    "bench_type": "helion",
                     "path": str(py_path),
                 })
 
