@@ -529,6 +529,11 @@ def run_kernelopt_problem(
         "--model", model,
     ]
 
+    # Standalone Triton/Helion tutorial kernels need --kernel-args '--profile-only'
+    # to skip their internal benchmarks during NCU profiling
+    if problem["bench_type"] in ("triton", "helion"):
+        cmd.extend(["--kernel-args", "--profile-only"])
+
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
