@@ -23,7 +23,21 @@ WARMUP_REPS = 25
 TIMING_REPS = 100
 
 
-_BENCH_SCRIPT = '''\
+def benchmark_kernel(
+    kernel_path: str,
+    gpu_id: int | None = None,
+    warmup: int = WARMUP_REPS,
+    reps: int = TIMING_REPS,
+    timeout: int = 120,
+) -> dict:
+    """Benchmark a kernel file end-to-end using CUDA Events in a subprocess.
+
+    Returns dict with keys: median_ms, min_ms, max_ms, error.
+    The subprocess isolation ensures we don't hold a CUDA context in the
+    parent process (critical for EXCLUSIVE_PROCESS GPU mode and cascade
+    prevention).
+    """
+    script = f"""\
 import json, sys, os, torch
 
 torch.cuda.set_device(0)
@@ -39,7 +53,7 @@ fn = getattr(mod, "kernel_function", None) or getattr(mod, "call", None)
 get_inputs = getattr(mod, "get_inputs", None)
 
 if fn is None or get_inputs is None:
-    print(json.dumps({"error": "kernel_function or get_inputs not found", "median_ms": -1}))
+    print(json.dumps({{"error": "kernel_function or get_inputs not found", "median_ms": -1}}))
     sys.exit(0)
 
 try:
@@ -64,24 +78,7 @@ try:
         print(json.dumps({{"median_ms": median_ms, "min_ms": times[0], "max_ms": times[-1]}}))
 except Exception as e:
     print(json.dumps({{"error": str(e)[:300], "median_ms": -1}}))
-'''
-
-
-def benchmark_kernel(
-    kernel_path: str,
-    gpu_id: int | None = None,
-    warmup: int = WARMUP_REPS,
-    reps: int = TIMING_REPS,
-    timeout: int = 120,
-) -> dict:
-    """Benchmark a kernel file end-to-end using CUDA Events in a subprocess.
-
-    Returns dict with keys: median_ms, min_ms, max_ms, error.
-    The subprocess isolation ensures we don't hold a CUDA context in the
-    parent process (critical for EXCLUSIVE_PROCESS GPU mode and cascade
-    prevention).
-    """
-    script = _BENCH_SCRIPT.format(warmup=warmup, reps=reps)
+"""
 
     env = os.environ.copy()
     if gpu_id is not None:
