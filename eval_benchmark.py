@@ -486,6 +486,95 @@ print(json.dumps(result))
         return {"eager_ns": -1, "compile_ns": -1, "error": str(e)[:200]}
 
 
+def measure_baselines_tutorial(kernel_path: str, gpu_id: int) -> dict:
+    """Measure eager + torch.compile baselines for a tutorial kernel with reference_function.
+
+    Uses the same torch.cuda.Event timing as KB/SOL baselines.
+    Looks for reference_function + get_inputs in the kernel file.
+    """
+    script = f"""\
+import json, sys, os, torch, importlib.util
+os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
+torch.cuda.set_device(0)
+
+spec = importlib.util.spec_from_file_location("prob", "{kernel_path}")
+mod = importlib.util.module_from_spec(spec)
+sys.modules["prob"] = mod
+spec.loader.exec_module(mod)
+
+ref_fn = getattr(mod, "reference_function", None)
+get_inputs = getattr(mod, "get_inputs", None)
+
+result = {{"eager_ns": -1, "compile_ns": -1, "error": ""}}
+
+if ref_fn is None or get_inputs is None:
+    result["error"] = "no reference_function or get_inputs found"
+    print(json.dumps(result))
+    sys.exit(0)
+
+inputs = get_inputs()
+
+try:
+    with torch.no_grad():
+        for _ in range(25):
+            ref_fn(*inputs)
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(100):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            ref_fn(*inputs)
+            e.record()
+            torch.cuda.synchronize()
+            times.append(s.elapsed_time(e) * 1e6)
+        times.sort()
+        result["eager_ns"] = times[len(times)//2]
+except Exception as ex:
+    result["error"] = f"eager: {{ex}}"
+
+try:
+    compiled = torch.compile(ref_fn, mode="default")
+    with torch.no_grad():
+        for _ in range(5):
+            compiled(*inputs)
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(100):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            compiled(*inputs)
+            e.record()
+            torch.cuda.synchronize()
+            times.append(s.elapsed_time(e) * 1e6)
+        times.sort()
+        result["compile_ns"] = times[len(times)//2]
+except Exception as ex:
+    result["error"] += f" compile: {{ex}}"
+
+print(json.dumps(result))
+"""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+            timeout=BASELINE_TIMEOUT_S,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)},
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("{"):
+                    return json.loads(line)
+        return {"eager_ns": -1, "compile_ns": -1,
+                "error": f"exit={proc.returncode}: {(proc.stderr or '')[-200:]}"}
+    except subprocess.TimeoutExpired:
+        return {"eager_ns": -1, "compile_ns": -1, "error": "baseline timeout"}
+    except Exception as e:
+        return {"eager_ns": -1, "compile_ns": -1, "error": str(e)[:200]}
+
+
 # ---------------------------------------------------------------------------
 # SOL JSON -> .py conversion (for kernelopt run)
 # ---------------------------------------------------------------------------
@@ -634,7 +723,9 @@ def run_kernelopt_problem(
     else:
         kernel_path = problem["path"]
 
-    # Measure baselines (skip for standalone Triton — they ARE the baseline)
+    # Measure baselines (eager + torch.compile of the reference implementation).
+    # All types have a PyTorch reference: KernelBench has Model, SOL has run(),
+    # Triton/Helion tutorials have reference_function (PyTorch spec from website).
     if problem["bench_type"] == "kernelbench":
         baselines = measure_baselines_kb(kernel_path, gpu_id)
         result["eager_ns"] = baselines.get("eager_ns", -1)
@@ -643,7 +734,10 @@ def run_kernelopt_problem(
         baselines = measure_baselines_sol(problem["path"], gpu_id)
         result["eager_ns"] = baselines.get("eager_ns", -1)
         result["compile_ns"] = baselines.get("compile_ns", -1)
-    # For triton tutorials: no eager/compile baselines (standalone Triton files)
+    elif problem["bench_type"] in ("triton", "helion"):
+        baselines = measure_baselines_tutorial(kernel_path, gpu_id)
+        result["eager_ns"] = baselines.get("eager_ns", -1)
+        result["compile_ns"] = baselines.get("compile_ns", -1)
     else:
         baselines = {}
     if baselines.get("error"):
@@ -694,47 +788,40 @@ def run_kernelopt_problem(
 
     # Wall-clock benchmark kpt outputs for consistent cross-comparison.
     # Uses identical torch.cuda.Event timing as eager/compile baselines.
-    #
-    # Triton/Helion tutorials: best_kernel.py stays in tutorial format (no
-    # kernel_function/get_inputs), so wall-clock benchmarking is not possible.
-    # For tutorials, the NCU-based `speedup` from kpt is the primary metric
-    # (internally consistent — both baseline and optimized use same NCU config).
-    #
-    # KernelBench/SOL: best_kernel.py has kernel_function + get_inputs, so
-    # wall-clock benchmarking works. Speedups vs eager/compile are all wall-clock.
-    if problem["bench_type"] not in ("triton", "helion"):
-        best_kp = result.get("best_kernel_path", "")
-        if best_kp and Path(best_kp).exists():
-            # 1. Wall-clock benchmark (torch.cuda.Event, boost clocks)
-            bench = wall_clock_benchmark(best_kp, gpu_id)
-            result["best_wall_ns"] = bench.get("wall_ns", -1)
-            if bench.get("error"):
-                result["error"] += f"best_bench: {bench['error']} | "
+    # All kernel types have kernel_function + get_inputs (KernelBench/SOL after
+    # synthesis, Triton/Helion tutorials via kpt interface wrapper).
+    best_kp = result.get("best_kernel_path", "")
+    if best_kp and Path(best_kp).exists():
+        # 1. Wall-clock benchmark (torch.cuda.Event, boost clocks)
+        bench = wall_clock_benchmark(best_kp, gpu_id)
+        result["best_wall_ns"] = bench.get("wall_ns", -1)
+        if bench.get("error"):
+            result["error"] += f"best_bench: {bench['error']} | "
 
-            # 2. NCU with --clock-control none (kernel duration at boost clocks)
-            #    This gives T_kernel directly comparable to T_wall for Amdahl's analysis
-            ncu_boost = ncu_boost_duration(best_kp, gpu_id, kpt_output / "_boost_profile")
-            result["best_kernel_boost_ns"] = ncu_boost.get("kernel_ns", -1)
-            if ncu_boost.get("error"):
-                result["error"] += f"boost_ncu: {ncu_boost['error']} | "
+        # 2. NCU with --clock-control none (kernel duration at boost clocks)
+        #    This gives T_kernel directly comparable to T_wall for Amdahl's analysis
+        ncu_boost = ncu_boost_duration(best_kp, gpu_id, kpt_output / "_boost_profile")
+        result["best_kernel_boost_ns"] = ncu_boost.get("kernel_ns", -1)
+        if ncu_boost.get("error"):
+            result["error"] += f"boost_ncu: {ncu_boost['error']} | "
 
-        # Compute wall-clock-consistent speedups (all same measurement method)
-        if result["eager_ns"] > 0 and result["best_wall_ns"] > 0:
-            result["speedup_vs_eager"] = round(
-                result["eager_ns"] / result["best_wall_ns"], 3
-            )
-        if result["compile_ns"] > 0 and result["best_wall_ns"] > 0:
-            result["speedup_vs_compile"] = round(
-                result["compile_ns"] / result["best_wall_ns"], 3
-            )
+    # Compute wall-clock-consistent speedups (all same measurement method)
+    if result["eager_ns"] > 0 and result["best_wall_ns"] > 0:
+        result["speedup_vs_eager"] = round(
+            result["eager_ns"] / result["best_wall_ns"], 3
+        )
+    if result["compile_ns"] > 0 and result["best_wall_ns"] > 0:
+        result["speedup_vs_compile"] = round(
+            result["compile_ns"] / result["best_wall_ns"], 3
+        )
 
-        # Amdahl's analysis: kernel execution % of total wall time.
-        # Both best_kernel_boost_ns and best_wall_ns use boost clocks → directly comparable.
-        if result["best_kernel_boost_ns"] > 0 and result["best_wall_ns"] > 0:
-            result["kernel_pct"] = round(
-                min(result["best_kernel_boost_ns"] / result["best_wall_ns"] * 100, 100.0), 1
-            )
-            result["host_overhead_pct"] = round(100.0 - result["kernel_pct"], 1)
+    # Amdahl's analysis: kernel execution % of total wall time.
+    # Both best_kernel_boost_ns and best_wall_ns use boost clocks → directly comparable.
+    if result["best_kernel_boost_ns"] > 0 and result["best_wall_ns"] > 0:
+        result["kernel_pct"] = round(
+            min(result["best_kernel_boost_ns"] / result["best_wall_ns"] * 100, 100.0), 1
+        )
+        result["host_overhead_pct"] = round(100.0 - result["kernel_pct"], 1)
 
     return result
 
@@ -956,45 +1043,36 @@ def main():
 
         if status == "pass":
             successes += 1
-            is_tutorial = problem.get("bench_type") in ("triton", "helion")
 
-            if is_tutorial:
-                # Triton/Helion tutorials: NCU-based speedup (internally consistent)
-                baseline_us = result.get("baseline_latency_ns", -1) / 1e3 if result.get("baseline_latency_ns", -1) > 0 else -1
-                best_us = result.get("best_latency_ns", -1) / 1e3 if result.get("best_latency_ns", -1) > 0 else -1
-                speedup = result.get("speedup", 0)
-                print(f"  PASS  baseline(ncu)={baseline_us:.1f}us best(ncu)={best_us:.1f}us "
-                      f"speedup={speedup:.2f}x  [{wall:.0f}s]")
+            # Unified output format for all kernel types
+            eager_us = result.get("eager_ns", -1) / 1e3 if result.get("eager_ns", -1) > 0 else -1
+            compile_us = result.get("compile_ns", -1) / 1e3 if result.get("compile_ns", -1) > 0 else -1
+            best_wall_us = result.get("best_wall_ns", -1) / 1e3 if result.get("best_wall_ns", -1) > 0 else -1
+            vs_eager = result.get("speedup_vs_eager", 0)
+            vs_compile = result.get("speedup_vs_compile", 0)
+            kernel_pct = result.get("kernel_pct", 0)
+
+            # Line 1: timings
+            parts = []
+            if eager_us > 0:
+                parts.append(f"eager={eager_us:.1f}us")
+            if compile_us > 0:
+                parts.append(f"compile={compile_us:.1f}us")
+            if best_wall_us > 0:
+                parts.append(f"best={best_wall_us:.1f}us")
+            print(f"  PASS  {' '.join(parts)}")
+            # Line 2: speedups + kernel efficiency
+            sp_parts = []
+            if vs_eager > 0:
+                sp_parts.append(f"vs_eager={vs_eager:.2f}x")
+            if vs_compile > 0:
+                sp_parts.append(f"vs_compile={vs_compile:.2f}x")
+            if kernel_pct > 0:
+                sp_parts.append(f"kernel={kernel_pct:.0f}%")
+            if sp_parts:
+                print(f"        {' '.join(sp_parts)}  [{wall:.0f}s]")
             else:
-                # KernelBench/SOL: wall-clock speedups + Amdahl's analysis
-                eager_us = result.get("eager_ns", -1) / 1e3 if result.get("eager_ns", -1) > 0 else -1
-                compile_us = result.get("compile_ns", -1) / 1e3 if result.get("compile_ns", -1) > 0 else -1
-                best_wall_us = result.get("best_wall_ns", -1) / 1e3 if result.get("best_wall_ns", -1) > 0 else -1
-                vs_eager = result.get("speedup_vs_eager", 0)
-                vs_compile = result.get("speedup_vs_compile", 0)
-                kernel_pct = result.get("kernel_pct", 0)
-
-                # Line 1: timings
-                parts = []
-                if eager_us > 0:
-                    parts.append(f"eager={eager_us:.1f}us")
-                if compile_us > 0:
-                    parts.append(f"compile={compile_us:.1f}us")
-                if best_wall_us > 0:
-                    parts.append(f"best={best_wall_us:.1f}us")
-                print(f"  PASS  {' '.join(parts)}")
-                # Line 2: speedups + kernel efficiency
-                sp_parts = []
-                if vs_eager > 0:
-                    sp_parts.append(f"vs_eager={vs_eager:.2f}x")
-                if vs_compile > 0:
-                    sp_parts.append(f"vs_compile={vs_compile:.2f}x")
-                if kernel_pct > 0:
-                    sp_parts.append(f"kernel={kernel_pct:.0f}%")
-                if sp_parts:
-                    print(f"        {' '.join(sp_parts)}  [{wall:.0f}s]")
-                else:
-                    print(f"        [{wall:.0f}s]")
+                print(f"        [{wall:.0f}s]")
         else:
             failures += 1
             err = result.get("error", "")[:80]

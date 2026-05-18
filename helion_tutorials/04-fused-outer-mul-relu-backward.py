@@ -1,10 +1,25 @@
-"""Helion Tutorial Problem 4: Fused Outer Multiplication - Backwards."""
+"""Helion Tutorial Problem 4: Fused Outer Multiplication - Backwards.
+
+Source: https://helionlang.com/helion_tutorials.html#problem-4-fused-outer-multiplication-backwards
+"""
 import torch
 import helion
 import helion.language as hl
+from torch import Tensor
+
+
+def mul_relu_block_back_spec(x: Tensor, y: Tensor, dz: Tensor) -> tuple[Tensor, Tensor]:
+    x = x.clone()
+    y = y.clone()
+    x = x.requires_grad_(True)
+    y = y.requires_grad_(True)
+    z = torch.relu(x * y[:, None])
+    grad_x, grad_y = torch.autograd.grad(z, [x, y], dz, retain_graph=True)
+    return grad_x, grad_y
+
 
 @helion.kernel(config=helion.Config(block_sizes=[[32, 32], [32, 32]]))
-def kernel_function(
+def mul_relu_block_back_kernel(
     x: torch.Tensor, y: torch.Tensor, dz: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     n0 = x.size(1)
@@ -31,6 +46,15 @@ def kernel_function(
 
     return dx, dy
 
+
+# ===== kpt interface =====
+
+def reference_function(*inputs):
+    return mul_relu_block_back_spec(*inputs)
+
+def kernel_function(*inputs):
+    return mul_relu_block_back_kernel(*inputs)
+
 def get_inputs():
     return [
         torch.randn(512, 1024, device="cuda"),
@@ -38,9 +62,14 @@ def get_inputs():
         torch.randn(512, 1024, device="cuda"),
     ]
 
+
 if __name__ == "__main__":
     import sys
     inputs = get_inputs()
-    result = kernel_function(*inputs)
-    if "--profile-only" not in sys.argv:
-        print("PASS")
+    if "--profile-only" in sys.argv:
+        kernel_function(*inputs)
+        torch.cuda.synchronize()
+    else:
+        kernel_function(*inputs)
+        torch.cuda.synchronize()
+        print("Kernel executed successfully.")
