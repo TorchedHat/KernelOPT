@@ -153,16 +153,17 @@ def discover_problems(assignments: list[str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def wall_clock_benchmark(kernel_path: str, gpu_id: int) -> dict:
-    """Wall-clock benchmark a Triton/synthesized kernel file using torch.cuda.Event.
+    """Wall-clock benchmark a kernel file using triton.testing.do_bench.
 
-    Uses identical timing method as measure_baselines_kb/sol (25 warmup,
-    100 reps, median) so all measurements are directly comparable.
+    do_bench uses CUDA events internally (25 warmup, 100 reps, median).
+    Same measurement method as measure_baselines_kb/sol/tutorial.
     Returns {"wall_ns": float, "error": str}.
     """
     script = f"""\
 import json, sys, os, torch, importlib.util
 os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
 torch.cuda.set_device(0)
+from triton.testing import do_bench
 
 spec = importlib.util.spec_from_file_location("_bench", "{kernel_path}")
 mod = importlib.util.module_from_spec(spec)
@@ -182,20 +183,8 @@ if fn is None or get_inputs is None:
 try:
     inputs = get_inputs()
     with torch.no_grad():
-        for _ in range(25):
-            fn(*inputs)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            fn(*inputs)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["wall_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: fn(*inputs), warmup=25, rep=100)
+        result["wall_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] = f"benchmark: {{ex}}"
 
@@ -277,11 +266,15 @@ with torch.no_grad():
 
 
 def measure_baselines_kb(problem_path: str, gpu_id: int) -> dict:
-    """Measure PyTorch eager and torch.compile baselines for a KB problem."""
+    """Measure PyTorch eager and torch.compile baselines for a KB problem.
+
+    Uses triton.testing.do_bench (CUDA events, 25 warmup, 100 reps, median).
+    """
     script = f"""\
 import json, sys, os, torch, importlib.util
 os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
 torch.cuda.set_device(0)
+from triton.testing import do_bench
 
 spec = importlib.util.spec_from_file_location("prob", "{problem_path}")
 mod = importlib.util.module_from_spec(spec)
@@ -294,40 +287,16 @@ result = {{"eager_ns": -1, "compile_ns": -1, "error": ""}}
 
 try:
     with torch.no_grad():
-        for _ in range(25):
-            model(*inputs)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            model(*inputs)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["eager_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: model(*inputs), warmup=25, rep=100)
+        result["eager_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] = f"eager: {{ex}}"
 
 try:
     compiled = torch.compile(model, mode="default")
     with torch.no_grad():
-        for _ in range(5):
-            compiled(*inputs)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            compiled(*inputs)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["compile_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: compiled(*inputs), warmup=25, rep=100)
+        result["compile_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] += f" compile: {{ex}}"
 
@@ -425,42 +394,20 @@ run_fn = mod.__dict__["run"]
 
 result = {{"eager_ns": -1, "compile_ns": -1, "error": ""}}
 
+from triton.testing import do_bench
+
 try:
     with torch.no_grad():
-        for _ in range(25):
-            run_fn(*args)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            run_fn(*args)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["eager_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: run_fn(*args), warmup=25, rep=100)
+        result["eager_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] = f"eager: {{ex}}"
 
 try:
     compiled_fn = torch.compile(run_fn, mode="default")
     with torch.no_grad():
-        for _ in range(5):
-            compiled_fn(*args)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            compiled_fn(*args)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["compile_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: compiled_fn(*args), warmup=25, rep=100)
+        result["compile_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] += f" compile: {{ex}}"
 
@@ -489,13 +436,14 @@ print(json.dumps(result))
 def measure_baselines_tutorial(kernel_path: str, gpu_id: int) -> dict:
     """Measure eager + torch.compile baselines for a tutorial kernel with reference_function.
 
-    Uses the same torch.cuda.Event timing as KB/SOL baselines.
+    Uses triton.testing.do_bench (CUDA events, 25 warmup, 100 reps, median).
     Looks for reference_function + get_inputs in the kernel file.
     """
     script = f"""\
 import json, sys, os, torch, importlib.util
 os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
 torch.cuda.set_device(0)
+from triton.testing import do_bench
 
 spec = importlib.util.spec_from_file_location("prob", "{kernel_path}")
 mod = importlib.util.module_from_spec(spec)
@@ -516,40 +464,16 @@ inputs = get_inputs()
 
 try:
     with torch.no_grad():
-        for _ in range(25):
-            ref_fn(*inputs)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            ref_fn(*inputs)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["eager_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: ref_fn(*inputs), warmup=25, rep=100)
+        result["eager_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] = f"eager: {{ex}}"
 
 try:
     compiled = torch.compile(ref_fn, mode="default")
     with torch.no_grad():
-        for _ in range(5):
-            compiled(*inputs)
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            compiled(*inputs)
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e) * 1e6)
-        times.sort()
-        result["compile_ns"] = times[len(times)//2]
+        median_ms = do_bench(lambda: compiled(*inputs), warmup=25, rep=100)
+        result["compile_ns"] = float(median_ms) * 1e6
 except Exception as ex:
     result["error"] += f" compile: {{ex}}"
 
