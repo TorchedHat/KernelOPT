@@ -119,6 +119,16 @@ def find_bottleneck_kernel(filepath: str) -> tuple[int, list[dict]]:
     return all_kernels[0]["kernel_id"], all_kernels
 
 
+def sum_all_kernel_durations(filepath: str) -> float:
+    """Sum Duration (ns) across all kernels in an NCU CSV.
+
+    Used for Amdahl's analysis: total GPU kernel time vs wall-clock time.
+    Returns total_ns (0.0 if no kernels found).
+    """
+    _, all_kernels = find_bottleneck_kernel(filepath)
+    return sum(k["duration_ns"] for k in all_kernels)
+
+
 def parse_ncu_csv(
     filepath: str, kernel_id: int = 0
 ) -> tuple[dict, list, dict]:

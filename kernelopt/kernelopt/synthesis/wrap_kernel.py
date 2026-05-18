@@ -163,6 +163,34 @@ def build_standalone_kernel(
     wrapper_code = _translate_call_to_kernel_function(call_source, kernel_parts, inductor_source)
     get_inputs_code = _extract_get_inputs(inductor_source)
 
+    # Extract helper functions (e.g. decompose_k_mm_*) that call() references
+    # but aren't @triton.jit kernels. Without these the standalone file crashes.
+    kernel_name_set = set()
+    for kp in kernel_parts:
+        m = re.search(r'def\s+(\w+)\s*\(', kp)
+        if m:
+            kernel_name_set.add(m.group(1))
+    helper_funcs = _extract_helper_functions(inductor_source, kernel_name_set)
+
+    # After translation, some Inductor references may remain (e.g. extern_kernels.bmm,
+    # reinterpret_tensor nested inside other calls, triton_helpers in kernel code).
+    # Add imports for any that survived translation.
+    all_code = "\n".join(kernel_parts + helper_funcs + [wrapper_code, get_inputs_code])
+    if "extern_kernels" in all_code:
+        imports.append("from torch._inductor.select_algorithm import extern_kernels")
+    if re.search(r'\breinterpret_tensor\b', all_code):
+        imports.append("reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor")
+    if "triton_helpers" in all_code:
+        imports.append("from torch._inductor.runtime import triton_helpers")
+    if "assert_size_stride" in all_code:
+        imports.append("assert_size_stride = torch._C._dynamo.guards.assert_size_stride")
+    if re.search(r'\bempty_strided_cuda\b', all_code):
+        imports.append("empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda")
+    if re.search(r'\btl_math\b', all_code):
+        imports.append("import triton.language.math as tl_math")
+    if "get_raw_stream" in all_code:
+        imports.append("from torch._C import _cuda_getCurrentRawStream as get_raw_stream")
+
     main_block = [
         'if __name__ == "__main__":',
         "    import argparse",
@@ -179,7 +207,7 @@ def build_standalone_kernel(
         '        print("Kernel executed successfully.")',
     ]
 
-    parts = imports + [""] + kernel_parts + ["", wrapper_code, "", get_inputs_code, ""] + main_block + [""]
+    parts = imports + [""] + kernel_parts + helper_funcs + ["", wrapper_code, "", get_inputs_code, ""] + main_block + [""]
     return "\n".join(parts)
 
 
@@ -208,6 +236,82 @@ def _extract_function_from_source(source: str, func_name: str) -> str:
     return "\n".join(func_lines)
 
 
+def _parse_kernel_signatures(kernel_parts: list[str]) -> dict[str, tuple[list[str], list[str]]]:
+    """Parse @triton.jit kernel signatures to extract positional and constexpr params.
+
+    Returns {kernel_name: (positional_params, constexpr_params)}.
+    """
+    sigs = {}
+    for kp in kernel_parts:
+        m = re.search(r'def\s+(\w+)\s*\(([^)]+)\)', kp)
+        if not m:
+            continue
+        name = m.group(1)
+        raw_params = m.group(2)
+        positional = []
+        constexpr = []
+        for param in raw_params.split(","):
+            param = param.strip()
+            pname = param.split(":")[0].strip()
+            if not pname:
+                continue
+            if "tl.constexpr" in param or "constexpr" in param:
+                constexpr.append(pname)
+            else:
+                positional.append(pname)
+        sigs[name] = (positional, constexpr)
+    return sigs
+
+
+# Reasonable defaults for Inductor constexpr params
+_CONSTEXPR_DEFAULTS = {
+    "XBLOCK": 1024,
+    "YBLOCK": 8,
+    "RBLOCK": 64,
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "BLOCK_K": 32,
+}
+
+
+def _extract_helper_functions(inductor_source: str, kernel_names: set[str]) -> list[str]:
+    """Extract non-kernel helper function definitions from Inductor source.
+
+    Finds functions like decompose_k_mm_512_split_8() that are called by call()
+    but aren't @triton.jit kernels.
+    """
+    helpers = []
+    lines = inductor_source.split("\n")
+    i = 0
+    while i < len(lines):
+        m = re.match(r'def\s+(\w+)\s*\(', lines[i])
+        if m:
+            fname = m.group(1)
+            # Skip call(), benchmark_compiled_module(), and known kernel functions
+            if fname in ("call", "benchmark_compiled_module") or fname in kernel_names:
+                i += 1
+                continue
+            # Extract the full function body
+            func_lines = [lines[i]]
+            i += 1
+            while i < len(lines):
+                line = lines[i]
+                if line.strip() == "":
+                    func_lines.append(line)
+                    i += 1
+                    continue
+                if line[0] not in (" ", "\t") and line.strip() != "":
+                    break
+                func_lines.append(line)
+                i += 1
+            while func_lines and func_lines[-1].strip() == "":
+                func_lines.pop()
+            helpers.append("\n".join(func_lines))
+        else:
+            i += 1
+    return helpers
+
+
 def _translate_call_to_kernel_function(
     call_source: str,
     kernel_parts: list[str],
@@ -216,14 +320,11 @@ def _translate_call_to_kernel_function(
     """Translate Inductor's call(args) to a clean kernel_function(*inputs).
 
     Converts:
-      - extern_kernels.mm(a, b, out=c) -> c = torch.mm(a, b)
-      - extern_kernels.addmm(bias, a, b, out=c) -> c = torch.addmm(bias, a, b)
-      - extern_kernels.convolution(...) -> torch.nn.functional.conv2d(...)
-      - empty_strided_cuda(shape, stride, dtype) -> torch.empty(shape, dtype=dtype, device='cuda')
-      - kernel.run(ptrs, numel, stream=s) -> kernel[grid](ptrs, numel, XBLOCK=1024)
-      - reinterpret_tensor(t, shape, stride, offset) -> t.view(shape) or t.as_strided(...)
-      - assert_size_stride, del statements -> removed
-      - get_raw_stream(0) -> removed (not needed for direct launch)
+      - extern_kernels.mm/addmm/convolution -> torch equivalents
+      - empty_strided_cuda -> torch.empty
+      - kernel.run(args, stream=s) -> kernel[grid](positional_args, CONSTEXPR=val)
+      - reinterpret_tensor -> kept as-is (imported separately)
+      - assert_size_stride, del, DeviceGuard -> removed
     """
     if not call_source:
         if kernel_parts:
@@ -233,6 +334,7 @@ def _translate_call_to_kernel_function(
     lines = call_source.split("\n")
     out = []
     kernel_names = set()
+    kernel_sigs = _parse_kernel_signatures(kernel_parts)
 
     for kp in kernel_parts:
         m = re.search(r'def\s+(\w+)\s*\(', kp)
@@ -272,24 +374,11 @@ def _translate_call_to_kernel_function(
         if not indent and stripped and not stripped.startswith("#"):
             indent = "    "
 
-        # extern_kernels.mm(a, b, out=c) -> c = torch.mm(a, b)
-        m = re.match(r'\s*extern_kernels\.mm\((.+?),\s*(.+?),\s*out=(\w+)\)', stripped)
-        if m:
-            a, b, c = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-            b = re.sub(r'reinterpret_tensor\((\w+),\s*\([^)]+\),\s*\([^)]+\),\s*\d+\)', r'\1.T', b)
-            out.append(f"{indent}{c} = torch.mm({a}, {b})")
-            continue
+        # extern_kernels.mm/addmm/bmm: keep as-is (extern_kernels imported).
+        # The old approach tried to translate reinterpret_tensor → .T which was
+        # only correct for transposition and broke on broadcasts/reshapes.
 
-        # extern_kernels.addmm(bias, a, b, out=c) -> c = torch.addmm(bias, a, b)
-        m = re.match(r'\s*extern_kernels\.addmm\((.+?),\s*(.+?),\s*(.+?),\s*out=(\w+)\)', stripped)
-        if m:
-            bias, a, b, c = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
-            b = re.sub(r'reinterpret_tensor\((\w+),\s*\([^)]+\),\s*\([^)]+\),\s*\d+\)', r'\1.T', b)
-            bias = re.sub(r'reinterpret_tensor\((\w+),\s*\([^)]+\),\s*\([^)]+\),\s*\d+\)', r'\1', bias)
-            out.append(f"{indent}{c} = torch.addmm({bias}, {a}, {b})")
-            continue
-
-        # extern_kernels.convolution(...) -> torch.nn.functional.conv2d(...)
+        # extern_kernels.convolution(...) -> torch.ops.aten.convolution(...)
         m = re.match(r'\s*(\w+)\s*=\s*extern_kernels\.convolution\((.+)\)', stripped)
         if m:
             var = m.group(1)
@@ -307,7 +396,7 @@ def _translate_call_to_kernel_function(
                 line,
             )
 
-        # kernel.run(args, stream=s) -> kernel[grid](args, XBLOCK=1024)
+        # kernel.run(args, stream=s) -> kernel[grid](positional_args, CONSTEXPR=val, ...)
         for kname in kernel_names:
             pattern = rf'{kname}\.run\(([^)]+)\)'
             m = re.search(pattern, stripped)
@@ -315,12 +404,49 @@ def _translate_call_to_kernel_function(
                 raw_args = m.group(1)
                 args_list = [a.strip() for a in raw_args.split(",")]
                 clean_args = [a for a in args_list if not a.startswith("stream=")]
-                numel = clean_args[-1] if clean_args else "1"
-                ptr_args = clean_args[:-1]
-                all_a = ", ".join(ptr_args + [numel])
-                line = f"{indent}grid = (triton.cdiv({numel}, 1024),)"
-                out.append(line)
-                out.append(f"{indent}{kname}[grid]({all_a}, XBLOCK=1024)")
+
+                # Use parsed kernel signature to split positional vs constexpr
+                if kname in kernel_sigs:
+                    pos_params, cexpr_params = kernel_sigs[kname]
+                    n_pos = len(pos_params)
+                    pos_args = clean_args[:n_pos]
+                    extra_args = clean_args[n_pos:]  # grid/meta args from .run()
+
+                    # Build constexpr kwargs with defaults
+                    constexpr_kwargs = []
+                    for cp in cexpr_params:
+                        val = _CONSTEXPR_DEFAULTS.get(cp, 1024)
+                        constexpr_kwargs.append(f"{cp}={val}")
+
+                    # Grid computation:
+                    # - If kernel has constexpr params (pointwise/reduction):
+                    #   grid = cdiv(last_scalar_param, first_constexpr_default)
+                    # - If kernel has NO constexpr (template kernels):
+                    #   extra .run() args are grid scalars from Inductor template
+                    #   Use first extra arg as the primary grid dimension
+                    if cexpr_params:
+                        grid_numel = pos_args[-1] if pos_args else "1"
+                        grid_block = _CONSTEXPR_DEFAULTS.get(cexpr_params[0], 1024)
+                    elif extra_args:
+                        # Template kernel: .run() passes grid dims as extra args
+                        grid_numel = extra_args[0]
+                        grid_block = 1
+                    else:
+                        grid_numel = pos_args[-1] if pos_args else "1"
+                        grid_block = 1024
+
+                    all_a = ", ".join(pos_args)
+                    if constexpr_kwargs:
+                        all_a += ", " + ", ".join(constexpr_kwargs)
+                else:
+                    # Fallback: no signature info, use old behavior
+                    numel = clean_args[-1] if clean_args else "1"
+                    all_a = ", ".join(clean_args) + ", XBLOCK=1024"
+                    grid_numel = numel
+                    grid_block = 1024
+
+                out.append(f"{indent}grid = (triton.cdiv({grid_numel}, {grid_block}),)")
+                out.append(f"{indent}{kname}[grid]({all_a})")
                 break
         else:
             # buf1 = buf0; del buf0  -- handle buffer reuse
@@ -329,12 +455,9 @@ def _translate_call_to_kernel_function(
                 out.append(f"{indent}{m.group(1)} = {m.group(2)}")
                 continue
 
-            # reinterpret_tensor in non-extern context
-            line = re.sub(
-                r'reinterpret_tensor\((\w+),\s*(\([^)]+\)),\s*\([^)]+\),\s*\d+\)',
-                r'\1.reshape(\2)',
-                line,
-            )
+            # reinterpret_tensor: keep as-is (imported separately).
+            # The old .reshape() translation was lossy — it dropped stride/broadcast
+            # semantics, causing RuntimeErrors on broadcast views.
 
             out.append(line)
             continue
