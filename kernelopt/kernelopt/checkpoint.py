@@ -101,6 +101,11 @@ def serialize_for_checkpoint(state: GraphState) -> dict[str, Any]:
         "candidates": cand_json,
         "plans": plans_json,
         "correctness_failure_items": list(state.get("correctness_failure_items", [])),
+        "optimization_strategy": state.get("optimization_strategy"),
+        "_original_pytorch_path": state.get("_original_pytorch_path"),
+        "_original_pytorch_source": state.get("_original_pytorch_source"),
+        "baseline_wall_ms": state.get("baseline_wall_ms", -1),
+        "best_wall_ms": state.get("best_wall_ms", -1),
     }
 
 
@@ -189,6 +194,11 @@ def graph_state_from_checkpoint_payload(
         "candidates": candidates,
         "plans": plans,
         "correctness_failure_items": list(gs.get("correctness_failure_items", [])),
+        "optimization_strategy": gs.get("optimization_strategy"),
+        "_original_pytorch_path": gs.get("_original_pytorch_path"),
+        "_original_pytorch_source": gs.get("_original_pytorch_source"),
+        "baseline_wall_ms": gs.get("baseline_wall_ms", -1),
+        "best_wall_ms": gs.get("best_wall_ms", -1),
     }
 
     return graph_state, entry

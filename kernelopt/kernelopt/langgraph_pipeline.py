@@ -2,9 +2,14 @@
 LangGraph-based optimization pipeline.
 
 Graph:
-  profile_baseline → generate_plans → execute_plans → profile_candidates
-       → summarize_results → select_best → increment_iteration
+  [maybe_synthesize] → profile_baseline → analyze_strategy → generate_plans → execute_plans
+       → profile_candidates → summarize_results
+       → select_best → increment_iteration
        → {should_continue: continue → generate_plans | stop → END}
+
+maybe_synthesize runs only when framework=="pytorch" (auto-detected).
+It converts PyTorch input to Triton via torch.compile, then the rest
+of the pipeline proceeds on the synthesized Triton kernel.
 """
 
 from __future__ import annotations
@@ -104,13 +109,14 @@ def profile_baseline(state: GraphState) -> dict:
         get_latency_ns,
         run_profiler_agent,
     )
-    from kernelopt.functions.csv_parser import parse_ncu_csv
+    from kernelopt.functions.csv_parser import parse_ncu_csv, find_bottleneck_kernel
 
     cfg = state["config"]
     output_dir = Path(state["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = state["kernel_path"]
     kernel_id = state.get("kernel_id", 0)
+    auto_kernel_id = (kernel_id == 0 and not cfg.kernel_name)
 
     ui = get_pipeline_ui()
     if ui:
@@ -171,6 +177,96 @@ def profile_baseline(state: GraphState) -> dict:
         ctx_json = str(output_dir / "baseline_profiling_context.json")
         pipe_print(f"  [dim]Profiling context: {ctx_json}[/]")
 
+        # Multi-kernel bottleneck discovery: if kernel_id was auto (0) and
+        # the CSV has multiple kernels, find the most expensive one and
+        # re-parse the context for that kernel.
+        csv_path = str(output_dir / "baseline.csv")
+        if auto_kernel_id and Path(csv_path).exists():
+            bottleneck_id, all_kernels = find_bottleneck_kernel(csv_path)
+            if all_kernels and len(all_kernels) > 1:
+                pipe_print(f"  [dim]Multi-kernel file: {len(all_kernels)} kernels detected[/]")
+                for k in all_kernels[:8]:
+                    is_target = k["kernel_id"] == bottleneck_id
+                    marker = "[bold cyan]→[/]" if is_target else "  "
+                    dur_us = k["duration_ns"] / 1000
+                    name = k["kernel_name"][:55]
+                    kind = k.get("kind", "")
+                    tag = f" [dim]({kind})[/]" if kind and kind != "user" else ""
+                    pipe_print(f"  {marker} [{k['kernel_id']}] {dur_us:>10.2f} µs  {name}{tag}")
+                if len(all_kernels) > 8:
+                    pipe_print(f"    ... and {len(all_kernels) - 8} more")
+
+            if all_kernels and len(all_kernels) > 1:
+                # For synthesized multi-kernel files, the baseline latency should
+                # be for the kernel that matches what candidates will produce.
+                # Candidates are standalone Triton files, so baseline latency
+                # should be the Triton kernel's latency (for apples-to-apples comparison).
+                # The planner still sees ALL kernels (including library calls) for strategy.
+                is_synth = bool(state.get("_original_pytorch_path"))
+                if is_synth:
+                    user_kernels = [k for k in all_kernels if k.get("kind") == "user"]
+                    if user_kernels:
+                        kernel_id = user_kernels[0]["kernel_id"]
+                        pipe_print(
+                            f"  [bold]Baseline target: "
+                            f"ID={kernel_id} ({user_kernels[0]['kernel_name'][:50]})[/]"
+                        )
+                    else:
+                        kernel_id = bottleneck_id
+                        pipe_print(
+                            f"  [bold]Bottleneck: "
+                            f"ID={kernel_id} ({all_kernels[0]['kernel_name'][:50]})[/]"
+                        )
+                else:
+                    kernel_id = bottleneck_id
+                    pipe_print(
+                        f"  [bold]Bottleneck: "
+                        f"ID={kernel_id} ({all_kernels[0]['kernel_name'][:50]})[/]"
+                    )
+
+                sections, rules, launch = parse_ncu_csv(csv_path, kernel_id)
+                baseline_ctx = build_profiling_context(
+                    sections, rules, launch, kernel_path, kernel_id=kernel_id
+                )
+
+                # Inject multi-kernel summary into profiling context so the planner
+                # knows about ALL kernels (including the cuBLAS GEMM bottleneck).
+                if all_kernels and len(all_kernels) > 1:
+                    kernel_summary = []
+                    for k in all_kernels:
+                        dur_us = k["duration_ns"] / 1000
+                        kind = k.get("kind", "user")
+                        kernel_summary.append(
+                            f"  [{k['kernel_id']}] {dur_us:>10.2f} µs  {k['kernel_name'][:60]}  ({kind})"
+                        )
+                    user_kernel_count = sum(1 for k in all_kernels if k.get("kind") == "user")
+                    if user_kernel_count == 0:
+                        guidance = (
+                            "No user @triton.jit kernels found — computation is entirely "
+                            "library calls. Optimization scope is very limited."
+                        )
+                    elif user_kernel_count == 1:
+                        guidance = (
+                            "Focus optimization on the single @triton.jit user kernel. "
+                            "Library calls (cuBLAS, cuDNN) are already hardware-optimized."
+                        )
+                    else:
+                        guidance = (
+                            f"{user_kernel_count} @triton.jit user kernels found. "
+                            "Consider fusing adjacent user kernels or optimizing the "
+                            "most expensive one."
+                        )
+
+                    baseline_ctx["multi_kernel_summary"] = (
+                        f"This file launches {len(all_kernels)} GPU kernels. "
+                        f"The bottleneck is kernel [{all_kernels[0]['kernel_id']}] "
+                        f"({all_kernels[0]['kernel_name'][:40]}) at "
+                        f"{all_kernels[0]['duration_ns']/1000:.1f} µs "
+                        f"({all_kernels[0].get('kind','user')}). "
+                        f"{guidance}\n"
+                        + "\n".join(kernel_summary)
+                    )
+
     latency = get_latency_ns(baseline_ctx)
     framework = state["framework"]
     if framework == "auto":
@@ -199,9 +295,269 @@ def profile_baseline(state: GraphState) -> dict:
         "current_profiling_context": baseline_ctx,
         "framework": framework,
         "ncu_config": ncu_config,
+        "kernel_id": kernel_id,
     }
     _checkpoint_stage(state, out, "after_baseline")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Node 1.5: Strategy Analysis (two-phase planning)
+# ---------------------------------------------------------------------------
+
+_STRATEGY_SYSTEM_PROMPT = """\
+You are the Strategy Analyst in a GPU kernel optimization pipeline.
+
+Given a kernel's multi-kernel profile and source code, decide the HIGH-LEVEL
+optimization strategy. You do NOT write code — you decide WHAT to optimize.
+
+IMPORTANT GUIDANCE: Library calls (extern_kernels.mm, cuBLAS GEMM,
+extern_kernels.convolution, cuDNN) are already hardware-optimized by NVIDIA.
+Focus primarily on @triton.jit kernel functions and their parameters —
+this is where real acceleration happens. Rewriting library calls as Triton
+is extremely difficult and has a very low success rate. Only recommend it
+if strong NCU evidence shows the library call is suboptimal for this
+specific workload size and hardware.
+
+Return a JSON object with:
+{
+  "strategy_type": "optimize_kernel" | "fuse_pointwise" | "tune_parameters",
+  "reasoning": "one paragraph explaining why",
+  "primary_target": "description of what to optimize in the @triton.jit kernel(s)",
+  "fusion_opportunity": "specific pointwise fusion description or null",
+  "plan_guidance": ["guidance string for plan A", "for plan B", "for plan C"]
+}
+
+Strategy types:
+- "optimize_kernel": The Triton kernel has inefficiencies. Optimize tile sizes,
+  memory access patterns, occupancy, vectorization, or precision.
+- "fuse_pointwise": Multiple Triton pointwise kernels can be fused into one to
+  eliminate intermediate memory traffic. Do NOT fuse with library calls.
+- "tune_parameters": The Triton kernel is already well-structured. Focus on
+  constexpr parameters (XBLOCK, num_warps, num_stages, eviction policies).
+"""
+
+
+def _compute_ncu_tier(profiling_ctx: dict) -> dict:
+    """Derive optimization tier from NCU SOL% and occupancy metrics.
+
+    Returns a dict with strategy_type, reasoning, and recommended approaches
+    based on whether the kernel is memory-bound, compute-bound, or underutilized.
+    """
+    throughput = profiling_ctx.get("GPU Speed Of Light Throughput", {})
+    mem_section = profiling_ctx.get("Memory Workload Analysis", {})
+
+    mem_sol_str = throughput.get("Memory [%]", throughput.get("DRAM [%]", "0"))
+    compute_sol_str = throughput.get("Compute (SM) [%]", throughput.get("SM [%]", "0"))
+
+    try:
+        mem_sol = float(str(mem_sol_str).replace("%", "").strip())
+    except (ValueError, TypeError):
+        mem_sol = 0.0
+    try:
+        compute_sol = float(str(compute_sol_str).replace("%", "").strip())
+    except (ValueError, TypeError):
+        compute_sol = 0.0
+
+    if mem_sol > 80 or compute_sol > 80:
+        return {
+            "tier": 0,
+            "tier_name": "near_optimal",
+            "strategy_type": "tune_parameters",
+            "reasoning": f"Kernel is near hardware limits (Memory SOL: {mem_sol:.0f}%, Compute SOL: {compute_sol:.0f}%). "
+                         f"Only minor parameter tuning may help.",
+            "primary_target": "constexpr parameters (tile sizes, num_warps)",
+            "plan_guidance": [
+                "Try different XBLOCK/RBLOCK values to find the sweet spot for this specific workload size",
+                "Experiment with num_warps (2, 4, 8) and num_stages",
+                "Try eviction_policy hints on loads/stores",
+            ],
+        }
+    elif mem_sol > compute_sol:
+        return {
+            "tier": 1,
+            "tier_name": "memory_bound",
+            "strategy_type": "optimize_kernel",
+            "reasoning": f"Kernel is memory-bound (Memory SOL: {mem_sol:.0f}% > Compute SOL: {compute_sol:.0f}%). "
+                         f"Focus on reducing memory traffic and improving access patterns.",
+            "primary_target": "memory access patterns and data movement",
+            "plan_guidance": [
+                "Improve memory coalescing in loads/stores",
+                "Add vectorized loads (float4) to increase bandwidth utilization",
+                "Use L2 compression hints (eviction_policy) to reduce memory traffic",
+                "Increase tile sizes to improve L2 cache hit rate",
+            ],
+        }
+    elif compute_sol > mem_sol:
+        return {
+            "tier": 2,
+            "tier_name": "compute_bound",
+            "strategy_type": "optimize_kernel",
+            "reasoning": f"Kernel is compute-bound (Compute SOL: {compute_sol:.0f}% > Memory SOL: {mem_sol:.0f}%). "
+                         f"Focus on reducing instruction count and improving occupancy.",
+            "primary_target": "computation efficiency and occupancy",
+            "plan_guidance": [
+                "Reduce register pressure to increase occupancy",
+                "Eliminate branch divergence",
+                "Use BF16/FP16 for intermediate computations where precision allows",
+                "Reduce unnecessary operations (common subexpression elimination)",
+            ],
+        }
+    else:
+        return {
+            "tier": 3,
+            "tier_name": "underutilized",
+            "strategy_type": "optimize_kernel",
+            "reasoning": f"Kernel is underutilized (Memory SOL: {mem_sol:.0f}%, Compute SOL: {compute_sol:.0f}%). "
+                         f"Significant room for improvement in both memory and compute.",
+            "primary_target": "overall kernel efficiency",
+            "plan_guidance": [
+                "Increase tile sizes to improve parallelism and cache utilization",
+                "Fuse adjacent pointwise operations to eliminate intermediate buffers",
+                "Add vectorized loads and stores",
+                "Consider register tiling for compute-intensive sections",
+            ],
+        }
+
+
+def analyze_strategy(state: GraphState) -> dict:
+    """Phase 1: Decide the macro optimization strategy before generating plans.
+
+    For multi-kernel files: one LLM call to analyze the kernel landscape and
+    decide whether to fuse, optimize, or rewrite. The strategy guides all N
+    planners in Phase 2.
+
+    For single-kernel files: pass-through (strategy = optimize_kernel).
+    """
+    profiling_ctx = state.get("current_profiling_context", {})
+    multi_kernel_summary = profiling_ctx.get("multi_kernel_summary", "")
+
+    # Derive optimization tier from NCU metrics
+    ncu_tier = _compute_ncu_tier(profiling_ctx)
+
+    if not multi_kernel_summary or "single kernel" in multi_kernel_summary.lower():
+        return {"optimization_strategy": {
+            "strategy_type": ncu_tier.get("strategy_type", "optimize_kernel"),
+            "reasoning": ncu_tier.get("reasoning", "Single kernel file — optimize the kernel directly."),
+            "primary_target": ncu_tier.get("primary_target", "the kernel"),
+            "fusion_opportunity": None,
+            "plan_guidance": ncu_tier.get("plan_guidance", []),
+            "ncu_tier": ncu_tier,
+        }}
+
+    kernel_source = state.get("best_kernel", "")
+
+    # If there are no @triton.jit kernels in the source, optimization scope
+    # is extremely limited (computation is entirely library calls).
+    if "@triton.jit" not in kernel_source and "No user @triton.jit" in multi_kernel_summary:
+        pipe_print("  [yellow]No @triton.jit kernels — computation is all library calls. "
+                   "Limited optimization scope.[/]")
+        return {"optimization_strategy": {
+            "strategy_type": "tune_parameters",
+            "reasoning": "No user @triton.jit kernels found. The computation is entirely "
+                         "library calls (cuBLAS/cuDNN). Only minor parameter tuning of the "
+                         "computation graph may help.",
+            "primary_target": "launch parameters and memory layout",
+            "fusion_opportunity": None,
+            "plan_guidance": [
+                "Check if batch dimensions or tensor layouts can be improved",
+                "Look for redundant memory copies or suboptimal strides",
+            ],
+            "ncu_tier": ncu_tier,
+        }}
+
+    from kernelopt.llm import build_llm
+    import json as _json
+
+    cfg = state["config"]
+    llm_config = {
+        "model": cfg.planner_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
+
+    pipe_print("  Analyzing optimization strategy...")
+
+    # Query memory bank for past experiences with similar kernels
+    from kernelopt.memory_bank import MemoryBank, classify_kernel_structure, get_hardware_info
+    from kernelopt.reference_kernels import get_relevant_references
+    bank = MemoryBank()
+    kernel_struct = classify_kernel_structure(kernel_source, profiling_ctx)
+    hw_info = get_hardware_info()
+    past_failures = bank.get_failures(kernel_struct, hw_info)
+    past_successes = bank.get_successes(kernel_struct, hw_info)
+    memory_context = bank.format_for_llm(past_failures + past_successes)
+
+    constraint_context = bank.format_constraints_for_llm()
+    if constraint_context:
+        memory_context = (memory_context + "\n\n" + constraint_context) if memory_context else constraint_context
+
+    templates = bank.get_templates(kernel_source, multi_kernel_summary)
+    if templates:
+        template_context = bank.format_for_llm(templates, max_entries=2)
+        memory_context = (memory_context + "\n\n" + template_context) if memory_context else template_context
+
+    # Get reference kernel examples for this kernel type
+    references = get_relevant_references(kernel_struct)
+    if references:
+        ref_context = "\n\n## Reference kernel examples (from Triton official tutorials):\n"
+        for name, code in references[:2]:
+            ref_context += f"\n### {name}\n```python\n{code[:1000]}\n```\n"
+        memory_context = (memory_context + ref_context) if memory_context else ref_context
+
+    if past_failures or references:
+        pipe_print(
+            f"  [dim]Memory bank: {len(past_failures)} failures, "
+            f"{len(past_successes)} successes, {len(references)} reference kernels[/]"
+        )
+
+    try:
+        llm = build_llm(**llm_config)
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        tier_context = (
+            f"## NCU-Guided Optimization Tier\n"
+            f"Tier {ncu_tier['tier']} ({ncu_tier['tier_name']}): {ncu_tier['reasoning']}\n"
+            f"Recommended approaches: {', '.join(ncu_tier.get('plan_guidance', []))}\n\n"
+        )
+        user_msg = (
+            f"## Multi-kernel profile\n{multi_kernel_summary}\n\n"
+            f"{tier_context}"
+            f"## Kernel source (first 200 lines)\n```python\n{kernel_source[:8000]}\n```\n\n"
+        )
+        if memory_context:
+            user_msg += f"\n{memory_context}\n\n"
+        user_msg += "Decide the optimization strategy. Return ONLY the JSON object."
+
+        response = llm.invoke([
+            SystemMessage(content=_STRATEGY_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+
+        text = response.content.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        strategy = _json.loads(text)
+        pipe_print(
+            f"  Strategy: [bold]{strategy.get('strategy_type', '?')}[/] — "
+            f"{strategy.get('reasoning', '')[:80]}"
+        )
+        return {"optimization_strategy": strategy}
+
+    except Exception as e:
+        pipe_print(f"  [yellow]Strategy analysis failed: {e}. Defaulting to optimize_kernel.[/]")
+        return {"optimization_strategy": {
+            "strategy_type": "rewrite_and_fuse",
+            "reasoning": f"Strategy analysis failed ({e}). Defaulting to hybrid approach.",
+            "primary_target": "the dominant kernel",
+            "fusion_opportunity": multi_kernel_summary.split("\n")[0] if multi_kernel_summary else None,
+            "plan_guidance": [],
+        }}
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +607,11 @@ def generate_plans(state: GraphState) -> dict:
         "project_id": cfg.project_id,
         "region": cfg.region,
     }
+
+    # Inject strategy context into profiling context for the planner
+    strategy = state.get("optimization_strategy", {})
+    if strategy:
+        profiling_ctx = {**profiling_ctx, "optimization_strategy": strategy}
 
     _plan_args = dict(
         profiling_context=profiling_ctx,
@@ -319,6 +680,7 @@ def execute_plans(state: GraphState) -> dict:
         optimized_source: str | None = None
         execution_result: dict = {}
         compiled_binary: str | None = None
+        correctness_retried = False
         outer_attempts = cfg.K if ext == ".cu" else 1
         executor_K = 1 if ext == ".cu" else cfg.K
 
@@ -415,6 +777,7 @@ def execute_plans(state: GraphState) -> dict:
             region=cfg.region,
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
+            original_pytorch_path=kernel_path if state.get("_original_pytorch_path") else None,
             debug=cfg.debug,
         )
         if _use_spinners():
@@ -426,6 +789,36 @@ def execute_plans(state: GraphState) -> dict:
 
         status = "[green]passed[/]" if passed else "[red]failed[/]"
         pipe_print(f"    Plan {plan_letter}: correctness {status}")
+
+        if not passed and cfg.K > 1 and not correctness_retried:
+            # Error-guided retry: feed the correctness error back to the
+            # executor so it can fix the bug rather than abandoning the plan.
+            pipe_print(f"    [yellow]Correctness failed — retrying with error feedback...[/]")
+            correctness_retried = True
+            try:
+                _retry_args = dict(
+                    kernel_source=current_kernel,
+                    optimization_plan=plan,
+                    memory=state.get("optimization_memory", []),
+                    K=1,
+                    llm_config=llm_config,
+                    correctness_error=msg[:500],
+                )
+                if _use_spinners():
+                    with phase_spinner("retry", f"plan {plan_letter}"):
+                        optimized_source, execution_result = run_executor_agent(**_retry_args)
+                else:
+                    optimized_source, execution_result = run_executor_agent(**_retry_args)
+
+                if optimized_source and execution_result.get("ready_for_profiling"):
+                    kernel_file = str(output_dir / f"{file_stem}_retry{ext}")
+                    Path(kernel_file).write_text(optimized_source)
+                    passed, msg = check_correctness(**{**_cc_args, "optimized_source": optimized_source})
+                    if passed:
+                        pipe_print(f"    [green]Retry succeeded![/]")
+                        execution_result["correctness"] = "passed"
+            except Exception as e:
+                pipe_print(f"    [dim]Retry failed: {e}[/]")
 
         if not passed:
             pipe_print(f"    [dim]Failure: {msg[:300]}[/]")
@@ -473,12 +866,16 @@ def execute_plans(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Node 4: Profile valid candidates with NCU
 # ---------------------------------------------------------------------------
 
 def profile_candidates(state: GraphState) -> dict:
     """Run NCU on each candidate that passed correctness."""
-    from kernelopt.agents.profiler import get_latency_ns, run_profiler_agent
+    from kernelopt.agents.profiler import (
+        build_profiling_context, get_latency_ns, run_profiler_agent,
+    )
 
     cfg = state["config"]
     candidates = list(state["candidates"])
@@ -486,9 +883,10 @@ def profile_candidates(state: GraphState) -> dict:
     ext = state["ext"]
     iteration = state.get("iteration", 0)
     kernel_basename = state["kernel_basename"]
-    kernel_id = state.get("kernel_id", 0)
+    baseline_kernel_id = state.get("kernel_id", 0)
     best_latency = state["best_latency_ns"]
     saved_ncu_config = state.get("ncu_config")  # reuse baseline config — full bypass
+    is_multi_kernel = baseline_kernel_id != 0 or bool(state.get("_original_pytorch_path"))
 
     llm_config = {
         "model": cfg.profiler_model or cfg.model,
@@ -525,12 +923,20 @@ def profile_candidates(state: GraphState) -> dict:
 
         try:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
+            # Candidates may have different launch patterns than baseline:
+            # - Multi-kernel files (synthesized): different kernel count/order
+            # - @triton.autotune candidates: warmup launches before real kernel
+            # Use fresh NCU config (LLM re-analyzes the candidate source) to
+            # avoid stale launch_skip/launch_count from baseline.
+            has_autotune = "@triton.autotune" in c.optimized_kernel
+            candidate_ncu_config = None if (is_multi_kernel or has_autotune) else saved_ncu_config
+
             _prof_args = dict(
                 kernel_path=kernel_file,
                 output_basename=output_base,
-                ncu_config=saved_ncu_config,
+                ncu_config=candidate_ncu_config,
                 pipeline_config=cfg,
-                kernel_id=kernel_id,
+                kernel_id=0,
                 binary_path=candidate_binary,
                 llm_config=llm_config,
             )
@@ -539,17 +945,33 @@ def profile_candidates(state: GraphState) -> dict:
                     ctx, _ = run_profiler_agent(**_prof_args)
             else:
                 ctx, _ = run_profiler_agent(**_prof_args)
-            c.profiling_context = ctx
             c.csv_path = f"{output_base}.csv"
             c.ncu_rep_path = f"{output_base}.ncu-rep"
+
+            # For multi-kernel candidates, find the user Triton kernel's latency
+            # (same logic as baseline bottleneck discovery)
+            if is_multi_kernel and Path(c.csv_path).exists():
+                from kernelopt.functions.csv_parser import find_bottleneck_kernel, parse_ncu_csv
+                cand_kid, cand_kernels = find_bottleneck_kernel(c.csv_path)
+                user_kernels = [k for k in cand_kernels if k.get("kind") == "user"]
+                if user_kernels:
+                    cand_kid = user_kernels[0]["kernel_id"]
+                if cand_kid != 0:
+                    sections, rules, launch = parse_ncu_csv(c.csv_path, cand_kid)
+                    ctx = build_profiling_context(
+                        sections, rules, launch, kernel_file, kernel_id=cand_kid
+                    )
+
+            c.profiling_context = ctx
             c.latency_ns = get_latency_ns(ctx)
             c.speedup = (
                 round(best_latency / c.latency_ns, 4)
                 if c.latency_ns > 0 else 0.0
             )
+
             pipe_print(
                 f"    Plan {c.plan_letter} ({c.direction}): "
-                f"{c.latency_ns:.0f} ns -> {c.speedup:.2f}x"
+                f"{c.latency_ns:.0f} ns ({c.speedup:.2f}x)"
             )
         except Exception as e:
             pipe_print(
@@ -663,6 +1085,42 @@ def summarize_results(state: GraphState) -> dict:
     top_items = select_top_k(experience_items, cfg.TopK, cfg.t_pos, cfg.t_neg)
     if top_items:
         memory = append_items(memory, top_items, cfg.ExpN)
+
+    # Write to persistent memory bank (cross-run learning)
+    try:
+        from kernelopt.memory_bank import (
+            MemoryBank, MemoryEntry, classify_kernel_structure, get_hardware_info,
+        )
+        bank = MemoryBank()
+        kernel_struct = classify_kernel_structure(current_kernel, profiling_before)
+        hw_info = get_hardware_info()
+        strategy = state.get("optimization_strategy", {})
+
+        for c in candidates:
+            if not c.direction:
+                continue
+            is_success = c.correctness_passed and c.speedup > 1.0
+            entry = MemoryEntry(
+                kernel_structure=kernel_struct,
+                hardware=hw_info,
+                strategy={
+                    "type": strategy.get("strategy_type", "optimize_kernel"),
+                    "direction": c.direction,
+                },
+                outcome="success" if is_success else (
+                    "failure" if not c.correctness_passed else "degradation"
+                ),
+                speedup=c.speedup if c.speedup > 0 else 0.0,
+                failure_reason=c.correctness_message[:200] if not c.correctness_passed else "",
+                optimization_insight=(
+                    next((it.get("insight", "") for it in top_items if it.get("direction") == c.direction), "")
+                    if top_items else ""
+                ),
+                code_pattern=c.optimized_kernel[:500] if is_success else "",
+            )
+            bank.add(entry)
+    except Exception as e:
+        pipe_print(f"  [dim]Memory bank write failed: {e}[/]")
 
     out = {"optimization_memory": memory}
     _checkpoint_stage(state, out, "after_summarize")
@@ -831,6 +1289,15 @@ def route_start(state: GraphState) -> str:
     }
     if entry in resume_targets:
         return resume_targets[entry]
+
+    framework = state.get("framework", "")
+    if framework == "pytorch":
+        return "maybe_synthesize"
+    if framework in ("auto", ""):
+        from kernelopt.agents.profiler.ncu_runner import extract_kernel_info
+        detected, _ = extract_kernel_info(state["kernel_path"])
+        if detected == "pytorch":
+            return "maybe_synthesize"
     return "profile_baseline"
 
 
@@ -849,6 +1316,97 @@ def save_iter_checkpoint(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Node 0 (conditional): Synthesize Triton from PyTorch via torch.compile
+# ---------------------------------------------------------------------------
+
+def maybe_synthesize(state: GraphState) -> dict:
+    """If input is PyTorch, convert to Triton via torch.compile.
+
+    Transparent to the rest of the pipeline -- after this node,
+    kernel_path points to a Triton .py file regardless of input format.
+    No-op when framework is not "pytorch".
+    """
+    framework = state.get("framework", "")
+    if framework not in ("pytorch", "auto", ""):
+        return {}
+
+    if framework in ("auto", ""):
+        from kernelopt.agents.profiler.ncu_runner import extract_kernel_info
+        detected, _ = extract_kernel_info(state["kernel_path"])
+        if detected != "pytorch":
+            return {}
+
+    from kernelopt.synthesis import extract_triton_from_pytorch, wrap_inductor_output
+    from kernelopt.synthesis.compile_extract import SynthesisError
+
+    kernel_path = state["kernel_path"]
+    output_dir = state["output_dir"]
+
+    pipe_print("[bold]Detected PyTorch input — synthesizing Triton via torch.compile...[/]")
+
+    original_source = Path(kernel_path).read_text()
+
+    try:
+        results = extract_triton_from_pytorch(kernel_path)
+
+        if not results:
+            raise SynthesisError("torch.compile produced no output for this input.")
+
+        primary = results[0]
+
+        wrapped_source = wrap_inductor_output(
+            inductor_source=primary["inductor_source"],
+            original_pytorch_source=original_source,
+            triton_kernel_sources=primary["triton_kernels"],
+        )
+
+        synth_dir = Path(output_dir) / "synthesis"
+        synth_dir.mkdir(parents=True, exist_ok=True)
+
+        wrapped_path = synth_dir / "synthesized_triton.py"
+        wrapped_path.write_text(wrapped_source)
+
+        (synth_dir / "original_pytorch.py").write_text(original_source)
+        (synth_dir / "raw_inductor_output.py").write_text(primary["inductor_source"])
+
+        n_kernels = len(primary["triton_kernels"])
+        has_extern = "extern_kernels" in primary["inductor_source"]
+        pipe_print(
+            f"  Synthesized: [green]{wrapped_path}[/] "
+            f"({n_kernels} Triton kernel{'s' if n_kernels != 1 else ''}"
+            f"{', + extern_kernels' if has_extern else ''})"
+        )
+
+        # Build a complete standalone Triton file for the LLM to read/modify
+        from kernelopt.synthesis.wrap_kernel import build_standalone_kernel
+        standalone_kernel = build_standalone_kernel(
+            triton_kernel_sources=primary["triton_kernels"],
+            inductor_source=primary["inductor_source"],
+        )
+
+        return {
+            "kernel_path": str(wrapped_path),
+            "kernel_source": wrapped_source,
+            "kernel_basename": "synthesized_triton",
+            "framework": "triton",
+            "ext": ".py",
+            "best_kernel": standalone_kernel,
+            "_original_pytorch_path": kernel_path,
+            "_original_pytorch_source": original_source,
+        }
+
+    except (SynthesisError, Exception) as e:
+        pipe_print(
+            f"  [yellow]Synthesis failed:[/] {e}\n"
+            f"  [dim]Continuing with original PyTorch file (no conversion)[/]"
+        )
+        return {
+            "_original_pytorch_path": kernel_path,
+            "_original_pytorch_source": original_source,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
 
@@ -856,7 +1414,9 @@ def build_graph():
     """Build and compile the LangGraph optimization pipeline."""
     graph = StateGraph(GraphState)
 
+    graph.add_node("maybe_synthesize", maybe_synthesize)
     graph.add_node("profile_baseline", profile_baseline)
+    graph.add_node("analyze_strategy", analyze_strategy)
     graph.add_node("generate_plans", generate_plans)
     graph.add_node("execute_plans", execute_plans)
     graph.add_node("profile_candidates", profile_candidates)
@@ -870,6 +1430,7 @@ def build_graph():
         START,
         route_start,
         {
+            "maybe_synthesize": "maybe_synthesize",
             "profile_baseline": "profile_baseline",
             "generate_plans": "generate_plans",
             "execute_plans": "execute_plans",
@@ -879,7 +1440,9 @@ def build_graph():
             "continuation_entry": "continuation_entry",
         },
     )
-    graph.add_edge("profile_baseline", "generate_plans")
+    graph.add_edge("maybe_synthesize", "profile_baseline")
+    graph.add_edge("profile_baseline", "analyze_strategy")
+    graph.add_edge("analyze_strategy", "generate_plans")
     graph.add_conditional_edges(
         "continuation_entry",
         should_continue,

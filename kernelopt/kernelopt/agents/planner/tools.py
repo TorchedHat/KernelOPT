@@ -93,9 +93,22 @@ class PlannerToolServer:
                 }
             }
 
+        if aspect == "multi_kernel_summary":
+            summary = ctx.get("multi_kernel_summary", "")
+            if summary:
+                return {"multi_kernel_summary": summary}
+            return {"multi_kernel_summary": "Single kernel file (no multi-kernel info)."}
+
+        if aspect == "optimization_strategy":
+            strategy = ctx.get("optimization_strategy", {})
+            if strategy:
+                return {"optimization_strategy": strategy}
+            return {"optimization_strategy": {"strategy_type": "optimize_kernel"}}
+
         valid = (
             "rules, occupancy, memory_workload, throughput, "
-            "scheduler, launch, gpu_specs, instruction_stats"
+            "scheduler, launch, gpu_specs, instruction_stats, "
+            "multi_kernel_summary, optimization_strategy"
         )
         raise ValueError(f"Unknown aspect: {aspect!r}. Must be one of: {valid}")
 

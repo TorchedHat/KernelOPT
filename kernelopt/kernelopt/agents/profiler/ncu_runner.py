@@ -15,7 +15,7 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
     """Parse the kernel source to detect framework and list all GPU kernel function names.
 
     Returns (framework, kernel_names).
-    framework: "triton" | "helion" | "cuda" | "unknown"
+    framework: "triton" | "helion" | "cuda" | "pytorch" | "unknown"
     kernel_names: suitable for --kernel-name flag (exact or regex pattern)
     """
     path = Path(kernel_path)
@@ -27,7 +27,14 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
             tree = ast.parse(source)
         except (OSError, SyntaxError):
             return "unknown", []
-        return _extract_python_kernels(tree)
+        framework, names = _extract_python_kernels(tree)
+        if framework != "unknown":
+            return framework, names
+        if _is_inductor_output(source):
+            return "triton", []
+        if _is_pytorch_source(source, tree):
+            return "pytorch", []
+        return "unknown", []
 
     elif ext == ".cu":
         try:
@@ -68,6 +75,44 @@ def _extract_cuda_kernels(source: str) -> tuple[str, list[str]]:
     return "unknown", []
 
 
+def _is_inductor_output(source: str) -> bool:
+    """Detect torch.compile / Inductor-generated output.
+
+    These files have Triton kernels compiled via ``async_compile.triton(...)``
+    rather than module-level ``@triton.jit`` decorators.
+    """
+    return "async_compile.triton(" in source or "async_compile = AsyncCompile()" in source
+
+
+def _is_pytorch_source(source: str, tree: ast.AST) -> bool:
+    """Detect whether a Python file is a PyTorch module/function (not already Triton/Helion).
+
+    Checks for KernelBench pattern (class Model(nn.Module) + get_inputs),
+    SOL-ExecBench pattern (def run() with torch), or generic nn.Module.
+    """
+    has_nn_module = bool(re.search(
+        r'class\s+\w+\s*\(\s*(?:nn\.Module|torch\.nn\.Module)\s*\)', source
+    ))
+    has_get_inputs = "def get_inputs(" in source
+    has_torch_import = "import torch" in source
+
+    if has_nn_module and has_get_inputs:
+        return True
+
+    if has_nn_module and has_torch_import:
+        return True
+
+    has_run_fn = bool(re.search(r'def\s+run\s*\(', source))
+    has_torch_no_grad = "@torch.no_grad" in source
+    if has_run_fn and has_torch_import and has_torch_no_grad:
+        return True
+
+    if has_run_fn and has_get_inputs and has_torch_import:
+        return True
+
+    return False
+
+
 def _detect_framework_from_name(kernel_name: str) -> str:
     if any(p in kernel_name for p in ["triton_", "__triton", "triton::"]):
         return "triton"
@@ -101,11 +146,15 @@ def build_ncu_command(
     ncu_extra_args: list[str] | None = None,
     kernel_args: list[str] | None = None,
     binary_path: str | None = None,
+    ncu_set: str = "full",
+    clock_control: str | None = None,
 ) -> list[str]:
     """Build the ncu command line for profiling.
 
     Args:
         binary_path: For .cu kernels, path to the compiled binary. If None, derived from kernel_path.
+        ncu_set: NCU metric set — "full" for optimization, "basic" for duration-only.
+        clock_control: NCU clock control — None for default (locked), "none" for boost clocks.
     """
     ext = Path(kernel_path).suffix
     if ext == ".py":
@@ -127,11 +176,14 @@ def build_ncu_command(
 
     cmd = [
         "ncu",
-        "--set", "full",
+        "--set", ncu_set,
         "--replay-mode", replay_mode,
         "--target-processes", "all",
         "--kernel-name-base", "demangled",
     ]
+
+    if clock_control is not None:
+        cmd.extend(["--clock-control", clock_control])
 
     # Only add --kernel-name if we have a non-empty filter
     if kernel_name:
@@ -308,3 +360,65 @@ def run_ncu(
         Path(profiling_context_path).write_text(json.dumps(ctx, indent=2))
 
     return csv_path, ncu_rep_path, profiling_context_path
+
+
+def run_ncu_boost(
+    wrapper_script_path: str,
+    output_dir: str,
+) -> float:
+    """Run NCU with --clock-control none to get total kernel duration at boost clocks.
+
+    Used for Amdahl's analysis: the returned T_kernel is directly comparable
+    to wall-clock measurements (same GPU clock state, no lock).
+
+    The wrapper_script_path should be a Python script that:
+      1. Imports and warms up the kernel (3+ calls)
+      2. Wraps the measured call in torch.cuda.nvtx.range_push("measure") / range_pop()
+
+    Uses --set basic (duration only) and --nvtx-include "measure/" to isolate
+    the profiled call from warmup/JIT/init.
+
+    Returns total kernel duration in nanoseconds (sum of all GPU kernels in the
+    measured range), or -1.0 on failure.
+    """
+    from kernelopt.functions.csv_parser import sum_all_kernel_durations
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    ncu_base = str(Path(output_dir) / "boost_profile")
+    ncu_rep = f"{ncu_base}.ncu-rep"
+    ncu_csv = f"{ncu_base}.csv"
+
+    cmd = build_ncu_command(
+        wrapper_script_path,
+        ncu_base,
+        kernel_name="",  # no filter — capture all kernels
+        ncu_set="basic",
+        clock_control="none",
+        replay_mode="kernel",
+        ncu_extra_args=["--nvtx", "--nvtx-include", "measure/"],
+    )
+
+    prof_env = os.environ.copy()
+    prof_env["PYTHONIOENCODING"] = "utf-8"
+    prof_env["PYTHONUTF8"] = "1"
+
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=300, env=prof_env,
+    )
+    if result.returncode != 0:
+        return -1.0
+    if "No kernels were profiled" in result.stdout:
+        return -1.0
+
+    try:
+        _export_csv_from_ncu_rep(ncu_rep, ncu_csv)
+        total_ns = sum_all_kernel_durations(ncu_csv)
+        return total_ns if total_ns > 0 else -1.0
+    except Exception:
+        return -1.0
+    finally:
+        for f in [ncu_rep, ncu_csv]:
+            try:
+                Path(f).unlink(missing_ok=True)
+            except Exception:
+                pass
