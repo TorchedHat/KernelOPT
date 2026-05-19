@@ -89,13 +89,17 @@ if __name__ == "__main__":
             flags=re.DOTALL,
         )
 
-    # Guard Inductor boilerplate imports that are version-dependent and often unused.
-    # Without this, synthesized_triton.py crashes on import in environments where
-    # these internal PyTorch symbols don't exist (e.g., _empty_strided_cpu_pinned).
+    # Guard Inductor boilerplate imports that may not exist in all PyTorch builds.
+    # Source: torch/_inductor/codegen/wrapper.py lines 1406-1433 always emits these
+    # assignments, but some symbols (cpu_pinned, xpu, mtia, p2p) may not exist
+    # in every PyTorch build/version. Wrapping in try/except matches how PyTorch
+    # itself guards empty_strided_p2p (wrapper.py line 1421-1433).
     _GUARD_PATTERNS = [
+        # From torch._C._dynamo.guards (may be absent in older/partial builds)
         "empty_strided_cpu_pinned = ",
         "empty_strided_xpu = ",
         "empty_strided_mtia = ",
+        # From torch._C._distributed_c10d._SymmetricMemory (requires distributed)
         "empty_strided_p2p = ",
     ]
     lines = base.split("\n")
