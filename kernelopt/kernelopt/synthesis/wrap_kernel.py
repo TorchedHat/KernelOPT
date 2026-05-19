@@ -89,6 +89,25 @@ if __name__ == "__main__":
             flags=re.DOTALL,
         )
 
+    # Guard Inductor boilerplate imports that are version-dependent and often unused.
+    # Without this, synthesized_triton.py crashes on import in environments where
+    # these internal PyTorch symbols don't exist (e.g., _empty_strided_cpu_pinned).
+    _GUARD_PATTERNS = [
+        "empty_strided_cpu_pinned = ",
+        "empty_strided_xpu = ",
+        "empty_strided_mtia = ",
+        "empty_strided_p2p = ",
+    ]
+    lines = base.split("\n")
+    guarded = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(pat) for pat in _GUARD_PATTERNS):
+            guarded.append(f"try:\n    {line}\nexcept (AttributeError, ImportError):\n    pass")
+        else:
+            guarded.append(line)
+    base = "\n".join(guarded)
+
     return base.rstrip() + "\n" + interface
 
 

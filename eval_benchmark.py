@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.11
 """Phase 2 benchmark runner — runs kernelopt on KernelBench + SOL problems.
 
 Designed for long unattended runs on a single GPU. Each GPU gets its own
@@ -12,8 +12,8 @@ Features:
   - Robust error handling: never crashes the batch
 
 Usage:
-    python eval_benchmark.py --gpu 2 --assignments kb_l1 --phase 1
-    python eval_benchmark.py --gpu 3 --assignments kb_l3,kb_l4,sol_train,sol_flashinfer --phase 1
+    python3.11 eval_benchmark.py --gpu 2 --assignments kb_l1 --phase 1
+    python3.11 eval_benchmark.py --gpu 3 --assignments kb_l3,kb_l4,sol_train,sol_flashinfer --phase 1
 """
 from __future__ import annotations
 
@@ -39,7 +39,8 @@ KERNELOPT_PKG = PROJ_ROOT / "kernelopt"
 sys.path.insert(0, str(KERNELOPT_PKG))
 sys.path.insert(0, str(PROJ_ROOT))
 
-BASELINE_TIMEOUT_S = 180  # 3 min for eager+compile baselines
+BASELINE_TIMEOUT_S = 1800  # 30 min safety net — prevents infinite hangs
+                           # without cutting off legitimate slow compilations
 
 # Ensure CUDA tools (ncu) are on PATH
 _CUDA_BIN = "/usr/local/cuda-12.8/bin"
@@ -619,7 +620,10 @@ def run_kernelopt_problem(
         "speedup": 0.0,
         "speedup_vs_eager": 0.0,
         "speedup_vs_compile": 0.0,
+        "synth_wall_ns": -1,
         "best_wall_ns": -1,
+        "synthesis_speedup": 0.0,
+        "optimization_speedup": 0.0,
         "best_kernel_boost_ns": -1,
         "kernel_pct": 0.0,
         "host_overhead_pct": 0.0,
@@ -633,7 +637,12 @@ def run_kernelopt_problem(
         "best_direction": "",
         "error": "",
         "wall_time_s": 0.0,
+        "baseline_time_s": 0.0,
+        "kpt_time_s": 0.0,
+        "bench_time_s": 0.0,
     }
+
+    problem_start = time.monotonic()
 
     # Determine kernel path for kernelopt
     if problem["bench_type"] == "sol":
@@ -650,6 +659,7 @@ def run_kernelopt_problem(
     # Measure baselines (eager + torch.compile of the reference implementation).
     # All types have a PyTorch reference: KernelBench has Model, SOL has run(),
     # Triton/Helion tutorials have reference_function (PyTorch spec from website).
+    baseline_start = time.monotonic()
     if problem["bench_type"] == "kernelbench":
         baselines = measure_baselines_kb(kernel_path, gpu_id)
         result["eager_ns"] = baselines.get("eager_ns", -1)
@@ -664,6 +674,7 @@ def run_kernelopt_problem(
         result["compile_ns"] = baselines.get("compile_ns", -1)
     else:
         baselines = {}
+    result["baseline_time_s"] = round(time.monotonic() - baseline_start, 1)
     if baselines.get("error"):
         result["error"] = f"baseline: {baselines['error']} | "
 
@@ -686,15 +697,14 @@ def run_kernelopt_problem(
 
     log_path = output_dir / f"log_{problem_id.replace('/', '_')}.txt"
 
-    start = time.monotonic()
+    kpt_start = time.monotonic()
     try:
         with open(log_path, "w") as log_f:
             proc = subprocess.run(
                 cmd, stdout=log_f, stderr=subprocess.STDOUT,
                 env=env, cwd=str(PROJ_ROOT),
             )
-        wall_time = time.monotonic() - start
-        result["wall_time_s"] = round(wall_time, 1)
+        result["kpt_time_s"] = round(time.monotonic() - kpt_start, 1)
         result["status"] = "pass" if proc.returncode == 0 else "kpt_error"
         if proc.returncode != 0:
             try:
@@ -703,33 +713,43 @@ def run_kernelopt_problem(
                 log_tail = ""
             result["error"] += f"exit={proc.returncode}: {log_tail}"
     except Exception as e:
-        result["wall_time_s"] = round(time.monotonic() - start, 1)
+        result["kpt_time_s"] = round(time.monotonic() - kpt_start, 1)
         result["status"] = "crash"
         result["error"] += str(e)[:300]
 
     # Parse results from the run_* subdirectory
     _parse_kpt_results(kpt_output, result)
 
-    # Wall-clock benchmark kpt outputs for consistent cross-comparison.
-    # Uses identical torch.cuda.Event timing as eager/compile baselines.
-    # All kernel types have kernel_function + get_inputs (KernelBench/SOL after
-    # synthesis, Triton/Helion tutorials via kpt interface wrapper).
+    # ── Wall-clock benchmarks ──
+    # All use triton.testing.do_bench (CUDA events, 25 warmup, 100 reps, median).
+    bench_start = time.monotonic()
+
+    # 1. Synthesized Triton baseline (KB/SOL only — before kpt LLM optimization)
+    synth_kp = result.get("synth_kernel_path", "")
+    if synth_kp and Path(synth_kp).exists():
+        bench = wall_clock_benchmark(synth_kp, gpu_id)
+        result["synth_wall_ns"] = bench.get("wall_ns", -1)
+        if bench.get("error"):
+            result["error"] += f"synth_bench: {bench['error']} | "
+
+    # 2. kpt-optimized best kernel
     best_kp = result.get("best_kernel_path", "")
     if best_kp and Path(best_kp).exists():
-        # 1. Wall-clock benchmark (torch.cuda.Event, boost clocks)
         bench = wall_clock_benchmark(best_kp, gpu_id)
         result["best_wall_ns"] = bench.get("wall_ns", -1)
         if bench.get("error"):
             result["error"] += f"best_bench: {bench['error']} | "
 
-        # 2. NCU with --clock-control none (kernel duration at boost clocks)
-        #    This gives T_kernel directly comparable to T_wall for Amdahl's analysis
+        # 3. NCU with --clock-control none (kernel duration at boost clocks)
+        #    for Amdahl's analysis: kernel_pct = T_kernel / T_wall
         ncu_boost = ncu_boost_duration(best_kp, gpu_id, kpt_output / "_boost_profile")
         result["best_kernel_boost_ns"] = ncu_boost.get("kernel_ns", -1)
         if ncu_boost.get("error"):
             result["error"] += f"boost_ncu: {ncu_boost['error']} | "
 
-    # Compute wall-clock-consistent speedups (all same measurement method)
+    # ── Speedup calculations (all wall-clock / wall-clock) ──
+
+    # Total end-to-end: original PyTorch vs kpt output
     if result["eager_ns"] > 0 and result["best_wall_ns"] > 0:
         result["speedup_vs_eager"] = round(
             result["eager_ns"] / result["best_wall_ns"], 3
@@ -739,6 +759,25 @@ def run_kernelopt_problem(
             result["compile_ns"] / result["best_wall_ns"], 3
         )
 
+    # Decomposed: separate synthesis contribution from optimization contribution.
+    # For KB/SOL: synthesis = eager → synth_wall, optimization = synth_wall → best_wall
+    # For Triton/Helion tutorials: no synthesis, so optimization_speedup = vs_eager
+    if result["synth_wall_ns"] > 0:
+        # Has synthesis step (KB/SOL)
+        if result["eager_ns"] > 0:
+            result["synthesis_speedup"] = round(
+                result["eager_ns"] / result["synth_wall_ns"], 3
+            )
+        if result["best_wall_ns"] > 0:
+            result["optimization_speedup"] = round(
+                result["synth_wall_ns"] / result["best_wall_ns"], 3
+            )
+    elif problem["bench_type"] in ("triton", "helion"):
+        # No synthesis — kpt optimizes the kernel directly
+        # optimization_speedup = vs_eager (the entire speedup is from kpt)
+        if result["eager_ns"] > 0 and result["best_wall_ns"] > 0:
+            result["optimization_speedup"] = result["speedup_vs_eager"]
+
     # Amdahl's analysis: kernel execution % of total wall time.
     # Both best_kernel_boost_ns and best_wall_ns use boost clocks → directly comparable.
     if result["best_kernel_boost_ns"] > 0 and result["best_wall_ns"] > 0:
@@ -746,6 +785,9 @@ def run_kernelopt_problem(
             min(result["best_kernel_boost_ns"] / result["best_wall_ns"] * 100, 100.0), 1
         )
         result["host_overhead_pct"] = round(100.0 - result["kernel_pct"], 1)
+
+    result["bench_time_s"] = round(time.monotonic() - bench_start, 1)
+    result["wall_time_s"] = round(time.monotonic() - problem_start, 1)
 
     return result
 
@@ -847,6 +889,11 @@ def _parse_kpt_results(kpt_output: Path, result: dict) -> None:
     best_kernel_file = run_dir / "best_kernel.py"
     if best_kernel_file.exists():
         result["best_kernel_path"] = str(best_kernel_file)
+
+    # Locate synthesized Triton file (for KB/SOL — measures synthesis-only speedup)
+    synth_file_path = synth_dir / "synthesized_triton.py" if synth_dir and synth_dir.exists() else None
+    if synth_file_path and synth_file_path.exists():
+        result["synth_kernel_path"] = str(synth_file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -968,13 +1015,18 @@ def main():
         if status == "pass":
             successes += 1
 
-            # Unified output format for all kernel types
             eager_us = result.get("eager_ns", -1) / 1e3 if result.get("eager_ns", -1) > 0 else -1
             compile_us = result.get("compile_ns", -1) / 1e3 if result.get("compile_ns", -1) > 0 else -1
+            synth_us = result.get("synth_wall_ns", -1) / 1e3 if result.get("synth_wall_ns", -1) > 0 else -1
             best_wall_us = result.get("best_wall_ns", -1) / 1e3 if result.get("best_wall_ns", -1) > 0 else -1
+            synth_sp = result.get("synthesis_speedup", 0)
+            opt_sp = result.get("optimization_speedup", 0)
             vs_eager = result.get("speedup_vs_eager", 0)
             vs_compile = result.get("speedup_vs_compile", 0)
             kernel_pct = result.get("kernel_pct", 0)
+            bl_t = result.get("baseline_time_s", 0)
+            kpt_t = result.get("kpt_time_s", 0)
+            bench_t = result.get("bench_time_s", 0)
 
             # Line 1: timings
             parts = []
@@ -982,11 +1034,17 @@ def main():
                 parts.append(f"eager={eager_us:.1f}us")
             if compile_us > 0:
                 parts.append(f"compile={compile_us:.1f}us")
+            if synth_us > 0:
+                parts.append(f"synth={synth_us:.1f}us")
             if best_wall_us > 0:
                 parts.append(f"best={best_wall_us:.1f}us")
             print(f"  PASS  {' '.join(parts)}")
-            # Line 2: speedups + kernel efficiency
+            # Line 2: decomposed speedups
             sp_parts = []
+            if synth_sp > 0:
+                sp_parts.append(f"synth={synth_sp:.2f}x")
+            if opt_sp > 0:
+                sp_parts.append(f"opt={opt_sp:.2f}x")
             if vs_eager > 0:
                 sp_parts.append(f"vs_eager={vs_eager:.2f}x")
             if vs_compile > 0:
@@ -994,9 +1052,9 @@ def main():
             if kernel_pct > 0:
                 sp_parts.append(f"kernel={kernel_pct:.0f}%")
             if sp_parts:
-                print(f"        {' '.join(sp_parts)}  [{wall:.0f}s]")
-            else:
-                print(f"        [{wall:.0f}s]")
+                print(f"        {' '.join(sp_parts)}")
+            # Line 3: timing breakdown
+            print(f"        [baseline={bl_t:.0f}s kpt={kpt_t:.0f}s bench={bench_t:.0f}s total={wall:.0f}s]")
         else:
             failures += 1
             err = result.get("error", "")[:80]

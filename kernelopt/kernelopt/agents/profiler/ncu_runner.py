@@ -403,7 +403,7 @@ def run_ncu_boost(
     prof_env["PYTHONUTF8"] = "1"
 
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=300, env=prof_env,
+        cmd, capture_output=True, text=True, timeout=1800, env=prof_env,
     )
     if result.returncode != 0:
         return -1.0
