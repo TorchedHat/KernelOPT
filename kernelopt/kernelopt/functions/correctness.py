@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -625,15 +628,15 @@ def _check_python_kernel(
         combined = result.stdout + result.stderr
 
         if debug:
-            print(f"[DEBUG] Correctness subprocess returncode: {result.returncode}")
-            print(f"[DEBUG] stdout length: {len(result.stdout)}")
-            print(f"[DEBUG] stderr length: {len(result.stderr)}")
-            print(f"[DEBUG] Combined output preview:\n{combined[:300]}")
+            logger.debug("Correctness subprocess returncode: %d", result.returncode)
+            logger.debug("stdout length: %d", len(result.stdout))
+            logger.debug("stderr length: %d", len(result.stderr))
+            logger.debug("Combined output preview:\n%s", combined[:300])
 
         # Check for crash
         if result.returncode != 0:
             if debug:
-                print(f"[DEBUG] Kernel crashed with exit code {result.returncode}")
+                logger.debug("Kernel crashed with exit code %d", result.returncode)
             return False, (
                 f"Optimized kernel crashed (exit {result.returncode}):\n"
                 f"{combined[:500]}"
@@ -649,15 +652,15 @@ def _check_python_kernel(
                 context_start = max(0, combined.find(indicator) - 100)
                 context_end = combined.find(indicator) + 200
                 if debug:
-                    print(f"[DEBUG] Triggered by indicator: '{indicator}'")
-                    print(f"[DEBUG] Context: {combined[context_start:context_end]}")
+                    logger.debug("Triggered by indicator: '%s'", indicator)
+                    logger.debug("Context: %s", combined[context_start:context_end])
                 return False, (
                     f"Failure indicator '{indicator}' found in output:\n"
                     f"{combined[:500]}"
                 )
 
         if debug:
-            print("[DEBUG] Correctness check PASSED")
+            logger.debug("Correctness check PASSED")
         return True, f"Kernel ran successfully (exit 0).\n{result.stdout[:200]}"
 
     except subprocess.TimeoutExpired:
