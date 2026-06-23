@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +59,8 @@ _RESUME_CKPT_FORBIDDEN = frozenset({
     "profiler_model",
     "verbose",
     "agentic_correctness",
+    "entry_point",
+    "input_shapes",
 })
 
 
@@ -75,6 +78,14 @@ def _run_output_dir(base: Path, *, run_subdir: bool) -> Path:
         return base
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return base / f"run_{stamp}"
+
+
+def _parse_shapes(s: str) -> list[tuple[int, ...]]:
+    """Parse ``"(8,512) (8,512,512)"`` into ``[(8, 512), (8, 512, 512)]``."""
+    shapes = []
+    for m in re.finditer(r'\(([^)]+)\)', s):
+        shapes.append(tuple(int(x.strip()) for x in m.group(1).split(',')))
+    return shapes
 
 
 @app.command()
@@ -133,6 +144,46 @@ def run(
     kernel_args: Optional[str] = typer.Option(
         None, "--kernel-args",
         help="Extra args passed to the kernel program (e.g. '--profile-only --m 4096')"
+    ),
+    search_policy: str = typer.Option(
+        "greedy", "--search-policy",
+        help='Search policy: "greedy" (single chain) or "beam" (multi-chain forest)',
+    ),
+    beam_width: int = typer.Option(
+        1, "--beam-width",
+        help="Number of concurrent optimization chains (beam width). Only used with --search-policy beam.",
+    ),
+    e2e_retries: int = typer.Option(
+        2, "--e2e-retries",
+        help="Max retries when optimized sub-kernel breaks full-model correctness or performance. "
+             "Feeds e2e error back to executor for targeted fix attempts.",
+    ),
+    e2e_perf_gate: bool = typer.Option(
+        True, "--e2e-perf-gate/--no-e2e-perf-gate",
+        help="After re-stitching, verify the full model is not slower than baseline. "
+             "Rejects per-kernel-fast but model-slow optimizations (e.g., stride/layout mismatches).",
+    ),
+    e2e_perf_margin: float = typer.Option(
+        1.03, "--e2e-perf-margin",
+        help="Noise margin for e2e performance gate. Reject if optimized_ms > baseline_ms * margin. "
+             "Default 1.03 (3%% tolerance for do_bench variance).",
+    ),
+    e2e_correctness_timeout: int = typer.Option(
+        180, "--e2e-correctness-timeout",
+        help="Timeout in seconds for e2e correctness subprocess. Includes torch.compile "
+             "capture, model compilation, and 3-seed verification. Increase for large models.",
+    ),
+    multi_kernel: bool = typer.Option(
+        True, "--multi-kernel/--single-kernel",
+        help="Optimize ALL Triton kernels in a PyTorch model sequentially, re-stitching each back",
+    ),
+    entry_point: Optional[str] = typer.Option(
+        None, "--entry-point",
+        help='Callable to compile: "ClassName", "ClassName.method", or "function_name". Auto-detected if omitted.',
+    ),
+    input_shapes: Optional[str] = typer.Option(
+        None, "--input-shapes",
+        help='Tensor shapes for synthesis, e.g. "(8,512) (8,512,512)". Each becomes a torch.randn(shape, device=cuda) input.',
     ),
     api_key: Optional[str] = typer.Option(
         None, "--api-key", help="API key (not needed for Vertex AI)"
@@ -307,6 +358,14 @@ def run(
                 verbose=verbose,
                 debug=debug,
                 agentic_correctness=agentic_correctness,
+                entry_point=entry_point,
+                input_shapes=_parse_shapes(input_shapes) if input_shapes else None,
+                search_policy=search_policy,
+                beam_width=beam_width,
+                e2e_retries=e2e_retries,
+                e2e_perf_gate=e2e_perf_gate,
+                e2e_perf_margin=e2e_perf_margin,
+                e2e_correctness_timeout=e2e_correctness_timeout,
             )
     else:
         resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
@@ -336,6 +395,14 @@ def run(
             verbose=verbose,
             debug=debug,
             agentic_correctness=agentic_correctness,
+            entry_point=entry_point,
+            input_shapes=_parse_shapes(input_shapes) if input_shapes else None,
+            search_policy=search_policy,
+                beam_width=beam_width,
+                e2e_retries=e2e_retries,
+                e2e_perf_gate=e2e_perf_gate,
+                e2e_perf_margin=e2e_perf_margin,
+                e2e_correctness_timeout=e2e_correctness_timeout,
         )
 
     cfg.hud = hud
@@ -391,6 +458,269 @@ def run(
     from kernelopt.progress import print_run_summary
 
     _run_start = _time.monotonic()
+
+    # Multi-kernel mode: optimize all Triton kernels sequentially
+    if multi_kernel and state.framework in ("pytorch", "auto", ""):
+        try:
+            from kernelopt.synthesis.graph_tracer import trace_model
+            from kernelopt.synthesis.fuse_groups import merge_fusible_groups
+            from kernelopt.synthesis.llm_codegen import generate_triton_kernel
+            from kernelopt.synthesis.validate_eager import validate_against_eager
+            from kernelopt.multi_kernel import optimize_all_kernels
+
+            console.print("[bold]Multi-kernel mode: synthesizing + optimizing all Triton kernels[/]")
+
+            # Phase 1: Trace computation graph + get Inductor fusion decisions
+            console.print("  [dim]Tracing computation graph...[/]")
+            kernel_groups = trace_model(str(kernel_path))
+            console.print(f"  [dim]Inductor generated {len(kernel_groups)} kernel(s)[/]")
+
+            # Phase 2: Merge fusible kernel groups
+            kernel_groups = merge_fusible_groups(kernel_groups)
+            console.print(f"  [green]After fusion: {len(kernel_groups)} kernel group(s)[/]")
+
+            llm_config_dict = {
+                "model": cfg.model,
+                "api_key": cfg.api_key,
+                "project_id": cfg.project_id,
+                "region": cfg.region,
+            }
+
+            synth_dir = Path(resolved_output) / "synthesis"
+            synth_dir.mkdir(parents=True, exist_ok=True)
+
+            # Phase 1b: LLM generates clean Triton kernels (with K retries)
+            codegen_attempts = cfg.K
+            # Include original PyTorch source so the LLM can see the exact formula
+            _pytorch_src = Path(kernel_path).read_text() if Path(kernel_path).exists() else ""
+            generated_kernels = []
+            for i, kg in enumerate(kernel_groups):
+                kname = kg.get("kernel_name", f"kernel_{i}")
+                ktype = kg.get("kernel_type", "unknown")
+                aten_ops = [op["name"] for op in kg.get("aten_graph", [])]
+                console.print(f"  [dim]Generating kernel {i}: {kname} ({ktype}) ops={aten_ops}[/]")
+                kg["pytorch_source"] = _pytorch_src
+
+                source = None
+                last_error = None
+                ok = False
+                msg = ""
+                for attempt in range(codegen_attempts):
+                    if attempt > 0:
+                        console.print(f"    [yellow]Retry {attempt}/{codegen_attempts} with error feedback...[/]")
+                        kg["_codegen_error"] = last_error
+
+                    source = generate_triton_kernel(kg, llm_config_dict)
+                    if source is None:
+                        console.print(f"    [red]LLM codegen failed for {kname}[/]")
+                        break
+
+                    kernel_path_gen = synth_dir / f"kernel_{i}_{kname[:40]}.py"
+                    kernel_path_gen.write_text(source)
+
+                    console.print(f"    [dim]Validating against PyTorch eager (attempt {attempt+1}/{codegen_attempts})...[/]")
+                    ok, msg = validate_against_eager(
+                        str(kernel_path), str(kernel_path_gen),
+                    )
+                    if ok:
+                        break
+                    last_error = msg
+                    console.print(f"    [dim]Attempt {attempt+1} failed: {msg[:150]}[/]")
+                    source = None
+
+                if source and ok:
+                    console.print(f"    [green]Correctness passed[/]")
+                    generated_kernels.append({
+                        "kernel_name": kname,
+                        "kernel_type": ktype,
+                        "source": source,
+                        "path": str(kernel_path_gen),
+                    })
+                else:
+                    console.print(f"    [red]Correctness failed: {msg[:200]}[/]")
+
+            if not generated_kernels:
+                console.print("[yellow]No valid kernels generated — falling back to Inductor path[/]")
+                # Fallback to old Inductor extraction path
+                from kernelopt.synthesis import extract_triton_from_pytorch, wrap_inductor_output
+                results = extract_triton_from_pytorch(
+                    str(kernel_path),
+                    entry_point=entry_point,
+                    input_shapes=_parse_shapes(input_shapes) if input_shapes else None,
+                )
+                if not results:
+                    console.print("[red]Synthesis produced no output[/]")
+                    raise typer.Exit(1)
+                primary = results[0]
+                orig_source = kernel_path.read_text()
+                wrapped = wrap_inductor_output(
+                    primary["inductor_source"], orig_source, primary["triton_kernels"],
+                )
+                synth_path = synth_dir / "synthesized_triton.py"
+                synth_path.write_text(wrapped)
+                state.kernel_path = str(synth_path)
+                state.kernel_source = wrapped
+                bk_files = primary.get("benchmark_kernel_files", [])
+                final_source, mk_results = optimize_all_kernels(state, bk_files, orig_source)
+            else:
+                # Phase 3: Optimize each generated kernel through Profile→Plan→Execute
+                orig_source = kernel_path.read_text()
+                bk_files = [{"source": gk["source"], "kernel_name": gk["kernel_name"]} for gk in generated_kernels]
+
+                # Use the first generated kernel as the standalone for optimization
+                # (multi-kernel assembly happens in Phase 4)
+                standalone_path = Path(generated_kernels[0]["path"])
+                state.kernel_path = str(standalone_path)
+                state.kernel_source = generated_kernels[0]["source"]
+                state.framework = "triton"
+                state.best_kernel = generated_kernels[0]["source"]
+
+                from kernelopt.langgraph_pipeline import run_langgraph_pipeline
+                console.print(f"\n  [bold]Optimizing {len(generated_kernels)} kernel(s)...[/]")
+
+                mk_results = []
+                for gk in generated_kernels:
+                    from kernelopt.state import PipelineConfig, PipelineState
+                    kernel_output_dir = Path(resolved_output) / f"opt_{gk['kernel_name'][:30]}"
+                    kernel_output_dir.mkdir(parents=True, exist_ok=True)
+
+                    kernel_cfg = PipelineConfig(
+                        T=cfg.T, N=cfg.N, K=cfg.K, TopK=cfg.TopK,
+                        model=cfg.model, api_key=cfg.api_key,
+                        project_id=cfg.project_id, region=cfg.region,
+                        planner_model=cfg.planner_model,
+                        executor_model=cfg.executor_model,
+                        profiler_model=cfg.profiler_model,
+                        summarizer_model=cfg.summarizer_model,
+                        output_dir=str(kernel_output_dir),
+                        kernel_path=gk["path"],
+                        agentic_correctness=cfg.agentic_correctness,
+                        search_policy=cfg.search_policy,
+                        beam_width=cfg.beam_width,
+                        replay_mode=cfg.replay_mode,
+                        debug=cfg.debug, verbose=cfg.verbose,
+                    )
+                    kernel_state = PipelineState(
+                        config=kernel_cfg,
+                        kernel_path=gk["path"],
+                        kernel_source=gk["source"],
+                        kernel_basename=gk["kernel_name"][:40],
+                        best_kernel=gk["source"],
+                        framework="triton",
+                        optimization_memory=list(state.optimization_memory),
+                    )
+                    kernel_state._baseline_standalone_path = gk["path"]
+
+                    try:
+                        console.print(f"\n  [bold]━━ {gk['kernel_name'][:50]} ━━[/]")
+                        result_state = run_langgraph_pipeline(kernel_state)
+                        from kernelopt.agents.profiler import get_latency_ns
+                        bl_ns = get_latency_ns(result_state.baseline_profiling_context)
+                        best_ns = result_state.best_latency_ns
+                        speedup = round(bl_ns / best_ns, 2) if best_ns > 0 and best_ns < float("inf") and bl_ns > 0 else 1.0
+
+                        # Save best kernel
+                        best_path = kernel_output_dir / "best_kernel.py"
+                        best_path.write_text(result_state.best_kernel)
+
+                        mk_results.append({
+                            "kernel_name": gk["kernel_name"],
+                            "status": "optimized",
+                            "speedup": speedup,
+                        })
+                        console.print(f"    {gk['kernel_name'][:40]}: {speedup:.2f}x")
+                        state.optimization_memory = list(result_state.optimization_memory)
+                    except Exception as e:
+                        console.print(f"    [red]Optimization failed: {e}[/]")
+                        mk_results.append({
+                            "kernel_name": gk["kernel_name"],
+                            "status": "failed",
+                            "reason": str(e)[:200],
+                            "speedup": 1.0,
+                        })
+
+                # Phase 4: Assemble final output
+                from kernelopt.synthesis.assemble import assemble_output
+                final_source = assemble_output(
+                    generated_kernels,
+                    optimized_dir=Path(resolved_output),
+                    original_pytorch_path=str(kernel_path),
+                )
+
+            # Save final model
+            final_path = Path(resolved_output) / "final_model.py"
+            final_path.write_text(final_source)
+
+            elapsed = _time.monotonic() - _run_start
+            mins, secs = divmod(int(elapsed), 60)
+            console.print(f"\n[bold]Multi-kernel complete[/] in {mins}m {secs:02d}s")
+            for r in mk_results:
+                name = r["kernel_name"][:40]
+                if r["status"] == "optimized" and r.get("speedup", 1) > 1:
+                    console.print(f"  [green]{name}: {r['speedup']:.2f}x (per-kernel)[/]")
+                else:
+                    console.print(f"  [dim]{name}: {r['status']}[/]")
+            console.print(f"  Final model: [cyan]{final_path}[/]")
+
+            # End-to-end model benchmark: eager vs compile vs KernelOPT
+            try:
+                from kernelopt.functions.benchmark import benchmark_model_e2e
+                e2e = benchmark_model_e2e(
+                    original_model_path=str(kernel_path),
+                    optimized_model_path=str(final_path),
+                )
+                # Correctness check first
+                if not e2e.get("correct", True):
+                    console.print(
+                        f"\n  [bold red]E2E correctness FAILED: {e2e.get('error', 'unknown')}[/]"
+                    )
+                    console.print(
+                        f"  [red]Optimized kernel produces wrong results — speedup not reported.[/]"
+                    )
+                else:
+                    eager = e2e.get("eager_ms", -1)
+                    compile_ = e2e.get("compile_ms", -1)
+                    opt = e2e.get("optimized_ms", -1)
+                    vs_compile = e2e.get("vs_compile", 0)
+                    vs_eager = e2e.get("vs_eager", 0)
+                    max_diff = e2e.get("max_diff", -1)
+                    console.print(f"\n  [bold]End-to-end (do_bench, subprocess-isolated, correctness verified max_diff={max_diff:.2e}):[/]")
+                    if eager > 0:
+                        console.print(f"    Eager:     {eager:.3f} ms")
+                    if compile_ > 0:
+                        console.print(f"    Compile:   {compile_:.3f} ms")
+                    if opt > 0:
+                        console.print(f"    KernelOPT: {opt:.3f} ms")
+                    _NOISE_THRESHOLD = 0.97  # 3% do_bench variance tolerance
+                    if vs_compile > 0 and vs_compile >= 1.0:
+                        console.print(
+                            f"  [bold green]vs compile: {vs_compile:.2f}x[/]"
+                        )
+                    elif vs_compile >= _NOISE_THRESHOLD:
+                        # Within measurement noise — report as baseline
+                        console.print(
+                            f"  [dim]vs compile: ~1.00x (within measurement noise, raw={vs_compile:.4f}x)[/]"
+                        )
+                    elif vs_compile > 0 and vs_compile < _NOISE_THRESHOLD:
+                        console.print(
+                            f"  [yellow]No improvement: KernelOPT output is {vs_compile:.2f}x vs torch.compile "
+                            f"(compile={compile_:.3f}ms, optimized={opt:.3f}ms). "
+                            f"torch.compile baseline is faster — keeping compile as best.[/]"
+                        )
+                    if vs_eager > 0:
+                        console.print(
+                            f"  [bold green]vs eager:   {vs_eager:.2f}x[/]"
+                        )
+                    if "error" in e2e:
+                        console.print(f"  [dim]E2E issues: {e2e['error']}[/]")
+            except Exception as exc:
+                console.print(f"  [dim]E2E benchmark failed: {exc}[/]")
+            raise typer.Exit(0)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            console.print(f"[red]Multi-kernel failed: {exc}[/]")
+            raise typer.Exit(1) from None
 
     try:
         final = run_langgraph_pipeline(state)

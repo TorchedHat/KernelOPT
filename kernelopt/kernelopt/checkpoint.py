@@ -45,12 +45,26 @@ def _iteration_result_from_dict(d: dict) -> IterationResult:
     )
 
 
-def _plans_to_json(plans: list[tuple[str, dict]]) -> list[dict[str, Any]]:
-    return [{"letter": letter, "plan": plan} for letter, plan in plans]
+def _plans_to_json(plans) -> list[dict[str, Any]]:
+    result = []
+    for entry in plans:
+        if len(entry) == 3:
+            letter, plan, chain_id = entry
+            result.append({"letter": letter, "plan": plan, "chain_id": chain_id})
+        else:
+            letter, plan = entry
+            result.append({"letter": letter, "plan": plan})
+    return result
 
 
-def _plans_from_json(data: list[dict[str, Any]]) -> list[tuple[str, dict]]:
-    return [(x["letter"], x["plan"]) for x in data]
+def _plans_from_json(data: list[dict[str, Any]]) -> list:
+    result = []
+    for x in data:
+        if "chain_id" in x:
+            result.append((x["letter"], x["plan"], x["chain_id"]))
+        else:
+            result.append((x["letter"], x["plan"]))
+    return result
 
 
 def serialize_for_checkpoint(state: GraphState) -> dict[str, Any]:
@@ -101,6 +115,19 @@ def serialize_for_checkpoint(state: GraphState) -> dict[str, Any]:
         "candidates": cand_json,
         "plans": plans_json,
         "correctness_failure_items": list(state.get("correctness_failure_items", [])),
+        "optimization_strategy": state.get("optimization_strategy"),
+        "_original_pytorch_path": state.get("_original_pytorch_path"),
+        "_original_pytorch_source": state.get("_original_pytorch_source"),
+        "_benchmark_kernel_source": state.get("_benchmark_kernel_source"),
+        "_all_benchmark_files": state.get("_all_benchmark_files"),
+        "_target_triton_kernel_name": state.get("_target_triton_kernel_name"),
+        "_baseline_standalone_path": state.get("_baseline_standalone_path"),
+        "baseline_wall_ms": state.get("baseline_wall_ms", -1),
+        "best_wall_ms": state.get("best_wall_ms", -1),
+        # Multi-chain forest search state
+        "active_kernels": state.get("active_kernels", []),
+        "global_best_kernel": state.get("global_best_kernel", ""),
+        "global_best_latency_ns": state.get("global_best_latency_ns", float("inf")),
     }
 
 
@@ -189,7 +216,36 @@ def graph_state_from_checkpoint_payload(
         "candidates": candidates,
         "plans": plans,
         "correctness_failure_items": list(gs.get("correctness_failure_items", [])),
+        "optimization_strategy": gs.get("optimization_strategy"),
+        "_original_pytorch_path": gs.get("_original_pytorch_path"),
+        "_original_pytorch_source": gs.get("_original_pytorch_source"),
+        "_benchmark_kernel_source": gs.get("_benchmark_kernel_source"),
+        "_baseline_standalone_path": gs.get("_baseline_standalone_path"),
+        "baseline_wall_ms": gs.get("baseline_wall_ms", -1),
+        "best_wall_ms": gs.get("best_wall_ms", -1),
     }
+
+    # Migrate old checkpoints: create active_kernels from legacy best_kernel
+    if gs.get("active_kernels"):
+        graph_state["active_kernels"] = gs["active_kernels"]
+        graph_state["global_best_kernel"] = gs.get("global_best_kernel", "")
+        graph_state["global_best_latency_ns"] = gs.get("global_best_latency_ns", float("inf"))
+    else:
+        # Old checkpoint without forest search — create single-entry beam
+        graph_state["active_kernels"] = [{
+            "chain_id": "chain_0",
+            "kernel_source": graph_state["best_kernel"],
+            "latency_ns": graph_state["best_latency_ns"],
+            "wall_ms": graph_state.get("best_wall_ms", float("inf")),
+            "speedup": 1.0,
+            "profiling_context": graph_state.get("current_profiling_context", {}),
+            "ncu_summary": "",
+            "history": [],
+            "depth": 0,
+            "alive": True,
+        }]
+        graph_state["global_best_kernel"] = graph_state["best_kernel"]
+        graph_state["global_best_latency_ns"] = graph_state["best_latency_ns"]
 
     return graph_state, entry
 

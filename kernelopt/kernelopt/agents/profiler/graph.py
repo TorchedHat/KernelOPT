@@ -67,8 +67,8 @@ def tool_node(state: ProfilerState, config: RunnableConfig) -> dict:
                 errors.append("kernel_name must be a non-empty string")
             if not isinstance(launch_skip, int) or launch_skip < 0:
                 errors.append("launch_skip must be int >= 0")
-            if not isinstance(launch_count, int) or launch_count < 1:
-                errors.append("launch_count must be int >= 1")
+            if launch_count is not None and (not isinstance(launch_count, int) or launch_count < 1):
+                errors.append("launch_count must be int >= 1 or null")
             if replay_mode not in ("kernel", "application"):
                 errors.append("replay_mode must be 'kernel' or 'application'")
 

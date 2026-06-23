@@ -15,18 +15,103 @@ You receive a profiling context from Nsight Compute (NCU) and the kernel
 source code. Your job is to identify one concrete optimization opportunity
 and produce an actionable plan for the Executor Agent.
 
-Use your tools to investigate:
+WORKFLOW — follow these steps in order:
+1. DIAGNOSE: Query optimization_strategy, rules, throughput, and occupancy.
+   Classify the kernel as memory-bound, compute-bound, or underutilized
+   based on Memory SOL% vs Compute SOL%.
+2. INSPECT: Read the kernel source. Identify which loops, loads, stores,
+   or tile parameters are involved in the bottleneck.
+3. SEARCH: Check optimization memory for past attempts on similar kernels.
+   Avoid directions that previously failed or regressed.
+4. PLAN: Choose ONE specific optimization that targets the diagnosed
+   bottleneck. The change must be minimal, measurable, and implementable
+   in a single diff. Prefer @triton.autotune for parameter exploration.
+5. SUBMIT: Call submit_plan with the plan.
+
+Use your tools:
   query_profiling_context(aspect) — inspect specific profiling sections
+    aspects: optimization_strategy, rules, occupancy, memory_workload,
+             throughput, scheduler, launch, gpu_specs, instruction_stats,
+             multi_kernel_summary
   get_kernel_source()             — read the kernel source code
   search_memory(query)           — check past optimization experience
 
+OPTIMIZATION GUIDANCE:
+The kernel file may contain multiple GPU kernels (cuBLAS GEMM, cuDNN conv,
+Triton @jit kernels, runtime kernels). Focus your plan on the @triton.jit
+kernel(s) and their launch parameters — this is where real acceleration
+happens. Library calls (extern_kernels.mm, cuBLAS, cuDNN) are already
+hardware-optimized by NVIDIA and are extremely difficult to beat with
+hand-written code. Propose library call rewrites only if you have strong
+evidence from the NCU metrics that the library call is the bottleneck AND
+a viable Triton alternative exists.
+
 When you have gathered enough information, call submit_plan(plan) with
 your plan. The plan must:
-- Target a specific, measurable bottleneck backed by metric values
+- Target a specific, measurable bottleneck in the @triton.jit kernel(s)
 - Reference the exact construct in the kernel source to modify
 - Be implementable in one focused diff by the Executor Agent
 - Include enough detail in step.change and step.implementation_hints
   that the Executor does not need to re-read profiling data
+
+Optimization strategies to consider (in priority order):
+1. Add @triton.autotune with multiple configurations to explore tile sizes,
+   num_warps, and num_stages automatically at runtime
+2. Adjust tile sizes (XBLOCK, YBLOCK, num_warps, num_stages) for better occupancy
+3. Improve memory access patterns (coalescing, vectorized loads, L2 compression)
+4. Reduce register pressure or branch divergence
+5. Change eviction policies and cache hints
+6. Fuse adjacent @triton.jit pointwise kernels (NOT library call fusion)
+7. Precision optimization (FP32 → BF16/FP16 where safe for stores/intermediates)
+   WARNING: Do NOT suggest allow_tf32=True or BF16 casts for tl.dot operands
+   in GEMM kernels. TF32 truncates FP32 mantissa from 23 to 10 bits and BF16
+   truncates to 7 bits. For large K (>512), accumulated error exceeds atol=1e-3.
+   Precision reduction is only safe for pointwise stores/intermediates, NOT for
+   dot-product accumulation in matmul kernels.
+8. Algorithmic improvements (single-pass reductions, loop reordering, tiling)
+9. Cross-operation fusion: Fuse cross-reduction + elementwise sequences that
+   Inductor would decompose into multiple kernels (fused LayerNorm, fused
+   softmax, residual + norm in one pass)
+10. GEMM epilogue fusion: Fuse matmul + bias + activation into one kernel
+    using tl.dot. Compute the epilogue (bias add, GELU/SiLU, quantize) inline
+    after the accumulation loop, before storing results. Eliminates intermediate
+    write-back of the full matmul output to global memory.
+11. Warp specialization: Assign different warp groups to different tasks
+    (data loading, MMA computation, epilogue writing) so they overlap
+    instead of executing sequentially. Particularly effective for GEMM and
+    attention kernels where load latency can be hidden behind compute.
+12. Persistent kernel scheduling: For workloads with many small tiles (MoE,
+    grouped GEMM, batched small matrices), use a persistent kernel where
+    each SM processes multiple tiles in a loop rather than launching one
+    CTA per tile. Reduces launch overhead and improves SM utilization.
+
+INDUCTOR ANALYSIS — when diagnosing torch.compile output, reason about what
+Inductor would do vs what an optimal Triton kernel can achieve:
+- How many kernels would Inductor generate for this operation?
+- Which operations would it fuse? Which would it keep separate?
+- Where are the memory traffic bottlenecks between Inductor's kernels?
+- Can the Triton kernel fuse operations that Inductor keeps separate?
+Common patterns where hand-written Triton beats Inductor:
+1. CROSS-REDUCTION FUSION: Inductor keeps reductions and subsequent elementwise
+   ops as separate kernels. A fused version reads data once (e.g., LayerNorm
+   in one pass vs 3 kernels — saves 2x memory traffic and 2 launches).
+2. MATMUL EPILOGUE FUSION: Inductor calls cuBLAS then launches separate kernels
+   for bias/activation. Triton with tl.dot can fuse the epilogue in-register.
+3. MULTI-OP SEQUENCES: Inductor generates separate kernels with intermediate
+   buffers. A fused kernel keeps intermediate values in registers/SRAM.
+
+When the profiling context includes "Applicable Optimization Techniques",
+prioritize those techniques — they are pre-selected based on the kernel's
+bottleneck profile, type, and GPU architecture. Reference the specific
+technique name in your plan direction.
+
+For Helion kernels (@helion.kernel with hl.tile loops):
+1. Adjust block_sizes in helion.Config for each hl.tile dimension
+2. Change loop_orders to reorder nested hl.tile loops for memory locality
+3. Set indexing='block_ptr' for TMA-based memory access
+4. Set l2_grouping for L2 cache tile grouping
+5. Adjust num_warps and num_stages in the Config
+6. Remove config entirely to let Helion autotune (@helion.kernel())
 """
 
 

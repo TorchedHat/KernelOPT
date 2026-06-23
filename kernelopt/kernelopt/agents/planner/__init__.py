@@ -52,8 +52,38 @@ def run_planner_agent(
         reverse=True,
     )
 
+    strategy = profiling_context.get("optimization_strategy", {})
+    strategy_type = strategy.get("strategy_type", "optimize_kernel")
+    plan_guidance = strategy.get("plan_guidance", [])
+
     def run_one(i: int) -> tuple[str, dict] | None:
-        hint = build_diversity_hint(i, sorted_rules)
+        strategy_prefix = (
+            f"OVERALL STRATEGY: {strategy_type} — {strategy.get('reasoning', '')} "
+            f"Target: {strategy.get('primary_target', 'the @triton.jit kernel')}. "
+        )
+
+        if strategy_type == "tune_parameters":
+            hint = (
+                f"{strategy_prefix}"
+                f"PARAMETER-ONLY optimization: modify ONLY constexpr values "
+                f"(XBLOCK, RBLOCK, num_warps, num_stages), eviction_policy hints, "
+                f"and grid dimensions. Do NOT change kernel body logic."
+            )
+            if plan_guidance and i < len(plan_guidance):
+                hint += f" Focus: {plan_guidance[i]}"
+        elif strategy_type == "fuse_pointwise":
+            hint = (
+                f"{strategy_prefix}"
+                f"Fuse adjacent @triton.jit pointwise kernels to eliminate intermediate "
+                f"memory traffic. Do NOT fuse with library calls (cuBLAS, cuDNN)."
+            )
+            if strategy.get("fusion_opportunity"):
+                hint += f" Fusion opportunity: {strategy['fusion_opportunity']}."
+        elif plan_guidance and i < len(plan_guidance):
+            hint = f"{strategy_prefix}{plan_guidance[i]}"
+        else:
+            ncu_hint = build_diversity_hint(i, sorted_rules)
+            hint = f"{strategy_prefix}{ncu_hint}"
         initial_msg = build_initial_message(hint, all_tried_directions)
 
         config = RunnableConfig(

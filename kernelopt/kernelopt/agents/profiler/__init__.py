@@ -13,7 +13,10 @@ Re-exports for backward compatibility (used by cli.py):
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 
@@ -116,8 +119,7 @@ def _resolve_ncu_config(
         if kernel_path.endswith(".cu"):
             kernel_source = Path(kernel_path).read_text()
             if "int main(" in kernel_source or "void main(" in kernel_source:
-                if pipeline_config.debug:
-                    print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
+                logger.debug("Detected CUDA binary with main(), forcing replay_mode='application'")
                 replay_mode = "application"
 
         return {
@@ -159,26 +161,29 @@ def _resolve_ncu_config(
         if pipeline_config.replay_mode != "kernel":
             llm_result = {**llm_result, "replay_mode": pipeline_config.replay_mode}
 
-        # Force kernel_name to be empty for Triton/Helion frameworks.
-        # JIT-compiled kernels have mangled names that don't match Python function names.
+        # For Triton/Helion: build a kernel name filter from detected names
+        # to exclude non-Triton CUDA kernels (like torch.randn).
+        # Reset launch_skip to 0 since the filter excludes non-Triton launches.
         if framework in ("triton", "helion"):
+            if detected_names:
+                kn_filter = _build_kernel_name_filter(detected_names)
+            else:
+                kn_filter = "regex:triton_"
             overrides = {
-                "kernel_name": "",
+                "kernel_name": kn_filter,
                 "launch_skip": 0,
-                "launch_count": None,
+                "launch_count": llm_result.get("launch_count") or 1,
             }
             if pipeline_config.replay_mode == "kernel":
                 overrides["replay_mode"] = "kernel"
-            if pipeline_config.debug:
-                print(f"[DEBUG] Detected {framework} kernel, overrides={overrides} (llm had: kernel_name={llm_result.get('kernel_name')!r}, replay_mode={llm_result.get('replay_mode')!r})")
+            logger.debug("Detected %s kernel, overrides=%s (llm had: kernel_name=%r, replay_mode=%r)", framework, overrides, llm_result.get('kernel_name'), llm_result.get('replay_mode'))
             llm_result = {**llm_result, **overrides}
 
         # Force application mode for CUDA files with main() — kernel mode doesn't work with standalone binaries.
         if framework == "cuda" and kernel_path.endswith(".cu"):
             kernel_source = Path(kernel_path).read_text()
             if "int main(" in kernel_source or "void main(" in kernel_source:
-                if pipeline_config.debug:
-                    print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application' (was: {llm_result.get('replay_mode')})")
+                logger.debug("Detected CUDA binary with main(), forcing replay_mode='application' (was: %s)", llm_result.get('replay_mode'))
                 llm_result = {**llm_result, "replay_mode": "application"}
 
         emit_profiler_output(f"[profiler] LLM config: {llm_result}\n")
@@ -186,8 +191,13 @@ def _resolve_ncu_config(
 
     # Fallback — deterministic extraction if LLM never called submit_ncu_config.
     # For CUDA, function names match NCU's demangled names directly.
-    # For Triton/Helion, JIT compilers mangle names — don't filter by name.
-    kernel_name_filter = _build_kernel_name_filter(detected_names) if framework == "cuda" else None
+    # For Triton/Helion, use detected kernel names or regex:triton_ fallback.
+    if framework == "cuda":
+        kernel_name_filter = _build_kernel_name_filter(detected_names)
+    elif framework in ("triton", "helion"):
+        kernel_name_filter = _build_kernel_name_filter(detected_names) if detected_names else "regex:triton_"
+    else:
+        kernel_name_filter = None
 
     # Note: for Triton/Helion, the default replay_mode ("kernel") is the only
     # technically correct mode — see the explicit override in the LLM path above.
@@ -196,8 +206,7 @@ def _resolve_ncu_config(
     if framework == "cuda" and kernel_path.endswith(".cu"):
         kernel_source = Path(kernel_path).read_text()
         if "int main(" in kernel_source or "void main(" in kernel_source:
-            if pipeline_config.debug:
-                print(f"[DEBUG] Detected CUDA binary with main(), forcing replay_mode='application'")
+            logger.debug("Detected CUDA binary with main(), forcing replay_mode='application'")
             replay_mode = "application"
 
     fallback_config = {
@@ -207,8 +216,7 @@ def _resolve_ncu_config(
         "kernel_args": list(pipeline_config.kernel_args),
         "replay_mode": replay_mode,
     }
-    if pipeline_config.debug:
-        print(f"[DEBUG] Using fallback config (LLM didn't call submit_ncu_config): {fallback_config}")
+    logger.debug("Using fallback config (LLM didn't call submit_ncu_config): %s", fallback_config)
     return fallback_config
 
 

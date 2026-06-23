@@ -8,6 +8,8 @@ from functools import cached_property
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from kernelopt.constants import VERTEX_API_TIMEOUT_S
+
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_PROJECT_ID = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
@@ -34,6 +36,7 @@ def _build_vertex_llm(
             return AnthropicVertex(
                 project_id=self._vertex_project_id,
                 region=self._vertex_region,
+                timeout=VERTEX_API_TIMEOUT_S,  # 15 min hard timeout — prevents infinite hangs on Vertex API
             )
 
         @cached_property
@@ -41,6 +44,7 @@ def _build_vertex_llm(
             return AsyncAnthropicVertex(
                 project_id=self._vertex_project_id,
                 region=self._vertex_region,
+                timeout=VERTEX_API_TIMEOUT_S,
             )
 
     return _ChatAnthropicVertex(

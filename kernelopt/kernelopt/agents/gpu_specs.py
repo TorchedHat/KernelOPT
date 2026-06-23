@@ -112,14 +112,21 @@ def _detect_from_cc_and_sm(sm_count: int | None, compute_capability: str) -> str
         return "unknown"
     cc = compute_capability
     if cc.startswith("9.0"):
-        if sm_count == 132: return "H100 SXM5"   # conservative — may be H200
+        if sm_count == 132:
+            # H200 and H100 SXM5 share CC 9.0, 132 SMs — check VRAM to distinguish
+            try:
+                import torch
+                mem_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+                return "H200 SXM5" if mem_gb > 100 else "H100 SXM5"
+            except Exception:
+                return "H100 SXM5"  # fallback when torch unavailable
         if sm_count == 114: return "H100 PCIe"
     elif cc.startswith("8.0"):
         if sm_count == 108: return "A100 SXM4"
     elif cc.startswith("8.9"):
         if sm_count == 142: return "L40S"
+        if sm_count == 128: return "RTX 4090"   # Ada Lovelace, CC 8.9
     elif cc.startswith("8.6"):
-        if sm_count == 128: return "RTX 4090"
         if sm_count == 82:  return "RTX 3090"
     return "unknown"
 

@@ -93,9 +93,22 @@ class PlannerToolServer:
                 }
             }
 
+        if aspect == "multi_kernel_summary":
+            summary = ctx.get("multi_kernel_summary", "")
+            if summary:
+                return {"multi_kernel_summary": summary}
+            return {"multi_kernel_summary": "Single kernel file (no multi-kernel info)."}
+
+        if aspect == "optimization_strategy":
+            strategy = ctx.get("optimization_strategy", {})
+            if strategy:
+                return {"optimization_strategy": strategy}
+            return {"optimization_strategy": {"strategy_type": "optimize_kernel"}}
+
         valid = (
             "rules, occupancy, memory_workload, throughput, "
-            "scheduler, launch, gpu_specs, instruction_stats"
+            "scheduler, launch, gpu_specs, instruction_stats, "
+            "multi_kernel_summary, optimization_strategy"
         )
         raise ValueError(f"Unknown aspect: {aspect!r}. Must be one of: {valid}")
 
@@ -106,13 +119,18 @@ class PlannerToolServer:
     def search_memory(self, query: str) -> list[dict]:
         """Return up to 3 memory items most relevant to the query.
 
-        Keyword matching is substring-based: "register" matches "registers_per_thread".
+        Word-level matching: "register" matches items containing "register"
+        or "registers" as a word. Words shorter than 3 characters are
+        filtered out to avoid trivial matches (e.g., "a" matching everything).
         An empty query returns the first 3 items in list order.
         """
         if not self.memory:
             return []
 
-        query_words = set(query.lower().split())
+        # Filter short words that produce noise matches
+        query_words = [w for w in query.lower().split() if len(w) >= 3]
+        if not query_words:
+            return self.memory[:3]
 
         def score(item: dict) -> int:
             text = " ".join([
@@ -121,7 +139,12 @@ class PlannerToolServer:
                 item.get("strategy_description", ""),
                 item.get("applicable_when", ""),
             ]).lower()
-            return sum(1 for w in query_words if w in text)
+            text_words = text.split()
+            # Word-level matching: query word must appear within a text word
+            return sum(
+                1 for w in query_words
+                if any(w in tw for tw in text_words)
+            )
 
         return sorted(self.memory, key=score, reverse=True)[:3]
 

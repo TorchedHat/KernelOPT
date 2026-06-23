@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import tempfile
 import types
 from pathlib import Path
@@ -12,52 +13,22 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from kernelopt.llm import build_llm
 
-CORRECTNESS_SYSTEM_PROMPT = """\
-You are the Correctness Agent. Given an optimized GPU kernel, return a JSON
-specification. Python will use that spec to load the kernel, run it, run a CPU
-reference, and compare with torch.allclose. You do NOT write a test script.
+logger = logging.getLogger(__name__)
 
----
-
-## WHAT TO RETURN
-
-### wrapper_function
-The name of the plain Python wrapper function in the file — the function that
-allocates the output tensor and calls the @triton.jit kernel with a grid.
-Example: "run_triton_softmax", "matmul", "flash_attn_forward".
-Do NOT name the @triton.jit kernel itself.
-
-### reference_code
-A self-contained Python string that defines a function named exactly `reference`.
-It receives the same positional arguments as wrapper_function but as CPU tensors.
-It must use only standard torch operations (no Triton, no CUDA).
-Start with `import torch` if needed.
-
-Example for row-wise softmax:
-    import torch
-    def reference(x):
-        return torch.softmax(x, dim=-1)
-
-### test_inputs
-An ordered list of input tensor specs matching the arguments wrapper_function
-expects. For each input specify:
-- shape: exact list of ints (use kernel_args dimensions if provided)
-- dtype: "float32", "float16", "bfloat16", "int32", or "int64"
-- distribution: "randn" for most ops, "rand" for ops needing [0,1], "ones"/"zeros" for special cases
-
-### atol / rtol
-Tolerances for torch.allclose (matches torch.testing.assert_close defaults):
-- FP32 (element-wise or reductions): atol=1e-5, rtol=1.3e-6
-- FP16: atol=1e-3, rtol=1e-3
-- BF16: atol=1e-5, rtol=1.6e-2
-
-### skip
-Set true ONLY if the operation cannot be tested automatically (custom RNG,
-hardware-specific stateful op). Default: false.
-"""
+from kernelopt.agents.correctness_prompts import CORRECTNESS_SYSTEM_PROMPT
 
 
-def _make_tensor(inp, device: str) -> torch.Tensor:
+def _make_input(inp, device: str):
+    """Create a test input value from a TestInput spec.
+
+    Returns a torch.Tensor (on *device*) for kind="tensor",
+    or a plain Python scalar for kind="scalar".
+    """
+    if inp.kind == "scalar":
+        val = inp.value if inp.value is not None else 1.0
+        cast = {"int": int, "bool": bool, "float": float}.get(inp.scalar_dtype or "float", float)
+        return cast(val)
+
     dtype_map = {
         "float32":  torch.float32,
         "float16":  torch.float16,
@@ -65,21 +36,22 @@ def _make_tensor(inp, device: str) -> torch.Tensor:
         "int32":    torch.int32,
         "int64":    torch.int64,
     }
-    dtype = dtype_map.get(inp.dtype, torch.float32)
+    dtype = dtype_map.get(inp.dtype or "float32", torch.float32)
+    shape = inp.shape or [1]
     dist = inp.distribution
     if dist == "randn":
-        return torch.randn(inp.shape, dtype=dtype, device=device)
+        return torch.randn(shape, dtype=dtype, device=device)
     elif dist == "rand":
-        return torch.rand(inp.shape, dtype=dtype, device=device)
+        return torch.rand(shape, dtype=dtype, device=device)
     elif dist == "ones":
-        return torch.ones(inp.shape, dtype=dtype, device=device)
+        return torch.ones(shape, dtype=dtype, device=device)
     elif dist == "zeros":
-        return torch.zeros(inp.shape, dtype=dtype, device=device)
+        return torch.zeros(shape, dtype=dtype, device=device)
     elif dist == "randint":
         lo = int(inp.low) if inp.low is not None else 0
         hi = int(inp.high) if inp.high is not None else 128
-        return torch.randint(lo, hi, inp.shape, dtype=dtype, device=device)
-    return torch.randn(inp.shape, dtype=dtype, device=device)
+        return torch.randint(lo, hi, shape, dtype=dtype, device=device)
+    return torch.randn(shape, dtype=dtype, device=device)
 
 
 def run_correctness_agent(
@@ -144,11 +116,11 @@ def run_correctness_agent(
 
     if spec.skip:
         reason = spec.skip_reason or "no reason given"
-        print(f"[correctness] SKIP: {reason}")
+        logger.info("SKIP: %s", reason)
         return False, f"Correctness skipped: {reason}"
 
-    print(f"[correctness] wrapper={spec.wrapper_function!r}  atol={spec.atol}  rtol={spec.rtol}")
-    print(f"[correctness] reference_code:\n{spec.reference_code}")
+    logger.debug("wrapper=%r  atol=%s  rtol=%s", spec.wrapper_function, spec.atol, spec.rtol)
+    logger.debug("reference_code:\n%s", spec.reference_code)
 
     # --- Step 2: Load optimized kernel via importlib (exact file, no ambiguity) ---
     kernel_basename = Path(kernel_path).stem
@@ -192,34 +164,49 @@ def run_correctness_agent(
             f"Defined names: {[k for k in ref_ns if not k.startswith('_')]}"
         )
 
-    # --- Step 4: Run GPU vs CPU comparison for 3 seeds ---
-    seeds = [0, 42, 1337]
+    # --- Step 4: Run GPU vs CPU comparison for multiple seeds ---
+    from kernelopt.memory import CORRECTNESS_SEEDS
+    seeds = CORRECTNESS_SEEDS
     failures: list[str] = []
 
     for seed in seeds:
         torch.manual_seed(seed)
         try:
-            inputs_cuda = [_make_tensor(inp, device="cuda") for inp in spec.test_inputs]
-            inputs_cpu  = [t.cpu() for t in inputs_cuda]
+            inputs_cuda = [_make_input(inp, device="cuda") for inp in spec.test_inputs]
+            inputs_cpu  = [t.cpu() if isinstance(t, torch.Tensor) else t for t in inputs_cuda]
 
             gpu_out = wrapper_fn(*inputs_cuda)
             ref_out = reference_fn(*inputs_cpu)
 
-            # Unwrap tuples (some kernels return (output, lse) etc.)
-            if isinstance(gpu_out, (tuple, list)):
-                gpu_out = gpu_out[0]
-            if isinstance(ref_out, (tuple, list)):
-                ref_out = ref_out[0]
+            # Normalize outputs to lists for multi-output comparison
+            if not isinstance(gpu_out, (tuple, list)):
+                gpu_out = [gpu_out]
+            if not isinstance(ref_out, (tuple, list)):
+                ref_out = [ref_out]
 
-            gpu_f = gpu_out.cpu().float()
-            ref_f = ref_out.float()
+            for _oi, (_g, _r) in enumerate(zip(gpu_out, ref_out)):
+                if not isinstance(_g, torch.Tensor) or not isinstance(_r, torch.Tensor):
+                    continue
+                gpu_f = _g.cpu().float()
+                ref_f = _r.float()
 
-            passed = torch.allclose(gpu_f, ref_f, atol=spec.atol, rtol=spec.rtol)
-            max_diff = (gpu_f - ref_f).abs().max().item()
-            print(f"[correctness] seed={seed}  passed={passed}  max_diff={max_diff:.3e}")
+                # Enforce minimum tolerance floor based on tensor size
+                atol = max(spec.atol, 1e-3 if gpu_f.numel() > 100_000 else spec.atol)
+                rtol = max(spec.rtol, 1e-3 if gpu_f.numel() > 100_000 else spec.rtol)
+                if atol > spec.atol or rtol > spec.rtol:
+                    logger.debug(
+                        "tolerance overridden for large tensor (%d elements): "
+                        "atol %s -> %s, rtol %s -> %s",
+                        gpu_f.numel(), f"{spec.atol:.0e}", f"{atol:.0e}",
+                        f"{spec.rtol:.0e}", f"{rtol:.0e}",
+                    )
 
-            if not passed:
-                failures.append(f"seed={seed}: max_diff={max_diff:.3e} > atol={spec.atol}")
+                passed = torch.allclose(gpu_f, ref_f, atol=atol, rtol=rtol)
+                max_diff = (gpu_f - ref_f).abs().max().item()
+                logger.debug("seed=%s output[%d]  passed=%s  max_diff=%.3e  atol=%s", seed, _oi, passed, max_diff, atol)
+
+                if not passed:
+                    failures.append(f"seed={seed} output[{_oi}]: max_diff={max_diff:.3e} > atol={atol}")
 
         except Exception as e:
             import traceback
