@@ -1,0 +1,77 @@
+--- baseline
++++ rebuilt
+@@ -5,26 +5,47 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 2048, 'YBLOCK': 1}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 4096, 'YBLOCK': 1}, num_warps=8, num_stages=4),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+-def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 24576
+-    xnumel = 3025
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 96)
+-    y1 = yindex // 96
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), xmask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
++def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
++    # Flat 1D indexing over all N*C*H*W elements in NHWC order
++    # Total elements = 256 * 96 * 55 * 55 = 74317824
++    # flat = n*(C*HW) + hw*C + c  (NHWC order)
++    # c = flat % 96, hw = (flat // 96) % 3025, n = flat // (96*3025)
++    C            = 96      # channels, stride-1 in input (NHWC)
++    HW           = 3025    # H*W = 55*55
++    N_IN_STRIDE  = 290400
++    HW_IN_STRIDE = 96
++    N_OUT_STRIDE = 290400
++    C_OUT_STRIDE = 3025
++    pid = tl.program_id(0)
++    offsets = pid * XBLOCK + tl.arange(0, XBLOCK)
++    numel = ynumel * xnumel  # 24576 * 3025 = 74317824... wait, 24576*3025 != 74317824
++    # Actually: ynumel=24576 (N*C=256*96), xnumel=3025 (H*W)
++    # Total = 24576 * 3025 = 74342400... let's compute correctly
++    # N=256, C=96, HW=3025 => total = 256*96*3025 = 74342400
++    # But plan says 74317824 = 256*96*55*55 = 256*96*3025 = 74342400? 
++    # 55*55=3025, 256*96=24576, 24576*3025=74342400
++    total = ynumel * xnumel
++    mask = offsets < total
++    c  = offsets % C
++    hw = (offsets // C) % HW
++    n  = offsets // (C * HW)
++    in_off  = n * N_IN_STRIDE + hw * HW_IN_STRIDE + c
++    tmp0 = tl.load(in_ptr0 + in_off, mask=mask)
++    tmp1 = tl.load(in_ptr1 + c, mask=mask)
+     tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, xmask)
+-
+-
++    out_off = n * N_OUT_STRIDE + c * C_OUT_STRIDE + hw
++    tl.store(out_ptr0 + out_off, tmp2, mask=mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -33,7 +54,7 @@
+     ynumel = 24576
+     xnumel = 3025
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025)
+     return arg_2
+ 
+ def get_inputs():

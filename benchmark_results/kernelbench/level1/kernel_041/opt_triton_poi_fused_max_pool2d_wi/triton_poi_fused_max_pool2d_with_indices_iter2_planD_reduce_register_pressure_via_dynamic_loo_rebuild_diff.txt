@@ -1,0 +1,87 @@
+--- baseline
++++ rebuilt
+@@ -3,18 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 128}, num_warps=8),
++        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 256}, num_warps=2, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 128}, num_warps=2, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=1),
+     ],
+-    key=['total_elements'],
++    key=['out_length', 'in_length'],
+ )
+ @triton.jit
+ def max_pool1d_kernel(
+@@ -31,39 +30,36 @@
+     total_elements,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    pid = tl.program_id(0)
+-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    mask = offsets < total_elements
++    bc_idx  = tl.program_id(0)   # one CTA per (batch, channel) pair
++    pid_out = tl.program_id(1)   # tile over out_pos
+ 
+-    # Decompose flat index into (batch, channel, out_pos)
+-    out_pos = offsets % out_length
+-    tmp = offsets // out_length
+-    channel = tmp % channels
+-    batch = tmp // channels
++    batch   = bc_idx // channels  # scalar
++    channel = bc_idx %  channels  # scalar
+ 
+-    # Compute the base input position
++    out_pos = pid_out * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = out_pos < out_length
++
++    # Base input offset for this (batch, channel) pair — scalar
++    base_offset = batch * (channels * in_length) + channel * in_length
++
++    # Starting input position for each output position
+     in_start = out_pos * stride - padding
+-
+-    # Compute the channel stride and batch stride
+-    ch_stride = in_length
+-    batch_stride = channels * in_length
+-
+-    # Base pointer offset for this (batch, channel)
+-    base_offset = batch * batch_stride + channel * ch_stride
+ 
+     # Initialize max value to -inf
+     max_val = tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32)
+ 
+-    # Unroll over kernel positions
++    # Dynamic loop — compiler reuses registers across iterations (no full unroll)
+     for k in range(kernel_size):
+         in_pos = in_start + k * dilation
+         valid = (in_pos >= 0) & (in_pos < in_length) & mask
+-        load_offset = base_offset + in_pos
+-        val = tl.load(in_ptr + load_offset, mask=valid, other=float('-inf'))
++        val = tl.load(in_ptr + base_offset + in_pos, mask=valid, other=float('-inf'))
+         max_val = tl.maximum(max_val, val)
+ 
+-    tl.store(out_ptr + offsets, max_val, mask=mask)
+-
++    # Output offset: bc_idx * out_length + out_pos
++    # = (batch * channels + channel) * out_length + out_pos
++    # = batch * channels * out_length + channel * out_length + out_pos  ✓
++    out_offset = bc_idx * out_length + out_pos
++    tl.store(out_ptr + out_offset, max_val, mask=mask)
+ 
+ def kernel_function(x):
+     # Parameters matching the model

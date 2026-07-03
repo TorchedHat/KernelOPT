@@ -1,0 +1,71 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,45 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 128}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 128}, num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=8, num_stages=1),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    # YBLOCK is always 128 (= number of channels, TILE_C)
++    # XBLOCK is the HW tile size (TILE_HW)
++    # Grid: axis-0 = hw tiles, axis-1 = batch (N=32)
++    hw_tile_id = tl.program_id(0)
++    n_id       = tl.program_id(1)
+ 
++    hw_off = hw_tile_id * XBLOCK
++    hw_idx = hw_off + tl.arange(0, XBLOCK)   # shape [XBLOCK]
++    c_idx  = tl.arange(0, YBLOCK)             # shape [YBLOCK=128]
++    hw_mask = hw_idx < xnumel
+ 
++    # COALESCED LOAD: shape [YBLOCK=128, XBLOCK]
++    # c_idx is the fast (innermost) dimension -> stride=1 in input -> coalesced
++    # addr = c + 128*hw + 4032000*n
++    load_addr = c_idx[:, None] + 128 * hw_idx[None, :] + 4032000 * n_id
++    load_mask = hw_mask[None, :]
++    tile = tl.load(in_ptr0 + load_addr, mask=load_mask, other=0.0)
++
++    # COALESCED STORE: shape [YBLOCK=128, XBLOCK]
++    # hw_idx is the fast (innermost) dimension -> stride=1 in output -> coalesced
++    # addr = hw + 31500*(c + 128*n)
++    y3_idx = c_idx + 128 * n_id
++    store_addr = hw_idx[None, :] + 31500 * y3_idx[:, None]
++    store_mask = hw_mask[None, :]
++    tl.store(out_ptr0 + store_addr, tile, mask=store_mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +51,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

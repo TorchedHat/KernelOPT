@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -37,8 +38,15 @@
+     # Accumulator
+     acc = tl.zeros([BLOCK_L], dtype=tl.float32)
+ 
++    # Base pointer for input
++    x_base = X_ptr + batch_idx * (IN_C * IN_L)
++
+     # Loop over in_channels in blocks
+     for ic_start in range(0, IN_C, BLOCK_IC):
++        # Hoist ic_offs and ic_mask outside the k-loop (they don't depend on k)
++        ic_offs = ic_start + tl.arange(0, BLOCK_IC)  # [BLOCK_IC]
++        ic_mask = ic_offs < IN_C                       # [BLOCK_IC]
++
+         # Loop over kernel positions
+         for k in range(KERNEL_SIZE):
+             # For output position o, kernel position k:
+@@ -47,38 +55,39 @@
+             k_dil = k * DILATION
+             # numerator for input index
+             num = out_offs - k_dil + PADDING
+-            # Check divisibility by stride
+-            valid_stride = (num % STRIDE) == 0
+             i_idx = num // STRIDE
++
++            # Compute validity mask
+             valid_i = (i_idx >= 0) & (i_idx < IN_L)
+-            valid = out_mask & valid_stride & valid_i
++            # STRIDE==1 fast-path: skip modulo check (always True when STRIDE==1)
++            if STRIDE == 1:
++                valid = out_mask & valid_i
++            else:
++                valid_stride = (num % STRIDE) == 0
++                valid = out_mask & valid_stride & valid_i
+ 
+             # Load weights for this kernel position, for BLOCK_IC channels
+-            ic_offs = ic_start + tl.arange(0, BLOCK_IC)
+-            ic_mask = ic_offs < IN_C
+-
+             # Weight shape: (IN_C, OUT_C, KERNEL_SIZE)
+             # weight[ic, oc, k]
+             w_ptrs = W_ptr + ic_offs * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k
+             w_vals = tl.load(w_ptrs, mask=ic_mask, other=0.0)  # [BLOCK_IC]
+ 
+-            # Load input for each valid output position
++            # Load input as 2D tile [BLOCK_IC, BLOCK_L]
+             # X shape: (BATCH, IN_C, IN_L)
+             # x[batch, ic, i_idx]
+-            # We need to accumulate over BLOCK_IC channels
+-            for ic_local in range(BLOCK_IC):
+-                ic = ic_start + ic_local
+-                if ic < IN_C:
+-                    w_val = tl.load(W_ptr + ic * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k)
+-                    x_ptrs = X_ptr + batch_idx * (IN_C * IN_L) + ic * IN_L + i_idx
+-                    x_vals = tl.load(x_ptrs, mask=valid, other=0.0)  # [BLOCK_L]
+-                    acc += x_vals * w_val
++            x_ptrs = (x_base
++                      + ic_offs[:, None] * IN_L   # [BLOCK_IC, 1]
++                      + i_idx[None, :])            # [1, BLOCK_L]
++            x_mask = ic_mask[:, None] & valid[None, :]  # [BLOCK_IC, BLOCK_L]
++            x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)  # [BLOCK_IC, BLOCK_L]
++
++            # Accumulate: sum over ic dimension using already-loaded w_vals
++            acc += tl.sum(w_vals[:, None] * x_tile, axis=0)  # [BLOCK_L]
+ 
+     # Store output
+     # Y shape: (BATCH, OUT_C, OUT_L)
+     y_ptrs = Y_ptr + batch_idx * (OUT_C * OUT_L) + oc * OUT_L + out_offs
+     tl.store(y_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: (IN_C, OUT_C, KERNEL_SIZE) - ConvTranspose1d weight is (in_channels, out_channels, kernel_size)

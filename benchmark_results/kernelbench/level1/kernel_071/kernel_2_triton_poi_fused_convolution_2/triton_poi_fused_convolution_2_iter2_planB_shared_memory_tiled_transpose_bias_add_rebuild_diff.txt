@@ -1,0 +1,68 @@
+--- baseline
++++ rebuilt
+@@ -5,26 +5,49 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+-def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 24576
+-    xnumel = 3025
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 96)
+-    y1 = yindex // 96
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), xmask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
++def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
++    # Reindex: XBLOCK tiles channel dim (stride=1 in in_ptr0 for coalesced loads)
++    # YBLOCK tiles spatial*batch dim
++    # This makes loads coalesced (channel is fast dim in NHWC input)
++    # Stores to NCHW output: spatial is fast dim, so we accept partial uncoalescing on stores
++    # but loads are the primary bottleneck (96.37% L2, 21.6 cycle stalls)
++
++    C = 96
++    HW = 3025
++
++    # pid(0) -> channel tiles, pid(1) -> (n, hw) tiles
++    c_tile = tl.program_id(0)   # tiles over channel dim
++    nhw_tile = tl.program_id(1) # tiles over n*HW
++
++    # Channel indices (fast dim for coalesced NHWC loads)
++    c_offs = c_tile * XBLOCK + tl.arange(0, XBLOCK)[None, :]
++    c_mask = c_offs < C
++
++    # Spatial*batch indices
++    nhw_offs = nhw_tile * YBLOCK + tl.arange(0, YBLOCK)[:, None]
++    nhw_mask = nhw_offs < (256 * HW)
++
++    n = nhw_offs // HW
++    hw = nhw_offs % HW
++
++    combined_mask = c_mask & nhw_mask
++
++    # NHWC load: stride (290400, 1, 5280, 96) -> index = n*290400 + hw*96 + c
++    # hw*96 + c: channel is fast (stride=1), so consecutive threads (varying c) are coalesced
++    load_idx = n * 290400 + hw * 96 + c_offs
++
++    tmp0 = tl.load(in_ptr0 + load_idx, combined_mask, other=0.0)
++    tmp1 = tl.load(in_ptr1 + c_offs, c_mask, other=0.0)
+     tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, xmask)
+ 
++    # NCHW store: stride (290400, 3025, 55, 1) -> index = n*290400 + c*3025 + hw
++    # spatial (hw) is fast dim in output, but c varies fastest here -> partially uncoalesced
++    # Still better than original where spatial varied fastest for uncoalesced loads
++    store_idx = n * 290400 + c_offs * 3025 + hw
+ 
++    tl.store(out_ptr0 + store_idx, tmp2, combined_mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

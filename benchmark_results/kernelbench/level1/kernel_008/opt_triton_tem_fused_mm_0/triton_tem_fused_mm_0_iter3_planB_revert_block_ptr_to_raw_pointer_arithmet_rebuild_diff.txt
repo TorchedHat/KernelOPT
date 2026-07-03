@@ -1,0 +1,76 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -17,6 +18,13 @@
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -41,16 +49,11 @@
+     pid_m = group_id * GROUP_M + (pid % group_size)
+     pid_n = (pid % width) // group_size
+ 
+-    # Row/col offsets
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    # Raw pointer arithmetic — avoids register spill from tl.make_block_ptr overhead
++    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+     rk = tl.arange(0, BLOCK_K)
+ 
+-    # Clamp indices for boundary safety in the K loop
+-    offs_am = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    offs_bn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-
+-    # Pointers to A and B tiles
+     A_ptrs = A_ptr + (offs_am[:, None] * stride_am + rk[None, :] * stride_ak)
+     B_ptrs = B_ptr + (rk[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+ 
+@@ -59,25 +62,22 @@
+     num_k_blocks = tl.cdiv(K, BLOCK_K)
+     for k in range(num_k_blocks):
+         k_remaining = K - k * BLOCK_K
+-        # Boundary mask for K dimension
+-        a_mask = rk[None, :] < k_remaining
+-        b_mask = rk[:, None] < k_remaining
++        # Load in FP32 (masked fills use FP32 zero), then cast to FP16 for Tensor Core path
++        a = tl.load(A_ptrs, mask=(offs_am[:, None] < M) & (rk[None, :] < k_remaining), other=0.0).to(tl.float16)
++        b = tl.load(B_ptrs, mask=(rk[:, None] < k_remaining) & (offs_bn[None, :] < N), other=0.0).to(tl.float16)
+ 
+-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
+-
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
++        # FP16 inputs with FP32 accumulator — uses FP16 Tensor Core path, accumulates in FP32
++        acc = tl.dot(a, b, acc=acc, out_dtype=tl.float32)
+ 
+         A_ptrs += BLOCK_K * stride_ak
+         B_ptrs += BLOCK_K * stride_bk
+ 
+-    # Write output
++    # Write output — acc is already FP32
+     rm_out = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     rn_out = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+     mask = (rm_out[:, None] < M) & (rn_out[None, :] < N)
+     C_ptrs = C_ptr + rm_out[:, None] * stride_cm + rn_out[None, :] * stride_cn
+     tl.store(C_ptrs, acc, mask=mask)
+-
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

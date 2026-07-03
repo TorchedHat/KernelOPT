@@ -1,0 +1,69 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,31 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        # num_stages=1 originals (trimmed to best shapes)
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 1}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 2}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 2}, num_warps=2, num_stages=1),
++        triton.Config({'XBLOCK': 256, 'YBLOCK': 1}, num_warps=8, num_stages=1),
++        # num_stages=2: double-buffered prefetch hides ~47-cycle L2 latency
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 1}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 2}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 2}, num_warps=2, num_stages=2),
++        triton.Config({'XBLOCK': 256, 'YBLOCK': 1}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 256, 'YBLOCK': 2}, num_warps=8, num_stages=2),
++        # num_stages=3: deeper pipeline, higher register cost
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2, num_stages=3),
++        triton.Config({'XBLOCK': 256, 'YBLOCK': 1}, num_warps=8, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+     ynumel = 24576
+@@ -13,18 +38,19 @@
+     yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+     ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+     xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
++    # KEY CHANGE: contiguity hints enable 128-bit vectorized memory instructions
++    xindex = xoffset + tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]
+     xmask = xindex < xnumel
+     x2 = xindex
+     y0 = (yindex % 96)
+     y1 = yindex // 96
+     y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), xmask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
++    # evict_first: streaming strided read, each element used once — frees L2 for bias
++    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), mask=xmask & ymask, eviction_policy='evict_first')
++    # evict_last: bias (96 floats) reused across 3025 spatial positions, keep in L2
++    tmp1 = tl.load(in_ptr1 + (y0), mask=ymask, eviction_policy='evict_last')
+     tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, xmask)
+-
+-
++    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, mask=xmask & ymask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -33,7 +59,7 @@
+     ynumel = 24576
+     xnumel = 3025
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025)
+     return arg_2
+ 
+ def get_inputs():

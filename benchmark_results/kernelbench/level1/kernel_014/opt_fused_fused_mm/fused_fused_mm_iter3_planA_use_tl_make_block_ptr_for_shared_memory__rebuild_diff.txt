@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -3,8 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        # NEW: small tiles, num_warps=2, deep pipeline — target coalescing fix
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=6, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=6, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        # EXISTING 8 configs retained unchanged
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+@@ -49,29 +58,36 @@
+     rm = row_start + tl.arange(0, BLOCK_M)
+     rn = col_start + tl.arange(0, BLOCK_N)
+ 
+-    # Compute matmul for this tile
+-    offs_am = rm
+-    offs_bn = rn
+-    offs_k = tl.arange(0, BLOCK_K)
+-
+-    A_ptrs = A_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+-    B_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
++    # Construct block pointer descriptors — enables XOR swizzle in PTX backend
++    A_block_ptr = tl.make_block_ptr(
++        base=A_ptr,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(row_start, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    B_block_ptr = tl.make_block_ptr(
++        base=B_ptr,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, col_start),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(1, 0),
++    )
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        # Load A tile
+-        a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < k_remaining)
+-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        # Load B tile
+-        b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
+-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
++        # Load A tile using block pointer with boundary check (replaces explicit mask)
++        a = tl.load(A_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        # Load B tile using block pointer with boundary check (replaces explicit mask)
++        b = tl.load(B_block_ptr, boundary_check=(0, 1), padding_option='zero')
+ 
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
++        acc = tl.dot(a, b, acc=acc, allow_tf32=True)
+ 
+-        A_ptrs += BLOCK_K * stride_ak
+-        B_ptrs += BLOCK_K * stride_bk
++        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
++        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+ 
+     # Apply triu mask: zero out elements where col < row (i.e., col - row < 0)
+     row_idx = rm[:, None]  # shape [BLOCK_M, 1]
+@@ -86,7 +102,6 @@
+ 
+     C_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+     tl.store(C_ptrs, acc.to(tl.float32), mask=boundary_mask)
+-
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

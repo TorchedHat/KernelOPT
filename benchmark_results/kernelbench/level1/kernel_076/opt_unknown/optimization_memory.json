@@ -1,0 +1,145 @@
+[
+  {
+    "item_id": "exp_conv1d_reg_pressure_hoist_001",
+    "iteration": 1,
+    "speedup": 1.1467,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_hoist_loop_invariants",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 134.0,
+        "Occupancy.theoretical_occupancy_pct": 18.75,
+        "Occupancy.achieved_occupancy_pct": 18.57,
+        "Occupancy.block_limit_registers": 3.0,
+        "Scheduler.no_eligible_pct": 54.26,
+        "Scheduler.active_warps_per_scheduler": 2.97,
+        "Scheduler.eligible_warps_per_scheduler": 0.7,
+        "GPU_SOL.compute_sm_throughput_pct": 47.4,
+        "GPU_SOL.duration_ms": 15.63
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 110.0,
+        "Occupancy.theoretical_occupancy_pct": 25.0,
+        "Occupancy.achieved_occupancy_pct": 24.78,
+        "Occupancy.block_limit_registers": 4.0,
+        "Scheduler.no_eligible_pct": 47.99,
+        "Scheduler.active_warps_per_scheduler": 3.96,
+        "Scheduler.eligible_warps_per_scheduler": 1.01,
+        "GPU_SOL.compute_sm_throughput_pct": 56.74,
+        "GPU_SOL.duration_ms": 13.63
+      }
+    },
+    "strategy_title": "Hoist Loop-Invariant Index Computations to Reduce Register Pressure",
+    "strategy_description": "When a Triton kernel computes batch index, output position, and base pointer offsets (via integer division and modulo on wide vectors) inside a reduction loop, those intermediate tensors remain live across iterations and inflate register usage. Hoisting these computations outside the loop reduces registers/thread (134\u2192110), which raises the block limit from registers (3\u21924 blocks/SM), improving theoretical occupancy (18.75%\u219225%) and eligible warps per scheduler (0.70\u21921.01), ultimately reducing kernel duration by ~13%. This pattern applies whenever NCU reports TheoreticalOccupancy limited by registers and the inner loop body contains index decode operations that are invariant to the loop induction variable.",
+    "slow_pseudocode": "# Inside K-loop (recomputed every iteration)\nfor k_start in range(0, K, BLOCK_K):\n    batch   = offs_m // L_out          # expensive div, live across iters\n    out_pos = offs_m % L_out           # expensive mod, live across iters\n    in_pos  = out_pos[:,None]*stride + kpos[None,:]*dilation - padding\n    valid_batch = batch[:,None] < N    # redundant when offs_m < M already checked\n    mask_x = valid_m & valid_k & valid_in & valid_batch\n    x_ptrs = X_ptr + batch[:,None]*(Ci*L_in) + ci[None,:]*L_in + in_pos\n    x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)",
+    "fast_pseudocode": "# HOISTED outside K-loop\nbatch   = offs_m // L_out\nout_pos = offs_m % L_out\nx_base  = X_ptr + batch*(Ci*L_in) + out_pos*stride   # base ptr precomputed\nvalid_m = offs_m < M                                  # valid_batch is redundant\n\nfor k_start in range(0, K, BLOCK_K):\n    ci   = offs_k // KERNEL_SIZE\n    kpos = offs_k % KERNEL_SIZE\n    in_pos  = out_pos[:,None]*stride + kpos[None,:]*dilation - padding\n    mask_x  = valid_m[:,None] & valid_k & valid_in    # no valid_batch\n    x_ptrs  = x_base[:,None] + ci[None,:]*L_in + kpos[None,:]*dilation\n    x_tile  = tl.load(x_ptrs, mask=mask_x, other=0.0)",
+    "applicable_when": "NCU reports TheoreticalOccupancy limited by registers (block_limit_registers < block_limit_warps), registers/thread > ~100, and the kernel inner loop body contains index decode operations (integer div/mod on SIMD-width vectors) that depend only on the outer program ID, not the loop induction variable. IssueSlotUtilization rule triggered with high no-eligible-warp percentage (>40%).",
+    "do_not_apply_when": "Register pressure is not the occupancy bottleneck (e.g., block_limit_shared_mem is the binding constraint). Also avoid if the hoisted computation is genuinely loop-variant (depends on k_start or offs_k). If occupancy is already near hardware maximum, further register reduction yields diminishing returns.",
+    "framework_notes": "Triton-specific: adding num_stages=3 and num_stages=4 autotune configs alongside the hoist enables the Triton software pipeline (cp.async on Hopper) to overlap memory loads with compute. The register reduction from hoisting is the primary driver; num_stages expansion is a secondary benefit. In CUDA, the equivalent is moving index arithmetic before the reduction loop and using __ldg or async copies."
+  },
+  {
+    "item_id": "9d0cf96f",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesce_output_store_via_layout_transpose",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesce_output_store_via_layout_transpose \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesce_output_store_via_layout_transpose' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.059e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.575e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.809e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The output store y_ptrs = Y_ptr + batch*(Co*L_out) + offs_n*L_out + out_pos writes Y in (N, Co, L_out) layout. The M-tile (pid_m) spans (batch, out_pos) pairs, so adjacent threads in the M-dimension write to addresses separated by L_out=174758 elements (~699KB stride). Every 32-thread warp issues 32 independent cache-line requests instead of 1, causing 48% excessive sectors. The fix is to allocate Y in (N, L_out, Co) layout so that the Co dimension (offs_n, BLOCK_N) is contiguous in memory. Adjacent threads in the N-tile then write to consecutive addresses (stride-1 in Co), collapsing 32 separate cache lines into 1 per warp. The output is transposed back to (N, Co, L_out) with a single .permute(0,2,1).contiguous() call after the kernel.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.059e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.575e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.809e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "e5d7d01e",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesced_output_store_via_transposed_accumulator",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesced_output_store_via_transposed_accumulator \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesced_output_store_via_transposed_accumulator' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.386e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.542e+01 > atol=0.001\nseed=1337 output[0]: max_diff=6.048e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The output tensor Y has layout (N, Co, L_out). The current kernel accumulates acc[BLOCK_M, BLOCK_N] where BLOCK_M indexes (batch, out_pos) and BLOCK_N indexes Co. The store y_ptrs = Y_ptr + batch[:,None]*(Co*L_out) + offs_n[None,:]*L_out + out_pos[:,None] has threads varying in M (out_pos, stride-1) as the fast warp dimension, but the N (Co) axis has stride L_out=174758 elements = 699032 bytes per step, causing massive non-coalesced global stores. NCU confirms only 26.9/32 bytes per sector are utilized and 48% of all sectors are excessive. By swapping the grid so pid_m indexes Co and pid_n indexes (batch, out_pos), threads in a warp vary in out_pos (stride-1 in memory), making the store fully coalesced. The tl.dot becomes w_tile[BLOCK_M=Co, BLOCK_K] @ x_tile[BLOCK_K, BLOCK_N=(batch,out_pos)] = acc[BLOCK_M, BLOCK_N], preserving the standard matmul shape contract.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.386e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.542e+01 > atol=0.001\nseed=1337 output[0]: max_diff=6.048e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f159d44d",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_uncoalesced_global_memory_access_by_swapping_tile_axes",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_uncoalesced_global_memory_access_by_swapping_tile_axes \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_uncoalesced_global_memory_access_by_swapping_tile_axes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.059e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.575e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.809e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel maps pid_m to (batch, out_pos) and pid_n to Co. The output store is Y[batch, co, out_pos] with layout (N, Co, L_out), so the pointer is: Y_ptr + batch*(Co*L_out) + co*L_out + out_pos. In the tile, offs_n (co) is the column axis and out_pos is the row axis. When a warp issues the store, consecutive threads differ in out_pos (row), but the column stride between co values is L_out=174758 elements so each thread in the warp accesses a different cache line, causing 32x sector amplification. Switching to a channels-last intermediate layout Y=(N,L_out,Co) makes the store stride-1 in the Co direction, fully coalescing all writes. The same dilation-induced gather pattern in X loads also contributes to uncoalesced reads.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.059e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.575e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.809e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_conv1d_tf32_allow_tf32_002",
+    "iteration": 2,
+    "speedup": 1.1467,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_for_tl_dot",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU_SOL.compute_sm_throughput_pct": 56.74,
+        "GPU_SOL.duration_ms": 13.63,
+        "Memory_Workload.L1_TEX_hit_rate_pct": 52.34,
+        "Memory_Workload.L2_hit_rate_pct": 48.72,
+        "Scheduler.no_eligible_pct": 47.99,
+        "Scheduler.eligible_warps_per_scheduler": 1.01,
+        "Occupancy.theoretical_occupancy_pct": 25.0,
+        "Occupancy.achieved_occupancy_pct": 24.78,
+        "Launch.registers_per_thread": 110.0
+      },
+      "key_metric_after": {
+        "GPU_SOL.compute_sm_throughput_pct": 56.75,
+        "GPU_SOL.duration_ms": 13.63,
+        "Memory_Workload.L1_TEX_hit_rate_pct": 52.34,
+        "Memory_Workload.L2_hit_rate_pct": 48.67,
+        "Scheduler.no_eligible_pct": 47.98,
+        "Scheduler.eligible_warps_per_scheduler": 1.01,
+        "Occupancy.theoretical_occupancy_pct": 25.0,
+        "Occupancy.achieved_occupancy_pct": 24.78,
+        "Launch.registers_per_thread": 110.0
+      }
+    },
+    "strategy_title": "Enable TF32 Tensor Cores via allow_tf32=True in tl.dot",
+    "strategy_description": "Adding allow_tf32=True to tl.dot is expected to route matrix multiplications through Tensor Core TF32 MMA instructions (~989 TFLOPS on H200) instead of scalar FP32 FFMA (~67 TFLOPS). However, in this case all NCU metrics (compute SM throughput, duration, occupancy, scheduler statistics) remained essentially unchanged before and after the change, indicating the kernel was not compute-bound on the dot product and the TF32 path was either already selected by Triton or the bottleneck lies elsewhere (uncoalesced memory access, low occupancy). The reported 1.1467x speedup appears to be measurement noise or attributable to the prior iteration's changes, not this diff.",
+    "slow_pseudocode": "# Inside K-loop\nacc = tl.dot(x_tile, w_tile, acc)\n...\ntl.store(y_ptrs, acc.to(tl.float32), mask=mask_out)",
+    "fast_pseudocode": "# Inside K-loop\nacc = tl.dot(x_tile, w_tile, acc, allow_tf32=True)\n...\ntl.store(y_ptrs, acc, mask=mask_out)  # acc already float32, cast removed",
+    "applicable_when": "Kernel is compute-bound (Compute SM Throughput >> Memory Throughput), tl.dot is the dominant instruction, K reduction dimension is large enough that TF32 error is acceptable (K < ~512 for atol=1e-3), and tile dimensions are multiples of 16 for Tensor Core compatibility.",
+    "do_not_apply_when": "Kernel is memory-bound or latency-bound (as evidenced by low eligible warps per scheduler, high no-eligible-warp %, and uncoalesced access warnings dominating). When NCU metrics show no change in compute throughput after applying allow_tf32=True, the bottleneck is not the dot product throughput. Also avoid when K is large (>512) and numerical precision is critical.",
+    "framework_notes": "Triton: allow_tf32=True is a parameter to tl.dot. On H200/Hopper, Triton may already select TF32 by default for float32 accumulators when tile shapes are Tensor Core-compatible (multiples of 16). The no-op .to(tl.float32) removal on the store is always safe when the accumulator is declared as tl.float32."
+  }
+]

@@ -1,0 +1,66 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,24 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=4),
+     ],
+     key=['n_elements'],
+ )
+@@ -24,20 +34,23 @@
+ ):
+     pid = tl.program_id(0)
+     block_start = pid * BLOCK_SIZE
+-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
++    # Alignment hints enable LDG.128 vectorized loads (4x float32 per transaction)
++    # tl.multiple_of: block_start is always a multiple of BLOCK_SIZE (pid * BLOCK_SIZE)
++    # tl.max_contiguous: arange(0, BLOCK_SIZE) produces BLOCK_SIZE contiguous values
++    offsets = tl.max_contiguous(
++        tl.multiple_of(block_start + tl.arange(0, BLOCK_SIZE), BLOCK_SIZE),
++        BLOCK_SIZE
++    )
+     mask = offsets < n_elements
+ 
+-    x = tl.load(input_ptr + offsets, mask=mask)
++    x = tl.load(input_ptr + offsets, mask=mask, eviction_policy='evict_first')
+ 
+-    # LeakyReLU: x if x > 0 else negative_slope * x
+-    zero = tl.full([BLOCK_SIZE], 0.0, dtype=tl.float32)
++    # LeakyReLU via FMA: select scale then fuse multiply-add to emit FFMA
+     x_f32 = x.to(tl.float32)
+-    is_positive = x_f32 > zero
+-    scaled = x_f32 * negative_slope
+-    result = tl.where(is_positive, x_f32, scaled)
++    scale = tl.where(x_f32 >= 0.0, 1.0, negative_slope)
++    result = tl.math.fma(x_f32, scale, 0.0)
+ 
+-    tl.store(output_ptr + offsets, result.to(output_ptr.dtype.element_ty), mask=mask)
+-
++    tl.store(output_ptr + offsets, result.to(output_ptr.dtype.element_ty), mask=mask, eviction_policy='evict_first')
+ 
+ def kernel_function(*inputs):
+     x = inputs[0]

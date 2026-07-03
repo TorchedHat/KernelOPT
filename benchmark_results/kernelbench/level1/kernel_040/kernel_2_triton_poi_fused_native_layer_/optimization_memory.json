@@ -1,0 +1,227 @@
+[
+  {
+    "item_id": "6cbf3ea5",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_xblock_with_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_xblock_with_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel processes 67M elements with XBLOCK=128, launching 524,288 CTAs \u2014 one element per thread. This causes: (1) near-zero L1 reuse for the 4M-element gamma/beta tensors (in_ptr3/in_ptr4) because adjacent CTAs cover disjoint 128-element windows with no overlap; (2) 81% of warp cycles stalled on L1TEX memory latency because each warp issues many independent global loads with no prefetch depth; (3) achieved occupancy of only 56.8% due to scheduling overhead from the enormous number of tiny CTAs. Increasing XBLOCK to 1024\u20132048 reduces the grid by 8\u201316x, allows each CTA to reuse the mean/variance scalars (in_ptr1/in_ptr2, only 16 values) and amortize gamma/beta loads across more threads, and enables the compiler to issue wider vectorized loads (128-bit LDG). Adding @triton.autotune explores the optimal block size automatically.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_xblock_regression_001",
+    "iteration": 1,
+    "speedup": 0.2379,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_for_memory_bound_pointwise",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 325.92,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 66.55,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 53.51,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.46,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.95,
+        "Occupancy.Achieved Occupancy_%": 56.78,
+        "Launch Statistics.Waves Per SM": 248.24,
+        "Launch Statistics.Block Size": 128.0,
+        "Instruction Statistics.Executed Instructions": 90177536.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 1370.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 15.77,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 75.33,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 6.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.7,
+        "Occupancy.Achieved Occupancy_%": 79.26,
+        "Launch Statistics.Waves Per SM": 992.97,
+        "Launch Statistics.Block Size": 512.0,
+        "Instruction Statistics.Executed Instructions": 806354944.0
+      }
+    },
+    "strategy_title": "Increasing XBLOCK in memory-bound Triton pointwise kernel causes regression",
+    "strategy_description": "Increasing XBLOCK from 128 to 512 in a Triton pointwise kernel with a fixed grid size caused a 4.2x slowdown. The autotune decorator selected XBLOCK=512 but the grid was not updated to use a meta-lambda, so the grid remained fixed at cdiv(xnumel, 128), launching 4x more threads than elements and executing ~9x more instructions (90M \u2192 806M). Additionally, switching from tl.full([XBLOCK], True) masks to xindex < xnumel masks added unnecessary predication overhead for a kernel where xnumel is a compile-time constant divisible by all candidate XBLOCK values. The DRAM throughput collapsed from 66.55% to 15.77% because the excess threads performed redundant masked-out work, and the kernel became compute-bound rather than memory-bound.",
+    "slow_pseudocode": "# BEFORE: fixed grid, no autotune\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)\n\n# Inside kernel:\nxmask = tl.full([XBLOCK], True, tl.int1)  # no masking needed\ntl.load(ptr + xindex, None)  # unconditional load\ntl.store(out + xindex, val, None)  # unconditional store",
+    "fast_pseudocode": "# CORRECT pattern: grid must use meta-lambda when autotuning XBLOCK\n@triton.autotune(configs=[triton.Config({'XBLOCK': 512}, num_warps=4)], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)  # keep if xnumel divisible by all XBLOCK values\n    tl.load(ptr + xindex, None)  # unconditional\n    tl.store(out + xindex, val, None)  # unconditional\n\n# Launch with meta-lambda grid:\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](..., xnumel)  # no XBLOCK kwarg; autotune controls it",
+    "applicable_when": "Never apply this specific pattern (fixed grid + autotune XBLOCK without meta-lambda grid). The meta-lambda grid fix is always required when autotuning XBLOCK.",
+    "do_not_apply_when": "Do not add @triton.autotune for XBLOCK without simultaneously converting the launch grid to a meta-lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. Also do not replace tl.full([XBLOCK], True) masks with xindex < xnumel when xnumel is divisible by all candidate XBLOCK values, as this adds unnecessary predication overhead.",
+    "framework_notes": "Triton autotune requires the launch grid to be a callable (meta-lambda) that reads meta['XBLOCK'] when XBLOCK is being autotuned. A fixed grid = (triton.cdiv(xnumel, fixed_block),) will not adapt to the autotuned XBLOCK, causing the kernel to launch with the wrong number of CTAs. This is a Triton-specific implementation requirement with no direct analog in CUDA (where block size is always explicit at launch)."
+  },
+  {
+    "item_id": "triton_autotune_vectorization_hints_regression_001",
+    "iteration": 1,
+    "speedup": 0.2671,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_with_vectorization_hints_on_elementwise_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 325.92,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 66.55,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 53.51,
+        "Instruction Statistics.Executed Instructions": 90177536.0,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Occupancy.Achieved Occupancy_%": 56.78,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.46,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.95
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 1220.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 17.76,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 74.59,
+        "Instruction Statistics.Executed Instructions": 713555968.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Occupancy.Achieved Occupancy_%": 87.5,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 7.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.54
+      }
+    },
+    "strategy_title": "Autotune + vectorization hints caused 8x instruction explosion",
+    "strategy_description": "Adding tl.max_contiguous/tl.multiple_of hints combined with @triton.autotune on a memory-bound elementwise kernel caused a 7.9x increase in executed instructions (90M \u2192 713M) and a 3.7x increase in kernel duration (326\u00b5s \u2192 1.22ms), despite improving occupancy and eligible warps. The autotune selected XBLOCK=256 with 32 registers/thread (vs 18 before), indicating the larger tile size and vectorization hints triggered a more complex code path that dramatically inflated instruction count without proportionally reducing memory transactions. DRAM throughput collapsed from 66.55% to 17.76%, suggesting the kernel became compute-bound on redundant work rather than memory-bound, and the xmask guard (changed from tl.full([XBLOCK], True) to xindex < xnumel) may have introduced unnecessary predication overhead across all loads and stores.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 do NOT do this\n@triton.autotune(configs=[...XBLOCK 128-2048...], key=['xnumel'])\n@triton.jit\ndef kernel(...):\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel  # unnecessary: xnumel divisible by all XBLOCK configs\n    xindex = tl.max_contiguous(tl.multiple_of(xindex, XBLOCK), XBLOCK)\n    x0 = xindex % 4194304\n    x0 = tl.max_contiguous(tl.multiple_of(x0, XBLOCK), XBLOCK)  # invalid: x0 not XBLOCK-aligned after modulo\n    tmp0 = tl.load(in_ptr0 + x2, xmask)\n    ...\n    tl.store(out_ptr0 + x2, tmp13, xmask)",
+    "fast_pseudocode": "# BEFORE (faster baseline) \u2014 keep this pattern for elementwise kernels\n@triton.jit\ndef kernel(...):\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = tl.full([XBLOCK], True, tl.int1)[:]  # no masking needed when xnumel % XBLOCK == 0\n    x0 = xindex % 4194304\n    tmp0 = tl.load(in_ptr0 + x2, None)  # no mask, no hints\n    ...\n    tl.store(out_ptr0 + x2, tmp13, None)",
+    "applicable_when": "Never apply this exact combination. The individual components (autotune, vectorization hints) may be valid separately, but combining them on a kernel where xnumel is already divisible by all XBLOCK configs and x0 is a modulo index (not XBLOCK-aligned) causes correctness-compromising hints and instruction explosion.",
+    "do_not_apply_when": "Do not apply tl.multiple_of(x0, XBLOCK) when x0 = xindex % N and XBLOCK < N \u2014 the modulo result is NOT guaranteed to be a multiple of XBLOCK, making the hint semantically incorrect and potentially causing the compiler to generate wrong or bloated code. Do not replace tl.full([XBLOCK], True) mask with xindex < xnumel when xnumel is already divisible by XBLOCK \u2014 this adds unnecessary predication to every load/store.",
+    "framework_notes": "In Triton, tl.multiple_of(x, N) asserts that x is divisible by N. Applying it to x0 = xindex % 4194304 is only valid if XBLOCK divides 4194304 AND the CTA's xoffset is such that x0 starts at a multiple of XBLOCK \u2014 this is not guaranteed for all blocks. The autotune overhead (selecting XBLOCK=256 with 32 registers vs baseline 18) also suggests register pressure increased significantly, limiting occupancy gains. The instruction count increase (7.9x) with only 2x more threads indicates ~4x more instructions per thread, consistent with compiler generating scalar fallback paths due to incorrect alignment hints."
+  },
+  {
+    "item_id": "f08413e3",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_meta_lambda",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_autotune_grid_meta_lambda \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_autotune_grid_meta_lambda' produced a kernel that crashed on execution after 4 attempt(s). Last error: kernel timed out after 60s",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has @triton.autotune with configs ranging XBLOCK=256-2048, but kernel_function launches with a FIXED grid = (triton.cdiv(xnumel, 128),) = 524288 CTAs. When autotune selects XBLOCK=512, the grid should be cdiv(67108864, 512) = 131072 CTAs but instead 524288 CTAs are launched, causing 4x redundant work. This inflates executed instructions from ~90M (correct baseline) to 806M (current broken state). DRAM throughput collapses from ~66% to 15.77% because threads are doing masked-out redundant work. The fix is a single-line change: replace the fixed grid with a meta-lambda so the grid adapts to whichever XBLOCK autotune selects. Memory item exp_triton_autotune_xblock_regression_001 documents this exact failure pattern and its fix.",
+    "do_not_apply_when": "Dry-run failed: kernel timed out after 60s",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6d8e570e",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + FPInstructions + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_triton_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'add_triton_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel is a regressed state caused by two implementation flaws introduced in a prior iteration: (1) xmask = xindex < xnumel adds unnecessary predication to every load/store \u2014 xnumel=67,108,864 is exactly divisible by all XBLOCK configs (128\u20132048), so the mask is always True and wastes instructions; (2) tl.multiple_of(x0, XBLOCK) is applied to x0 = xindex % 4194304, which is semantically INCORRECT \u2014 after the modulo, x0 is NOT guaranteed to be a multiple of XBLOCK (only guaranteed when xoffset % 4194304 == 0, which fails for most CTAs). This incorrect hint causes the Triton compiler to generate bloated scalar fallback paths, inflating instruction count 7.9x and collapsing DRAM throughput from 66.55% to 17.76%. The autotune decorator and meta-lambda grid are structurally correct and should be preserved. Removing the two flawed constructs will restore the baseline performance (~326\u00b5s) while retaining the autotune benefit.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "2cc857fd",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_meta_lambda_and_remove_register_pressure_hints",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + FPInstructions + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_autotune_grid_meta_lambda_and_remove_register_pressure_hints \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_autotune_grid_meta_lambda_and_remove_register_pressure_hints' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has @triton.autotune with XBLOCK configs from 128 to 2048, but the launch grid is hardcoded to triton.cdiv(xnumel, 128) \u2014 a fixed value that does NOT adapt to the autotuned XBLOCK. When autotune selects XBLOCK=256 (as it did here), the grid launches 2x too many CTAs (524,288 instead of 262,144), causing each element to be processed by 2 threads and inflating executed instructions from ~90M (baseline) to 713M (7.9x). Additionally, the tl.max_contiguous(tl.multiple_of(xindex, XBLOCK), XBLOCK) hint on xindex increases register pressure from 18 to 32 registers/thread. The xmask = xindex < xnumel predication is also unnecessary since xnumel=67108864 is divisible by all XBLOCK configs (128, 256, 512, 1024, 2048), adding overhead to every load/store. Fixing the grid to a meta-lambda, removing the invalid hint, and eliminating the unnecessary mask should restore the baseline ~90M instruction count and recover the 3.7x duration regression.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_remove_vectorization_hints_partial_fix_003",
+    "iteration": 3,
+    "speedup": 0.2671,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "remove_flawed_vectorization_hints_and_unnecessary_predication",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + FPInstructions + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 1.22,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 17.77,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 74.46,
+        "Instruction Statistics.Executed Instructions": 713555968.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Occupancy.Achieved Occupancy_%": 87.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 7.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.55
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 1.22,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 17.73,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 75.01,
+        "Instruction Statistics.Executed Instructions": 713555968.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Occupancy.Achieved Occupancy_%": 87.39,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 7.7,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.59
+      }
+    },
+    "strategy_title": "Partial hint removal leaves instruction count unchanged",
+    "strategy_description": "Removing only the tl.max_contiguous/tl.multiple_of hint on xindex (before the modulo) while leaving the xmask predication and the fixed grid in place produced zero measurable improvement: executed instructions remained at 713M, duration stayed at 1.22ms, and all throughput metrics were statistically identical before and after. The diff shows only the vectorization hint line was removed, but the xmask guard (xindex < xnumel) and the fixed grid were not touched, meaning the root causes of the regression (unnecessary predication on every load/store, and grid mismatch with autotuned XBLOCK) were left intact. This confirms that the instruction explosion is driven by the combination of flaws, not the hint alone \u2014 partial fixes are insufficient and the full set of changes (remove xmask, remove hint, fix grid to meta-lambda) must be applied atomically.",
+    "slow_pseudocode": "# Partial fix \u2014 only hint removed, xmask and fixed grid remain\nxindex = xoffset + tl.arange(0, XBLOCK)[:]\nxmask = xindex < xnumel  # still present \u2014 unnecessary predication\n# tl.max_contiguous/tl.multiple_of removed here\nx2 = xindex\nx1 = xindex // 4194304\nx0 = xindex % 4194304\ntmp0 = tl.load(in_ptr0 + x2, xmask)  # still masked\ntl.store(out_ptr0 + x2, tmp13, xmask)  # still masked\n\n# Launch grid still fixed:\ngrid = (triton.cdiv(xnumel, 128),)  # not a meta-lambda",
+    "fast_pseudocode": "# Full fix required \u2014 all three changes must be applied together\nxindex = xoffset + tl.arange(0, XBLOCK)[:]\n# NO xmask line\n# NO tl.max_contiguous/tl.multiple_of\nx2 = xindex\nx1 = xindex // 4194304\nx0 = xindex % 4194304\ntmp0 = tl.load(in_ptr0 + x2, None)  # unconditional\ntl.store(out_ptr0 + x2, tmp13, None)  # unconditional\n\n# Launch grid as meta-lambda:\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)",
+    "applicable_when": "Kernel is in the regressed state with 713M executed instructions, 17.7% DRAM throughput, 74-75% compute throughput, 1.22ms duration, and xmask predication + vectorization hints present. The fix must be applied as a complete atomic change.",
+    "do_not_apply_when": "Do not apply only a subset of the required fixes (e.g., removing only the vectorization hint while leaving xmask and fixed grid). Partial application leaves instruction count and duration completely unchanged, wasting an optimization iteration.",
+    "framework_notes": "In Triton, the instruction explosion from this regression is caused by the combination of: (1) xmask = xindex < xnumel adding predication to all loads/stores, (2) incorrect tl.multiple_of hints on modulo-derived indices, and (3) grid mismatch with autotuned XBLOCK. All three must be fixed atomically. Removing only the hint line has zero effect on the profiling metrics."
+  },
+  {
+    "item_id": "9e0caed9",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "remove_unnecessary_predication_and_invalid_hints_restore_unconditional_loads",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + FPInstructions + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "remove_unnecessary_predication_and_invalid_hints_restore_unconditional_loads \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'remove_unnecessary_predication_and_invalid_hints_restore_unconditional_loads' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is compute-bound at 74.86% SM throughput but only 17.5% DRAM throughput \u2014 a clear sign of instruction bloat rather than real compute work. The 713M executed instructions vs the ~90M original baseline (8x inflation) is caused by two prior-iteration mistakes still present in the code: (1) xmask = xindex < xnumel \u2014 unnecessary predication since xnumel=67,108,864 is exactly divisible by all XBLOCK configs (128,256,512,1024,2048), adding a comparison + conditional to every load and store; (2) tl.max_contiguous(tl.multiple_of(xindex, XBLOCK), XBLOCK) applied to xindex before the modulo decomposition \u2014 this hint causes the compiler to generate wider/scalar fallback paths and inflates instruction count. The autotune is selecting XBLOCK=256 with 32 registers/thread (vs 18 in the original), indicating the compiler is generating a more complex code path. The fix is to remove the tl.max_contiguous/tl.multiple_of hint on xindex entirely, replace xmask = xindex < xnumel with no mask (pass None to all loads/stores), and fix the launch grid to use a meta-lambda so autotune correctly scales the CTA count.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  }
+]

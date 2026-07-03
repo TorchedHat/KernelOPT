@@ -1,0 +1,80 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,9 @@
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -42,15 +46,19 @@
+     row_start = pid_m * BLOCK_M
+     col_start = pid_n * BLOCK_N
+ 
+-    # Early exit: if the entire tile is above the diagonal, output is zero
+-    # The tile covers rows [row_start, row_start+BLOCK_M) and cols [col_start, col_start+BLOCK_N)
+-    # A tile is entirely above diagonal if col_start > row_start + BLOCK_M - 1
+-    # i.e., the minimum row in the tile < maximum col in the tile means some elements are above diagonal
+-    # We only skip if col_start > row_start + BLOCK_M - 1 (entire tile above diagonal)
+     rm = row_start + tl.arange(0, BLOCK_M)
+     rn = col_start + tl.arange(0, BLOCK_N)
+ 
+-    # Compute matmul for this tile
++    # Early exit: entire tile is above the diagonal (all outputs are zero)
++    # col_start > row_start + BLOCK_M - 1 means the minimum row in the tile
++    # is less than the minimum col, so all elements are above the diagonal
++    if col_start > row_start + BLOCK_M - 1:
++        c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
++        mask_c = (rm[:, None] < M) & (rn[None, :] < N)
++        tl.store(c_ptrs, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32), mask=mask_c)
++        return
++
++    # Compute matmul for this tile (on or below diagonal)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+     # For lower triangular result: C[i,j] = sum_k A[i,k]*B[k,j] where i >= j
+@@ -67,7 +75,15 @@
+     A_base = A_ptr + offs_am[:, None] * stride_am
+     B_base = B_ptr + offs_bn[None, :] * stride_bn
+ 
+-    for k in range(0, tl.cdiv(K, BLOCK_K)):
++    # Restrict K-loop range exploiting lower-triangular sparsity of A and B:
++    # A[i,k]=0 for k>i => max useful k is row_start+BLOCK_M-1 (largest row in tile)
++    # B[k,j]=0 for j>k => min useful k is col_start (smallest col in tile)
++    k_lo = col_start
++    k_hi = min(row_start + BLOCK_M, K)  # Python min() on scalar tile coords
++    k_block_lo = k_lo // BLOCK_K        # Python integer floor division
++    k_block_hi = tl.cdiv(k_hi, BLOCK_K)
++
++    for k in range(k_block_lo, k_block_hi):
+         k_start = k * BLOCK_K
+         k_offs = k_start + offs_k
+ 
+@@ -81,7 +97,7 @@
+         mask_b = (k_offs[:, None] < K) & (offs_bn[None, :] < N)
+         b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+ 
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
++        acc = tl.dot(a, b, acc=acc, allow_tf32=True)
+ 
+     # Apply tril: zero out elements where col > row
+     row_idx = rm[:, None]  # [BLOCK_M, 1]
+@@ -95,7 +111,6 @@
+     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+     mask_c = (rm[:, None] < M) & (rn[None, :] < N)
+     tl.store(c_ptrs, acc.to(tl.float32), mask=mask_c)
+-
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

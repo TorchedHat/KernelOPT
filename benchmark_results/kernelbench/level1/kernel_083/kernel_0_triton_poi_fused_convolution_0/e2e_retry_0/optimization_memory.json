@@ -1,0 +1,88 @@
+[
+  {
+    "item_id": "exp_triton_autotune_yblock1_uncoalesced_stores_001",
+    "iteration": 1,
+    "speedup": 1.7917,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_yblock1_to_fix_strided_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.02,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8941.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.5,
+        "Memory Workload Analysis.L2 Hit Rate": 59.91,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.38,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.91,
+        "Scheduler Statistics.No Eligible": 71.82,
+        "Compute Workload Analysis.Issue Slots Busy": 28.08,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Occupancy.Achieved Occupancy": 55.51
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.36,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4973.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 76.67,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.06,
+        "Scheduler Statistics.No Eligible": 54.68,
+        "Compute Workload Analysis.Issue Slots Busy": 44.88,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Occupancy.Achieved Occupancy": 43.72
+      }
+    },
+    "strategy_title": "Autotune YBLOCK=1 to Eliminate Strided Cross-Channel Stores",
+    "strategy_description": "When a Triton kernel performs a layout permutation (e.g., NCHW to channels-last) with a 2D tile covering multiple output channels (YBLOCK>1), consecutive threads in the x-dimension write to addresses separated by the channel stride, causing uncoalesced stores and heavy L1TEX stall cycles (CPIStall rule). Setting YBLOCK=1 via @triton.autotune makes the channel index a scalar constant per CTA, eliminating cross-channel scatter and reducing warp cycles per issued instruction from ~31 to ~16. Adding autotune also allows the compiler to reduce register pressure (26\u219218 registers/thread) and select optimal XBLOCK, yielding a 1.79x speedup.",
+    "slow_pseudocode": "# Fixed YBLOCK=8: each CTA covers 8 y-rows (channels), causing stride-3 scatter\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]  # 8 rows\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    y0 = yindex % 3   # varies 0..2 across rows -> stride-3 scatter in stores\n    y1 = yindex // 3\n    tmp = tl.load(in_ptr + (xindex + xnumel*yindex), ...)\n    tl.store(out_ptr + (y0 + 3*xindex + C*y1), tmp, ...)  # uncoalesced\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune with YBLOCK=1 configs: y0 is scalar per CTA, no cross-channel scatter\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 1}, num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 1}, num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=8, num_stages=3),\n        # ... fallback configs with larger YBLOCK\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # same body \u2014 YBLOCK=1 makes y0 = scalar(0|1|2), stores are stride-3 but no inter-row scatter\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton kernel performs a layout permutation (e.g., NCHW\u2192NHWC/channels-last) where the 2D tile YBLOCK dimension spans multiple output channels; NCU reports UncoalescedGlobalAccess with >15% excess sectors, CPIStall with >10 cycles average L1TEX stall, and IssueSlotUtilization with eligible warps per scheduler <1.5. Kernel body is otherwise correct.",
+    "do_not_apply_when": "YBLOCK=1 would create too many CTA blocks and exceed grid dimension limits; when the store pattern is already coalesced (stride-1 in x); when the bottleneck is compute-bound rather than memory-latency-bound; when ynumel is very large and YBLOCK=1 causes excessive grid overhead.",
+    "framework_notes": "YBLOCK must be a power of 2 (tl.arange constraint in Triton). Use YBLOCK in {1,2,4,8} only. The grid lambda must be updated to use meta['XBLOCK'] and meta['YBLOCK'] when autotune is added. Autotune also implicitly enables num_warps/num_stages tuning which can reduce register pressure."
+  },
+  {
+    "item_id": "triton_autotune_contiguous_hints_layout_permute_001",
+    "iteration": 1,
+    "speedup": 1.4033,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_with_contiguous_hints_for_strided_layout_permute",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.22,
+        "Compute Workload Analysis.Issue Slots Busy": 28.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.38,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.91,
+        "Occupancy.Achieved Occupancy": 55.51,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.5,
+        "Memory Workload Analysis.L2 Hit Rate": 59.91,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Launch Statistics.Block Size": 128.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.29,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 25.18,
+        "Compute Workload Analysis.Issue Slots Busy": 62.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.63,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.98,
+        "Occupancy.Achieved Occupancy": 68.43,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 75.23,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Launch Statistics.Block Size": 256.0
+      }
+    },
+    "strategy_title": "Autotune Block Size + Contiguous Hints for Layout Permute",
+    "strategy_description": "When a Triton kernel performs a layout permutation (e.g., NCHW\u2192NHWC) with stride-1 loads but strided stores, and NCU reports CPIStall from L1TEX latency (~14.9 cycles/warp), low eligible warps per scheduler (~0.91), and <1.0 waves/SM, adding @triton.autotune to explore larger block sizes (128\u2192256+) combined with tl.max_contiguous/tl.multiple_of hints on the contiguous load index enables the compiler to emit wider (128-bit) vectorized loads and increases wave count. This reduced warp cycles per issued instruction from 31.4 to 20.6, doubled issue slot utilization from 28% to 62%, and cut duration from 6.02 \u00b5s to 4.29 \u00b5s (1.40\u00d7 speedup). The register count also dropped from 26 to 18 per thread, further improving occupancy from 55.5% to 68.4%.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    xoffset = program_id(0) * XBLOCK\n    xindex = xoffset + arange(0, XBLOCK)[None, :]  # no contiguity hint\n    tmp0 = load(in_ptr + (x2 + stride*y3), mask)   # scalar LDG.32\n    store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Launch with hardcoded XBLOCK=128, YBLOCK=8\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8),\n        Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=4),\n        Config({'XBLOCK': 256,  'YBLOCK': 2}, num_warps=4),\n        Config({'XBLOCK': 128,  'YBLOCK': 4}, num_warps=4),\n        Config({'XBLOCK': 128,  'YBLOCK': 8}, num_warps=4),\n        Config({'XBLOCK': 256,  'YBLOCK': 1}, num_warps=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    xoffset = program_id(0) * XBLOCK\n    # Signal stride-1 contiguity \u2192 compiler emits LDG.128\n    xindex = max_contiguous(multiple_of(xoffset + arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\n    tmp0 = load(in_ptr + (x2 + stride*y3), mask)   # vectorized LDG.128\n    store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Let autotune pick XBLOCK/YBLOCK/num_warps\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "Triton kernel performs a layout permutation (e.g., NCHW\u2192NHWC) with stride-1 loads and strided stores; NCU shows CPIStall from L1TEX (~10+ cycles/warp), IssueSlotUtilization <40%, eligible warps per scheduler <1.5, waves/SM <1.0, and UncoalescedGlobalAccess excessive sectors >10%; load index is stride-1 in the innermost dimension (textbook contiguous access pattern).",
+    "do_not_apply_when": "Load access pattern is not stride-1 (e.g., gather/scatter with irregular indices); kernel is already compute-bound (SM throughput >80%); autotune overhead is unacceptable (e.g., single-use kernels in latency-critical paths); XBLOCK is already at maximum power-of-two fitting the problem size.",
+    "framework_notes": "tl.max_contiguous and tl.multiple_of are Triton-specific compiler hints that do not change computed values but inform the LLVM backend to emit 128-bit vectorized loads (LDG.128) instead of scalar LDG.32. Equivalent in CUDA: use __ldg with float4 casts or __builtin_assume_aligned. The [None, :] reshape must be applied after the hint functions, not inside them, to preserve 2D indexing shape."
+  }
+]

@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "0e8a461e",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_contiguity_hints",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_contiguity_hints \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_contiguity_hints' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a transpose/layout-change operation reading from in_ptr0 with address formula (y0 + 128*x2 + 4032000*y1). The inner-loop dimension x2 is multiplied by 128, meaning consecutive threads in a warp access addresses 128 floats (512 bytes) apart \u2014 severely uncoalesced loads. L1 hit rate is 0%, L2 is saturated at 96.92%, and 57.7% of all warp stalls are L1TEX load latency. The compiler cannot emit 128-bit vectorized loads without contiguity hints. Adding tl.max_contiguous and tl.multiple_of to the load index will signal to the Triton compiler that the access pattern is contiguous and aligned, enabling 128-bit (float4) vectorized loads and reducing the number of memory transactions. Additionally, @triton.autotune explores multiple XBLOCK/YBLOCK/num_warps configurations to find the optimal tile.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_coalesced_transpose_tl_trans_autotune",
+    "iteration": 1,
+    "speedup": 1.2211,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "coalesced_transpose_via_tl_trans_tile_swap",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + CPIStall (57.7% of cycles stalled on L1TEX scoreboard)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 96.92,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 72.15,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 19.58,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 74.09,
+        "GPU Speed Of Light Throughput.Duration": 286.02
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 59.13,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 21.55,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 43.98,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 53.93,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.93,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.86,
+        "GPU Speed Of Light Throughput.Duration": 234.24
+      }
+    },
+    "strategy_title": "Coalesced Transpose via Tile Swap and tl.trans()",
+    "strategy_description": "When a Triton transpose kernel loads with a large stride between consecutive warp threads (e.g., stride-N in source layout), L1 hit rate collapses to 0% and L2 saturates near 100%. Swapping the tile orientation so that the load dimension spans the stride-1 axis of the source (making loads coalesced), then using tl.trans() to reorder the in-register tile before storing coalesced to the destination, converts strided memory transactions into 128-byte coalesced accesses. This reduced L2 throughput from 96.92% to 59.13%, raised L1 hit rate from 0% to 53.93%, and cut warp stall cycles per instruction from 74 to 40, yielding a 1.22x speedup.",
+    "slow_pseudocode": "# Non-coalesced: consecutive threads differ in spatial index (stride 128 in src)\nyindex = pid_y * YBLOCK + arange(YBLOCK)[:, None]  # [YBLOCK, 1]\nxindex = pid_x * XBLOCK + arange(XBLOCK)[None, :]  # [1, XBLOCK]\nc = yindex % 128; b = yindex // 128\n# Load: src addr = c + 128*xindex + 4032000*b  => stride-128 between threads\ntile = load(in_ptr + c + 128*xindex + 4032000*b, mask=xmask, eviction_policy='evict_last')  # [YBLOCK, XBLOCK]\nstore(out_ptr + xindex + 31500*yindex, tile, mask=xmask)",
+    "fast_pseudocode": "# Coalesced: swap tile orientation so threads span stride-1 axis on load\nrows = pid_y * YBLOCK + arange(YBLOCK)   # [YBLOCK]: channel/batch index\ncols = pid_x * XBLOCK + arange(XBLOCK)   # [XBLOCK]: spatial index\nc = rows % 128; b = rows // 128\n# Load [XBLOCK, YBLOCK]: threads span YBLOCK (channel, stride-1 in src) => COALESCED\nsrc = c[None, :] + 128 * cols[:, None] + 4032000 * b[None, :]  # [XBLOCK, YBLOCK]\ntile = load(in_ptr + src, mask=col_mask[:,None] & row_mask[None,:])  # [XBLOCK, YBLOCK]\n# Store [YBLOCK, XBLOCK]: threads span XBLOCK (spatial, stride-1 in dst) => COALESCED\ndst = cols[None, :] + 31500 * rows[:, None]  # [YBLOCK, XBLOCK]\nstore(out_ptr + dst, tl.trans(tile), mask=row_mask[:,None] & col_mask[None,:])\n# tl.trans() is a register-level shuffle: [XBLOCK, YBLOCK] -> [YBLOCK, XBLOCK], no shared memory needed\n# Wrap kernel with @triton.autotune over YBLOCK/XBLOCK tile shapes and num_stages",
+    "applicable_when": "L1/TEX hit rate is 0% or near 0%; L2 cache throughput is >80%; CPIStall rule fires with >40% of cycles stalled on L1TEX scoreboard; kernel is a layout permutation/transpose where the source tensor has stride-1 along a dimension that is NOT the innermost thread dimension in the current tiling; DRAM throughput is high relative to compute throughput.",
+    "do_not_apply_when": "The kernel is already compute-bound (Compute SM Throughput >60%); the source tensor's stride-1 dimension is already aligned with the innermost thread dimension (loads are already coalesced); tl.trans() is unavailable or the tile dimensions are not powers of 2; the transpose involves more than 2 dimensions requiring a more complex shared-memory tiling approach.",
+    "framework_notes": "tl.trans() in Triton performs a register-level 2D tile transpose ([M, N] -> [N, M]) without explicit shared memory allocation, making it efficient for in-register data reordering. The equivalent in CUDA would require shared memory tiling with padding to avoid bank conflicts. @triton.autotune with key=['ynumel', 'xnumel'] allows the runtime to select the best YBLOCK/XBLOCK combination and num_stages for the target hardware."
+  }
+]

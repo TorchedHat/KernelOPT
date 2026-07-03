@@ -1,0 +1,87 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4,  num_stages=1),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8,  num_stages=1),
+        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),
+        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 512},  num_warps=8,  num_stages=1),
+        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),
+        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512},  num_warps=8,  num_stages=1),
+        triton.Config({'XBLOCK': 8, 'R0_BLOCK': 256},  num_warps=8,  num_stages=1),
+    ],
+    key=['xnumel', 'r0_numel'],
+)
+@triton.jit
+def triton_red_fused_native_layer_norm_0(in_ptr0, out_ptr0, out_ptr1, out_ptr2, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 512
+    r0_numel = 131072
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    tmp2_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp2_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp2_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK, loop_unroll_factor=2):
+        r0_index = r0_offset + r0_base
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 131072*x0), xmask, eviction_policy='evict_first', other=0.0)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        # Compute per-column weight directly from offset+index+1, avoiding accumulation
+        tmp2_weight_next = tl.broadcast_to(tl.cast(r0_offset + r0_base + 1, tl.float32), [XBLOCK, R0_BLOCK])
+        _delta = tmp1 - tmp2_mean
+        _inv_w = 1.0 / tmp2_weight_next
+        tmp2_mean_next = libdevice.fma(_delta, _inv_w, tmp2_mean)
+        _delta2 = tmp1 - tmp2_mean_next
+        tmp2_m2_next = libdevice.fma(_delta, _delta2, tmp2_m2)
+        tmp2_mean = tl.where(xmask, tmp2_mean_next, tmp2_mean)
+        tmp2_m2 = tl.where(xmask, tmp2_m2_next, tmp2_m2)
+        tmp2_weight = tl.where(xmask, tmp2_weight_next, tmp2_weight)
+    tmp3, tmp4, tmp5 = triton_helpers.welford(tmp2_mean, tmp2_m2, tmp2_weight, 1)
+    tmp2 = tmp3[:, None]
+    tmp6 = tmp4[:, None]
+    tmp7 = tmp5[:, None]
+    tl.store(out_ptr0 + (x0), tmp2, xmask, eviction_policy='evict_last')
+    tl.store(out_ptr1 + (x0), tmp6, xmask, eviction_policy='evict_last')
+    tl.store(out_ptr2 + (x0), tmp7, xmask, eviction_policy='evict_last')
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    xnumel = 512
+    r0_numel = 131072
+    grid = (triton.cdiv(xnumel, 1),)
+    triton_red_fused_native_layer_norm_0[grid](arg_0, arg_1, arg_2, arg_3, 512, 131072)
+    return arg_3
+
+def get_inputs():
+    arg_0 = rand_strided((16, 64, 256, 256), (4194304, 65536, 256, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((16, 1, 1, 1, 32), (32, 512, 512, 512, 1), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((16, 1, 1, 1, 32), (32, 512, 512, 512, 1), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((16, 1, 1, 1, 32), (32, 512, 512, 512, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

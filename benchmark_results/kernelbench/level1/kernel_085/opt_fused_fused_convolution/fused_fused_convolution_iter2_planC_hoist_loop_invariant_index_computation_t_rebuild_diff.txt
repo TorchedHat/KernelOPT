@@ -1,0 +1,56 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -11,6 +12,12 @@
+         triton.Config({'BLOCK_M': 64}, num_warps=2, num_stages=4),
+         triton.Config({'BLOCK_M': 256}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 512}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 32},  num_warps=1, num_stages=4),
++        triton.Config({'BLOCK_M': 64},  num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 32},  num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_M': 128}, num_warps=2, num_stages=4),
+     ],
+     key=['M', 'C'],
+ )
+@@ -50,14 +57,19 @@
+     # X shape: [N, C, IN_H, IN_W]
+     x_batch_c_base = batch * (C * IN_H * IN_W) + c * (IN_H * IN_W)
+ 
++    # Hoist stride multiplications out of the double loop — computed once per CTA
++    ih_base = out_h * STRIDE_H - PAD_H   # vector [BLOCK_M], one multiply
++    iw_base = out_w * STRIDE_W - PAD_W   # vector [BLOCK_M], one multiply
++
+     for kh in tl.static_range(KH):
++        ih = ih_base + kh                  # simple add, no multiply
++        ih_valid = (ih >= 0) & (ih < IN_H)
++        ih_offset = ih * IN_W              # hoist IN_W multiply out of kw loop
+         for kw in tl.static_range(KW):
+-            ih = out_h * STRIDE_H + kh - PAD_H
+-            iw = out_w * STRIDE_W + kw - PAD_W
++            iw = iw_base + kw              # simple add, no multiply
++            valid = mask_m & ih_valid & (iw >= 0) & (iw < IN_W)
+ 
+-            valid = mask_m & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+-
+-            x_ptrs = X_ptr + x_batch_c_base + ih * IN_W + iw
++            x_ptrs = X_ptr + x_batch_c_base + ih_offset + iw
+             x_val = tl.load(x_ptrs, mask=valid, other=0.0)
+ 
+             w_val = tl.load(w_base + kh * KW + kw)
+@@ -68,7 +80,6 @@
+     # Y shape: [N, C, OUT_H, OUT_W], strides: [C*OUT_H*OUT_W, OUT_H*OUT_W, OUT_W, 1]
+     y_ptrs = Y_ptr + batch * (C * OUT_H * OUT_W) + c * (OUT_H * OUT_W) + out_h * OUT_W + out_w
+     tl.store(y_ptrs, acc.to(tl.float32), mask=mask_m)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: [128, 1, 3, 7], x: [32, 128, 128, 256]

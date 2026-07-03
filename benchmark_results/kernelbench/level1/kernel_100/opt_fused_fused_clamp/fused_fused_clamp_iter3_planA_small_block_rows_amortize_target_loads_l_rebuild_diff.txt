@@ -1,0 +1,79 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,16 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_N': 1024}, num_warps=4, num_stages=2),
+         triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_N': 2048}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_N': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_N': 512},  num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_N': 4096}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+     ],
+     key=['M', 'N'],
+ )
+@@ -21,22 +23,37 @@
+     pred_stride_m, pred_stride_n,
+     BLOCK_N: tl.constexpr,
+ ):
+-    row_id = tl.program_id(0)
+-    if row_id >= M:
+-        return
++    # Each CTA processes 2 consecutive rows to amortize target_ptr loads
++    block_id = tl.program_id(0)
++    row0 = block_id * 2
++    row1 = block_id * 2 + 1
+ 
+-    acc = tl.zeros((), dtype=tl.float32)
++    valid0 = row0 < M
++    valid1 = row1 < M
++
++    acc0 = tl.zeros((), dtype=tl.float32)
++    acc1 = tl.zeros((), dtype=tl.float32)
+ 
+     for col_off in range(0, N, BLOCK_N):
+         cols = col_off + tl.arange(0, BLOCK_N)
+-        mask = cols < N
+-        pred = tl.load(pred_ptr + row_id * pred_stride_m + cols * pred_stride_n, mask=mask, other=0.0)
+-        tgt = tl.load(target_ptr + cols, mask=mask, other=0.0)
+-        val = 1.0 - pred * tgt
+-        val = tl.where(val > 0.0, val, 0.0)
+-        acc += tl.sum(val, axis=0)
++        col_mask = cols < N
++        # Load target once, reuse for both rows
++        tgt = tl.load(target_ptr + cols, mask=col_mask, other=0.0)
+ 
+-    tl.store(partial_ptr + row_id, acc)
++        if valid0:
++            pred0 = tl.load(pred_ptr + row0 * pred_stride_m + cols * pred_stride_n, mask=col_mask, other=0.0)
++            v0 = 1.0 - pred0 * tgt
++            acc0 += tl.sum(tl.where(v0 > 0.0, v0, 0.0), axis=0)
++
++        if valid1:
++            pred1 = tl.load(pred_ptr + row1 * pred_stride_m + cols * pred_stride_n, mask=col_mask, other=0.0)
++            v1 = 1.0 - pred1 * tgt
++            acc1 += tl.sum(tl.where(v1 > 0.0, v1, 0.0), axis=0)
++
++    if valid0:
++        tl.store(partial_ptr + row0, acc0)
++    if valid1:
++        tl.store(partial_ptr + row1, acc1)
+ 
+ 
+ @triton.autotune(
+@@ -49,6 +66,7 @@
+     key=['M'],
+ )
+ @triton.jit
++
+ def hinge_loss_reduce_kernel(
+     partial_ptr, out_ptr,
+     M, total_elements,

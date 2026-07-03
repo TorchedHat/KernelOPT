@@ -1,0 +1,62 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -12,6 +13,10 @@
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_warps=8, num_stages=3),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_warps=4, num_stages=4),
+         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+     ],
+     key=['M_TOTAL', 'OUT_C', 'TOTAL_K'],
+ )
+@@ -41,6 +46,10 @@
+     out_h = (offs_m // OUT_W) % OUT_H
+     batch = offs_m // (OUT_W * OUT_H)
+ 
++    # Precompute M-dim spatial bases ONCE (shape [BLOCK_M]) — hoisted out of K-loop
++    ih_base = out_h * STRIDE_H - PAD_H
++    iw_base = out_w * STRIDE_W - PAD_W
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+     for k_off in range(0, TOTAL_K, BLOCK_K):
+@@ -51,9 +60,9 @@
+         kh = (offs_k // KW) % KH
+         in_c = offs_k // (KH * KW)
+ 
+-        # Compute input coordinates
+-        ih = out_h[:, None] * STRIDE_H + kh[None, :] * DIL_H - PAD_H
+-        iw = out_w[:, None] * STRIDE_W + kw[None, :] * DIL_W - PAD_W
++        # Compute input coordinates using hoisted base offsets
++        ih = ih_base[:, None] + kh[None, :] * DIL_H
++        iw = iw_base[:, None] + kw[None, :] * DIL_W
+ 
+         valid_m = offs_m[:, None] < M_TOTAL
+         valid_k = offs_k[None, :] < TOTAL_K
+@@ -68,7 +77,7 @@
+         w_ptrs = W_ptr + offs_n[None, :] * s_wn + in_c[:, None] * s_wc + kh[:, None] * s_wh + kw[:, None] * s_ww
+         w_tile = tl.load(w_ptrs, mask=valid_wk & valid_wn, other=0.0)
+ 
+-        acc = tl.dot(x_tile, w_tile, acc)
++        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=True)
+ 
+     # Store output
+     valid_out_m = offs_m[:, None] < M_TOTAL
+@@ -76,7 +85,6 @@
+ 
+     y_ptrs = Y_ptr + batch[:, None] * s_yn + offs_n[None, :] * s_yc + out_h[:, None] * s_yh + out_w[:, None] * s_yw
+     tl.store(y_ptrs, acc.to(tl.float32), mask=valid_out_m & valid_out_n)
+-
+ 
+ def kernel_function(weight, x):
+     N, IN_C, IN_H, IN_W = x.shape

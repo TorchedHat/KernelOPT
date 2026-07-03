@@ -1,0 +1,147 @@
+[
+  {
+    "item_id": "exp_triton_num_stages_relu_regression_001",
+    "iteration": 1,
+    "speedup": 0.7844,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "add_num_stages_to_autotune_configs_for_streaming_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 86.52,
+        "GPU Speed Of Light Throughput.Duration": 3.02,
+        "Occupancy.Achieved Occupancy": 85.23,
+        "Scheduler Statistics.Active Warps Per Scheduler": 13.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 154.21,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 1572864.0,
+        "Launch Statistics.Waves Per SM": 744.73
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 67.95,
+        "GPU Speed Of Light Throughput.Duration": 3.85,
+        "Occupancy.Achieved Occupancy": 30.91,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.67,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 49.02,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 6291456.0,
+        "Launch Statistics.Waves Per SM": 1489.45
+      }
+    },
+    "strategy_title": "Adding num_stages to Triton autotune configs hurt occupancy",
+    "strategy_description": "Adding num_stages=2/4 to Triton autotune configs for a streaming memory-bound kernel caused the autotuner to select a smaller block size (64 vs 128), which quadrupled the grid size (6.29M vs 1.57M blocks) and collapsed achieved occupancy from 85% to 31% (active warps per scheduler dropped from 13.47 to 4.67). Although per-warp stall cycles improved (154 \u2192 49 cycles), DRAM throughput fell from 86.5% to 68% and total duration increased from 3.02ms to 3.85ms, indicating that the occupancy collapse more than offset any pipelining benefit. For kernels already near peak DRAM bandwidth with high occupancy, introducing num_stages can backfire if the autotuner selects a config with fewer warps per SM, reducing memory-level parallelism.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 autotuner picked BLOCK_SIZE=64, num_stages=2\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_SIZE': 256},  num_warps=2,  num_stages=2),\n    triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=2),\n    triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=4),\n    # ... more configs with num_stages=2/4 ...\n    triton.Config({'BLOCK_SIZE': 16384}, num_warps=16, num_stages=4),\n], key=['n_elements'])\n# Result: autotuner selected BLOCK_SIZE=64, grid=6.29M, occupancy=31%",
+    "fast_pseudocode": "# BEFORE (faster) \u2014 no num_stages, autotuner picked BLOCK_SIZE=128\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),\n    triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),\n    triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),\n    triton.Config({'BLOCK_SIZE': 512},  num_warps=4),\n    triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),\n    triton.Config({'BLOCK_SIZE': 256},  num_warps=2),\n], key=['n_elements'])\n# Result: autotuner selected BLOCK_SIZE=128, grid=1.57M, occupancy=85%",
+    "applicable_when": "Kernel is already achieving >80% DRAM throughput and >80% occupancy with no num_stages; adding num_stages is expected to hide L1TEX stalls via software pipelining.",
+    "do_not_apply_when": "The kernel is already near peak DRAM bandwidth (>80%) with high achieved occupancy (>80%) and the autotuner search space includes small block sizes \u2014 adding num_stages can cause the autotuner to select a smaller block size that collapses occupancy and reduces DRAM throughput, resulting in a net regression. Do not add num_stages without constraining the minimum block size to prevent occupancy collapse.",
+    "framework_notes": "Triton num_stages controls software pipelining depth (async cp.async prefetch). When num_stages>1, Triton allocates shared memory buffers for each stage, which can interact with the autotuner's block size selection in unexpected ways. If adding num_stages, ensure the autotune config space does not include block sizes so small that the resulting grid overwhelms the scheduler and collapses occupancy."
+  },
+  {
+    "item_id": "80730ff4",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "multi_element_per_thread_loop_unroll_to_hide_l1tex_latency",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "multi_element_per_thread_loop_unroll_to_hide_l1tex_latency \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'multi_element_per_thread_loop_unroll_to_hide_l1tex_latency' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The autotuner selected BLOCK_SIZE=2048 with num_warps=8 (256 threads/block), producing a grid of 786,432 blocks. Each warp issues a single tl.load and immediately stalls for 79.2 cycles waiting for L1TEX data (scoreboard dependency), with only 0.17 eligible warps per scheduler per cycle (88.95% no-eligible cycles). L1 hit rate is 0%, so every load goes to L2/DRAM. The kernel is memory-latency-limited, not bandwidth-limited. The fix is to have each thread process ELEMENTS_PER_THREAD elements in a compile-time-unrolled loop, issuing multiple independent loads before any store. This creates a software pipeline of in-flight memory requests per thread, increasing memory-level parallelism (MLP) per warp from 1 to ELEMENTS_PER_THREAD, hiding the 79.2-cycle L1TEX latency. It also reduces grid size by ELEMENTS_PER_THREAD times, reducing scheduling overhead. Registers per thread is only 18 \u2014 there is ample register headroom to hold multiple in-flight values without spilling.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "9a6ae529",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "constexpr_unroll_multiple_independent_loads_per_cta",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "constexpr_unroll_multiple_independent_loads_per_cta \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'constexpr_unroll_multiple_independent_loads_per_cta' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The autotuner selected BLOCK_SIZE=128 (the smallest config), producing 1.57M blocks each with only 4 warps. Each warp issues a single tl.load then immediately stalls ~92 cycles on L1TEX scoreboard dependency (77% of all stall cycles). With only 0.14 eligible warps/scheduler/cycle, the GPU is severely latency-limited. The fix is to have each CTA issue UNROLL_FACTOR independent tl.load calls (on non-overlapping chunks) before any compute or store, so the GPU can overlap their DRAM latencies. This increases memory-level parallelism (MLP) per warp from 1 to UNROLL_FACTOR without a runtime loop (which previously crashed). Registers per thread is only 18, leaving ample headroom for UNROLL_FACTOR=2 or 4 additional live values. num_stages was previously tried and regressed; eviction policies, vectorized loads, and large block sizes are all excluded. This approach is structurally distinct: it uses a compile-time constexpr unroll factor as a new autotune dimension, not a runtime loop.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "4b5a678a",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "dual_chunk_load_store_to_double_mlp_per_warp",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "dual_chunk_load_store_to_double_mlp_per_warp \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'dual_chunk_load_store_to_double_mlp_per_warp' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely memory-latency-limited: 89.7% of scheduler cycles have no eligible warp, and 77.1% of all stall cycles are L1TEX scoreboard stalls (avg 101.9 cycles per warp). The autotuner selected BLOCK_SIZE=128 (the smallest config), producing 1.57M blocks with only 4 warps each. Each warp issues one tl.load then immediately stalls \u2014 MLP per warp is effectively 1. With only 18 registers/thread there is ample register headroom to hold two independent load results simultaneously. The fix is to have each CTA issue TWO independent tl.load calls on non-overlapping chunks before any compute or store, doubling MLP per warp. Prior attempts at unrolling crashed because UNROLL_FACTOR was added as an autotune key and the grid lambda was not updated consistently; this plan avoids that by hardcoding factor=2 directly in the kernel body and halving the grid in the launch lambda.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_small_block_regression_005",
+    "iteration": 5,
+    "speedup": 0.3907,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "add_triton_autotune_small_block_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 86.3,
+        "GPU Speed Of Light Throughput.Duration": 3.03,
+        "Occupancy.Achieved Occupancy": 85.11,
+        "Scheduler Statistics.Active Warps Per Scheduler": 13.62,
+        "Scheduler Statistics.No Eligible": 89.7,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 132.2,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 1572864.0,
+        "Launch Statistics.Waves Per SM": 744.73,
+        "Memory Workload Analysis.Memory Throughput": 4.24,
+        "Instruction Statistics.Executed Instructions": 245366784.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 33.88,
+        "GPU Speed Of Light Throughput.Duration": 7.73,
+        "Occupancy.Achieved Occupancy": 43.31,
+        "Scheduler Statistics.Active Warps Per Scheduler": 6.78,
+        "Scheduler Statistics.No Eligible": 77.77,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.51,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 12582912.0,
+        "Launch Statistics.Waves Per SM": 5957.82,
+        "Memory Workload Analysis.Memory Throughput": 1.66,
+        "Instruction Statistics.Executed Instructions": 1358954496.0
+      }
+    },
+    "strategy_title": "Shrinking autotune block size range collapses occupancy and DRAM BW",
+    "strategy_description": "Replacing a large-block autotune config space (BLOCK_SIZE 1024\u201316384) with a small-block space (BLOCK_SIZE 128\u20131024) caused the autotuner to select BLOCK_SIZE=128, which exploded the grid from 1.57M to 12.58M blocks (8x more), driving waves-per-SM from 745 to 5958. This massively increased scheduling overhead and collapsed achieved occupancy from 85% to 43% (active warps/scheduler: 13.62 \u2192 6.78), while also inflating executed instruction count by 5.5x due to per-block overhead. DRAM throughput fell from 86.3% to 33.9% and duration more than doubled (3.03ms \u2192 7.73ms). Although per-warp stall cycles improved (132 \u2192 30), the occupancy collapse and instruction explosion far outweighed any latency-hiding benefit.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 autotuner picked BLOCK_SIZE=128, grid=12.58M\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_SIZE': 128},  num_warps=4),\n    triton.Config({'BLOCK_SIZE': 256},  num_warps=4),\n    triton.Config({'BLOCK_SIZE': 512},  num_warps=8),\n    triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),\n], key=['n_elements'])\n# Result: autotuner selected BLOCK_SIZE=128, grid=12.58M, occupancy=43%, DRAM=33.9%",
+    "fast_pseudocode": "# BEFORE (faster) \u2014 autotuner picked BLOCK_SIZE=128, grid=1.57M\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_SIZE': 1024},  num_warps=4),\n    triton.Config({'BLOCK_SIZE': 1024},  num_warps=8),\n    triton.Config({'BLOCK_SIZE': 2048},  num_warps=8),\n    triton.Config({'BLOCK_SIZE': 2048},  num_warps=16),\n    triton.Config({'BLOCK_SIZE': 4096},  num_warps=16),\n    triton.Config({'BLOCK_SIZE': 8192},  num_warps=16),\n    triton.Config({'BLOCK_SIZE': 16384}, num_warps=16),\n], key=['n_elements'])\n# Result: autotuner selected BLOCK_SIZE=128, grid=1.57M, occupancy=85%, DRAM=86.3%",
+    "applicable_when": "Kernel is already achieving >80% DRAM throughput and >80% occupancy; considering replacing large-block autotune configs with smaller block sizes to reduce per-warp stall cycles.",
+    "do_not_apply_when": "The kernel is already near peak DRAM bandwidth (>80%) with high achieved occupancy (>80%). Shrinking the autotune block size range to small values (e.g. 128\u20131024) causes the autotuner to select tiny blocks, exploding grid size, collapsing occupancy, and dramatically reducing DRAM throughput. Do not reduce the minimum block size in the autotune config space when the kernel is already bandwidth-saturated \u2014 the resulting grid explosion causes more harm than any per-warp latency improvement.",
+    "framework_notes": "In Triton, the grid size is computed as ceil(n_elements / BLOCK_SIZE). Selecting BLOCK_SIZE=128 for a 200M-element workload produces 1.57M blocks per grid dimension, but if the grid formula is not updated (e.g. due to a bug or different grid lambda), the grid can be 8x larger. Always verify that the grid lambda correctly divides by the selected BLOCK_SIZE to avoid instruction count explosion."
+  }
+]

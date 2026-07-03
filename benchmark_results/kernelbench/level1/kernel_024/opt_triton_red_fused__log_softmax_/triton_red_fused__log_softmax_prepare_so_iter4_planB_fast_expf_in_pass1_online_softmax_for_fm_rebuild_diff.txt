@@ -1,0 +1,91 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,24 @@
+ import triton.language as tl
+ from triton.language.extra import libdevice
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_N': 1024, 'num_stages': 2}, num_warps=32),
+-        triton.Config({'BLOCK_N': 2048, 'num_stages': 2}, num_warps=32),
+-        triton.Config({'BLOCK_N': 4096, 'num_stages': 2}, num_warps=32),
+-        triton.Config({'BLOCK_N': 512, 'num_stages': 3}, num_warps=16),
+-        triton.Config({'BLOCK_N': 1024, 'num_stages': 3}, num_warps=16),
+-        triton.Config({'BLOCK_N': 2048, 'num_stages': 3}, num_warps=16),
+-        triton.Config({'BLOCK_N': 256, 'num_stages': 4}, num_warps=8),
+-        triton.Config({'BLOCK_N': 512, 'num_stages': 4}, num_warps=8),
++        triton.Config({'BLOCK_N': 16384, 'PASS1_STAGES': 4, 'PASS2_STAGES': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'PASS1_STAGES': 3, 'PASS2_STAGES': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'PASS1_STAGES': 5, 'PASS2_STAGES': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'PASS1_STAGES': 4, 'PASS2_STAGES': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'PASS1_STAGES': 3, 'PASS2_STAGES': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'PASS1_STAGES': 2, 'PASS2_STAGES': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192,  'PASS1_STAGES': 5, 'PASS2_STAGES': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192,  'PASS1_STAGES': 4, 'PASS2_STAGES': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192,  'PASS1_STAGES': 3, 'PASS2_STAGES': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192,  'PASS1_STAGES': 5, 'PASS2_STAGES': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192,  'PASS1_STAGES': 4, 'PASS2_STAGES': 2}, num_warps=16),
++        triton.Config({'BLOCK_N': 8192,  'PASS1_STAGES': 6, 'PASS2_STAGES': 2}, num_warps=16),
++        triton.Config({'BLOCK_N': 4096,  'PASS1_STAGES': 4, 'PASS2_STAGES': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 4096,  'PASS1_STAGES': 5, 'PASS2_STAGES': 3}, num_warps=16),
++        triton.Config({'BLOCK_N': 2048,  'PASS1_STAGES': 4, 'PASS2_STAGES': 3}, num_warps=16),
+     ],
+     key=['N'],
+ )
+@@ -23,7 +31,8 @@
+     M,
+     N,
+     BLOCK_N: tl.constexpr,
+-    num_stages: tl.constexpr,
++    PASS1_STAGES: tl.constexpr,
++    PASS2_STAGES: tl.constexpr,
+ ):
+     # Each program handles one row
+     row_idx = tl.program_id(0)
+@@ -38,34 +47,37 @@
+     row_max = tl.full((), float('-inf'), dtype=tl.float32)
+     row_sum = tl.zeros((), dtype=tl.float32)
+     
+-    for col_off in tl.range(0, N, BLOCK_N, num_stages=num_stages):
++    for col_off in tl.range(0, N, BLOCK_N, num_stages=PASS1_STAGES):
+         cols = col_off + tl.arange(0, BLOCK_N)
+         mask = cols < N
+-        x = tl.load(row_start + cols, mask=mask, other=float('-inf')).to(tl.float32)
++        x = tl.load(row_start + cols, mask=mask, other=float('-inf'), eviction_policy='evict_last').to(tl.float32)
+         
+         # Online softmax update
+         block_max = tl.max(x, axis=0)
+         new_max = tl.maximum(row_max, block_max)
+         
+         # Update sum: scale old sum by exp(old_max - new_max), add new terms
+-        row_sum = row_sum * tl.exp(row_max - new_max) + tl.sum(tl.exp(x - new_max), axis=0)
++        # Use fast_expf (ex2.approx.f32) to enable FMA fusion around multiply-add
++        row_sum = row_sum * libdevice.fast_expf(row_max - new_max) + tl.sum(libdevice.fast_expf(x - new_max), axis=0)
+         row_max = new_max
+     
+     log_sum = tl.log(row_sum)
+     
++    # Hoist loop-invariant scalar outside Pass 2 loop for FMA exposure
++    offset = -(row_max + log_sum)
++    
+     # Pass 2: compute log_softmax = x - max - log(sum(exp(x - max)))
+     out_start = output_ptr + row_idx * N
+     
+-    for col_off in tl.range(0, N, BLOCK_N, num_stages=num_stages):
++    for col_off in tl.range(0, N, BLOCK_N, num_stages=PASS2_STAGES):
+         cols = col_off + tl.arange(0, BLOCK_N)
+         mask = cols < N
+-        x = tl.load(row_start + cols, mask=mask, other=0.0).to(tl.float32)
++        x = tl.load(row_start + cols, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+         
+-        # log_softmax = x - max - log_sum
+-        out = x - row_max - log_sum
++        # log_softmax = x + offset  (FMA-friendly; offset = -(row_max + log_sum))
++        out = x + offset
+         
+         tl.store(out_start + cols, out.to(tl.float32), mask=mask)
+-
+ 
+ def kernel_function(*inputs):
+     x, = inputs

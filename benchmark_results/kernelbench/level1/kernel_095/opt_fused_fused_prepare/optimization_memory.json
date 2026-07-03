@@ -1,0 +1,247 @@
+[
+  {
+    "item_id": "exp_001_online_softmax_triton_regression",
+    "iteration": 1,
+    "speedup": 0.6725,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "single_pass_online_softmax_fused_cross_entropy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall (MIO scoreboard)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 233.5,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 342161.0,
+        "Memory Workload Analysis.Memory Throughput": 2.33,
+        "Memory Workload Analysis.L2 Hit Rate": 38.15,
+        "Instruction Statistics.Executed Instructions": 117080064.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.85,
+        "Launch Statistics.Registers Per Thread": 23.0,
+        "CPIStall L1TEX stall pct": 39.54,
+        "CPIStall MIO stall pct": 32.22
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 347.2,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 520462.0,
+        "Memory Workload Analysis.Memory Throughput": 1.56,
+        "Memory Workload Analysis.L2 Hit Rate": 0.88,
+        "Instruction Statistics.Executed Instructions": 178159616.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.62,
+        "Launch Statistics.Registers Per Thread": 27.0,
+        "CPIStall MIO stall pct": 46.17
+      }
+    },
+    "strategy_title": "Online Softmax Single-Pass Hurts When L2 Cache Is Hot",
+    "strategy_description": "Replacing a two-pass (max then sum_exp) loop with a single-pass online softmax recurrence increased kernel duration from 233.5 \u00b5s to 347.2 \u00b5s (0.67x). Despite halving global loads in theory, the L2 hit rate collapsed from 38.15% to 0.88%, total executed instructions grew from 117M to 178M, and MIO stall cycles worsened from 32.2% to 46.2% of cycles. The online recurrence introduces additional exp() calls per block (one extra tl.exp(row_max - new_max) per iteration for the rescaling step) that generate MIO/MUFU stalls, and the register pressure increase (23\u219227 registers/thread) may have disrupted the compiler's instruction scheduling. When the two-pass kernel already achieves meaningful L2 reuse (38% hit rate) and the dominant stall is L1TEX scoreboard rather than pure DRAM bandwidth, the extra arithmetic in the online recurrence can outweigh the memory traffic savings.",
+    "slow_pseudocode": "# Two-pass: max then sum_exp\nrow_max = -inf\nfor off in range(0, N, BLOCK_N):  # Pass 1\n    x = load(predictions[row, off:off+BLOCK_N])\n    row_max = max(row_max, max(x))\nrow_sum = 0\nfor off in range(0, N, BLOCK_N):  # Pass 2\n    x = load(predictions[row, off:off+BLOCK_N])\n    row_sum += sum(exp(x - row_max))\nlog_sum_exp = log(row_sum) + row_max",
+    "fast_pseudocode": "# Single-pass online softmax (SLOWER in this case)\nrow_max = -inf\nrow_sum = 0\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])\n    block_max = max(x)\n    new_max = max(row_max, block_max)\n    row_sum = row_sum * exp(row_max - new_max) + sum(exp(x - new_max))\n    row_max = new_max\nlog_sum_exp = log(row_sum) + row_max",
+    "applicable_when": "DRAM throughput is the dominant bottleneck (>70% DRAM utilization), L2 hit rate is low (<10%), and the kernel is purely bandwidth-limited with no significant compute stalls from special functions.",
+    "do_not_apply_when": "The two-pass kernel already achieves meaningful L2 cache reuse (L2 hit rate >30%), the dominant stall is MIO/MUFU (special math instructions like exp), or register pressure is near the block limit. The extra exp() call per block in the online recurrence adds MIO stalls that can exceed the savings from reduced memory traffic.",
+    "framework_notes": "In Triton, each tl.exp() call on a scalar (the rescaling factor exp(row_max - new_max)) is executed as a MUFU instruction, which stalls on the MIO pipeline. When N is small enough that the second pass hits L2 cache (as seen here with 38% L2 hit rate), the two-pass approach avoids this extra MUFU overhead entirely."
+  },
+  {
+    "item_id": "exp_001_online_softmax_single_pass",
+    "iteration": 1,
+    "speedup": 1.1511,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_two_pass_into_online_softmax_single_pass",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 233.5,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 47.4,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 66.5,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 3.95,
+        "Memory Workload Analysis.L2 Hit Rate": 38.15,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.85,
+        "Scheduler Statistics.No Eligible": 32.68,
+        "Compute Workload Analysis.Issue Slots Busy": 67.3
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 202.85,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 54.19,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 73.81,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.31,
+        "Memory Workload Analysis.L2 Hit Rate": 0.83,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.69,
+        "Scheduler Statistics.No Eligible": 25.34,
+        "Compute Workload Analysis.Issue Slots Busy": 74.76
+      }
+    },
+    "strategy_title": "Fuse Two-Pass Softmax Into Single Online-Softmax Pass",
+    "strategy_description": "When a kernel iterates over a row twice \u2014 once to compute the max and once to compute the sum of exponentials \u2014 the second pass re-reads the same data from L2/DRAM due to low L1 hit rates (~4%), doubling global memory traffic and causing heavy L1TEX scoreboard stalls (~9 cycles/warp, ~40% of total stall cycles). Replacing the two loops with a single online-softmax pass (tracking running_max and rescaled running_sum simultaneously via the identity: sum = sum * exp(old_max - new_max) + sum(exp(x - new_max))) halves global memory reads, reducing warp cycles per instruction from 22.85 to 20.69 and improving SM throughput from 66.5% to 73.8%. This technique is applicable whenever a reduction over a large dimension requires two sequential passes that cannot be cached in L1.",
+    "slow_pseudocode": "# Pass 1: compute row max\nrow_max = -inf\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])  # reads from L2/DRAM\n    row_max = max(row_max, max(x))\n\n# Pass 2: compute sum_exp (re-reads same data)\nrow_sum = 0.0\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])  # second read from L2/DRAM\n    row_sum += sum(exp(x - row_max))\n\nlog_sum_exp = log(row_sum) + row_max",
+    "fast_pseudocode": "# Single online-softmax pass\nrow_max = -inf\nrow_sum = 0.0\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])  # single read\n    block_max = max(x)\n    new_max = max(row_max, block_max)\n    # Rescale existing sum and accumulate new block\n    row_sum = row_sum * exp(row_max - new_max) + sum(where(mask, exp(x - new_max), 0.0))\n    row_max = new_max\n\nlog_sum_exp = log(row_sum) + row_max",
+    "applicable_when": "Kernel performs two sequential passes over a large row/sequence dimension for softmax/log-softmax/cross-entropy; L1 hit rate is very low (<5%) indicating the second pass re-reads from L2/DRAM; L1TEX scoreboard stalls account for >30% of total stall cycles; DRAM throughput is moderate (<60%) suggesting bandwidth is not yet saturated and reducing reads will help.",
+    "do_not_apply_when": "The row dimension fits entirely in L1/shared memory (high L1 hit rate on second pass); the kernel already uses a single-pass algorithm; numerical precision requirements are stricter than float32 and the online rescaling introduces unacceptable error; the bottleneck is compute-bound rather than memory-bound.",
+    "framework_notes": "In Triton, the online rescaling uses tl.exp(row_max - new_max) for the correction factor. The initial state (row_max=-inf, row_sum=0.0) is safe because exp(-inf - (-inf)) = exp(0) = 1 but row_sum=0 so the rescale term is 0. Masked positions should use other=float('-inf') so exp(-inf - max) = 0. Also added num_stages=3 and num_stages=4 autotune configs for larger BLOCK_N values to enable software pipelining of loads."
+  },
+  {
+    "item_id": "exp_001_triton_online_softmax_single_pass_regression",
+    "iteration": 1,
+    "speedup": 0.8634,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "online_softmax_single_pass_with_autotune_stage_increase",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall (MIO), MemoryCacheAccessPattern (stores)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 233.5,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 342161.0,
+        "Instruction Statistics.Executed Instructions": 117080064.0,
+        "Launch Statistics.Registers Per Thread": 23.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 3.95,
+        "Memory Workload Analysis.L2 Hit Rate": 38.15,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.85,
+        "Compute Workload Analysis.Executed Ipc Active": 2.69,
+        "Occupancy.Block Limit Registers": 21.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 270.43,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 404969.0,
+        "Instruction Statistics.Executed Instructions": 165314560.0,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.6,
+        "Memory Workload Analysis.L2 Hit Rate": 0.8,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.67,
+        "Compute Workload Analysis.Executed Ipc Active": 3.15,
+        "Occupancy.Block Limit Registers": 16.0
+      }
+    },
+    "strategy_title": "Online Softmax Single-Pass Increases Instruction Count and Register Pressure",
+    "strategy_description": "Converting a two-pass softmax (max pass + exp-sum pass) to a single-pass online softmax with inline target capture increased total executed instructions by ~41% (117M \u2192 165M) and raised registers per thread from 23 to 28, tightening the register block limit from 21 to 16 blocks. Although warp cycles per instruction improved slightly (22.85 \u2192 19.67) and L1/L2 hit rates dropped (L2: 38% \u2192 0.8%), the net effect was a 16% slowdown because the additional arithmetic work (rescaling running_sum each block with exp(running_max - new_max)) and higher register pressure outweighed the memory traffic savings from eliminating the second pass. The kernel remained memory-bound (Mem Busy 80\u219284%) and the second kernel (reduce_loss_kernel) was not actually fused in this diff, so intermediate buffer round-trips were not eliminated.",
+    "slow_pseudocode": "# Two-pass: reads predictions twice\nfor off in range(0, N, BLOCK_N):  # pass 1: max\n    x = load(predictions[row, off:off+BLOCK_N])\n    row_max = max(row_max, block_max(x))\nfor off in range(0, N, BLOCK_N):  # pass 2: exp-sum\n    x = load(predictions[row, off:off+BLOCK_N])\n    row_sum += sum(exp(x - row_max))\nstore(per_row_loss[row], loss)\nstore(per_row_valid[row], valid_int)",
+    "fast_pseudocode": "# Single-pass online softmax (attempted)\nrunning_max = -inf; running_sum = 0.0; pred_at_target = 0.0\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])\n    pred_at_target += sum(where(cols == safe_target, x, 0.0))  # extra work\n    block_max = max(x)\n    new_max = max(running_max, block_max)\n    running_sum = running_sum * exp(running_max - new_max) + sum(where(mask, exp(x - new_max), 0.0))  # extra exp per block\n    running_max = new_max\n# Still stores to per_row_loss and per_row_valid (reduce kernel NOT fused)\nstore(per_row_loss[row], loss)\nstore(per_row_valid[row], valid_int)",
+    "applicable_when": "Never apply this specific pattern: online softmax single-pass that adds per-block rescaling exp() calls without also fusing the downstream reduction kernel to eliminate intermediate buffers.",
+    "do_not_apply_when": "When the online softmax rescaling (running_sum * exp(running_max - new_max)) adds more arithmetic instructions than the memory reads saved by eliminating the second pass, especially when the vocabulary/row size N is small enough that the second pass is cheap relative to the extra exp() calls per block. Also avoid when the downstream reduce kernel is not actually fused \u2014 the intermediate buffer stores remain uncoalesced and the round-trip through HBM is not eliminated. Do not apply when register pressure increase (23\u219228 regs/thread) tightens block limit and reduces theoretical occupancy headroom.",
+    "framework_notes": "Triton-specific: increasing num_stages from 2 to 3-4 in autotune configs also contributed to higher register usage (software pipelining requires more live registers). The combination of online softmax + higher num_stages compounded register pressure. If attempting online softmax, must simultaneously fuse the reduce kernel (use tl.atomic_add) to realize the memory traffic benefit."
+  },
+  {
+    "item_id": "a3c661f0",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "parallelize_reduce_loss_with_atomic_add_and_eliminate_intermediate_stores",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (global stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "parallelize_reduce_loss_with_atomic_add_and_eliminate_intermediate_stores \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'parallelize_reduce_loss_with_atomic_add_and_eliminate_intermediate_stores' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_095/opt_fused_fused_prepare/fused_fused_prepare_iter2_planA_parallelize_reduce_loss_with_atomic_add_.py\", line 177, in <module>\n    ",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The #1 NCU rule flags global stores with only 4.0/32 bytes utilized per sector (12.5% store efficiency). This arises because cross_entropy_per_row_kernel launches 32768 programs (one per row), each writing a single float to per_row_loss[row] and a single int to per_row_valid[row]. These scalar stores are non-coalesced by construction: each CTA writes to a single unique row address, so no intra-warp coalescing is possible. The fix is to eliminate the intermediate per_row_loss and per_row_valid buffers entirely by having cross_entropy_per_row_kernel accumulate directly into two scalar output accumulators using tl.atomic_add. This removes both the uncoalesced stores AND the entire serial reduce_loss_kernel (grid=1, single program looping over all M=32768 rows). Eliminating 4x uncoalesced memory transactions (2 stores in cross_entropy_per_row_kernel + 2 loads in reduce_loss_kernel) for 32768 rows is the primary gain.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_095/opt_fused_fused_prepare/fuse",
+    "framework_notes": null
+  },
+  {
+    "item_id": "abfb0075",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "eliminate_intermediate_buffers_via_atomic_reduction_in_cross_entropy_kernel",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (global stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "eliminate_intermediate_buffers_via_atomic_reduction_in_cross_entropy_kernel \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'eliminate_intermediate_buffers_via_atomic_reduction_in_cross_entropy_kernel' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_095/opt_fused_fused_prepare/fused_fused_prepare_iter2_planC_eliminate_intermediate_buffers_via_atomi.py\", line 169, in <module>\n    ",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The top NCU rule (73.2% estimated speedup) is uncoalesced global stores: only 4/32 bytes per sector are utilized. This is caused by cross_entropy_per_row_kernel storing two scalars (per_row_loss[row] and per_row_valid[row]) from a 128-thread CTA where only 1 thread performs the store. Each CTA writes a single scalar to a unique row address; within a 32-thread warp sector, only 1 of 32 threads is active, wasting 31/32 of every cache line fetched for the store. Additionally, reduce_loss_kernel is launched with grid=(1,) \u2014 a single serial program that loops over all M=32768 rows \u2014 which forces a full round-trip of per_row_loss and per_row_valid through HBM. The fix is to eliminate both intermediate buffers by having cross_entropy_per_row_kernel use tl.atomic_add to accumulate loss and valid_count directly into two output scalars, then divide once. This removes: (1) the uncoalesced scalar stores to per_row_loss/per_row_valid, (2) the entire reduce_loss_kernel launch, (3) the HBM round-trip of 32768*8=256KB of intermediate data. Memory search confirms the current kernel already uses single-pass online softmax, so this targets the remaining dominant bottleneck.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_095/opt_fused_fused_prepare/fuse",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_tiled_rows_coalesced_stores_regression",
+    "iteration": 2,
+    "speedup": 0.1536,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tiled_rows_per_cta_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy (register-limited)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 202.85,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 299044.0,
+        "Instruction Statistics.Executed Instructions": 114196480.0,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Occupancy.Achieved Occupancy": 96.54,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Memory Workload Analysis.L2 Hit Rate": 0.83,
+        "Memory Workload Analysis.DRAM Throughput (via SOL)": 54.19,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 73.81,
+        "Launch Statistics.Waves Per SM": 15.52
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 1520.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2273528.0,
+        "Instruction Statistics.Executed Instructions": 962600960.0,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Achieved Occupancy": 73.69,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Block Limit Registers": 12.0,
+        "Memory Workload Analysis.L2 Hit Rate": 35.42,
+        "Memory Workload Analysis.DRAM Throughput (via SOL)": 7.29,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 80.39,
+        "Launch Statistics.Waves Per SM": 20.69
+      }
+    },
+    "strategy_title": "Tiling Rows Per CTA for Coalesced Stores Causes Massive Regression",
+    "strategy_description": "Processing BLOCK_M=8 rows per CTA via a tl.static_range inner loop to enable coalesced vector stores caused a 6.5x slowdown (202 \u00b5s \u2192 1520 \u00b5s). The static loop over BLOCK_M rows serialized work that was previously parallel across CTAs, increasing total executed instructions by 8.4x (114M \u2192 963M) and raising registers per thread from 28 to 40, which dropped theoretical occupancy from 100% to 75% (block limit registers fell from 16 to 12). Although DRAM throughput collapsed from 54% to 7% (indicating the L2 now caches the smaller working set), the compute throughput rose to 80% and the kernel became compute-bound on the serialized loop body. The scatter-into-BLOCK_M-array pattern (tl.where(tl.arange(0, BLOCK_M) == m, val, arr)) inside the static loop generates O(BLOCK_M\u00b2) comparison and select instructions per row, which dominates the instruction count explosion. Coalescing stores is not worth serializing row-parallel work when each CTA already issues only scalar stores.",
+    "slow_pseudocode": "# BLOCK_M rows per CTA, serialized via static_range (SLOW)\npid = program_id(0)\nrow_start = pid * BLOCK_M\nlosses = zeros([BLOCK_M])\nvalids = zeros([BLOCK_M])\nfor m in static_range(0, BLOCK_M):  # serialized\n    row = row_start + m\n    # two-pass softmax for this row\n    row_max = -inf\n    for off in range(0, N, BLOCK_N):\n        x = load(predictions[row, off:off+BLOCK_N])\n        row_max = max(row_max, max(x))\n    row_sum = 0\n    for off in range(0, N, BLOCK_N):\n        x = load(predictions[row, off:off+BLOCK_N])\n        row_sum += sum(exp(x - row_max))\n    loss_val = -(pred_at_target - log(row_sum) - row_max)\n    # scatter into array: O(BLOCK_M) comparisons per element\n    losses = where(arange(0, BLOCK_M) == m, loss_val, losses)\n    valids = where(arange(0, BLOCK_M) == m, valid_val, valids)\n# coalesced vector store\nstore(per_row_loss[row_start:row_start+BLOCK_M], losses)\nstore(per_row_valid[row_start:row_start+BLOCK_M], valids)",
+    "fast_pseudocode": "# One row per CTA, scalar store (FASTER)\nrow = program_id(0)\n# two-pass softmax\nrow_max = -inf\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])\n    row_max = max(row_max, max(x))\nrow_sum = 0\nfor off in range(0, N, BLOCK_N):\n    x = load(predictions[row, off:off+BLOCK_N])\n    row_sum += sum(exp(x - row_max))\nloss = -(pred_at_target - log(row_sum) - row_max)\nstore(per_row_loss[row], loss)   # scalar, uncoalesced but cheap\nstore(per_row_valid[row], valid_int)",
+    "applicable_when": "Never: tiling multiple rows per CTA via a static inner loop to coalesce scalar output stores is counterproductive when the per-row compute work (two softmax passes over N) is large relative to the store cost.",
+    "do_not_apply_when": "When each CTA already does substantial compute per row (multiple passes over large N), serializing rows via a static loop multiplies instruction count by BLOCK_M and raises register pressure, causing occupancy collapse. The scatter-into-array pattern (tl.where(arange == m, val, arr)) inside the loop generates O(BLOCK_M\u00b2) instructions. Avoid when the uncoalesced store cost is small relative to the per-row compute cost.",
+    "framework_notes": "In Triton, tl.static_range unrolls the loop at compile time, but the scatter pattern `losses = tl.where(tl.arange(0, BLOCK_M) == m, loss_val, losses)` inside the unrolled loop generates BLOCK_M comparison+select instructions per iteration, totaling BLOCK_M\u00b2 such instructions overall. This is the primary cause of the 8.4x instruction count explosion. A better approach for coalescing stores would be to use tl.atomic_add or restructure so threads within a warp each handle a different row (warp-level row tiling), not CTA-level serialization."
+  },
+  {
+    "item_id": "ed38d442",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fuse_cross_entropy_reduction_via_atomic_add_eliminate_intermediate_buffers",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (global stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fuse_cross_entropy_reduction_via_atomic_add_eliminate_intermediate_buffers \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fuse_cross_entropy_reduction_via_atomic_add_eliminate_intermediate_buffers' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_095/opt_fused_fused_prepare/fused_fused_prepare_iter4_planB_fuse_cross_entropy_reduction_via_atomic_.py\", line 179, in <module>\n    ",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The dominant bottleneck (70% estimated speedup) is uncoalesced global stores in cross_entropy_per_row_kernel. Each of the 32768 CTAs writes exactly one float32 scalar to per_row_loss[row] and one int32 scalar to per_row_valid[row]. Since each CTA maps to a unique row, there is zero intra-warp coalescing: only 4 of 32 bytes per sector are utilized, wasting 87.5% of every store transaction. Additionally, reduce_loss_kernel is launched with grid=(1,) \u2014 a single serial program that loops over all M=32768 rows, forcing a full 256KB HBM round-trip of the intermediate buffers. The fix is to eliminate both intermediate buffers by having cross_entropy_per_row_kernel accumulate directly into two pre-zeroed scalar output tensors using tl.atomic_add. This removes: (1) the 32768 uncoalesced float32 stores to per_row_loss, (2) the 32768 uncoalesced int32 stores to per_row_valid, (3) the entire reduce_loss_kernel launch and its 32768-row serial loop. Prior atomic_add attempts crashed due to implementation bugs (using torch.empty instead of torch.zeros for output scalars, and incorrect dtype handling). The correct implementation uses torch.zeros for pre-initialization and tl.atomic_add with explicit float32 casting.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_095/opt_fused_fused_prepare/fuse",
+    "framework_notes": null
+  },
+  {
+    "item_id": "ed55ba0e",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "pack_loss_and_valid_into_interleaved_float2_buffer_to_improve_store_coalescing",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (global stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "pack_loss_and_valid_into_interleaved_float2_buffer_to_improve_store_coalescing \u2014 correctness failure",
+    "strategy_description": "Plan 'pack_loss_and_valid_into_interleaved_float2_buffer_to_improve_store_coalescing' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.359e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.357e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.358e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "cross_entropy_per_row_kernel launches 32,768 CTAs (one per row). Each CTA writes exactly ONE float32 to per_row_loss[row] and ONE int32 to per_row_valid[row]. Within a 32-thread warp, only 1 thread is active for each store, so only 4 of 32 bytes in each 32-byte sector are used \u2014 12.5% store efficiency. NCU estimates 70.21% speedup from fixing this. Prior attempts to fix via tl.atomic_add crashed (items a3c661f0, abfb0075). The solution is to pack both scalars into a single interleaved float2 buffer: store [loss_row0, valid_row0, loss_row1, valid_row1, ...] so that consecutive CTAs (row=i and row=i+1) write to adjacent 8-byte slots within the same 32-byte sector. This doubles sector utilization from 4/32 to 8/32 bytes per sector and halves the number of store transactions. The reduce_loss_kernel is updated to load from the interleaved buffer. No algorithmic change, no atomic operations, no register pressure increase. Online softmax is NOT applied (it regressed in item exp_001_online_softmax_triton_regression). libdevice.log is replaced with tl.log to reduce MIO stall pressure.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.359e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.357e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.358e+00 > atol=0.001",
+    "framework_notes": null
+  }
+]

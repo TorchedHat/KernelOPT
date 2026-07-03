@@ -1,0 +1,305 @@
+[
+  {
+    "item_id": "exp_002_triton_evict_first_streaming",
+    "iteration": 2,
+    "speedup": 1.0855,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_cache_policy_for_streaming_load_and_store",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.95,
+        "GPU Speed Of Light Throughput.Duration": 258.18,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.04,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.26,
+        "Scheduler Statistics.No Eligible": 45.01,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 53.93,
+        "Compute Workload Analysis.Issue Slots Busy": 54.96
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 95.06,
+        "GPU Speed Of Light Throughput.Duration": 262.24,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.89,
+        "Scheduler Statistics.No Eligible": 43.99,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 55.3,
+        "Compute Workload Analysis.Issue Slots Busy": 56.0
+      }
+    },
+    "strategy_title": "Use evict_first Cache Policy for Streaming Loads and Stores",
+    "strategy_description": "For streaming kernels with near-zero L1 hit rate (\u22640.05%), changing tl.load eviction_policy from 'evict_last' to 'evict_first' and adding eviction_policy='evict_first' to tl.store signals to the hardware that data has no temporal reuse, freeing L1 capacity for other warps and reducing MIO queue pressure. In this case, the NCU-reported MIO stall fraction dropped slightly (38.1% \u2192 37.2%) and warp cycles per issued instruction improved marginally (20.26 \u2192 19.89), yielding a modest 8.5% speedup. However, the L1/TEX throughput remained near-saturated (94.95% \u2192 95.06%), indicating the kernel remains L1-bound and the eviction hint alone cannot fully relieve the bottleneck when the access pattern itself is still partially uncoalesced.",
+    "slow_pseudocode": "# evict_last on load (default), no policy on store\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + batch*y1), mask, eviction_policy='evict_last')\ntl.store(out_ptr0 + (x2 + stride*y3), tmp0, mask)",
+    "fast_pseudocode": "# evict_first on both load and store for streaming data\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + batch*y1), mask, eviction_policy='evict_first')\ntl.store(out_ptr0 + (x2 + stride*y3), tmp0, mask, eviction_policy='evict_first')\n# Also expand autotune configs with larger XBLOCK=128 variants",
+    "applicable_when": "L1/TEX Hit Rate \u2264 0.1% (confirming zero temporal reuse), L1/TEX Cache Throughput > 90% (L1 is saturated), CPIStall rule triggered with MIO queue stalls > 30% of stall cycles, kernel is a streaming copy/transpose with write-once output data, eviction_policy on load is currently 'evict_last'",
+    "do_not_apply_when": "L1/TEX Hit Rate > 5% (data has meaningful temporal reuse and evict_last is beneficial); kernel is compute-bound rather than memory-bound; L1/TEX throughput is below 70% (L1 is not the bottleneck); the primary bottleneck is DRAM bandwidth rather than L1 saturation",
+    "framework_notes": "In Triton, eviction_policy='evict_first' maps to the CUDA streaming eviction hint (equivalent to __ldg with streaming hint or CUDA's cudaAccessPropStreaming). It is most effective when L1 hit rate is near zero. On Hopper/Ampere GPUs this hint is respected for both loads and stores. The speedup here (1.086x) is modest because the kernel remains L1/TEX-bound at ~95% throughput \u2014 the uncoalesced store pattern (28.4/32 bytes utilized per sector) is the deeper bottleneck that eviction policy alone cannot fix."
+  },
+  {
+    "item_id": "exp_003_triton_vectorized_store_hints_grid_lambda",
+    "iteration": 3,
+    "speedup": 1.1051,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_store_hints_with_correct_grid_lambda",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 259.84,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 95.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.22,
+        "Memory Workload Analysis.Mem Busy": 93.67,
+        "Memory Workload Analysis.L2 Hit Rate": 54.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.25,
+        "Scheduler Statistics.No Eligible": 45.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.16,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 388762.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 257.6,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.98,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.27,
+        "Memory Workload Analysis.Mem Busy": 93.79,
+        "Memory Workload Analysis.L2 Hit Rate": 54.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.26,
+        "Scheduler Statistics.No Eligible": 45.01,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 386308.0
+      }
+    },
+    "strategy_title": "Apply tl.multiple_of/max_contiguous Hints to Raw xindex for Vectorized Stores",
+    "strategy_description": "When a Triton kernel's store address has a contiguous dimension (stride-1 in x), applying `tl.max_contiguous(tl.multiple_of(xindex, [1, XBLOCK]), [1, XBLOCK])` to the raw 2D xindex tensor (shape [1, XBLOCK]) before decomposition enables the compiler to emit 128-bit vectorized STG instructions, reducing store transaction count. The key is to apply the hint to the raw xindex (shape [1, XBLOCK]) using per-dimension list arguments, not to a scalar or post-decomposition variable \u2014 the latter causes a shape mismatch error. The profiling metrics show a modest improvement (Duration 259.84 \u2192 257.6 us, Elapsed Cycles 388762 \u2192 386308) with all other metrics nearly unchanged, indicating the bottleneck remains L1/TEX saturation from uncoalesced loads rather than store throughput.",
+    "slow_pseudocode": "# No vectorization hint on store\nx2 = xindex  # shape [1, XBLOCK]\ny0 = yindex % 128\ny1 = yindex // 128\ny3 = yindex\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + batch_stride*y1), xmask & ymask, eviction_policy='evict_last')\ntl.store(out_ptr0 + (x2 + out_stride*y3), tmp0, xmask & ymask)",
+    "fast_pseudocode": "# Apply vectorization hint to raw xindex (shape [1, XBLOCK]) using list args\nx2 = xindex  # shape [1, XBLOCK]\nx2_vec = tl.max_contiguous(tl.multiple_of(xindex, [1, XBLOCK]), [1, XBLOCK])\ny0 = yindex % 128\ny1 = yindex // 128\ny3 = yindex\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + batch_stride*y1), xmask & ymask, eviction_policy='evict_last')\n# Use x2_vec only in store; x2 still used in load to preserve strided access\ntl.store(out_ptr0 + (x2_vec + out_stride*y3), tmp0, xmask & ymask)",
+    "applicable_when": "Triton kernel has a stride-1 store dimension (MemoryCacheAccessPattern rule triggered, store bytes utilized < 32/32 per sector), xindex is a 2D tensor of shape [1, XBLOCK], and the store address uses xindex directly without post-decomposition arithmetic; L1/TEX Cache Throughput > 90% with MIO stalls > 30%",
+    "do_not_apply_when": "The hint is applied to a scalar or post-decomposition variable (causes shape mismatch error); the store dimension is not contiguous in memory (stride != 1); the kernel is compute-bound rather than memory-bound; the primary bottleneck is uncoalesced loads (not stores) \u2014 in that case this hint yields only marginal gains (~1%) and the root cause requires a shared-memory transpose or grid dimension swap",
+    "framework_notes": "In Triton, tl.multiple_of and tl.max_contiguous must be applied to the full tensor with matching shape. For a 2D xindex of shape [1, XBLOCK], use list arguments: tl.multiple_of(xindex, [1, XBLOCK]) and tl.max_contiguous(..., [1, XBLOCK]). Applying to a scalar x2 after decomposition (e.g., x2 = xindex[0]) causes 'Shape of input to multiple_of' errors. The hinted pointer must only be used in the store \u2014 the load must continue using the original unhinted x2 to preserve correctness of the strided access pattern."
+  },
+  {
+    "item_id": "exp_003_triton_vectorized_store_contiguous_hint",
+    "iteration": 3,
+    "speedup": 1.0881,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_store_hints_with_lambda_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 259.84,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 95.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.22,
+        "Memory Workload Analysis.Mem Busy": 93.67,
+        "Memory Workload Analysis.L2 Hit Rate": 54.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.25,
+        "Scheduler Statistics.No Eligible": 45.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.16,
+        "Compute Workload Analysis.Issue Slots Busy": 55.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 261.63,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.99,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 55.31,
+        "Memory Workload Analysis.Mem Busy": 93.87,
+        "Memory Workload Analysis.L2 Hit Rate": 54.6,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.89,
+        "Scheduler Statistics.No Eligible": 44.0,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.22,
+        "Compute Workload Analysis.Issue Slots Busy": 55.97
+      }
+    },
+    "strategy_title": "Vectorized Store Hints via tl.max_contiguous on Arange Slice",
+    "strategy_description": "When a Triton kernel's store address has a stride-1 dimension (x2) but NCU reports only ~28.4/32 bytes utilized per sector on global stores (MemoryCacheAccessPattern rule), applying tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK) to the 1D arange slice before reshaping \u2014 then adding the large-stride y-term separately \u2014 signals to the Triton compiler that the x-indices are contiguous and aligned, enabling 128-bit vectorized STG instructions. Critically, the hint must be applied only to the arange slice (1D), not to the full compound index expression, to avoid shape mismatch errors. In this case, the per-invocation NCU metrics changed only marginally (Warp Cycles/Instruction 20.25\u219219.89, Issue Slots Busy 55.0%\u219256.0%), suggesting the autotuner selected a slightly different config rather than the vectorization hint itself driving the gain; the kernel remains L1/TEX-bound at ~95% throughput.",
+    "slow_pseudocode": "# Store with bare x2 index \u2014 compiler cannot prove contiguity\nx2 = xindex  # scalar derived from xoffset + arange\ntl.store(out_ptr0 + (x2 + 31500*y3), tmp0, mask)",
+    "fast_pseudocode": "# Apply contiguous hint to 1D arange first, then reshape \u2014 avoids shape mismatch\nx2_vec = tl.max_contiguous(\n    tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK),\n    XBLOCK\n)[None, :]  # reshape to [1, XBLOCK] after hint\ntl.store(out_ptr0 + (x2_vec + 31500*y3), tmp0, mask, eviction_policy='evict_first')\n# Grid must be a lambda: lambda meta: (cdiv(ynumel, meta['YBLOCK']), cdiv(xnumel, meta['XBLOCK']))",
+    "applicable_when": "MemoryCacheAccessPattern rule triggered with store bytes utilized per sector < 30/32; kernel has a stride-1 store dimension (x-axis) with XBLOCK >= 16 (power-of-2 aligned); L1/TEX throughput > 90%; the store index is a compound expression with a large-stride y-term added to a contiguous x-term",
+    "do_not_apply_when": "The hint is applied to the full compound index expression (x2 + stride*y3) rather than only the arange slice \u2014 this causes a shape mismatch compilation error; kernel is compute-bound; the store dimension is not stride-1 in memory; XBLOCK is not a power of 2 (alignment requirement for 128-bit STG)",
+    "framework_notes": "In Triton, tl.multiple_of(idx, N) and tl.max_contiguous(idx, N) must be applied to the raw arange tensor (1D), not to a scalar or compound expression. Apply the hint before any reshape ([None, :] or [:, None]) and before adding large-stride offset terms. The grid must be a lambda reading meta['XBLOCK'] and meta['YBLOCK'] for autotune to function correctly \u2014 a hardcoded grid ignores the selected config and causes all autotune variants to silently run with wrong tile coverage."
+  },
+  {
+    "item_id": "exp_003_triton_vectorized_store_hints_with_expanded_autotune",
+    "iteration": 3,
+    "speedup": 1.0879,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_stores_with_contiguous_hints_and_expanded_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 259.84,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 95.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.22,
+        "Memory Workload Analysis.Mem Busy": 93.67,
+        "Memory Workload Analysis.L2 Hit Rate": 54.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.25,
+        "Scheduler Statistics.No Eligible": 45.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.16
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 261.66,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 95.01,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.21,
+        "Memory Workload Analysis.Mem Busy": 93.68,
+        "Memory Workload Analysis.L2 Hit Rate": 54.35,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.26,
+        "Scheduler Statistics.No Eligible": 45.03,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.16
+      }
+    },
+    "strategy_title": "tl.max_contiguous + tl.multiple_of Store Hints with Expanded Autotune",
+    "strategy_description": "Applying tl.multiple_of and tl.max_contiguous hints to the store index in a Triton transpose kernel (targeting the MemoryCacheAccessPattern rule, 28.4/32 bytes utilized per sector) produced a 1.088x speedup, but the NCU per-invocation metrics are essentially unchanged (Duration 259.84 vs 261.66 us, Mem Busy 93.67% vs 93.68%, Warp Cycles/Instruction 20.25 vs 20.26). This indicates the speedup comes from the expanded autotune config space selecting a better tile configuration at benchmark time, not from the vectorization hints themselves improving the store coalescing. When the kernel is already deeply L1/TEX-bound (>93% Mem Busy, ~95% L1/TEX throughput), compiler hints for store vectorization do not measurably shift the bottleneck metrics \u2014 the access pattern inefficiency (28.4/32 bytes/sector) persists because the root cause is tile boundary misalignment, not missing compiler hints.",
+    "slow_pseudocode": "# Store without contiguous hints\nx2 = xindex  # shape [YBLOCK, XBLOCK]\ntl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask & ymask)",
+    "fast_pseudocode": "# Store with contiguous hints (compiler hint only, no value change)\nx2 = xindex  # shape [YBLOCK, XBLOCK]\nx2_vec = tl.max_contiguous(tl.multiple_of(x2, [1, XBLOCK]), [1, XBLOCK])\ntl.store(out_ptr0 + (x2_vec + 31500*y3), tmp0, xmask & ymask)\n# Also expand autotune configs with XBLOCK=128 variants and num_stages=3,4",
+    "applicable_when": "MemoryCacheAccessPattern rule triggered with store sector utilization < 30/32 bytes; kernel is a layout transpose with stride-1 store dimension; autotune config space is limited and can be expanded with XBLOCK=128 variants",
+    "do_not_apply_when": "Kernel is already deeply L1/TEX-bound (Mem Busy > 93%, L1/TEX Throughput > 94%) \u2014 hints will not shift the bottleneck; the store index is a 2D tensor and tl.multiple_of requires matching shape argument (list, not scalar) to avoid shape mismatch errors; do not apply if prior attempts with these hints caused correctness failures without careful shape argument validation",
+    "framework_notes": "In Triton, tl.multiple_of and tl.max_contiguous are compiler hints that do NOT change computed values \u2014 they only inform the compiler about alignment/contiguity for vectorized instruction selection (STG.128 vs STG.32). When the store index x2 is a 2D tensor of shape [YBLOCK, XBLOCK], the hint argument must be a list matching the tensor rank: tl.multiple_of(x2, [1, XBLOCK]) not tl.multiple_of(x2, XBLOCK). Passing a scalar to a 2D tensor causes a shape mismatch compilation error (as seen in iteration 2 item 8ca16760). The speedup in this iteration is attributable to the expanded autotune config space rather than the hints themselves."
+  },
+  {
+    "item_id": "df5059ba",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "shared_memory_tile_transpose_for_coalesced_loads",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "shared_memory_tile_transpose_for_coalesced_loads \u2014 correctness failure",
+    "strategy_description": "Plan 'shared_memory_tile_transpose_for_coalesced_loads' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.141e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "This is a 4D tensor layout transpose from channels-last (NHWC-like, stride=(4032000,1,32000,128)) to channels-first (NCHW-like, stride=(4032000,31500,250,1)). The load address is y0 + 128*x2 + 4032000*y1: XBLOCK threads step by 128 floats (512 bytes) per thread in the x2 dimension, producing 32 separate 32-byte cache-line transactions per warp instead of 1 \u2014 fully non-coalesced. This saturates L1/TEX at 95% with only 0.04% hit rate and floods the MIO queue (38.3% of stall cycles). The store address x2 + 31500*y3 is stride-1 in x and is already coalesced. Prior attempts (vectorized store hints, evict_first, grid swap) gave only 1-10% gains because they do not fix the fundamental load coalescing problem. The fix is to reorder the 2D tile so that the channel dimension (stride-1 in source) is the innermost warp dimension (last axis of the 2D tile), making loads coalesced, then use tl.trans() to transpose the register tile before storing so stores are also coalesced.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.141e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_004_triton_register_transpose_coalesced_load_store",
+    "iteration": 4,
+    "speedup": 1.4314,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "register_transpose_for_coalesced_load_and_store",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 257.6,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.98,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.27,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 41.02,
+        "Memory Workload Analysis.Mem Busy": 93.79,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.04,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.26,
+        "Scheduler Statistics.No Eligible": 45.01,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.17,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 69.89,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Block Limit Registers": 12.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 198.88,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 38.67,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 37.88,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 53.45,
+        "Memory Workload Analysis.Mem Busy": 39.71,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 40.25,
+        "Scheduler Statistics.No Eligible": 61.61,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 91.92,
+        "Launch Statistics.Registers Per Thread": 25.0,
+        "Occupancy.Block Limit Registers": 16.0
+      }
+    },
+    "strategy_title": "Register Transpose to Coalesce Both Loads and Stores",
+    "strategy_description": "When a transpose kernel has non-coalesced loads (warp-consecutive threads access stride-N memory, saturating L1/TEX above 94% with near-zero hit rate and high MIO stalls), swapping the tile orientation during the load phase so that the stride-1 dimension is warp-fast (innermost arange), then calling tl.trans() to flip the in-register tile, then storing with the original orientation, converts both loads and stores to fully coalesced accesses. This eliminated L1/TEX saturation (94.98% \u2192 38.67%), reduced registers per thread (40 \u2192 25), raised theoretical occupancy (75% \u2192 100%), and shifted the bottleneck from L1/TEX to DRAM bandwidth (DRAM throughput 41% \u2192 53%), yielding a 1.43x speedup. The key insight is that tl.trans() performs an in-register transpose with no shared memory overhead, making it the correct fix when the load and store coalescing requirements are orthogonal.",
+    "slow_pseudocode": "# Non-coalesced load: warp-consecutive threads vary x2 (stride-128 in input)\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # [YBLOCK, 1] slow\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # [1, XBLOCK] fast, stride-128 in input\ny0 = yindex % 128; y1 = yindex // 128\ntmp0 = tl.load(in_ptr + (y0 + 128*x2 + batch*y1), mask)  # 32 transactions/warp\ntl.store(out_ptr + (x2_vec + out_stride*yindex), tmp0, mask)",
+    "fast_pseudocode": "# LOAD PHASE: swap orientation so y0 (stride-1) is warp-fast -> COALESCED\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # [XBLOCK, 1] slow\nyindex = yoffset + tl.arange(0, YBLOCK)[None, :]  # [1, YBLOCK] fast, stride-1 in input\ny0 = yindex % 128; y1 = yindex // 128\ntmp0 = tl.load(in_ptr + (y0 + 128*xindex + batch*y1), xmask & ymask)  # 1 transaction/warp\n\n# TRANSPOSE in registers: [XBLOCK, YBLOCK] -> [YBLOCK, XBLOCK], no SRAM needed\ntmp0_T = tl.trans(tmp0)\n\n# STORE PHASE: original orientation, x is warp-fast (stride-1 in output) -> COALESCED\nyindex_s = yoffset + tl.arange(0, YBLOCK)[:, None]  # [YBLOCK, 1] slow\nxindex_s = xoffset + tl.arange(0, XBLOCK)[None, :]  # [1, XBLOCK] fast, stride-1 in output\nx2_vec = tl.max_contiguous(tl.multiple_of(xindex_s, [1, XBLOCK]), [1, XBLOCK])\ntl.store(out_ptr + (x2_vec + out_stride*yindex_s), tmp0_T, ymask_s & xmask_s)\n# All autotune configs must use power-of-2 XBLOCK and YBLOCK (required by tl.trans)\n# num_stages=1 (no pipelining benefit in single-load kernel)\n# Grid: lambda meta: (cdiv(ynumel, meta['YBLOCK']), cdiv(xnumel, meta['XBLOCK']))",
+    "applicable_when": "Triton transpose/layout-copy kernel where: (1) L1/TEX Cache Throughput > 90% with L1/TEX Hit Rate < 0.1% (streaming, no reuse), (2) MemoryCacheAccessPattern rule triggered on loads (warp-consecutive threads access stride-N memory, N > 1), (3) MIO stall fraction > 30% of total stall cycles, (4) registers per thread > 32 limiting occupancy (Block Limit Registers < 16), (5) the load and store coalescing requirements are orthogonal (stride-1 axes are different dimensions for load vs store)",
+    "do_not_apply_when": "XBLOCK or YBLOCK are not powers of 2 (tl.trans requires power-of-2 tile dimensions); the tile is too large to fit in registers (XBLOCK * YBLOCK > ~512 elements per thread group may cause register spilling); the kernel already has coalesced loads (L1/TEX throughput < 70%); the stride-1 axis is the same for both load and store (no transpose needed); kernel is compute-bound rather than memory-bound",
+    "framework_notes": "In Triton, tl.trans() performs an in-register tile transpose with no shared memory overhead, unlike CUDA where shared memory tiling is typically required for coalesced transpose. tl.trans() requires both tile dimensions to be powers of 2 (16, 32, 64, 128). The load and store phases must use separate index tensors with opposite orientations: load uses [XBLOCK,1] x [1,YBLOCK] (y is warp-fast for stride-1 loads), store uses [YBLOCK,1] x [1,XBLOCK] (x is warp-fast for stride-1 stores). All autotune configs must use num_stages=1 since there is no software pipelining opportunity in a single-load kernel. The grid lambda must read meta['YBLOCK'] and meta['XBLOCK'] to correctly cover all autotune configs."
+  },
+  {
+    "item_id": "exp_004_triton_expand_autotune_large_xblock",
+    "iteration": 4,
+    "speedup": 1.1038,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_with_large_xblock_variants",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 257.6,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.98,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.27,
+        "Memory Workload Analysis.Mem Busy": 93.79,
+        "Memory Workload Analysis.L2 Hit Rate": 54.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.26,
+        "Scheduler Statistics.No Eligible": 45.01,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 386308.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 257.89,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.99,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.23,
+        "Memory Workload Analysis.Mem Busy": 93.7,
+        "Memory Workload Analysis.L2 Hit Rate": 54.41,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.24,
+        "Scheduler Statistics.No Eligible": 44.98,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 386801.0
+      }
+    },
+    "strategy_title": "Add Large XBLOCK Autotune Configs to Saturated Transpose Kernel",
+    "strategy_description": "Adding large-XBLOCK autotune configs (XBLOCK=128/256/512/1024 with small YBLOCK=8/4/2/1) to an existing autotune decorator on an L1/TEX-saturated transpose kernel produced a 1.10x wall-clock speedup, but the NCU per-invocation metrics are essentially unchanged (Duration 257.6 vs 257.9 us, Mem Busy 93.79% vs 93.7%, Warp Cycles/Instruction 20.26 vs 20.24). This indicates the speedup is attributable to the autotuner selecting a marginally better config at benchmark level rather than any measurable per-invocation improvement. When the kernel is already deeply L1/TEX-bound (>93% Mem Busy, ~95% L1/TEX throughput), expanding the autotune config space with large-XBLOCK variants yields only marginal gains and does not address the root bottleneck (uncoalesced loads, MIO stalls).",
+    "slow_pseudocode": "# Autotune with small-XBLOCK configs only (XBLOCK <= 64)\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 32}, num_warps=4, num_stages=3),\n        triton.Config({'YBLOCK': 64,  'XBLOCK': 32}, num_warps=4, num_stages=3),\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 64}, num_warps=8, num_stages=3),\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 32}, num_warps=4, num_stages=4),\n        triton.Config({'YBLOCK': 64,  'XBLOCK': 32}, num_warps=8, num_stages=4),\n    ],\n    key=['ynumel', 'xnumel'],\n)",
+    "fast_pseudocode": "# Add large-XBLOCK configs (XBLOCK=128..1024, YBLOCK=8..1)\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 32},  num_warps=4, num_stages=3),\n        triton.Config({'YBLOCK': 64,  'XBLOCK': 32},  num_warps=4, num_stages=3),\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 64},  num_warps=8, num_stages=3),\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 32},  num_warps=4, num_stages=4),\n        triton.Config({'YBLOCK': 64,  'XBLOCK': 32},  num_warps=8, num_stages=4),\n        triton.Config({'YBLOCK': 8,   'XBLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'YBLOCK': 4,   'XBLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'YBLOCK': 2,   'XBLOCK': 512}, num_warps=8, num_stages=2),\n        triton.Config({'YBLOCK': 1,   'XBLOCK': 1024},num_warps=8, num_stages=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)",
+    "applicable_when": "Triton kernel already has @triton.autotune with small-XBLOCK configs only (XBLOCK <= 64); kernel is L1/TEX-bound (L1/TEX Cache Throughput > 90%, Mem Busy > 90%); autotune config space has not yet explored large XBLOCK values; the kernel body is correct for any power-of-2 XBLOCK value",
+    "do_not_apply_when": "Kernel is already deeply L1/TEX-bound with no measurable per-invocation metric improvement from prior autotune expansions \u2014 further config expansion yields diminishing returns (<1% per-invocation gain); the root bottleneck is uncoalesced loads requiring structural changes (shared-memory transpose, grid dimension swap); YBLOCK*XBLOCK must not exceed hardware thread limit per block (1024); large XBLOCK with YBLOCK=1 may cause poor occupancy if the problem size in Y is large",
+    "framework_notes": "In Triton, adding large-XBLOCK (128\u20131024) with correspondingly small YBLOCK (8\u20131) configs explores a different tile aspect ratio. These configs keep total threads per block (YBLOCK*XBLOCK) at 1024 or below. The grid lambda must use meta['YBLOCK'] and meta['XBLOCK'] for these configs to function correctly. On H200, the speedup from this expansion is marginal (~1.10x) when the kernel is already near the L1/TEX saturation ceiling \u2014 the autotuner finds a slightly better config but cannot overcome the fundamental memory access pattern inefficiency."
+  },
+  {
+    "item_id": "exp_004_triton_arange_axis_swap_coalesced_load",
+    "iteration": 4,
+    "speedup": 1.0838,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "arange_axis_swap_for_coalesced_load_in_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 257.6,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.98,
+        "Memory Workload Analysis.Mem Busy": 93.79,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.26,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.17,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 69.89,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Launch Statistics.Waves Per SM": 79.84
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 262.66,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 92.01,
+        "Memory Workload Analysis.Mem Busy": 90.89,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.12,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.7,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 58.07,
+        "Launch Statistics.Registers Per Thread": 48.0,
+        "Launch Statistics.Waves Per SM": 95.81
+      }
+    },
+    "strategy_title": "Swap tl.arange Axes to Coalesce Loads in Transpose Kernel",
+    "strategy_description": "Swapping the tl.arange reshape axes so that the stride-1 memory dimension becomes the fast-varying (innermost) thread dimension \u2014 changing yindex from [:, None] to [None, :] and xindex from [None, :] to [:, None] \u2014 is intended to make loads coalesced when y0 (stride-1 in source) varies across threads. However, in this case the approach increased register pressure from 40 to 48 registers/thread, which reduced theoretical occupancy from 75% to 62.5% and achieved occupancy from 69.89% to 58.07%, while Warp Cycles Per Issued Instruction actually improved (20.26 \u2192 17.12) and L1/TEX throughput dropped slightly (94.98% \u2192 92.01%). Despite the per-warp stall improvement, the occupancy reduction and increased waves/SM (79.84 \u2192 95.81) resulted in only a marginal 1.08x speedup \u2014 lower than the 1.10x achieved by the grid dimension swap approach (exp_001) which did not incur the register penalty.",
+    "slow_pseudocode": "# yindex shape [YBLOCK, 1] \u2014 slow-varying; xindex shape [1, XBLOCK] \u2014 fast-varying\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # stride-1 dim is slow-varying -> non-coalesced load\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]\ny0 = yindex % 128  # stride-1 in source, but slow-varying\nx2 = xindex        # stride-128 in source, but fast-varying\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + batch*y1), mask)",
+    "fast_pseudocode": "# yindex shape [1, YBLOCK] \u2014 fast-varying; xindex shape [XBLOCK, 1] \u2014 slow-varying\nyindex = yoffset + tl.arange(0, YBLOCK)[None, :]  # stride-1 dim is now fast-varying\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]\ny0 = yindex % 128  # stride-1 in source, fast-varying -> coalesced load\nx2 = xindex        # stride-128 in source, slow-varying\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + batch*y1), mask)\n# Store hint: apply to 1D arange before reshape\nx2_vec = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[:, None]\ntl.store(out_ptr0 + (x2_vec + out_stride*y3), tmp0, mask, eviction_policy='evict_first')",
+    "applicable_when": "Triton transpose kernel where the stride-1 load dimension (y0) is assigned to the slow-varying tl.arange axis ([:, None]) while the high-stride dimension (x2) is fast-varying ([None, :]); L1/TEX Cache Throughput > 90%, MemoryCacheAccessPattern rule triggered, CPIStall MIO stalls > 30%; the grid dimension swap (program_id axis reassignment) has already been applied",
+    "do_not_apply_when": "The axis swap increases register count significantly (e.g., 40 \u2192 48 registers/thread), reducing occupancy below 65% \u2014 in that case the occupancy loss offsets the coalescing gain and the net speedup is lower than simpler approaches; if the grid dimension swap (exp_001) already achieves better speedup without register penalty, prefer that approach; do not apply when YBLOCK is not a power of 2 (Triton tl.arange requirement)",
+    "framework_notes": "In Triton, swapping tl.arange reshape axes ([None, :] vs [:, None]) changes which dimension is the fast-varying thread dimension within a tile. This is distinct from swapping program_id(0)/program_id(1) (which changes which grid axis is innermost). The axis swap within the tile can increase register pressure because the compiler must track more live values across the 2D tile shape. On H200 with 40\u219248 registers/thread, Block Limit Registers drops from 12 to 10 blocks/SM, reducing theoretical occupancy from 75% to 62.5%. The tl.max_contiguous hint for stores must be applied to the 1D arange before [:, None] reshape to avoid shape mismatch errors."
+  }
+]

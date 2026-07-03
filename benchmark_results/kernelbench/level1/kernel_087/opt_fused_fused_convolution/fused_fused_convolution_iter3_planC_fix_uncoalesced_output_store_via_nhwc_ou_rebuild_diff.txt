@@ -1,0 +1,92 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,8 @@
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -30,9 +33,9 @@
+     # M = N_batch * H * W (output spatial positions)
+     # N = out_channels (Co)
+     # K = in_channels (Ci)
+-    # x layout: (N_batch, Ci, H, W) with strides stride_xn, stride_xc, stride_xh, stride_xw
+-    # w layout: (Co, Ci) with strides stride_wco, stride_wci
+-    # out layout: (N_batch, Co, H, W) with strides stride_on, stride_oc, stride_oh, stride_ow
++    # x layout: (N_batch, H, W, Ci) [NHWC] with strides stride_xn, stride_xc, stride_xh, stride_xw
++    # w layout: (Ci, Co) with strides stride_wci, stride_wco (transposed for coalesced Co access)
++    # out layout: (N_batch, H, W, Co) [NHWC] with strides stride_on, stride_oc, stride_oh, stride_ow
+ 
+     pid = tl.program_id(0).to(tl.int64)
+     grid_m = tl.cdiv(M, BLOCK_M)
+@@ -53,13 +56,6 @@
+     # offs_m = batch_idx * HW + hw_idx
+     batch_idx = offs_m // HW   # [BLOCK_M]
+     hw_idx = offs_m % HW       # [BLOCK_M]
+-    h_idx = hw_idx // tl.cdiv(HW, HW)  # placeholder, compute properly
+-    # Actually HW = H*W, hw_idx = h*W + w
+-    # We need h and w for the x pointer
+-    # x_ptr[batch, ci, h, w] = x_ptr + batch*stride_xn + ci*stride_xc + h*stride_xh + w*stride_xw
+-    # Since stride_xh = W and stride_xw = 1 (NCHW contiguous):
+-    # x_ptr[batch, ci, hw] = x_ptr + batch*stride_xn + ci*stride_xc + hw  (since h*W+w = hw_idx)
+-    # This works because stride_xh * h + stride_xw * w = W*h + w = hw_idx when stride_xw=1
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+@@ -67,34 +63,36 @@
+         k_offs = k * BLOCK_K + offs_k  # [BLOCK_K]
+ 
+         # Load x tile: shape [BLOCK_M, BLOCK_K]
+-        # x[batch_idx[m], k_offs[k], hw_idx[m]]
+-        # ptr = x_ptr + batch_idx[m]*stride_xn + k_offs[k]*stride_xc + hw_idx[m]
++        # x[batch_idx[m], hw_idx[m], k_offs[k]] in NHWC layout
++        # ptr = x_ptr + batch_idx[m]*stride_xn + k_offs[k]*stride_xc + hw_idx[m]*stride_xw
++        # stride_xc = 1 (Ci innermost in NHWC), stride_xw = Ci
+         x_batch = batch_idx[:, None]   # [BLOCK_M, 1]
+         x_ci = k_offs[None, :]         # [1, BLOCK_K]
+         x_hw = hw_idx[:, None]         # [BLOCK_M, 1]
+-        x_ptrs = x_ptr + x_batch.to(tl.int64) * stride_xn + x_ci.to(tl.int64) * stride_xc + x_hw.to(tl.int64)
++        x_ptrs = x_ptr + x_batch.to(tl.int64) * stride_xn + x_ci.to(tl.int64) * stride_xc + x_hw.to(tl.int64) * stride_xw
+         x_mask = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+ 
+         # Load w tile: shape [BLOCK_K, BLOCK_N]
+-        # w[offs_n[n], k_offs[k]] -> w_ptr + offs_n[n]*stride_wco + k_offs[k]*stride_wci
++        # w is now (Ci, Co) with stride_wci=Co, stride_wco=1
++        # w_ptr + k_offs[k]*stride_wci + offs_n[n]*stride_wco
+         w_ci = k_offs[:, None]         # [BLOCK_K, 1]
+         w_co = offs_n[None, :]         # [1, BLOCK_N]
+         w_ptrs = w_ptr + w_co.to(tl.int64) * stride_wco + w_ci.to(tl.int64) * stride_wci
+         w_mask = (k_offs[:, None] < K) & (offs_n[None, :] < N)
+         w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+ 
+-        acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=False)
++        acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=True)
+ 
+-    # Store output: out[batch_idx[m], offs_n[n], hw_idx[m]]
+-    # out_ptr + batch_idx[m]*stride_on + offs_n[n]*stride_oc + hw_idx[m]
++    # Store output in NHWC layout: out[batch_idx[m], hw_idx[m], offs_n[n]]
++    # out_ptr + batch_idx[m]*stride_on + hw_idx[m]*stride_ow + offs_n[n]*stride_oc
++    # With NHWC: stride_oc=1, so adjacent threads (different offs_n) write consecutive addresses
+     out_batch = batch_idx[:, None]   # [BLOCK_M, 1]
+     out_co = offs_n[None, :]         # [1, BLOCK_N]
+     out_hw = hw_idx[:, None]         # [BLOCK_M, 1]
+-    out_ptrs = out_ptr + out_batch.to(tl.int64) * stride_on + out_co.to(tl.int64) * stride_oc + out_hw.to(tl.int64)
++    out_ptrs = out_ptr + out_batch.to(tl.int64) * stride_on + out_hw.to(tl.int64) * stride_ow + out_co.to(tl.int64) * stride_oc
+     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     tl.store(out_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(w, x):
+     # w: (Co, Ci, 1, 1), x: (N, Ci, H, W)

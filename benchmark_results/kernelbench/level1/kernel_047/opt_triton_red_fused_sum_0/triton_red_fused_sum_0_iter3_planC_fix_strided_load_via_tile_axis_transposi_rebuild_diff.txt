@@ -1,0 +1,72 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -8,11 +9,15 @@
+         triton.Config({'BLOCK_M': 1, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+         triton.Config({'BLOCK_M': 1, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 1, 'BLOCK_R': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 2048}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 2048}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 2, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+         triton.Config({'BLOCK_M': 2, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 4, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+         triton.Config({'BLOCK_M': 4, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 4096}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 2048}, num_warps=8, num_stages=3),
+     ],
+     key=['batch', 'reduce_dim', 'last_dim'],
+ )
+@@ -40,6 +45,8 @@
+     col_offsets = out_start + tl.arange(0, BLOCK_M)
+     batch_idx = col_offsets // last_dim
+     col_idx = col_offsets % last_dim
++    # Hint: col_idx is contiguous and aligned to BLOCK_M
++    col_idx = tl.max_contiguous(tl.multiple_of(col_idx, BLOCK_M), BLOCK_M)
+ 
+     mask_out = (batch_idx < batch) & (col_idx < last_dim)
+ 
+@@ -48,26 +55,27 @@
+ 
+     for r_start in range(0, reduce_dim, BLOCK_R):
+         r_offsets = r_start + tl.arange(0, BLOCK_R)
++        # Hint: r_offsets are contiguous and aligned to BLOCK_R
++        r_offsets = tl.max_contiguous(tl.multiple_of(r_offsets, BLOCK_R), BLOCK_R)
+         r_mask = r_offsets < reduce_dim
+ 
+         # Load: in_ptr[batch_idx, r_offsets, col_idx]
+-        # Shape: [BLOCK_M, BLOCK_R]
++        # Shape: [BLOCK_R, BLOCK_M]  (transposed for coalesced access)
+         # in_ptr stride: [reduce_dim * last_dim, last_dim, 1]
+         # Linear index: batch_idx * reduce_dim * last_dim + r * last_dim + col_idx
+ 
+-        b_idx = batch_idx[:, None]  # [BLOCK_M, 1]
+-        r_idx = r_offsets[None, :]  # [1, BLOCK_R]
+-        c_idx = col_idx[:, None]    # [BLOCK_M, 1]
++        b_idx = batch_idx[None, :]  # [1, BLOCK_M] — broadcast over r
++        r_idx = r_offsets[:, None]  # [BLOCK_R, 1] — r varies on axis=0
++        c_idx = col_idx[None, :]    # [1, BLOCK_M] — col varies on axis=1 (contiguous)
+ 
+-        linear_idx = b_idx * (reduce_dim * last_dim) + r_idx * last_dim + c_idx
++        linear_idx = b_idx * (reduce_dim * last_dim) + r_idx * last_dim + c_idx  # [BLOCK_R, BLOCK_M]
+ 
+-        combined_mask = mask_out[:, None] & r_mask[None, :]
++        combined_mask = r_mask[:, None] & mask_out[None, :]  # [BLOCK_R, BLOCK_M]
+ 
+         vals = tl.load(in_ptr + linear_idx, mask=combined_mask, other=0.0)
+-        acc += tl.sum(vals, axis=1)
++        acc += tl.sum(vals, axis=0)  # reduce over BLOCK_R (axis=0), acc shape stays [BLOCK_M]
+ 
+     tl.store(out_ptr + col_offsets, acc, mask=mask_out)
+-
+ 
+ def kernel_function(x):
+     # x: [128, 4096, 4095], reduce over dim=1, keepdim=True -> [128, 1, 4095]

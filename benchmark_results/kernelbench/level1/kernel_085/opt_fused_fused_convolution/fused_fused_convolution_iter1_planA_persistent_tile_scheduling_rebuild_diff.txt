@@ -1,0 +1,111 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -8,7 +9,7 @@
+         triton.Config({'BLOCK_M': 256}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_M': 512}, num_warps=8, num_stages=3),
+-        triton.Config({'BLOCK_M': 64}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 64},  num_warps=2, num_stages=4),
+         triton.Config({'BLOCK_M': 256}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=4),
+     ],
+@@ -24,51 +25,59 @@
+     M,
+     BLOCK_M: tl.constexpr,
+ ):
+-    pid_m = tl.program_id(0)
+-    pid_c = tl.program_id(1)
++    # Persistent kernel: each CTA loops over a strided range of flat tile_ids
++    cta_id = tl.program_id(0)
++    num_ctas = tl.num_programs(0)
+ 
+-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    mask_m = offs_m < M
++    # Compute total number of tiles (same as original 2D grid total)
++    num_tiles_m = tl.cdiv(M, BLOCK_M)
++    num_tiles_total = num_tiles_m * C
+ 
+-    # Decode spatial position
+-    out_w = offs_m % OUT_W
+-    tmp = offs_m // OUT_W
+-    out_h = tmp % OUT_H
+-    batch = tmp // OUT_H
++    for tile_idx in tl.range(cta_id, num_tiles_total, num_ctas):
++        pid_m = tile_idx % num_tiles_m
++        pid_c = tile_idx // num_tiles_m
+ 
+-    # Channel index
+-    c = pid_c
++        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++        mask_m = offs_m < M
+ 
+-    # Accumulator
+-    acc = tl.zeros([BLOCK_M], dtype=tl.float32)
++        # Decode spatial position
++        out_w = offs_m % OUT_W
++        tmp = offs_m // OUT_W
++        out_h = tmp % OUT_H
++        batch = tmp // OUT_H
+ 
+-    # Weight base pointer for this channel: W[c, 0, :, :]
+-    # Weight shape: [C, 1, KH, KW], strides: [KH*KW, KH*KW, KW, 1]
+-    w_base = W_ptr + c * KH * KW
++        # Channel index
++        c = pid_c
+ 
+-    # Input base: X[batch, c, :, :], strides: [C*IN_H*IN_W, IN_H*IN_W, IN_W, 1]
+-    # X shape: [N, C, IN_H, IN_W]
+-    x_batch_c_base = batch * (C * IN_H * IN_W) + c * (IN_H * IN_W)
++        # Accumulator
++        acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+ 
+-    for kh in tl.static_range(KH):
+-        for kw in tl.static_range(KW):
+-            ih = out_h * STRIDE_H + kh - PAD_H
+-            iw = out_w * STRIDE_W + kw - PAD_W
++        # Weight base pointer for this channel: W[c, 0, :, :]
++        # Weight shape: [C, 1, KH, KW], strides: [KH*KW, KH*KW, KW, 1]
++        w_base = W_ptr + c * KH * KW
+ 
+-            valid = mask_m & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
++        # Input base: X[batch, c, :, :], strides: [C*IN_H*IN_W, IN_H*IN_W, IN_W, 1]
++        # X shape: [N, C, IN_H, IN_W]
++        x_batch_c_base = batch * (C * IN_H * IN_W) + c * (IN_H * IN_W)
+ 
+-            x_ptrs = X_ptr + x_batch_c_base + ih * IN_W + iw
+-            x_val = tl.load(x_ptrs, mask=valid, other=0.0)
++        for kh in tl.static_range(KH):
++            for kw in tl.static_range(KW):
++                ih = out_h * STRIDE_H + kh - PAD_H
++                iw = out_w * STRIDE_W + kw - PAD_W
+ 
+-            w_val = tl.load(w_base + kh * KW + kw)
++                valid = mask_m & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+ 
+-            acc += x_val * w_val
++                x_ptrs = X_ptr + x_batch_c_base + ih * IN_W + iw
++                x_val = tl.load(x_ptrs, mask=valid, other=0.0)
+ 
+-    # Store output: Y[batch, c, out_h, out_w]
+-    # Y shape: [N, C, OUT_H, OUT_W], strides: [C*OUT_H*OUT_W, OUT_H*OUT_W, OUT_W, 1]
+-    y_ptrs = Y_ptr + batch * (C * OUT_H * OUT_W) + c * (OUT_H * OUT_W) + out_h * OUT_W + out_w
+-    tl.store(y_ptrs, acc.to(tl.float32), mask=mask_m)
++                w_val = tl.load(w_base + kh * KW + kw)
+ 
++                acc += x_val * w_val
++
++        # Store output: Y[batch, c, out_h, out_w]
++        # Y shape: [N, C, OUT_H, OUT_W], strides: [C*OUT_H*OUT_W, OUT_H*OUT_W, OUT_W, 1]
++        y_ptrs = Y_ptr + batch * (C * OUT_H * OUT_W) + c * (OUT_H * OUT_W) + out_h * OUT_W + out_w
++        tl.store(y_ptrs, acc.to(tl.float32), mask=mask_m)
+ 
+ def kernel_function(weight, x):
+     # weight: [128, 1, 3, 7], x: [32, 128, 128, 256]

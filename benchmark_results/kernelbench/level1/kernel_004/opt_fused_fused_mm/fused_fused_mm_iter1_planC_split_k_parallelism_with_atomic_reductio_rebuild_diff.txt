@@ -1,0 +1,95 @@
+--- baseline
++++ rebuilt
+@@ -8,20 +8,22 @@
+ # We tile over K dimension and accumulate dot product.
+ # For large K (1048576), we need to be careful about register pressure.
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 1024}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 2048}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 4096}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 8192}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_K': 1024}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_K': 2048}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_K': 1024}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_K': 2048}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_K': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 16, 'BLOCK_K': 512}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 2048, 'K_SPLITS': 8},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 4096, 'K_SPLITS': 8},  num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 2048, 'K_SPLITS': 16}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 4096, 'K_SPLITS': 16}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 2, 'BLOCK_K': 2048, 'K_SPLITS': 16}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 2, 'BLOCK_K': 4096, 'K_SPLITS': 16}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 2048, 'K_SPLITS': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_K': 4096, 'K_SPLITS': 32}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 2, 'BLOCK_K': 2048, 'K_SPLITS': 32}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 4, 'BLOCK_K': 2048, 'K_SPLITS': 32}, num_warps=8, num_stages=4),
+     ],
+     key=['M', 'K'],
++    reset_to_zero=['C_ptr'],
+ )
+ @triton.jit
+ def matvec_kernel(
+@@ -31,38 +33,43 @@
+     stride_bk,
+     BLOCK_M: tl.constexpr,
+     BLOCK_K: tl.constexpr,
++    K_SPLITS: tl.constexpr,
+ ):
+-    # Each program handles BLOCK_M rows
+-    pid = tl.program_id(0)
+-    row_start = pid * BLOCK_M
+-    
++    # Each program handles BLOCK_M rows and a K-slice
++    pid_m = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    row_start = pid_m * BLOCK_M
++
+     # Row offsets for this block
+     row_offsets = row_start + tl.arange(0, BLOCK_M)
+     row_mask = row_offsets < M
+-    
++
++    # Compute K-slice bounds for this pid_k
++    k_split_size = tl.cdiv(K, K_SPLITS)
++    k_begin = pid_k * k_split_size
++    k_end = tl.minimum(k_begin + k_split_size, K)
++
+     # Accumulator: one per row in BLOCK_M
+     acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+-    
+-    # Iterate over K dimension in tiles
+-    for k_start in tl.range(0, K, BLOCK_K):
++
++    # Iterate over this K-slice in tiles
++    for k_start in tl.range(k_begin, k_end, BLOCK_K):
+         k_offsets = k_start + tl.arange(0, BLOCK_K)
+-        k_mask = k_offsets < K
+-        
++        k_mask = k_offsets < k_end
++
+         # Load B tile: shape [BLOCK_K]
+         b_ptrs = B_ptr + k_offsets * stride_bk
+         b = tl.load(b_ptrs, mask=k_mask, other=0.0)
+-        
++
+         # Load A tile: shape [BLOCK_M, BLOCK_K]
+         a_ptrs = A_ptr + row_offsets[:, None] * stride_am + k_offsets[None, :] * stride_ak
+         a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+-        
++
+         # Accumulate dot product
+         acc += tl.sum(a * b[None, :], axis=1)
+-    
+-    # Store results
+-    c_ptrs = C_ptr + row_offsets
+-    tl.store(c_ptrs, acc, mask=row_mask)
+ 
++    # Atomically accumulate partial results into C
++    tl.atomic_add(C_ptr + row_offsets, acc, mask=row_mask)
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

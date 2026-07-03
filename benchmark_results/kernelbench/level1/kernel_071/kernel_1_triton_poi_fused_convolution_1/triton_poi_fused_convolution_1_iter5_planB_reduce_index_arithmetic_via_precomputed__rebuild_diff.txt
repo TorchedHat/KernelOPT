@@ -1,0 +1,101 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,75 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 16},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 64},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 64},  num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=8, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    # ynumel=4096 (N*C=32*128), xnumel=31500 (H*W=126*250)
++    # Input  stride: (4032000, 1, 32000, 128) -- contiguous along C (stride=1)
++    # Output stride: (4032000, 31500, 250, 1) -- contiguous along W (stride=1)
++    pid_nc = tl.program_id(0)  # tiles N*C (ynumel=4096)
++    pid_hw = tl.program_id(1)  # tiles H*W (xnumel=31500)
+ 
++    nc_off = pid_nc * XBLOCK + tl.arange(0, XBLOCK)  # [XBLOCK]
++    hw_off = pid_hw * YBLOCK + tl.arange(0, YBLOCK)  # [YBLOCK]
++    nc_mask = nc_off < ynumel
++    hw_mask = hw_off < xnumel
+ 
++    # --- Scalar CTA-level base values (4 IDIVs total per CTA, not per element) ---
++    nc_base = pid_nc * XBLOCK          # scalar int
++    n_base  = nc_base // 128           # scalar IDIV (once per CTA)
++    c_base  = nc_base % 128            # scalar IMOD (once per CTA)
++    hw_base = pid_hw * YBLOCK          # scalar int
++    h_base  = hw_base // 250           # scalar IDIV (once per CTA)
++    w_base  = hw_base % 250            # scalar IMOD (once per CTA)
++
++    # --- Per-element: only additions + small-range carry correction ---
++    # nc decomposition: XBLOCK divides 128, so c_local is always in [0,128) — no wrap
++    nc_arange = tl.arange(0, XBLOCK)   # [XBLOCK]
++    c_l_1d = c_base + nc_arange        # [XBLOCK], no modulo needed (no wrap guaranteed)
++
++    # hw decomposition: carry trick handles at most one row boundary per tile (YBLOCK <= 250)
++    hw_arange = tl.arange(0, YBLOCK)   # [YBLOCK]
++    w_local   = w_base + hw_arange     # [YBLOCK], range [w_base, w_base+YBLOCK)
++    h_carry   = (w_local >= 250).to(tl.int32)  # [YBLOCK], 0 or 1
++    w_l_1d    = w_local - h_carry * 250        # [YBLOCK], equivalent to % 250
++    h_l_1d    = h_base + h_carry               # [YBLOCK]
++
++    # COALESCED LOAD: nc is the fast (column) axis, C stride=1 in input
++    # Broadcast to 2D tile [YBLOCK, XBLOCK]:
++    c_l_2d = c_l_1d[None, :]          # [1, XBLOCK]
++    h_l_2d = h_l_1d[:, None]          # [YBLOCK, 1]
++    w_l_2d = w_l_1d[:, None]          # [YBLOCK, 1]
++    mask_load = hw_mask[:, None] & nc_mask[None, :]  # [YBLOCK, XBLOCK]
++    load_idx = n_base * 4032000 + c_l_2d + h_l_2d * 32000 + w_l_2d * 128
++    tmp = tl.load(in_ptr0 + load_idx, mask=mask_load)  # [YBLOCK, XBLOCK]
++
++    # CRITICAL: tl.trans() swaps axes -> [XBLOCK, YBLOCK]
++    tmp_t = tl.trans(tmp)
++
++    # COALESCED STORE: hw is the fast (column) axis, stride=1 in output
++    # Store index using same scalar bases:
++    c_s_local = c_base + tl.arange(0, XBLOCK)  # [XBLOCK], same as c_l_1d
++    c_s_2d = c_s_local[:, None]       # [XBLOCK, 1]
++    hw_store_1d = hw_base + tl.arange(0, YBLOCK)  # [YBLOCK], flat hw index (contiguous in output)
++    mask_store = nc_mask[:, None] & hw_mask[None, :]  # [XBLOCK, YBLOCK]
++    store_idx = n_base * 4032000 + c_s_2d * 31500 + hw_store_1d[None, :]
++    tl.store(out_ptr0 + store_idx, tmp_t, mask=mask_store)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +81,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

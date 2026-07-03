@@ -1,0 +1,149 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 32768, 'XBLOCK': 1}, num_warps=32, num_stages=1),
+        triton.Config({'BLOCK_N': 16384, 'XBLOCK': 1}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_N': 8192, 'XBLOCK': 1}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_N': 4096, 'XBLOCK': 1}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_N': 2048, 'XBLOCK': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 1024, 'XBLOCK': 1}, num_warps=4, num_stages=2),
+    ],
+    key=['N'],
+)
+@triton.jit
+def reverse_cumsum_kernel(
+    in_ptr,
+    out_ptr,
+    M,
+    N,
+    BLOCK_N: tl.constexpr,
+    XBLOCK: tl.constexpr,
+):
+    # Each program handles one row
+    row_id = tl.program_id(0)
+    
+    if row_id >= M:
+        return
+    
+    row_base_in = in_ptr + row_id * N
+    row_base_out = out_ptr + row_id * N
+    
+    # We need to compute reverse cumsum:
+    # out[i] = sum(x[i:])
+    # This is equivalent to: flip -> cumsum -> flip
+    # 
+    # Strategy: iterate from right to left, accumulating sum
+    # We process in blocks of BLOCK_N, going from the end to the start
+    
+    # We'll do a two-pass approach:
+    # Pass 1: compute block sums from right to left
+    # Pass 2: compute prefix sums within each block, offset by block suffix sums
+    
+    # For large N, we need to handle multiple blocks
+    # We iterate from right to left
+    
+    # Number of blocks
+    num_blocks = (N + BLOCK_N - 1) // BLOCK_N
+    
+    # We'll accumulate the running sum from the right
+    running_sum = tl.zeros([1], dtype=tl.float32)
+    
+    # Process blocks from right to left
+    for block_idx in range(num_blocks - 1, -1, -1):
+        block_start = block_idx * BLOCK_N
+        offsets = block_start + tl.arange(0, BLOCK_N)
+        mask = offsets < N
+        
+        # Load values
+        vals = tl.load(row_base_in + offsets, mask=mask, other=0.0).to(tl.float32)
+        
+        # Compute suffix sum within this block (from right to left)
+        # We need: out[j] = sum(vals[j:block_end]) + running_sum
+        # This is: reverse cumsum of vals + running_sum
+        
+        # Flip the block, compute cumsum, flip back
+        # Since BLOCK_N is constexpr, we can use associative scan
+        # We need to reverse the indices within the block
+        
+        # Reverse the values within the block
+        rev_offsets = (BLOCK_N - 1) - tl.arange(0, BLOCK_N)
+        # Map reversed offsets to actual positions
+        actual_rev_offsets = block_start + rev_offsets
+        rev_mask = actual_rev_offsets < N
+        rev_vals = tl.load(row_base_in + actual_rev_offsets, mask=rev_mask, other=0.0).to(tl.float32)
+        
+        # Compute prefix cumsum on reversed values
+        # Use associative scan
+        rev_cumsum = tl.cumsum(rev_vals, axis=0)
+        
+        # Add running_sum to all elements
+        rev_cumsum = rev_cumsum + running_sum
+        
+        # Update running_sum: total sum of this block
+        block_total = tl.sum(vals, axis=0)
+        running_sum = running_sum + block_total
+        
+        # Now we need to store: the reversed cumsum back in original order
+        # rev_cumsum[k] corresponds to position block_start + (BLOCK_N-1-k)
+        # So out[block_start + j] = rev_cumsum[BLOCK_N-1-j]
+        # We store by reversing the output indices
+        
+        # Store back: position block_start + (BLOCK_N-1-k) gets rev_cumsum[k]
+        store_offsets = block_start + rev_offsets  # = block_start + (BLOCK_N-1) - arange(BLOCK_N)
+        store_mask = store_offsets < N
+        tl.store(row_base_out + store_offsets, rev_cumsum.to(tl.float32), mask=store_mask)
+
+
+def kernel_function(x):
+    assert x.is_cuda and x.dtype == torch.float32
+    M, N = x.shape
+    out = torch.empty_like(x)
+    
+    grid = lambda meta: (M,)
+    
+    reverse_cumsum_kernel[grid](
+        x, out,
+        M, N,
+    )
+    
+    return out
+
+
+def get_inputs():
+    return [torch.rand(32768, 32768, device='cuda', dtype=torch.float32)]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    
+    inputs = get_inputs()
+    
+    # Verify correctness on a small example first
+    x_small = torch.rand(4, 8, device='cuda', dtype=torch.float32)
+    ref = torch.cumsum(x_small.flip(1), dim=1).flip(1)
+    out = kernel_function(x_small)
+    
+    if not args.profile_only:
+        print(f"Max diff (small): {(ref - out).abs().max().item()}")
+        assert torch.allclose(ref, out, atol=1e-3), f"Mismatch! Max diff: {(ref - out).abs().max().item()}"
+        print("Small test passed!")
+    
+    # Run on full inputs
+    output = kernel_function(*inputs)
+    torch.cuda.synchronize()
+    
+    if not args.profile_only:
+        # Verify against PyTorch
+        ref_full = torch.cumsum(inputs[0].flip(1), dim=1).flip(1)
+        max_diff = (ref_full - output).abs().max().item()
+        print(f"Max diff (full): {max_diff}")
+        assert max_diff < 1e-3, f"Mismatch on full input! Max diff: {max_diff}"
+        print("Full test passed!")
+        print("Kernel executed successfully.")

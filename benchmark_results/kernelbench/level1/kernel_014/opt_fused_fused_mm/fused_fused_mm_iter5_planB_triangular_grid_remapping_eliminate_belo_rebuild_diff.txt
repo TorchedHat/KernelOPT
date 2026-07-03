@@ -1,0 +1,104 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,19 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=2, num_warps=1),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -30,45 +33,44 @@
+     grid_m = tl.cdiv(M, BLOCK_M)
+     grid_n = tl.cdiv(N, BLOCK_N)
+ 
+-    # L2 cache optimization: group programs
+-    width = GROUP_M * grid_n
+-    group_id = pid // width
+-    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+-    pid_m = group_id * GROUP_M + (pid % group_size)
+-    pid_n = (pid % width) // group_size
++    # Triangular decode: map 1D pid to (pid_m, pid_n) with pid_n >= pid_m
++    # Row pid_m has (grid_n - pid_m) tiles with pid_n in [pid_m, grid_n)
++    # Cumulative tiles before row r: r*grid_n - r*(r-1)//2
++    # Quadratic solve: find largest pid_m s.t. pid_m*grid_n - pid_m*(pid_m-1)//2 <= pid
++    discriminant = tl.cast((2 * grid_n + 1) * (2 * grid_n + 1) - 8 * pid, tl.float64)
++    pid_m = tl.cast(tl.math.floor((2 * grid_n + 1 - tl.math.sqrt(discriminant)) / 2), tl.int32)
++    pid_m = tl.minimum(pid_m, grid_m - 1)  # clamp to valid row range
++    cum_before = pid_m * grid_n - pid_m * (pid_m - 1) // 2
++    pid_n = pid_m + (pid - cum_before)  # pid_n >= pid_m guaranteed
+ 
+     # Row and column start indices for this tile
+     row_start = pid_m * BLOCK_M
+     col_start = pid_n * BLOCK_N
+ 
+-    # Early exit: if the entire tile is below the diagonal, output zeros
+-    # Upper triangular condition: col >= row, i.e., col_start + BLOCK_N - 1 >= row_start
+-    # If col_start + BLOCK_N - 1 < row_start, entire tile is below diagonal
+-    # We still need to handle partial tiles
+-
+     rm = row_start + tl.arange(0, BLOCK_M)
+     rn = col_start + tl.arange(0, BLOCK_N)
+ 
+-    # Compute matmul for this tile
++    # Compute matmul for this tile using raw pointer arithmetic
+     offs_am = rm
+     offs_bn = rn
+     offs_k = tl.arange(0, BLOCK_K)
+ 
+-    A_ptrs = A_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+-    B_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
++    # Shorten K-loop: A is upper-triangular so A[i,k]=0 for k<i
++    # Start at k_start aligned to BLOCK_K boundary
++    k_start = (row_start // BLOCK_K) * BLOCK_K
++
++    A_ptrs = A_ptr + offs_am[:, None] * stride_am + (offs_k[None, :] + k_start) * stride_ak
++    B_ptrs = B_ptr + (offs_k[:, None] + k_start) * stride_bk + offs_bn[None, :] * stride_bn
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        # Load A tile
+-        a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < k_remaining)
++    for k in range(k_start // BLOCK_K, tl.cdiv(K, BLOCK_K)):
++        a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_K)
++        b_mask = (offs_k[:, None] < K - k * BLOCK_K) & (offs_bn[None, :] < N)
+         a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        # Load B tile
+-        b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
+         b = tl.load(B_ptrs, mask=b_mask, other=0.0)
+ 
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
++        acc = tl.dot(a, b, acc=acc, allow_tf32=True)
+ 
+         A_ptrs += BLOCK_K * stride_ak
+         B_ptrs += BLOCK_K * stride_bk
+@@ -86,7 +88,6 @@
+ 
+     C_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+     tl.store(C_ptrs, acc.to(tl.float32), mask=boundary_mask)
+-
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

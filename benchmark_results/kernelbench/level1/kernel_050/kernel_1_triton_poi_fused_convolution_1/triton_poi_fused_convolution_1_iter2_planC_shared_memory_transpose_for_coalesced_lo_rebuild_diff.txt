@@ -1,0 +1,64 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,47 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    # Input:  [N=32, C=128, H=126, W=250], strides [4032000, 1, 32000, 128]
++    # Output: [N=32, C=128, H=126, W=250], strides [4032000, 31500, 250, 1]
++    # xnumel = 31500 (spatial positions H*W = 126*250)
++    # ynumel = 4096  (N*C = 32*128)
++    # YBLOCK repurposed as TILE_C (=128, all channels per CTA)
++    # XBLOCK repurposed as TILE_X (spatial tile size)
++    pid_y = tl.program_id(1)   # batch index n (0..31)
++    pid_x = tl.program_id(0)   # spatial tile index
+ 
++    # Spatial indices: stride=1 in output => coalesced store dim
++    x_base = pid_x * XBLOCK
++    x_idx = x_base + tl.arange(0, XBLOCK)   # shape [XBLOCK]
++    x_mask = x_idx < xnumel
+ 
++    # Channel indices 0..127: stride=1 in input => coalesced load dim
++    c_idx = tl.arange(0, YBLOCK)             # shape [YBLOCK=128]
++
++    # Phase 1: COALESCED LOAD
++    # Load tile shape: [XBLOCK, YBLOCK] — c_idx is the LAST (innermost) dim
++    # In input: element offset = n*4032000 + c*1 + x_idx*128
++    # c_idx innermost (stride=1 in input) => coalesced loads
++    load_offsets = x_idx[:, None] * 128 + c_idx[None, :] + 4032000 * pid_y
++    # load_offsets shape: [XBLOCK, YBLOCK]
++    load_mask = x_mask[:, None]  # broadcast over YBLOCK, shape [XBLOCK, YBLOCK]
++    tile = tl.load(in_ptr0 + load_offsets, mask=load_mask, other=0.0)
++    # tile shape: [XBLOCK, YBLOCK]
++
++    # Phase 2: COALESCED STORE
++    # Store tile shape: [YBLOCK, XBLOCK] — x_idx is the LAST (innermost) dim
++    # In output: element offset = n*4032000 + c*31500 + x_idx
++    # x_idx innermost (stride=1 in output) => coalesced stores
++    # Transpose tile from [XBLOCK, YBLOCK] to [YBLOCK, XBLOCK]
++    tile_t = tl.trans(tile)
++    # tile_t shape: [YBLOCK, XBLOCK]
++    store_offsets = c_idx[:, None] * 31500 + x_idx[None, :] + 4032000 * pid_y
++    # store_offsets shape: [YBLOCK, XBLOCK]
++    store_mask = x_mask[None, :]  # broadcast over YBLOCK, shape [YBLOCK, XBLOCK]
++    tl.store(out_ptr0 + store_offsets, tile_t, mask=store_mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

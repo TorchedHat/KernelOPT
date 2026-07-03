@@ -1,0 +1,38 @@
+[
+  {
+    "item_id": "exp_tanh_triton_num_stages_autotune_regression_001",
+    "iteration": 2,
+    "speedup": 0.7744,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "expand_num_stages_autotune_configs_for_memory_bound_elementwise",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 86.63,
+        "GPU Speed Of Light Throughput.Duration": 3.02,
+        "Memory Workload Analysis.Memory Throughput": 4.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.96,
+        "Occupancy.Achieved Occupancy": 87.66,
+        "Launch Statistics.Grid Size": 1572864.0,
+        "Launch Statistics.Waves Per SM": 744.73
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 67.09,
+        "GPU Speed Of Light Throughput.Duration": 3.9,
+        "Memory Workload Analysis.Memory Throughput": 3.3,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.89,
+        "Occupancy.Achieved Occupancy": 69.83,
+        "Launch Statistics.Grid Size": 6291456.0,
+        "Launch Statistics.Waves Per SM": 2978.91
+      }
+    },
+    "strategy_title": "Expanding num_stages autotune configs hurts memory-bound elementwise kernels",
+    "strategy_description": "Adding num_stages=1/2/4 variants to the autotune search space for a memory-bound elementwise kernel caused the autotuner to select a smaller BLOCK_SIZE (128 elements/block), inflating the grid from 1.57M to 6.29M CTAs and waves/SM from 744 to 2978. This massively increased launch overhead and reduced achieved occupancy from 87.7% to 69.8%, dropping DRAM throughput from 86.6% to 67.1% and increasing duration by ~29%. The root cause is that for elementwise kernels with no reuse, num_stages>1 does not help because there is no tile-level data reuse to pipeline \u2014 the autotuner instead picks a config that minimizes per-block work, which backfires by creating excessive scheduling overhead. The structural anti-pattern is adding num_stages to autotune configs for kernels where each element is loaded, transformed, and stored exactly once with no inter-tile dependency.",
+    "slow_pseudocode": "# BEFORE (faster): 6 configs, all num_stages=2, BLOCK_SIZE in {256,512,1024,2048,4096,8192,16384}\n@triton.autotune(configs=[\n    Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),\n    Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),\n    Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=2),\n    Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=2),\n    Config({'BLOCK_SIZE': 256},  num_warps=4,  num_stages=2),\n    Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=2),\n    Config({'BLOCK_SIZE': 16384},num_warps=16, num_stages=2),\n], key=['n_elements'])\ndef tanh_kernel(...):\n    offsets = tl.max_contiguous(tl.multiple_of(block_start + tl.arange(0, BLOCK_SIZE), BLOCK_SIZE), BLOCK_SIZE)\n    x = tl.load(input_ptr + offsets, mask=mask)\n    y = libdevice.tanh(x)\n    tl.store(output_ptr + offsets, y, mask=mask)",
+    "fast_pseudocode": "# AFTER (slower): 16 configs, num_stages in {1,2,4}, BLOCK_SIZE in {256,512,1024,2048,4096,8192}\n# Autotuner selected BLOCK_SIZE=128 (smallest), grid=6.29M, waves/SM=2978 -> regression\n@triton.autotune(configs=[\n    Config({'BLOCK_SIZE': 256},  num_warps=4,  num_stages=1),\n    Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=1),\n    # ... 14 more configs spanning num_stages in {1,2,4} ...\n    Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=4),\n], key=['n_elements'])\ndef tanh_kernel(...):\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    x = tl.load(input_ptr + offsets, mask=mask, eviction_policy='evict_first')\n    y = libdevice.tanh(x)\n    tl.store(output_ptr + offsets, y, mask=mask, eviction_policy='evict_first')",
+    "applicable_when": "Never beneficial for pure elementwise kernels (load-compute-store, no reuse). This strategy is a dead end when: DRAM throughput is already >80%, kernel has no inter-tile data reuse, and the autotuner search space includes small BLOCK_SIZE configs that can be selected.",
+    "do_not_apply_when": "Kernel is purely elementwise (each element loaded once, transformed, stored once). Expanding num_stages autotune configs risks the autotuner selecting a small block size that inflates grid/wave count and destroys occupancy. Also avoid when the existing autotune configs already include num_stages=2 and the kernel is already near peak DRAM bandwidth.",
+    "framework_notes": "In Triton, num_stages controls software pipelining depth via cp.async. For elementwise kernels with no shared memory or inter-tile reuse, num_stages>1 provides no benefit because there is nothing to pipeline across tiles. The autotuner's warm-up may select a suboptimal config when the search space is too large, especially if small BLOCK_SIZE configs are included alongside num_stages variants."
+  }
+]

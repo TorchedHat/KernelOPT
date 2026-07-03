@@ -1,0 +1,50 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -11,6 +12,12 @@
+         triton.Config({'BLOCK_N': 4096, 'BLOCK_ROWS': 1}, num_warps=16, num_stages=2),
+         triton.Config({'BLOCK_N': 256, 'BLOCK_ROWS': 1}, num_warps=4, num_stages=4),
+         triton.Config({'BLOCK_N': 8192, 'BLOCK_ROWS': 1}, num_warps=32, num_stages=2),
++        triton.Config({'BLOCK_N': 1024, 'BLOCK_ROWS': 1}, num_warps=8, num_stages=5),
++        triton.Config({'BLOCK_N': 2048, 'BLOCK_ROWS': 1}, num_warps=16, num_stages=5),
++        triton.Config({'BLOCK_N': 4096, 'BLOCK_ROWS': 1}, num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_N': 1024, 'BLOCK_ROWS': 1}, num_warps=16, num_stages=6),
++        triton.Config({'BLOCK_N': 512, 'BLOCK_ROWS': 1}, num_warps=8, num_stages=6),
++        triton.Config({'BLOCK_N': 2048, 'BLOCK_ROWS': 1}, num_warps=8, num_stages=4),
+     ],
+     key=['N'],
+ )
+@@ -37,20 +44,19 @@
+     for col_off in tl.range(0, N, BLOCK_N):
+         cols = col_off + tl.arange(0, BLOCK_N)
+         mask = cols < N
+-        x = tl.load(x_ptr + row_start + cols, mask=mask, other=0.0).to(tl.float32)
++        x = tl.load(x_ptr + row_start + cols, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+         acc += tl.sum(x * x, axis=0)
+     
+-    # Compute L2 norm
+-    norm = tl.sqrt(acc)
++    # Compute inverse L2 norm (rsqrt is single MUFU.RSQ instruction, avoids FDIV)
++    inv_norm = tl.where(acc > 0.0, tl.math.rsqrt(acc), 0.0)
+     
+-    # Pass 2: divide by norm and store
++    # Pass 2: multiply by inv_norm and store (FMUL instead of FDIV)
+     for col_off in tl.range(0, N, BLOCK_N):
+         cols = col_off + tl.arange(0, BLOCK_N)
+         mask = cols < N
+         x = tl.load(x_ptr + row_start + cols, mask=mask, other=0.0).to(tl.float32)
+-        out = x / norm
+-        tl.store(out_ptr + row_start + cols, out.to(tl.float32), mask=mask)
+-
++        out = x * inv_norm
++        tl.store(out_ptr + row_start + cols, out.to(tl.float32), mask=mask, eviction_policy='evict_first')
+ 
+ def kernel_function(x):
+     M, N = x.shape

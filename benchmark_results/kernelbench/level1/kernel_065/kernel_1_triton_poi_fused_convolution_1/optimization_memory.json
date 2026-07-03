@@ -1,0 +1,244 @@
+[
+  {
+    "item_id": "exp_003_expand_autotune_configs_num_stages",
+    "iteration": 3,
+    "speedup": 1.949,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_with_varied_num_stages",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 145.15,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 33.54,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.68,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 45.57,
+        "Scheduler Statistics.No Eligible": 51.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.13,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.21,
+        "Instruction Statistics.Executed Instructions": 52356096.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 146.62,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.09,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 45.32,
+        "Scheduler Statistics.No Eligible": 55.05,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.66,
+        "Instruction Statistics.Executed Instructions": 50332672.0
+      }
+    },
+    "strategy_title": "Expanding Autotune num_stages Does Not Help Latency-Bound Kernels",
+    "strategy_description": "Expanding the @triton.autotune config list from 7 configs (all num_stages=2/3/4) to 21 configs covering num_stages=2, 3, and 4 across the same tile shapes produced no improvement: duration increased slightly from 145.15 \u00b5s to 146.62 \u00b5s, and scheduler 'No Eligible' cycles worsened from 51.96% to 55.05%. The profiling metrics are nearly identical before and after, indicating the autotuner selected a config equivalent to the prior baseline. For memory-bound transpose kernels where the bottleneck is uncoalesced L2/DRAM loads (IssueSlotUtilization flagged at ~52%), increasing num_stages in Triton's software pipeline does not meaningfully hide latency because the kernel lacks tl.dot or structured async-copy opportunities \u2014 the Triton backend cannot emit deep async prefetch for scalar/elementwise loads. The 1.949x speedup reflects the cumulative gain from prior iterations (evict_first on loads), not an incremental gain from this change.",
+    "slow_pseudocode": "# 7 configs, num_stages=3 and 4 only\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4, num_stages=3),\n        # ... 5 more configs, num_stages=3 or 4\n    ],\n    key=['ynumel', 'xnumel'],\n)",
+    "fast_pseudocode": "# 21 configs, num_stages=2/3/4 \u2014 autotuner picks same winner, no gain\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=2),\n        # ... 6 more num_stages=2 configs\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),\n        # ... 6 more num_stages=3 configs\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=4),\n        # ... 6 more num_stages=4 configs\n    ],\n    key=['ynumel', 'xnumel'],\n)",
+    "applicable_when": "Never \u2014 expanding num_stages in autotune configs for elementwise/transpose Triton kernels (no tl.dot) does not improve latency hiding when the bottleneck is uncoalesced global loads.",
+    "do_not_apply_when": "When the kernel is a pure elementwise or layout-transpose kernel (no tl.dot, no structured shared-memory tiling), increasing num_stages in @triton.autotune configs does not help because Triton cannot emit deep async prefetch for scalar loads. The IssueSlotUtilization bottleneck from uncoalesced loads cannot be resolved by software pipelining depth alone. Do not apply when 'No Eligible' cycles remain above 50% and L1/TEX hit rate is near 0% \u2014 the root cause is access pattern, not pipeline depth.",
+    "framework_notes": "In Triton, num_stages controls the depth of the software pipeline for async memory operations, but this primarily benefits kernels using tl.dot (matrix multiply) or explicit shared-memory staging. For kernels with only tl.load/tl.store on global memory without tl.dot, the Triton compiler may not generate meaningful async prefetch regardless of num_stages value. In CUDA, the equivalent concept is __pipeline_memcpy_async depth, which similarly only helps when there are structured, predictable load patterns."
+  },
+  {
+    "item_id": "a8fe85c3",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "smem_staged_transpose_for_coalesced_loads",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "smem_staged_transpose_for_coalesced_loads \u2014 correctness failure",
+    "strategy_description": "Plan 'smem_staged_transpose_for_coalesced_loads' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.148e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout-transpose: source strides (4032000,1,32000,128), dest strides (4032000,31500,250,1). The load address is y0 + 128*x2 + 4032000*y1 where x2 is the warp-fast dimension (XBLOCK). Consecutive X-threads access source addresses 128 floats (512 bytes) apart \u2014 maximally uncoalesced. The stride-1 source dimension is y0=yindex%128, which varies along Y. This structural mismatch causes 52% no-eligible scheduler cycles and near-zero L1 hit rate. All pointer-hint approaches (tl.max_contiguous/tl.multiple_of on X or Y) and tile-swap autotune have been tried and failed (crashes or no gain). The correct fix is a shared-memory staged transpose: load a TILE_Y x TILE_X block coalesced along Y (stride-1 source dim), transpose via tl.trans, then store coalesced along X (stride-1 dest dim).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.148e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "7e43c1f2",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "shared_memory_staged_coalesced_transpose",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + MemoryCacheAccessPattern + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "shared_memory_staged_coalesced_transpose \u2014 correctness failure",
+    "strategy_description": "Plan 'shared_memory_staged_coalesced_transpose' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.141e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a 4D tensor layout permutation: source strides (4032000,1,32000,128), dest strides (4032000,31500,250,1). Load address `in_ptr0 + (y0 + 128*x2 + 4032000*y1)` has x2 with stride 128 floats in the load \u2014 consecutive warp threads (varying along XBLOCK) access addresses 512 bytes apart, causing maximally uncoalesced loads (32 separate 32-byte transactions per warp instead of 1x128-byte). Store address `out_ptr0 + (x2 + 31500*y3)` has y3 with stride 31500 \u2014 uncoalesced stores. Neither access can be made coalesced simultaneously in a simple 2D tiling without shared memory staging. The prior dimension-swap attempt (ca2bb164) crashed due to an implementation flaw. The correct fix is a staged transpose using tl.trans(): (1) load a [TILE_x, TILE_y] tile coalesced along y0 (stride-1 source dim) as the fast inner dim, (2) transpose with tl.trans() to get [TILE_y, TILE_x], (3) store coalesced along x2 (stride-1 dest dim) as the fast inner dim. This eliminates the structural uncoalesced access pattern that all prior single-pass approaches failed to fix.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.141e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_004_yblock128_contiguity_hints_load_vectorization",
+    "iteration": 4,
+    "speedup": 1.815,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "yblock128_contiguity_hints_on_stride1_load_dimension",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 145.76,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 33.44,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.25,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 45.45,
+        "Scheduler Statistics.No Eligible": 52.12,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.43,
+        "Occupancy.Achieved Occupancy": 91.99,
+        "Instruction Statistics.Executed Instructions": 52356096.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 157.44,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 30.63,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 51.15,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 42.17,
+        "Scheduler Statistics.No Eligible": 47.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 28.22,
+        "Occupancy.Achieved Occupancy": 92.96,
+        "Instruction Statistics.Executed Instructions": 63484928.0
+      }
+    },
+    "strategy_title": "YBLOCK=128 + Contiguity Hints on Stride-1 Load Dimension",
+    "strategy_description": "In a layout-transpose kernel where the load's stride-1 source dimension is y0 = yindex % 128 (not the warp-fast x dimension), applying tl.max_contiguous and tl.multiple_of hints to the yindex arange and setting YBLOCK=128 in autotune configs reduces scheduler no-eligible cycles from 52.1% to 47.5% and warp cycles per instruction from 30.4 to 28.2, improving compute throughput from 47.3% to 51.2%. The 1.815x speedup is cumulative (including prior evict_first gains); the incremental effect of this change is modest because the Triton/LLVM backend still does not fully vectorize the load despite the hints \u2014 the modulo operation on yindex obscures the contiguity from the compiler. The strategy is most effective when YBLOCK exactly matches the modulus (128) so that y0 spans [0..127] per CTA, but the backend must also recognize the resulting address as stride-1 to emit LDG.128.",
+    "slow_pseudocode": "# yindex without contiguity hints; YBLOCK < 128 configs dominate autotune\nyoffset = tl.program_id(1) * YBLOCK\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]\ny0 = yindex % 128  # stride-1 in source, but compiler cannot prove contiguity\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), mask=mask, eviction_policy='evict_first')",
+    "fast_pseudocode": "# Apply contiguity hints to yindex; add YBLOCK=128 autotune configs\nyoffset = tl.program_id(1) * YBLOCK\n_yr = tl.max_contiguous(tl.multiple_of(tl.arange(0, YBLOCK), 1), YBLOCK)\nyindex = yoffset + _yr[:, None]\ny0 = yindex % 128  # with YBLOCK=128, spans [0..127] exactly per CTA\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), mask=mask, eviction_policy='evict_first')\n# Autotune configs include:\n# triton.Config({'XBLOCK': 32, 'YBLOCK': 128}, num_warps=4, num_stages=2)\n# triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=4, num_stages=2)\n# triton.Config({'XBLOCK': 8,  'YBLOCK': 128}, num_warps=4, num_stages=2)\n# triton.Config({'XBLOCK': 32, 'YBLOCK': 128}, num_warps=8, num_stages=3)\n# triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=8, num_stages=3)",
+    "applicable_when": "Layout-transpose kernel where the load address has a stride-1 dimension along the slow (Y) tile axis (e.g., y0 = yindex % K with coefficient 1 in the load expression), while the warp-fast (X) dimension has a large stride in the source tensor causing uncoalesced loads. IssueSlotUtilization flagged (>50% no-eligible cycles), L1/TEX hit rate near 0%, and the modulus K matches a power-of-2 YBLOCK size. Apply tl.max_contiguous + tl.multiple_of to the yindex arange and add YBLOCK=K autotune configs.",
+    "do_not_apply_when": "When the stride-1 source dimension is along the warp-fast (X) axis \u2014 apply hints to xindex instead. Do not apply when YBLOCK cannot be set equal to the modulus K (e.g., K is not a power of 2 or exceeds shared memory limits). Also avoid when the modulo operation on yindex prevents the Triton/LLVM backend from recognizing the resulting address as stride-1 despite the hints \u2014 in that case the incremental gain is small and instruction count increases (52M \u2192 63M instructions observed here). Note: the 1.815x speedup here is cumulative; the marginal gain from this specific change over the prior baseline is smaller.",
+    "framework_notes": "tl.multiple_of(tl.arange(0, YBLOCK), 1) is always mathematically correct (all integers are multiples of 1). tl.max_contiguous(..., YBLOCK) asserts YBLOCK consecutive values are contiguous. These are Triton-specific compiler hints; in CUDA the equivalent is __builtin_assume or aligned pointer attributes. The hints must be applied to a 1D arange before reshaping with [:, None] \u2014 applying them after reshape (to a 2D tensor) causes a shape error in tl.multiple_of."
+  },
+  {
+    "item_id": "a0a321b4",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesced_transpose_via_dimension_role_swap",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesced_transpose_via_dimension_role_swap \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesced_transpose_via_dimension_role_swap' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.148e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a 4D layout transpose from NCHW (strides 4032000,1,32000,128) to NHWC (strides 4032000,31500,250,1). In the current layout, XBLOCK is the warp-fast dimension for both load and store. The load address is `y0 + 128*x2 + 4032000*y1`: x2 varies along XBLOCK with stride 128 floats (512 bytes), causing maximally uncoalesced loads \u2014 32 separate 32-byte transactions per warp instead of 1x128-byte burst. The store address is `x2 + 31500*y3`: x2 varies along XBLOCK with stride 1 (coalesced), but y3 varies along YBLOCK with stride 31500 (uncoalesced). The structural problem is that the stride-1 source dimension (y0 = yindex%128, the channel dim) and the stride-1 destination dimension (x2, the spatial dim) are on different axes, so both cannot be coalesced simultaneously in the current 2D tiling. The fix is to swap the roles of the program dimensions: make the warp-fast dim cover the channel (y0) dimension (stride-1 in source) and the warp-slow dim cover the spatial (x2) dimension (stride-1 in destination). This makes loads coalesced along the channel axis and stores coalesced along the spatial axis. Prior shared-memory transpose attempts (tl.trans) failed correctness; this approach avoids tl.trans entirely and instead restructures the index arithmetic directly.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.148e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "5681a8fb",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "correct_smem_staged_transpose_with_tl_trans",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + MemoryCacheAccessPattern + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "correct_smem_staged_transpose_with_tl_trans \u2014 correctness failure",
+    "strategy_description": "Plan 'correct_smem_staged_transpose_with_tl_trans' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.141e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel transposes a 4D tensor from strides (4032000,1,32000,128) to (4032000,31500,250,1). The load address is `y0 + 128*x2 + 4032000*y1` where x2 varies along XBLOCK (warp-fast dim) with stride 128 floats = 512 bytes \u2014 maximally uncoalesced (32 separate 32-byte transactions per warp). The store address is `x2 + 31500*y3` where x2 is stride-1 along XBLOCK \u2014 already coalesced. The structural fix is a tl.trans()-based staged transpose: (1) load a [XBLOCK x YBLOCK] tile with Y as the fast (inner) dimension so consecutive warp threads access y0 values that are stride-1 in source, (2) transpose the tile in-register with tl.trans() to get [YBLOCK x XBLOCK], (3) store with X as the fast dimension (already coalesced). Previous smem-staged attempts (items 7e43c1f2, a8fe85c3) failed correctness due to wrong index arithmetic \u2014 the fix is to carefully rebuild index grids from scratch after tl.trans() using the transposed shape, NOT reusing pre-trans index variables.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.141e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_005_tl_trans_register_staged_coalesced_transpose",
+    "iteration": 5,
+    "speedup": 1.9805,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tl_trans_register_staged_coalesced_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 148.1,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.64,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.16,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 44.87,
+        "Scheduler Statistics.No Eligible": 54.97,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.73,
+        "Occupancy.Achieved Occupancy": 91.94
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 144.29,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 33.4,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.06,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 46.24,
+        "Scheduler Statistics.No Eligible": 53.95,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.22,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.78,
+        "Occupancy.Achieved Occupancy": 91.97
+      }
+    },
+    "strategy_title": "tl.trans() In-Register Transpose for Coalesced Load+Store",
+    "strategy_description": "When a layout-transpose kernel has structurally uncoalesced loads (warp-fast dimension has large stride in source tensor) and uncoalesced stores (slow dimension has large stride in output tensor), using tl.trans() to perform an in-register transpose enables both coalesced loads and coalesced stores simultaneously. The pattern is: (1) load a [YBLOCK, XBLOCK] tile with Y as the fast dimension (stride-1 in source \u2192 coalesced LDG), (2) call tl.trans(tile) to get [XBLOCK, YBLOCK] in registers, (3) store with X as the fast dimension (stride-1 in output \u2192 coalesced STG). Critical implementation requirement: keep all index vectors (yindex, xindex, y0, y1, ymask, xmask) as 1D arrays and only broadcast to 2D at the load_addr and store_addr computation steps \u2014 this avoids index mapping bugs that cause correctness failures. Both XBLOCK and YBLOCK must be powers of 2 for tl.trans() to work correctly.",
+    "slow_pseudocode": "# Uncoalesced: x2 has stride 128 floats in source (512 bytes/warp)\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # [YBLOCK, 1] 2D\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # [1, XBLOCK] 2D\nmask = (yindex < ynumel) & (xindex < xnumel)\ny0 = yindex % 128\ny1 = yindex // 128\ntmp0 = tl.load(in_ptr0 + (y0 + 128*xindex + 4032000*y1), mask=mask)\ntl.store(out_ptr0 + (xindex + 31500*yindex), tmp0, mask=mask)",
+    "fast_pseudocode": "# Coalesced load + tl.trans() + coalesced store\n# Keep all indices 1D until final broadcast\nyrange = tl.arange(0, YBLOCK)           # [YBLOCK] 1D\nyindex = yoffset + yrange               # [YBLOCK] 1D\nymask = yindex < ynumel                 # [YBLOCK] 1D\nxrange = tl.arange(0, XBLOCK)           # [XBLOCK] 1D\nxindex = xoffset + xrange               # [XBLOCK] 1D\nxmask = xindex < xnumel                 # [XBLOCK] 1D\ny0 = yindex % 128                       # [YBLOCK] 1D \u2014 stride-1 in source\ny1 = yindex // 128                      # [YBLOCK] 1D\n# Coalesced load: Y is fast dim (stride-1 in source)\nload_mask = ymask[:, None] & xmask[None, :]                           # [YBLOCK, XBLOCK]\nload_addr = y0[:, None] + 128*xindex[None, :] + 4032000*y1[:, None]  # [YBLOCK, XBLOCK]\ntile = tl.load(in_ptr0 + load_addr, mask=load_mask, other=0.0)\n# In-register transpose: [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK]\ntile_t = tl.trans(tile)\n# Coalesced store: X is fast dim (stride-1 in output)\nstore_mask = xmask[:, None] & ymask[None, :]                          # [XBLOCK, YBLOCK]\nstore_addr = xindex[:, None] + 31500*yindex[None, :]                  # [XBLOCK, YBLOCK]\ntl.store(out_ptr0 + store_addr, tile_t, mask=store_mask)\n# Autotune: power-of-2 XBLOCK and YBLOCK only (required by tl.trans)\n# e.g. {XBLOCK:32,YBLOCK:32}, {XBLOCK:64,YBLOCK:64}, {XBLOCK:128,YBLOCK:32}, etc.",
+    "applicable_when": "Layout-transpose kernel where the warp-fast (X) dimension has a large stride in the source tensor (causing uncoalesced loads) AND the slow (Y) dimension has a large stride in the output tensor (causing uncoalesced stores). IssueSlotUtilization flagged (>50% no-eligible cycles), L1/TEX hit rate near 0%, MemoryCacheAccessPattern and UncoalescedGlobalAccess rules triggered. The stride-1 source dimension must align with the Y tile axis so that loading along Y is coalesced.",
+    "do_not_apply_when": "When XBLOCK or YBLOCK cannot be constrained to powers of 2 (tl.trans() requirement). When the kernel has a reduction loop or tl.dot \u2014 in that case shared-memory staging may be more appropriate. When the access pattern is already coalesced on both load and store sides. When prior correctness failures occurred due to 2D index broadcasting before load_addr/store_addr computation \u2014 ensure all intermediate index tensors remain 1D until the final broadcast step.",
+    "framework_notes": "tl.trans() on a [YBLOCK, XBLOCK] register tile is a warp-level register shuffle on Hopper/Ampere GPUs with no shared memory round-trip, making it more efficient than shared-memory staged transpose. Both XBLOCK and YBLOCK must be powers of 2. The key correctness constraint is to keep yindex, xindex, y0, y1, ymask, xmask as 1D vectors throughout and only broadcast to 2D at the load_addr and store_addr lines \u2014 applying [:, None] or [None, :] earlier causes index mapping bugs. In CUDA, the equivalent is a warp-shuffle-based register transpose or a shared-memory tile transpose with __syncthreads()."
+  },
+  {
+    "item_id": "exp_005_tl_trans_staged_coalesced_transpose",
+    "iteration": 5,
+    "speedup": 1.9229,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "smem_staged_coalesced_transpose_corrected_index_mapping",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 148.1,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.64,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.16,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 44.87,
+        "Scheduler Statistics.No Eligible": 54.97,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.02,
+        "Memory Workload Analysis.L2 Hit Rate": 55.45,
+        "Instruction Statistics.Executed Instructions": 50332672.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 148.61,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.84,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.64,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 44.55,
+        "Scheduler Statistics.No Eligible": 51.75,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.84,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.59,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.01,
+        "Memory Workload Analysis.L2 Hit Rate": 55.49,
+        "Instruction Statistics.Executed Instructions": 52356096.0
+      }
+    },
+    "strategy_title": "tl.trans() Staged Transpose Corrects Uncoalesced Load Pattern",
+    "strategy_description": "For layout-transpose kernels where the load's stride-1 source dimension is along the slow (Y) tile axis but the warp-fast (X) dimension has a large stride (causing maximally uncoalesced loads), using tl.trans() to perform a register-level staged transpose can achieve correctness while reducing scheduler no-eligible cycles (54.97% \u2192 51.75%) and warp cycles per issued instruction (32.73 \u2192 30.59). The key correctness requirements are: (1) all XBLOCK and YBLOCK autotune values must be powers of 2 (required by tl.trans()), (2) the store address must be fully recomputed in transposed [XBLOCK, YBLOCK] shape using tl.trans(x2) and tl.trans(y3), and (3) the store mask must be recomputed directly from arange rather than transposing the original masks to avoid shape errors. Despite achieving correctness where prior attempts failed (max_diff ~8.5), the NCU metrics show only modest improvement because the load itself remains structurally uncoalesced \u2014 tl.trans() transposes the register tile after the uncoalesced load has already occurred, so DRAM throughput barely changes (32.64% \u2192 32.84%).",
+    "slow_pseudocode": "# Uncoalesced load: x2 (warp-fast) has stride 128 in source\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # [YBLOCK, 1]\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # [1, XBLOCK]\ny0 = yindex % 128; y1 = yindex // 128; y3 = yindex; x2 = xindex\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), mask=mask, eviction_policy='evict_first')\ntl.store(out_ptr0 + (x2 + 31500*y3), tmp0, mask=mask)",
+    "fast_pseudocode": "# Phase 1: Load [YBLOCK, XBLOCK] tile (same uncoalesced pattern)\n_yr = tl.max_contiguous(tl.multiple_of(tl.arange(0, YBLOCK), 1), YBLOCK)\nyindex = yoffset + _yr[:, None]\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]\ny0 = yindex % 128; y1 = yindex // 128; y3 = yindex; x2 = xindex\ntmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), mask=mask, other=0.0, eviction_policy='evict_first')\n# Phase 2: Transpose register tile [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK]\ntmp_T = tl.trans(tmp0)  # requires XBLOCK, YBLOCK both powers of 2\n# Phase 3: Store with transposed addresses [XBLOCK, YBLOCK]\n# tl.trans(x2): [1,XBLOCK] -> [XBLOCK,1]; tl.trans(y3): [YBLOCK,1] -> [1,YBLOCK]\nstore_addr = tl.trans(x2) + 31500 * tl.trans(y3)  # broadcasts to [XBLOCK, YBLOCK]\nstore_xmask = (tl.arange(0, XBLOCK)[:, None] + xoffset < xnumel)\nstore_ymask = (tl.arange(0, YBLOCK)[None, :] + yoffset < ynumel)\ntl.store(out_ptr0 + store_addr, tmp_T, mask=store_xmask & store_ymask, eviction_policy='evict_first')\n# Autotune: all configs must have XBLOCK, YBLOCK as powers of 2, num_stages=1",
+    "applicable_when": "Layout-transpose kernel where loads are structurally uncoalesced (warp-fast X dimension has large stride in source tensor), stores are coalesced (stride-1 along X in destination), and prior single-pass approaches have failed. Use when correctness of index mapping is the primary concern and tl.trans() is available (Triton). All tile sizes must be powers of 2.",
+    "do_not_apply_when": "When the goal is to coalesce the loads themselves \u2014 tl.trans() transposes the register tile AFTER the uncoalesced load, so DRAM throughput does not improve significantly (only ~0.2pp improvement observed). Do not apply when XBLOCK or YBLOCK cannot be constrained to powers of 2. Do not apply when the speedup target requires >2x improvement over baseline \u2014 this approach achieves correctness but does not eliminate the root-cause uncoalesced load pattern. Also do not apply when the kernel has non-power-of-2 tile dimensions in autotune configs, as tl.trans() will fail.",
+    "framework_notes": "tl.trans() in Triton operates on register tiles and requires both dimensions to be powers of 2. It is equivalent to a register-level matrix transpose with no explicit shared memory allocation. When transposing address tensors (e.g., tl.trans(x2) where x2 is [1, XBLOCK]), the result is [XBLOCK, 1]. Store masks must be recomputed from tl.arange rather than transposing the original masks to avoid shape broadcasting errors. num_stages=1 is required in autotune configs when using tl.trans() to avoid software-pipeline conflicts."
+  }
+]

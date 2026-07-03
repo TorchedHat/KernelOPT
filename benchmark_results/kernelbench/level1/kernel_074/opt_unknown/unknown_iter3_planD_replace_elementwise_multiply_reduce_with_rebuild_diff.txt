@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,35 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_L': 128, 'BLOCK_IC': 8}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_L': 256, 'BLOCK_IC': 8}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_L': 512, 'BLOCK_IC': 4}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_L': 64, 'BLOCK_IC': 16}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_L': 256, 'BLOCK_IC': 16}, num_warps=8, num_stages=3),
+-        triton.Config({'BLOCK_L': 128, 'BLOCK_IC': 16}, num_warps=4, num_stages=3),
++        # BLOCK_IC=2: minimal register footprint, highest occupancy potential
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 2}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 2}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 2}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 2}, num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 2}, num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 2}, num_warps=4, num_stages=3),
++        # BLOCK_IC=4: balanced register pressure vs arithmetic intensity
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 4}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 4}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 4}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 4}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 4}, num_warps=4, num_stages=3),
++        # Original configs kept as fallback
++        triton.Config({'BLOCK_L': 128,  'BLOCK_IC': 8},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 8},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 4},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 16}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_L': 128,  'BLOCK_IC': 16}, num_warps=4, num_stages=3),
++        # New configs with BLOCK_IC=16 and BLOCK_IC=32 to enable tl.dot path
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 16}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 16}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 32}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 32}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_L': 256,  'BLOCK_IC': 16}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 16}, num_warps=8, num_stages=3),
+     ],
+     key=['IN_C', 'OUT_L', 'KERNEL_SIZE'],
+ )
+@@ -62,23 +83,26 @@
+             w_ptrs = W_ptr + ic_offs * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k
+             w_vals = tl.load(w_ptrs, mask=ic_mask, other=0.0)  # [BLOCK_IC]
+ 
+-            # Load input for each valid output position
++            # Load input for all BLOCK_IC channels and all BLOCK_L output positions at once
+             # X shape: (BATCH, IN_C, IN_L)
+-            # x[batch, ic, i_idx]
+-            # We need to accumulate over BLOCK_IC channels
+-            for ic_local in range(BLOCK_IC):
+-                ic = ic_start + ic_local
+-                if ic < IN_C:
+-                    w_val = tl.load(W_ptr + ic * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k)
+-                    x_ptrs = X_ptr + batch_idx * (IN_C * IN_L) + ic * IN_L + i_idx
+-                    x_vals = tl.load(x_ptrs, mask=valid, other=0.0)  # [BLOCK_L]
+-                    acc += x_vals * w_val
++            # x_ptrs_2d[ic_local, l] = X_ptr + batch_idx*(IN_C*IN_L) + ic_offs[ic_local]*IN_L + i_idx[l]
++            x_ptrs_2d = X_ptr + batch_idx * (IN_C * IN_L) + ic_offs[:, None] * IN_L + i_idx[None, :]  # [BLOCK_IC, BLOCK_L]
++            x_mask_2d = ic_mask[:, None] & valid[None, :]  # [BLOCK_IC, BLOCK_L]
++            x_block = tl.load(x_ptrs_2d, mask=x_mask_2d, other=0.0)  # [BLOCK_IC, BLOCK_L]
++
++            # Accumulate: weight each channel's x values by its weight, then sum over IC dimension
++            # Use tl.dot when BLOCK_IC >= 16 (tl.dot requires contraction dim >= 16)
++            # w_vals[None, :] is [1, BLOCK_IC], x_block is [BLOCK_IC, BLOCK_L] -> result [1, BLOCK_L]
++            # Use tl.reshape to convert [1, BLOCK_L] -> [BLOCK_L] (indexing with [0,:] not supported in Triton)
++            if BLOCK_IC >= 16:
++                acc += tl.reshape(tl.dot(w_vals[None, :], x_block, allow_tf32=False), [BLOCK_L])  # [BLOCK_L]
++            else:
++                acc += tl.sum(x_block * w_vals[:, None], axis=0)  # [BLOCK_L]
+ 
+     # Store output
+     # Y shape: (BATCH, OUT_C, OUT_L)
+     y_ptrs = Y_ptr + batch_idx * (OUT_C * OUT_L) + oc * OUT_L + out_offs
+     tl.store(y_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: (IN_C, OUT_C, KERNEL_SIZE) - ConvTranspose1d weight is (in_channels, out_channels, kernel_size)

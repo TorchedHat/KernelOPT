@@ -1,0 +1,84 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,20 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=2),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -30,7 +34,11 @@
+     # M = N_batch * H * W (output spatial positions)
+     # N = out_channels (Co)
+     # K = in_channels (Ci)
+-    # x layout: (N_batch, Ci, H, W) with strides stride_xn, stride_xc, stride_xh, stride_xw
++    # x layout: (N_batch, H, W, Ci) NHWC — strides repurposed:
++    #   stride_xn  = H*W*Ci  (batch stride)
++    #   stride_xc  = Ci       (flat hw_idx stride, i.e. x_nhwc.stride(2))
++    #   stride_xh  = 1        (channel stride, i.e. x_nhwc.stride(3))
++    #   stride_xw  = unused (0)
+     # w layout: (Co, Ci) with strides stride_wco, stride_wci
+     # out layout: (N_batch, Co, H, W) with strides stride_on, stride_oc, stride_oh, stride_ow
+ 
+@@ -53,13 +61,10 @@
+     # offs_m = batch_idx * HW + hw_idx
+     batch_idx = offs_m // HW   # [BLOCK_M]
+     hw_idx = offs_m % HW       # [BLOCK_M]
+-    h_idx = hw_idx // tl.cdiv(HW, HW)  # placeholder, compute properly
+-    # Actually HW = H*W, hw_idx = h*W + w
+-    # We need h and w for the x pointer
+-    # x_ptr[batch, ci, h, w] = x_ptr + batch*stride_xn + ci*stride_xc + h*stride_xh + w*stride_xw
+-    # Since stride_xh = W and stride_xw = 1 (NCHW contiguous):
+-    # x_ptr[batch, ci, hw] = x_ptr + batch*stride_xn + ci*stride_xc + hw  (since h*W+w = hw_idx)
+-    # This works because stride_xh * h + stride_xw * w = W*h + w = hw_idx when stride_xw=1
++    # x_nhwc[batch, hw_idx, ci]:
++    #   offset = batch*stride_xn + hw_idx*stride_xc + ci*stride_xh
++    # where stride_xn=H*W*Ci, stride_xc=Ci (x_nhwc.stride(2)), stride_xh=1 (x_nhwc.stride(3))
++    # This gives coalesced access: adjacent ci values are stride-1 contiguous
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+@@ -67,12 +72,12 @@
+         k_offs = k * BLOCK_K + offs_k  # [BLOCK_K]
+ 
+         # Load x tile: shape [BLOCK_M, BLOCK_K]
+-        # x[batch_idx[m], k_offs[k], hw_idx[m]]
+-        # ptr = x_ptr + batch_idx[m]*stride_xn + k_offs[k]*stride_xc + hw_idx[m]
++        # x_nhwc[batch_idx[m], hw_idx[m], k_offs[k]]
++        # ptr = x_ptr + batch_idx[m]*stride_xn + hw_idx[m]*stride_xc + k_offs[k]*stride_xh
+         x_batch = batch_idx[:, None]   # [BLOCK_M, 1]
+         x_ci = k_offs[None, :]         # [1, BLOCK_K]
+         x_hw = hw_idx[:, None]         # [BLOCK_M, 1]
+-        x_ptrs = x_ptr + x_batch.to(tl.int64) * stride_xn + x_ci.to(tl.int64) * stride_xc + x_hw.to(tl.int64)
++        x_ptrs = x_ptr + x_batch.to(tl.int64) * stride_xn + x_hw.to(tl.int64) * stride_xc + x_ci.to(tl.int64) * stride_xh
+         x_mask = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+ 
+@@ -94,7 +99,6 @@
+     out_ptrs = out_ptr + out_batch.to(tl.int64) * stride_on + out_co.to(tl.int64) * stride_oc + out_hw.to(tl.int64)
+     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     tl.store(out_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(w, x):
+     # w: (Co, Ci, 1, 1), x: (N, Ci, H, W)

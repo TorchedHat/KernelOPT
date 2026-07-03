@@ -1,0 +1,96 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -11,6 +12,8 @@
+         triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+         triton.Config({'BLOCK_SIZE': 1024}, num_warps=16),
+         triton.Config({'BLOCK_SIZE': 32}, num_warps=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+     ],
+     key=['total_elements'],
+ )
+@@ -34,21 +37,36 @@
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    block_base = pid * BLOCK_SIZE          # scalar CTA-level base
++    lane = tl.arange(0, BLOCK_SIZE)        # [0..BLOCK_SIZE-1]
++    offsets = block_base + lane
+     mask = offsets < total_elements
+ 
+-    # Decompose flat index into (n, c, od, oh, ow)
+-    # total_elements = N * C * D_out * H_out * W_out
+-    # Layout: n, c, od, oh, ow (row-major)
+-    tmp = offsets
+-    ow = tmp % W_out
+-    tmp = tmp // W_out
+-    oh = tmp % H_out
+-    tmp = tmp // H_out
+-    od = tmp % D_out
+-    tmp = tmp // D_out
+-    c = tmp % C
+-    n = tmp // C
++    # Scalar decomposition of block_base (4 divmods at CTA level, not vectorized)
++    tmp_s = block_base
++    ow_base = tmp_s % W_out
++    tmp_s = tmp_s // W_out
++    oh_s = tmp_s % H_out
++    tmp_s = tmp_s // H_out
++    od_s = tmp_s % D_out
++    tmp_s = tmp_s // D_out
++    c_s = tmp_s % C
++    n_s = tmp_s // C
++
++    # Per-thread: only ow varies; carry-propagate boundary crossings
++    ow_vec = ow_base + lane          # may exceed W_out
++    carry_oh = ow_vec // W_out       # 0,1,2,... (vector int div on small values)
++    ow = ow_vec % W_out              # true per-thread ow
++    oh_vec = oh_s + carry_oh
++    carry_od = oh_vec // H_out
++    oh = oh_vec % H_out
++    od_vec = od_s + carry_od
++    carry_c = od_vec // D_out
++    od = od_vec % D_out
++    c_vec = c_s + carry_c
++    carry_n = c_vec // C
++    c = c_vec % C
++    n = n_s + carry_n
+ 
+     # Compute max over kernel window
+     max_val = tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32)
+@@ -76,10 +94,10 @@
+                 valid = mask & valid_d & valid_h & valid_w
+ 
+                 in_offset = base_nc + id_ * in_stride_d + ih * in_stride_h + iw * in_stride_w
+-                val = tl.load(in_ptr + in_offset, mask=valid, other=float('-inf'))
++                val = tl.load(in_ptr + in_offset, mask=valid, other=float('-inf'), eviction_policy='evict_last')
+                 max_val = tl.maximum(max_val, val)
+ 
+-    tl.store(out_ptr + offsets, max_val, mask=mask)
++    tl.store(out_ptr + offsets, max_val, mask=mask, eviction_policy='evict_first')
+ 
+ 
+ @triton.autotune(
+@@ -90,10 +108,13 @@
+         triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+         triton.Config({'BLOCK_SIZE': 1024}, num_warps=16),
+         triton.Config({'BLOCK_SIZE': 32}, num_warps=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+     ],
+     key=['total_elements'],
+ )
+ @triton.jit
++
+ def max_pool3d_kernel_general(
+     in_ptr,
+     out_ptr,

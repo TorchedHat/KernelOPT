@@ -1,0 +1,102 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+
+
+
+@triton.autotune(
+    configs=[
+        # num_stages=1 baselines (keep originals)
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 256},  num_warps=4,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=1),
+        # num_stages=2: overlap load of next tile with compute on current tile
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8,  num_stages=2),
+        # num_stages=4: deeper pipeline for high-latency DRAM paths
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=4),
+        # New configs: low-warp small/medium blocks
+        triton.Config({'BLOCK_SIZE': 256},  num_warps=2,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 512},  num_warps=2,  num_stages=1),
+        # New configs: very large blocks to reduce grid size
+        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 8192},  num_warps=8,  num_stages=2),
+    ],
+    key=['numel'],
+)
+@triton.jit
+def elu_kernel(
+    in_ptr,
+    out_ptr,
+    numel,
+    ALPHA: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+
+    x = tl.load(in_ptr + offsets, mask=mask, other=0.0, eviction_policy='evict_first')
+
+    # ELU: x if x > 0 else alpha * (exp(x) - 1)
+    is_positive = x > 0.0
+    # Use constexpr guard: when ALPHA=1.0, skip the non-fused multiply entirely
+    # (1.0 * expm1(x) == expm1(x) exactly in IEEE-754)
+    if ALPHA == 1.0:
+        neg_val = libdevice.expm1(x)  # multiply eliminated; saves non-fused FP32 instruction
+    else:
+        neg_val = ALPHA * libdevice.expm1(x)
+    result = tl.where(is_positive, x, neg_val)
+
+    tl.store(out_ptr + offsets, result, mask=mask, eviction_policy='evict_first')
+
+def kernel_function(*inputs):
+    x = inputs[0]
+    alpha = 1.0
+
+    output = torch.empty_like(x)
+    numel = x.numel()
+
+    grid = lambda meta: (triton.cdiv(numel, meta['BLOCK_SIZE']),)
+    elu_kernel[grid](
+        x,
+        output,
+        numel,
+        alpha,
+    )
+
+    return output
+
+
+def get_inputs():
+    x = torch.rand(4096, 393216, device='cuda', dtype=torch.float32)
+    return [x]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    output = kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        # Verify correctness
+        import torch.nn.functional as F
+        ref = F.elu(inputs[0], alpha=1.0)
+        max_diff = (output - ref).abs().max().item()
+        print(f"Max difference from reference: {max_diff}")
+        assert max_diff < 1e-3, f"Results don't match! Max diff: {max_diff}"
+        print("Kernel executed successfully.")

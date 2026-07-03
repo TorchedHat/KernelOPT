@@ -1,0 +1,110 @@
+--- baseline
++++ rebuilt
+@@ -3,17 +3,7 @@
+ import triton.language as tl
+ 
+ 
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BLOCK_SIZE': 64}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16),
+-        triton.Config({'BLOCK_SIZE': 32}, num_warps=2),
+-    ],
+-    key=['total_elements'],
+-)
++
+ @triton.jit
+ def max_pool3d_kernel(
+     in_ptr,
+@@ -31,27 +21,25 @@
+     in_stride_n, in_stride_c, in_stride_d, in_stride_h, in_stride_w,
+     # Total output elements
+     total_elements,
+-    BLOCK_SIZE: tl.constexpr,
++    BLOCK_W: tl.constexpr,
+ ):
+-    pid = tl.program_id(0)
+-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    mask = offsets < total_elements
+-
+-    # Decompose flat index into (n, c, od, oh, ow)
+-    # total_elements = N * C * D_out * H_out * W_out
+-    # Layout: n, c, od, oh, ow (row-major)
+-    tmp = offsets
+-    ow = tmp % W_out
+-    tmp = tmp // W_out
+-    oh = tmp % H_out
+-    tmp = tmp // H_out
+-    od = tmp % D_out
+-    tmp = tmp // D_out
+-    c = tmp % C
+-    n = tmp // C
++    # 3D grid: axis-0 = N*C, axis-1 = D_out*H_out, axis-2 = ceil(W_out/BLOCK_W)
++    pid_nc = tl.program_id(0)   # covers N*C
++    pid_dh = tl.program_id(1)   # covers D_out*H_out
++    pid_w  = tl.program_id(2)   # covers ceil(W_out/BLOCK_W)
++
++    # CTA-level scalar decomposition (only 4 cheap divmods, not per-thread)
++    n  = pid_nc // C
++    c  = pid_nc % C
++    od = pid_dh // H_out
++    oh = pid_dh % H_out
++
++    # Thread-level vectorization over W dimension only
++    ow = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
++    mask = ow < W_out
+ 
+     # Compute max over kernel window
+-    max_val = tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32)
++    max_val = tl.full([BLOCK_W], float('-inf'), dtype=tl.float32)
+ 
+     # Base input pointer offset for (n, c)
+     base_nc = n * in_stride_n + c * in_stride_c
+@@ -59,7 +47,7 @@
+     # Starting positions in input (before padding offset)
+     d_start = od * stride_d - pad_d
+     h_start = oh * stride_h - pad_h
+-    w_start = ow * stride_w - pad_w
++    w_start = ow * stride_w - pad_w   # vector over BLOCK_W threads
+ 
+     for kd in tl.static_range(0, 3):  # kernel_d = 3
+         id_ = d_start + kd * dil_d
+@@ -70,16 +58,18 @@
+             valid_h = (ih >= 0) & (ih < H_in)
+ 
+             for kw in tl.static_range(0, 3):  # kernel_w = 3
+-                iw = w_start + kw * dil_w
++                iw = w_start + kw * dil_w   # vector: each thread has its own iw
+                 valid_w = (iw >= 0) & (iw < W_in)
+ 
+                 valid = mask & valid_d & valid_h & valid_w
+ 
+                 in_offset = base_nc + id_ * in_stride_d + ih * in_stride_h + iw * in_stride_w
+-                val = tl.load(in_ptr + in_offset, mask=valid, other=float('-inf'))
++                val = tl.load(in_ptr + in_offset, mask=valid, other=float('-inf'), eviction_policy='evict_last')
+                 max_val = tl.maximum(max_val, val)
+ 
+-    tl.store(out_ptr + offsets, max_val, mask=mask)
++    # Output offset: row-major layout ((n*C+c)*D_out+od)*H_out*W_out + oh*W_out + ow
++    out_offset = ((n * C + c) * D_out + od) * H_out * W_out + oh * W_out + ow
++    tl.store(out_ptr + out_offset, max_val, mask=mask, eviction_policy='evict_first')
+ 
+ 
+ @triton.autotune(
+@@ -90,10 +80,13 @@
+         triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+         triton.Config({'BLOCK_SIZE': 1024}, num_warps=16),
+         triton.Config({'BLOCK_SIZE': 32}, num_warps=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+     ],
+     key=['total_elements'],
+ )
+ @triton.jit
++
+ def max_pool3d_kernel_general(
+     in_ptr,
+     out_ptr,

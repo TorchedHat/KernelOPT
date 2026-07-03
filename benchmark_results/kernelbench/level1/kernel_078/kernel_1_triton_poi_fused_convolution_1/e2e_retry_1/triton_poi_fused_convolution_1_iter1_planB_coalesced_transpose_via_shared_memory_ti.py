@@ -1,0 +1,77 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4,  num_stages=3),
+        triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=8,  num_stages=4),
+        triton.Config({'XBLOCK': 128, 'YBLOCK': 16},  num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 16,  'YBLOCK': 128}, num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 32,  'YBLOCK': 16},  num_warps=4,  num_stages=2),
+        triton.Config({'XBLOCK': 16,  'YBLOCK': 32},  num_warps=4,  num_stages=2),
+    ],
+    key=['ynumel', 'xnumel'],
+)
+@triton.jit
+def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+    ynumel = 4096
+    xnumel = 31500
+    xoffset = tl.program_id(0) * XBLOCK
+    yoffset = tl.program_id(1) * YBLOCK
+    # 1D index arrays
+    xindex = xoffset + tl.arange(0, XBLOCK)  # shape [XBLOCK]
+    yindex = yoffset + tl.arange(0, YBLOCK)  # shape [YBLOCK]
+    # Boundary mask for x (xnumel=31500 is not a power of 2)
+    xmask = xindex < xnumel  # shape [XBLOCK]
+    # Decompose yindex into channel (y0) and batch (y1)
+    y0 = yindex % 128   # channel dim — stride-1 in source, shape [YBLOCK]
+    y1 = yindex // 128  # batch dim, shape [YBLOCK]
+    # Build source addresses: shape [YBLOCK, XBLOCK]
+    # src layout: strides (4032000, 1, 32000, 128) => offset = b*4032000 + c*1 + h*32000 + w*128
+    # x2 encodes (h,w) as flat index: 128*x2 = h*32000 + w*128
+    # y0 = c (stride-1), y1 = b
+    src_addrs = y0[:, None] + 128 * xindex[None, :] + 4032000 * y1[:, None]
+    # Load coalesced along y (y0 is stride-1 in source): shape [YBLOCK, XBLOCK]
+    # Mask out-of-bounds x; y is always in bounds (4096 divisible by all YBLOCK configs)
+    tile = tl.load(in_ptr0 + src_addrs, mask=xmask[None, :], other=0.0)
+    # Transpose in registers: [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK]
+    tile_T = tl.trans(tile)
+    # Build destination addresses: shape [XBLOCK, YBLOCK]
+    # dst layout: strides (4032000, 31500, 250, 1) => offset = b*4032000 + c*31500 + h*250 + w
+    # xindex = w + h*250 (flat x index, stride-1), yindex = c + b*128 (flat y index)
+    # dst_addr = xindex + 31500 * yindex
+    dst_addrs = xindex[:, None] + 31500 * yindex[None, :]
+    # Store coalesced along x (stride-1 in dst): shape [XBLOCK, YBLOCK]
+    tl.store(out_ptr0 + dst_addrs, tile_T, mask=xmask[:, None])
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 4096
+    xnumel = 31500
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((32, 128, 126, 250), (4032000, 1, 32000, 128), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((32, 128, 126, 250), (4032000, 31500, 250, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

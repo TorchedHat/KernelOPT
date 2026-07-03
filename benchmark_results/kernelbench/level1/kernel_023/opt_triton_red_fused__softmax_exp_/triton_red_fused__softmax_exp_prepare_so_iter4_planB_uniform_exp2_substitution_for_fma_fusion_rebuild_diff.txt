@@ -1,0 +1,92 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,21 @@
+         triton.Config({'BLOCK_N': 2048, 'num_stages': 3}, num_warps=16),
+         triton.Config({'BLOCK_N': 4096, 'num_stages': 3}, num_warps=16),
+         triton.Config({'BLOCK_N': 8192, 'num_stages': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192, 'num_stages': 4}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'num_stages': 4}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'num_stages': 3}, num_warps=32),
++        triton.Config({'BLOCK_N': 16384, 'num_stages': 4}, num_warps=16),
++        triton.Config({'BLOCK_N': 8192, 'num_stages': 4}, num_warps=16),
++        triton.Config({'BLOCK_N': 4096, 'num_stages': 4}, num_warps=32),
++        # New num_warps=8 configs for higher SM occupancy
++        triton.Config({'BLOCK_N': 1024, 'num_stages': 2}, num_warps=8),
++        triton.Config({'BLOCK_N': 2048, 'num_stages': 2}, num_warps=8),
++        triton.Config({'BLOCK_N': 4096, 'num_stages': 2}, num_warps=8),
++        triton.Config({'BLOCK_N': 4096, 'num_stages': 4}, num_warps=8),
++        triton.Config({'BLOCK_N': 8192, 'num_stages': 2}, num_warps=8),
++        triton.Config({'BLOCK_N': 8192, 'num_stages': 4}, num_warps=8),
++        triton.Config({'BLOCK_N': 16384, 'num_stages': 2}, num_warps=8),
++        triton.Config({'BLOCK_N': 16384, 'num_stages': 4}, num_warps=8),
+     ],
+     key=['N'],
+ )
+@@ -27,37 +43,43 @@
+ ):
+     # Each program handles one row
+     row_idx = tl.program_id(0)
+-    
+-    row_start = input_ptr + row_idx * N
+-    
++
++    row_start = tl.multiple_of(input_ptr + row_idx * N, 16)
++
+     # Pass 1: find max and compute sum of exp(x - max) using online algorithm
+     row_max = tl.full((), float('-inf'), dtype=tl.float32)
+     row_sum = tl.zeros((), dtype=tl.float32)
+-    
++
++    # log2(e) constant for converting exp to exp2 (faster MUFU.EX2 path)
++    LOG2E: tl.constexpr = 1.4426950408889634
++
+     for col_off in tl.range(0, N, BLOCK_N, num_stages=num_stages):
+-        col_idx = col_off + tl.arange(0, BLOCK_N)
++        col_idx = tl.max_contiguous(tl.multiple_of(col_off + tl.arange(0, BLOCK_N), 16), BLOCK_N)
+         mask = col_idx < N
+         x = tl.load(row_start + col_idx, mask=mask, other=float('-inf')).to(tl.float32)
+-        
++
+         # Online softmax update
+         block_max = tl.max(x, axis=0)
+         new_max = tl.maximum(row_max, block_max)
+-        
+-        # Update sum: scale old sum by exp(old_max - new_max), add new block's contribution
+-        row_sum = row_sum * tl.exp(row_max - new_max) + tl.sum(tl.exp(x - new_max), axis=0)
++
++        # Update sum: scale old sum by exp2(scalar * log2e) [faster MUFU.EX2 on critical path],
++        # add new block's contribution using tl.exp2 for FMA fusion opportunity
++        row_sum = row_sum * tl.exp2((row_max - new_max) * LOG2E) + tl.sum(tl.exp2((x - new_max) * LOG2E), axis=0)
+         row_max = new_max
+-    
++
+     # Pass 2: normalize and store
+-    out_row_start = output_ptr + row_idx * N
+-    
++    out_row_start = tl.multiple_of(output_ptr + row_idx * N, 16)
++
++    # Hoist reciprocal out of loop to enable FMA fusion of exp2() * inv_sum
++    inv_sum = 1.0 / row_sum
++
+     for col_off in tl.range(0, N, BLOCK_N, num_stages=num_stages):
+-        col_idx = col_off + tl.arange(0, BLOCK_N)
++        col_idx = tl.max_contiguous(tl.multiple_of(col_off + tl.arange(0, BLOCK_N), 16), BLOCK_N)
+         mask = col_idx < N
+         x = tl.load(row_start + col_idx, mask=mask, other=float('-inf')).to(tl.float32)
+-        
+-        out = tl.exp(x - row_max) / row_sum
+-        tl.store(out_row_start + col_idx, out.to(tl.float32), mask=mask)
+ 
++        out = tl.exp2((x - row_max) * LOG2E) * inv_sum
++        tl.store(out_row_start + col_idx, out, mask=mask)
+ 
+ def kernel_function(*inputs):
+     x, = inputs

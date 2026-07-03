@@ -1,0 +1,105 @@
+--- baseline
++++ rebuilt
+@@ -6,16 +6,20 @@
+ # Input: [batch, in_channels, L_in]
+ # Output: [batch, out_channels, L_out] where L_out = L_in + kernel_size - 1 (stride=1, padding=0)
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -40,50 +44,41 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    # K dimension: in_channels * kernel_size
+-    # For each k: ic = k // kernel_size, kk = k % kernel_size
+-    # ConvTranspose1d: Y[b, oc, l_out] = sum_{ic, kk} X[b, ic, l_in] * W[ic, oc, kk]
+-    # where l_in = l_out - kk (when stride=1, padding=0)
+-    # i.e., for output position l_out, kernel position kk, input position = l_out - kk
+-    # valid when 0 <= l_out - kk < L_in
++    # ConvTranspose1d: Y[b, oc, l_out] = sum_{ic, kk} X[b, ic, l_out - kk] * W[ic, oc, kk]
++    # Flat K-loop: K = in_channels * kernel_size, ic = k // kernel_size, kk = k % kernel_size
++    # W_flat[k, oc] = weight[ic, oc, kk] where k = ic*kernel_size + kk (pre-permuted in host)
++    # stride_wb = N (row stride), stride_wc = 1 (col stride, COALESCED over oc)
++
++    valid_m = offs_m < M
++    valid_n = offs_n < N
+ 
+     for k_start in range(0, K, BLOCK_K):
+-        offs_k = k_start + tl.arange(0, BLOCK_K)
+-        # Decode k into (ic, kk)
+-        ic = offs_k // kernel_size
+-        kk = offs_k % kernel_size
+-
+-        # Input positions for each (m, k): l_in = l_out - kk
+-        # l_out = offs_m, kk = kk
+-        # Shape: [BLOCK_M, BLOCK_K]
+-        l_in = offs_m[:, None] - kk[None, :]  # [BLOCK_M, BLOCK_K]
+-
+-        # Validity masks
+-        valid_k = offs_k < K  # [BLOCK_K]
+-        valid_m = offs_m < M  # [BLOCK_M]
+-        valid_l_in = (l_in >= 0) & (l_in < L_in)  # [BLOCK_M, BLOCK_K]
++        offs_k = k_start + tl.arange(0, BLOCK_K)   # [BLOCK_K]
++        ic = offs_k // kernel_size                   # [BLOCK_K]
++        kk = offs_k % kernel_size                    # [BLOCK_K]
++        l_in = offs_m[:, None] - kk[None, :]        # [BLOCK_M, BLOCK_K]
++        valid_k = offs_k < K
++        valid_l_in = (l_in >= 0) & (l_in < L_in)   # [BLOCK_M, BLOCK_K]
+         mask_x = valid_m[:, None] & valid_l_in & valid_k[None, :]
+-
+-        # Load X[b, ic, l_in]: stride_xb * pid_b + stride_xc * ic + stride_xl * l_in
+-        x_ptrs = X_ptr + pid_b * stride_xb + ic[None, :] * stride_xc + l_in * stride_xl
++        # X transposed [batch, L_in, in_channels]: ic dim has stride_xc=stride_xtc=1 -> COALESCED
++        x_ptrs = (X_ptr
++                  + pid_b * stride_xb
++                  + l_in * stride_xl
++                  + ic[None, :] * stride_xc)  # stride_xc = stride_xtc = 1 (coalesced)
+         x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)  # [BLOCK_M, BLOCK_K]
+-
+-        # Load W[ic, oc, kk]: stride_wb * ic + stride_wc * oc + stride_wk * kk
+-        # Shape: [BLOCK_K, BLOCK_N]
+-        valid_n = offs_n < N  # [BLOCK_N]
+         mask_w = valid_k[:, None] & valid_n[None, :]
+-        w_ptrs = W_ptr + ic[:, None] * stride_wb + offs_n[None, :] * stride_wc + kk[:, None] * stride_wk
++        # W_flat[offs_k, oc]: offs_k = ic*kernel_size + kk, stride_wc=1 -> COALESCED over oc
++        # stride_wk is unused (W_flat has been pre-permuted so offs_k is the flat row index)
++        w_ptrs = (W_ptr
++                  + offs_k[:, None] * stride_wb
++                  + offs_n[None, :] * stride_wc)
+         w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)  # [BLOCK_K, BLOCK_N]
+-
+         acc = tl.dot(x_tile, w_tile, acc=acc)
+ 
+     # Store output Y[b, oc, l_out]
+-    valid_m = offs_m < M
+-    valid_n = offs_n < N
+     mask_y = valid_m[:, None] & valid_n[None, :]
+     y_ptrs = Y_ptr + pid_b * stride_yb + offs_n[None, :] * stride_yc + offs_m[:, None] * stride_yl
+     tl.store(y_ptrs, acc.to(tl.float32), mask=mask_y)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: [in_channels, out_channels, kernel_size]

@@ -1,0 +1,123 @@
+--- baseline
++++ rebuilt
+@@ -3,18 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 16, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 256}, num_warps=8, num_stages=2),
++        triton.Config({'OW_TILE': 8},  num_warps=4, num_stages=2),
++        triton.Config({'OW_TILE': 8},  num_warps=8, num_stages=2),
++        triton.Config({'OW_TILE': 16}, num_warps=4, num_stages=2),
++        triton.Config({'OW_TILE': 16}, num_warps=8, num_stages=2),
++        triton.Config({'OW_TILE': 32}, num_warps=4, num_stages=2),
++        triton.Config({'OW_TILE': 32}, num_warps=8, num_stages=2),
+     ],
+-    key=['xnumel', 'rnumel'],
++    key=['OW', 'OH', 'B', 'C'],
+ )
+ @triton.jit
+ def avg_pool2d_kernel(
+@@ -24,46 +23,64 @@
+     KH, KW,
+     SH, SW,
+     xnumel, rnumel,
+-    XBLOCK: tl.constexpr,
+-    RBLOCK: tl.constexpr,
++    OW_TILE: tl.constexpr,
+ ):
+-    # Each program handles XBLOCK output elements
+-    # Reduction over KH*KW elements
+-    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None].to(tl.int64)
+-    xmask = xindex < xnumel
++    # 2D grid: pid0 over OW tiles, pid1 over B*C*OH
++    pid_ow = tl.program_id(0)
++    pid_row = tl.program_id(1)
+ 
+-    # Decode output indices
+-    ow = xindex % OW
+-    oh = (xindex // OW) % OH
+-    c  = (xindex // (OW * OH)) % C
+-    b  = xindex // (OW * OH * C)
++    # Decode pid_row -> (b, c, oh)
++    oh = pid_row % OH
++    tmp = pid_row // OH
++    c = tmp % C
++    b = tmp // C
+ 
+-    # Accumulator
+-    acc = tl.zeros([XBLOCK, RBLOCK], dtype=tl.float32)
++    # Output column offsets for this tile
++    ow_base = pid_ow * OW_TILE
++    ow_offs = ow_base + tl.arange(0, OW_TILE)
++    ow_mask = ow_offs < OW
+ 
+-    for r_offset in range(0, rnumel, RBLOCK):
+-        rindex = r_offset + tl.arange(0, RBLOCK)[None, :].to(tl.int64)
+-        rmask = rindex < rnumel
++    # Input base column for this tile
++    iw_base = ow_base * 11  # SW=11 always
+ 
+-        kw = rindex % KW
+-        kh = rindex // KW
++    # SHMEM_W = OW_TILE * SW + KW - 1 = OW_TILE * 11 + 10
++    # For OW_TILE=8:  SHMEM_W=98
++    # For OW_TILE=16: SHMEM_W=186
++    # For OW_TILE=32: SHMEM_W=362
++    SHMEM_W: tl.constexpr = OW_TILE * 11 + 10
+ 
+-        ih = oh * SH + kh
+-        iw = ow * SW + kw
++    # Accumulator for OW_TILE output elements
++    acc = tl.zeros([OW_TILE], dtype=tl.float32)
+ 
+-        # Compute flat input index
+-        in_idx = b * (C * H * W) + c * (H * W) + ih * W + iw
++    # Shared memory offsets (1D range over SHMEM_W)
++    shmem_offs = tl.arange(0, SHMEM_W)
+ 
+-        val = tl.load(in_ptr + in_idx, mask=(xmask & rmask), other=0.0)
+-        acc += val
++    # Loop over KH=11 rows (compile-time unrolled)
++    for kh in tl.static_range(11):
++        ih = oh * 11 + kh  # SH=11 always; ih always valid (no padding)
+ 
+-    total = tl.sum(acc, axis=1)[:, None]
+-    inv_count = 1.0 / (KH * KW)
+-    result = total * inv_count
++        # Pointer to start of this input row segment
++        row_ptr = in_ptr + b.to(tl.int64) * (C * H * W) + c.to(tl.int64) * (H * W) + ih.to(tl.int64) * W + iw_base
+ 
+-    tl.store(out_ptr + xindex, result, mask=xmask)
++        # Coalesced load of full row segment into registers (acts as shared memory)
++        shmem_mask = (iw_base + shmem_offs) < W
++        row_vals = tl.load(row_ptr + shmem_offs, mask=shmem_mask, other=0.0)
+ 
++        # Loop over KW=11 columns (compile-time unrolled)
++        for kw in tl.static_range(11):
++            # Index into row_vals: for each output ow_offs[i], the input col is
++            # (ow_offs[i] - ow_base)*SW + kw = (ow_offs[i] - ow_base)*11 + kw
++            shmem_idx = (ow_offs - ow_base) * 11 + kw  # shape [OW_TILE], values in [0, SHMEM_W)
++            # Gather from row_vals using shmem_idx
++            val = tl.gather(row_vals, shmem_idx, axis=0)
++            acc += tl.where(ow_mask, val, 0.0)
++
++    # Average: divide by KH*KW = 121
++    result = acc * (1.0 / 121)
++
++    # Store results
++    out_offs = b.to(tl.int64) * (C * OH * OW) + c.to(tl.int64) * (OH * OW) + oh.to(tl.int64) * OW + ow_offs
++    tl.store(out_ptr + out_offs, result, mask=ow_mask)
+ 
+ def kernel_function(x):
+     B, C, H, W = x.shape

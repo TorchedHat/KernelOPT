@@ -1,0 +1,40 @@
+[
+  {
+    "item_id": "exp_triton_vectorized_load_hint_autotune_001",
+    "iteration": 1,
+    "speedup": 1.3481,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_load_hint_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.07,
+        "Compute Workload Analysis.Issue Slots Busy": 29.12,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.49,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.92,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 55.31,
+        "Memory Workload Analysis.Memory Throughput": 991.12,
+        "Occupancy.Achieved Occupancy": 54.74
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.51,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.68,
+        "Compute Workload Analysis.Issue Slots Busy": 48.46,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 9.52,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.02,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 29.05,
+        "Memory Workload Analysis.Memory Throughput": 356.77,
+        "Occupancy.Achieved Occupancy": 47.58
+      }
+    },
+    "strategy_title": "Vectorized Load Hints + Autotune to Cut L1TEX Stalls",
+    "strategy_description": "When a Triton kernel shows high L1TEX scoreboard stall cycles (CPIStall rule, ~49% of cycles) and low issue slot utilization (~29%), applying tl.max_contiguous + tl.multiple_of hints on the load index enables the compiler to emit wider (128-bit) LDG instructions, reducing the number of L1TEX transactions and cutting warp stall cycles by ~50% (30.07 \u2192 15.68 cycles/instruction). Adding @triton.autotune over XBLOCK/YBLOCK/num_warps configurations allows the runtime to select the tile shape that best hides remaining memory latency, together yielding a 1.35x speedup (6.08 \u00b5s \u2192 4.51 \u00b5s). Note that L1 hit rate may drop (38% \u2192 9%) as larger vectorized transactions bypass L1 more aggressively, but L2 traffic also drops significantly (55% \u2192 29% throughput), indicating fewer total transactions.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    # ... mask setup ...\n    tmp0 = tl.load(in_ptr + (x2 + stride * y3), mask)  # no vectorization hint\n    tl.store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Fixed launch config\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 2}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=8),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 2}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xrange = tl.arange(0, XBLOCK)\n    xrange = tl.max_contiguous(tl.multiple_of(xrange, XBLOCK), XBLOCK)  # vectorization hint\n    xindex = xoffset + xrange[None, :]\n    # ... mask setup ...\n    tmp0 = tl.load(in_ptr + (x2 + stride * y3), mask)  # now emits LDG.128\n    tl.store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Autotuned launch\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "Triton pointwise/elementwise kernel with CPIStall rule triggered (L1TEX scoreboard stalls >30% of cycles), low issue slot utilization (<40%), uncoalesced or non-vectorized global loads where the X-dimension access is stride-1 and XBLOCK is a power-of-2, and the load index is provably contiguous and aligned to XBLOCK.",
+    "do_not_apply_when": "Load index is not stride-1 contiguous in X (e.g., gather/scatter patterns), or XBLOCK is not a power-of-2 (tl.multiple_of hint would be incorrect). Also avoid if the store pattern is the primary bottleneck (uncoalesced stores are not fixed by load hints). Do not apply if the kernel is already compute-bound (high SM throughput >80%).",
+    "framework_notes": "tl.max_contiguous(tl.multiple_of(idx, N), N) is Triton-specific syntax that signals to the compiler that the index tensor is a multiple of N and has N contiguous elements, enabling LDG.128 (128-bit vectorized load) on NVIDIA GPUs. The hint value N must not exceed the actual alignment of the base offset. In CUDA, the equivalent is using __ldg with 128-bit types (float4) or __builtin_assume_aligned. The @triton.autotune decorator explores tile configurations at first run and caches the best config per (key) shape."
+  }
+]

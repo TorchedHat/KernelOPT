@@ -1,0 +1,209 @@
+"""Animated progress display for non-HUD mode.
+
+When --hud is off, wraps long-running pipeline phases with Rich spinners
+so the user always sees something moving during LLM calls, NCU profiling,
+and other blocking operations.
+"""
+from __future__ import annotations
+
+import time
+from contextlib import contextmanager
+from typing import Iterator, Optional
+
+from rich.console import Console
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.table import Table
+from rich.text import Text
+
+_console = Console()
+
+PHASE_STYLES = {
+    "baseline":    ("dots",  "bold cyan",    "Profiling baseline"),
+    "planning":    ("dots",  "bold yellow",  "Generating plans"),
+    "executing":   ("dots",  "bold green",   "Executing"),
+    "correctness": ("dots",  "bold blue",    "Checking correctness"),
+    "profiling":   ("dots",  "bold magenta", "Profiling with NCU"),
+    "summarize":   ("dots",  "bold yellow",  "Summarizing results"),
+    "selecting":   ("dots",  "bold green",   "Selecting best"),
+}
+
+
+def _speedup_key(candidate):
+    """Reusable key function for sorting/maxing candidates by speedup."""
+    return candidate.speedup
+
+
+class _SpinnerDisplay:
+    """Renderable: colored braille spinner + message + live elapsed time."""
+
+    def __init__(self, message: str, spinner_name: str, style: str):
+        self._spinner = Spinner(spinner_name, style=style)
+        self._msg_text = Text(message, style=style.replace("bold ", ""))
+        self._start = time.monotonic()
+        self._col_defs = (
+            {"width": 3},
+            {},
+            {"justify": "right", "style": "dim"},
+        )
+
+    def __rich_console__(self, console, options):
+        elapsed = time.monotonic() - self._start
+        mins, secs = divmod(int(elapsed), 60)
+        time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
+
+        table = Table.grid(padding=(0, 1))
+        for col in self._col_defs:
+            table.add_column(**col)
+        table.add_row(self._spinner, self._msg_text, Text(f"[{time_str}]"))
+        yield from table.__rich_console__(console, options)
+
+
+@contextmanager
+def phase_spinner(
+    phase: str,
+    detail: str = "",
+    *,
+    console: Optional[Console] = None,
+) -> Iterator[None]:
+    """Context manager that shows a colored braille spinner for a pipeline phase.
+
+    Usage::
+
+        with phase_spinner("planning", "4 optimization plans"):
+            plans = run_planner_agent(...)
+    """
+    c = console or _console
+    spinner_name, style, label = PHASE_STYLES.get(
+        phase, ("dots", "white", phase.capitalize())
+    )
+    color = style.replace("bold ", "")
+    message = f"{label} {detail}".strip() if detail else label
+
+    display = _SpinnerDisplay(message, spinner_name, style)
+
+    with Live(display, console=c, refresh_per_second=10, transient=True):
+        yield
+
+    elapsed = time.monotonic() - display._start
+    mins, secs = divmod(int(elapsed), 60)
+    time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
+    c.print(f"  [green]✓[/] [{color}]{message}[/]  [dim]\\[{time_str}][/]")
+
+
+def print_run_header(
+    kernel_name: str,
+    gpu_name: str,
+    T: int,
+    N: int,
+    K: int,
+    output_dir: str,
+    model: str,
+    framework: str = "auto",
+    *,
+    console: Optional[Console] = None,
+) -> None:
+    """Print a structured run header at pipeline start."""
+    c = console or _console
+    c.print()
+    try:
+        from importlib.metadata import version as _pkg_version
+        _ver = _pkg_version("kernelopt")
+    except Exception:
+        _ver = "dev"
+    c.print(f"[bold]kernelopt[/] [dim]v{_ver}[/]")
+    c.print(f"  Kernel:    [cyan]{kernel_name}[/]")
+    c.print(f"  GPU:       [cyan]{gpu_name}[/]")
+    c.print(f"  Config:    T={T} iterations, N={N} plans, K={K} attempts")
+    c.print(f"  Framework: [green]{framework}[/]")
+    c.print(f"  Model:     [dim]{model}[/]")
+    c.print(f"  Output:    [dim]{output_dir}/[/]")
+    c.print()
+
+
+def print_run_summary(
+    baseline_ns: float,
+    best_ns: float,
+    best_direction: str,
+    iteration_results: list,
+    output_dir: str,
+    total_elapsed: float,
+    *,
+    console: Optional[Console] = None,
+) -> None:
+    """Print a structured summary when the pipeline completes."""
+    c = console or _console
+
+    mins, secs = divmod(int(total_elapsed), 60)
+    time_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
+    speedup = baseline_ns / best_ns if best_ns > 0 else 0.0
+
+    c.print()
+    c.print("[bold]━━ Run Complete ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]")
+    c.print(f"  Total time:   [bold]{time_str}[/]")
+
+    if speedup > 1.005:
+        c.print(
+            f"  Best speedup: [bold green]{speedup:.2f}x[/] "
+            f"([dim]{best_direction}[/])"
+        )
+    else:
+        c.print(f"  Best speedup: [yellow]{speedup:.2f}x[/] (no improvement)")
+
+    c.print(
+        f"  Baseline:     {baseline_ns / 1000:.2f} µs  →  "
+        f"Best: [green]{best_ns / 1000:.2f} µs[/]"
+    )
+    c.print()
+
+    for i, result in enumerate(iteration_results):
+        # Check if this iteration improved the overall best
+        if result.improved and result.best_candidate:
+            c.print(
+                f"    Iter {i + 1}: [green]improved to {result.best_candidate.speedup:.2f}x[/] — "
+                f"{result.best_candidate.direction}"
+            )
+        else:
+            # No improvement - show best candidate from this iteration
+            candidates = getattr(result, "candidates", [])
+            best_cand = max(candidates, key=_speedup_key, default=None)
+            if best_cand and best_cand.speedup > 0:
+                c.print(
+                    f"    Iter {i + 1}: [dim]no improvement[/] "
+                    f"(best candidate {best_cand.speedup:.2f}x)"
+                )
+            else:
+                c.print(f"    Iter {i + 1}: [dim]no valid candidates[/]")
+
+    c.print()
+    c.print("  [bold]Files:[/]")
+    c.print(f"    Best kernel: [cyan]{output_dir}/best_kernel.*[/]")
+    c.print(f"    Memory:      [dim]{output_dir}/optimization_memory.json[/]")
+    c.print(f"    Full log:    [dim]{output_dir}/optimization_log.md[/]")
+    c.print()
+    c.print("  [bold]Next steps:[/]")
+    c.print(f"    Continue: [cyan]kernelopt run ... --checkpoint {output_dir}/[/]")
+    c.print(f"    Inspect:  [cyan]kernelopt show {output_dir}/baseline.csv[/]")
+    c.print()
+
+
+def print_iteration_header(
+    iteration: int,
+    total: int,
+    best_speedup: float,
+    estimated_remaining: Optional[float] = None,
+    *,
+    console: Optional[Console] = None,
+) -> None:
+    """Print the iteration header with optional ETA."""
+    c = console or _console
+    eta = ""
+    if estimated_remaining is not None and estimated_remaining > 0:
+        mins, secs = divmod(int(estimated_remaining), 60)
+        eta = f"  [dim](~{mins}m {secs:02d}s remaining)[/]" if mins > 0 else f"  [dim](~{secs}s remaining)[/]"
+
+    c.print()
+    c.print(
+        f"[bold]━━ Iteration {iteration}/{total}[/]  "
+        f"Best: [green]{best_speedup:.2f}x[/]{eta}"
+    )

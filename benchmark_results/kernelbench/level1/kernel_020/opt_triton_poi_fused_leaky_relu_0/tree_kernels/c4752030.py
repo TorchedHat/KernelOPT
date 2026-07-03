@@ -1,0 +1,86 @@
+import torch
+import triton
+import triton.language as tl
+
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024, 'BLOCKS_PER_SM': 4},  num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'BLOCKS_PER_SM': 8},  num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048, 'BLOCKS_PER_SM': 4},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048, 'BLOCKS_PER_SM': 8},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096, 'BLOCKS_PER_SM': 4},  num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096, 'BLOCKS_PER_SM': 8},  num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 8192, 'BLOCKS_PER_SM': 4},  num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 8192, 'BLOCKS_PER_SM': 8},  num_warps=16, num_stages=4),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def leaky_relu_kernel(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    negative_slope,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_SM: tl.constexpr,
+):
+    pid = tl.program_id(0)           # in [0, NUM_SMS * BLOCKS_PER_SM)
+    grid_size = tl.num_programs(0)   # == NUM_SMS * BLOCKS_PER_SM
+    tile_id = pid
+    while tile_id * BLOCK_SIZE < n_elements:
+        block_start = tile_id.to(tl.int64) * BLOCK_SIZE
+        offsets = tl.max_contiguous(
+            tl.multiple_of(block_start + tl.arange(0, BLOCK_SIZE), BLOCK_SIZE),
+            BLOCK_SIZE
+        )
+        mask = offsets < n_elements
+        x = tl.load(input_ptr + offsets, mask=mask)
+        x_f32 = x.to(tl.float32)
+        result = tl.where(x_f32 >= 0, x_f32, x_f32 * negative_slope)
+        tl.store(output_ptr + offsets, result.to(output_ptr.dtype.element_ty), mask=mask)
+        tile_id += grid_size  # stride by total number of persistent CTAs
+
+def kernel_function(*inputs):
+    x = inputs[0]
+    negative_slope = 0.01
+
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+
+    leaky_relu_kernel[grid](
+        x,
+        output,
+        n_elements,
+        negative_slope,
+    )
+
+    return output
+
+
+def get_inputs():
+    x = torch.rand(4096, 393216, dtype=torch.float32, device='cuda')
+    return [x]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+
+    inputs = get_inputs()
+    output = kernel_function(*inputs)
+    torch.cuda.synchronize()
+
+    if not args.profile_only:
+        # Verify correctness
+        x = inputs[0]
+        expected = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        max_diff = (output - expected).abs().max().item()
+        print(f"Max difference from PyTorch reference: {max_diff}")
+        assert max_diff < 1e-3, f"Results don't match! Max diff: {max_diff}"
+        print("Kernel executed successfully and results match PyTorch reference.")

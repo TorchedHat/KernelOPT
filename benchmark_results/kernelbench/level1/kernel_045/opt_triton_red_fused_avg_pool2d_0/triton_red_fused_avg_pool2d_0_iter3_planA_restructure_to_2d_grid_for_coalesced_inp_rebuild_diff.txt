@@ -1,0 +1,102 @@
+--- baseline
++++ rebuilt
+@@ -3,18 +3,19 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 16, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 256}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32},  num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 32},  num_warps=8,  num_stages=3),
++        triton.Config({'XBLOCK': 64},  num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 64},  num_warps=8,  num_stages=3),
++        triton.Config({'XBLOCK': 128}, num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=8,  num_stages=3),
++        triton.Config({'XBLOCK': 256}, num_warps=8,  num_stages=2),
++        triton.Config({'XBLOCK': 256}, num_warps=16, num_stages=3),
+     ],
+-    key=['xnumel', 'rnumel'],
++    key=['OW', 'ynumel'],
+ )
+ @triton.jit
+ def avg_pool2d_kernel(
+@@ -23,47 +24,36 @@
+     OH, OW,
+     KH, KW,
+     SH, SW,
+-    xnumel, rnumel,
++    ynumel,
+     XBLOCK: tl.constexpr,
+-    RBLOCK: tl.constexpr,
+ ):
+-    # Each program handles XBLOCK output elements
+-    # Reduction over KH*KW elements
+-    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None].to(tl.int64)
+-    xmask = xindex < xnumel
++    pid_x = tl.program_id(0).to(tl.int64)
++    pid_y = tl.program_id(1).to(tl.int64)
+ 
+-    # Decode output indices
+-    ow = xindex % OW
+-    oh = (xindex // OW) % OH
+-    c  = (xindex // (OW * OH)) % C
+-    b  = xindex // (OW * OH * C)
++    # [XBLOCK] consecutive ow values — adjacent threads access adjacent columns
++    ow = pid_x * XBLOCK + tl.arange(0, XBLOCK).to(tl.int64)
++    ow_mask = ow < OW
+ 
+-    # Accumulator
+-    acc = tl.zeros([XBLOCK, RBLOCK], dtype=tl.float32)
++    # Decode (b, c, oh) from pid_y
++    oh_val = pid_y % OH
++    c_val  = (pid_y // OH) % C
++    b_val  = pid_y // (OH * C)
+ 
+-    for r_offset in range(0, rnumel, RBLOCK):
+-        rindex = r_offset + tl.arange(0, RBLOCK)[None, :].to(tl.int64)
+-        rmask = rindex < rnumel
++    # 1D accumulator — drastically reduces register pressure
++    acc = tl.zeros([XBLOCK], dtype=tl.float32)
+ 
+-        kw = rindex % KW
+-        kh = rindex // KW
++    for kh in range(KH):
++        ih = oh_val * SH + kh
++        for kw_i in range(KW):
++            # iw is [XBLOCK]: consecutive ow -> consecutive iw -> COALESCED loads
++            iw = ow * SW + kw_i
++            in_idx = b_val * (C * H * W) + c_val * (H * W) + ih * W + iw
++            val = tl.load(in_ptr + in_idx, mask=ow_mask, other=0.0)
++            acc += val
+ 
+-        ih = oh * SH + kh
+-        iw = ow * SW + kw
+-
+-        # Compute flat input index
+-        in_idx = b * (C * H * W) + c * (H * W) + ih * W + iw
+-
+-        val = tl.load(in_ptr + in_idx, mask=(xmask & rmask), other=0.0)
+-        acc += val
+-
+-    total = tl.sum(acc, axis=1)[:, None]
+-    inv_count = 1.0 / (KH * KW)
+-    result = total * inv_count
+-
+-    tl.store(out_ptr + xindex, result, mask=xmask)
+-
++    result = acc * (1.0 / (KH * KW))
++    out_idx = b_val * (C * OH * OW) + c_val * (OH * OW) + oh_val * OW + ow
++    tl.store(out_ptr + out_idx, result, mask=ow_mask)
+ 
+ def kernel_function(x):
+     B, C, H, W = x.shape

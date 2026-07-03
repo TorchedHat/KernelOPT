@@ -1,0 +1,112 @@
+--- baseline
++++ rebuilt
+@@ -3,18 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 16, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 256}, num_warps=8, num_stages=2),
++        triton.Config({'OW_BLOCK': 16, 'STRIP_W': 256},  num_warps=4, num_stages=2),
++        triton.Config({'OW_BLOCK': 16, 'STRIP_W': 256},  num_warps=8, num_stages=3),
++        triton.Config({'OW_BLOCK': 32, 'STRIP_W': 512},  num_warps=4, num_stages=2),
++        triton.Config({'OW_BLOCK': 32, 'STRIP_W': 512},  num_warps=8, num_stages=3),
++        triton.Config({'OW_BLOCK': 64, 'STRIP_W': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'OW_BLOCK': 64, 'STRIP_W': 1024}, num_warps=8, num_stages=3),
+     ],
+-    key=['xnumel', 'rnumel'],
++    key=['OW', 'OH', 'B', 'C'],
+ )
+ @triton.jit
+ def avg_pool2d_kernel(
+@@ -23,47 +22,51 @@
+     OH, OW,
+     KH, KW,
+     SH, SW,
+-    xnumel, rnumel,
+-    XBLOCK: tl.constexpr,
+-    RBLOCK: tl.constexpr,
++    OW_BLOCK: tl.constexpr,
++    STRIP_W:  tl.constexpr,
+ ):
+-    # Each program handles XBLOCK output elements
+-    # Reduction over KH*KW elements
+-    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None].to(tl.int64)
+-    xmask = xindex < xnumel
++    pid0 = tl.program_id(0).to(tl.int64)  # OW tile index
++    pid1 = tl.program_id(1).to(tl.int64)  # B*C*OH row index
+ 
+-    # Decode output indices
+-    ow = xindex % OW
+-    oh = (xindex // OW) % OH
+-    c  = (xindex // (OW * OH)) % C
+-    b  = xindex // (OW * OH * C)
++    # Decode pid1 -> (b, c, oh)
++    oh  = pid1 % OH
++    tmp = pid1 // OH
++    c   = tmp % C
++    b   = tmp // C
+ 
+-    # Accumulator
+-    acc = tl.zeros([XBLOCK, RBLOCK], dtype=tl.float32)
++    # Output column range for this CTA
++    ow_start = pid0 * OW_BLOCK
++    ow_offs  = ow_start + tl.arange(0, OW_BLOCK)  # shape [OW_BLOCK]
++    ow_mask  = ow_offs < OW
+ 
+-    for r_offset in range(0, rnumel, RBLOCK):
+-        rindex = r_offset + tl.arange(0, RBLOCK)[None, :].to(tl.int64)
+-        rmask = rindex < rnumel
++    acc = tl.zeros([OW_BLOCK], dtype=tl.float32)
+ 
+-        kw = rindex % KW
+-        kh = rindex // KW
++    row_base = b * (C * H * W) + c * (H * W)
++    iw_base  = ow_start * SW  # first input column for this CTA
+ 
++    # Contiguous strip offsets [0, 1, ..., STRIP_W-1]
++    strip_offs = tl.arange(0, STRIP_W)  # shape [STRIP_W]
++
++    for kh in tl.static_range(11):  # KH=11, fully unrolled
+         ih = oh * SH + kh
+-        iw = ow * SW + kw
++        strip_base = row_base + ih * W + iw_base
++        strip_mask = (iw_base + strip_offs) < W  # right-boundary guard
++        # Single coalesced load: STRIP_W contiguous floats
++        strip = tl.load(in_ptr + strip_base + strip_offs,
++                        mask=strip_mask, other=0.0)  # shape [STRIP_W]
+ 
+-        # Compute flat input index
+-        in_idx = b * (C * H * W) + c * (H * W) + ih * W + iw
++        for kw in tl.static_range(11):  # KW=11, fully unrolled
++            # For output column ow_offs[i], the strip offset is:
++            # (ow_offs[i] - ow_start) * SW + kw = tl.arange(0,OW_BLOCK)*SW + kw
++            gather_idx = tl.arange(0, OW_BLOCK) * SW + kw  # shape [OW_BLOCK]
++            # gather_idx < STRIP_W by construction (verified above)
++            acc += tl.where(ow_mask, strip[gather_idx], 0.0)
+ 
+-        val = tl.load(in_ptr + in_idx, mask=(xmask & rmask), other=0.0)
+-        acc += val
++    inv_count = 1.0 / (KH * KW)  # = 1/121
++    result = acc * inv_count
+ 
+-    total = tl.sum(acc, axis=1)[:, None]
+-    inv_count = 1.0 / (KH * KW)
+-    result = total * inv_count
+-
+-    tl.store(out_ptr + xindex, result, mask=xmask)
+-
++    out_idx = b * (C * OH * OW) + c * (OH * OW) + oh * OW + ow_offs
++    tl.store(out_ptr + out_idx, result, mask=ow_mask)
+ 
+ def kernel_function(x):
+     B, C, H, W = x.shape

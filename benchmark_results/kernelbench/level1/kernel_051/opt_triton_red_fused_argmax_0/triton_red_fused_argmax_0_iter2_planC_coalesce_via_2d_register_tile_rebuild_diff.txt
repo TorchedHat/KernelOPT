@@ -1,0 +1,119 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_R': 128, 'BLOCK_X': 1}, num_warps=4),
+-        triton.Config({'BLOCK_R': 256, 'BLOCK_X': 1}, num_warps=4),
+-        triton.Config({'BLOCK_R': 512, 'BLOCK_X': 1}, num_warps=8),
+-        triton.Config({'BLOCK_R': 1024, 'BLOCK_X': 1}, num_warps=8),
+-        triton.Config({'BLOCK_R': 2048, 'BLOCK_X': 1}, num_warps=16),
+-        triton.Config({'BLOCK_R': 4096, 'BLOCK_X': 1}, num_warps=16),
++        triton.Config({'BLOCK_R': 32,  'BLOCK_X': 32},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_R': 32,  'BLOCK_X': 64},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_R': 64,  'BLOCK_X': 32},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_R': 64,  'BLOCK_X': 64},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_R': 128, 'BLOCK_X': 32},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_R': 128, 'BLOCK_X': 64},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_R': 16,  'BLOCK_X': 128}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_R': 32,  'BLOCK_X': 128}, num_warps=8, num_stages=2),
+     ],
+     key=['R', 'N'],
+ )
+@@ -24,48 +27,60 @@
+     BLOCK_R: tl.constexpr,
+     BLOCK_X: tl.constexpr,
+ ):
+-    # Each program handles one (batch, col) pair
++    # Each program handles one (batch, col_block) pair
++    # BLOCK_X = number of consecutive columns per CTA (column tile size)
+     pid = tl.program_id(0)
+-    # pid indexes over B * N output elements
+-    batch_idx = pid // N
+-    col_idx = pid % N
++    num_col_blocks = tl.cdiv(N, BLOCK_X)
++    batch_idx = pid // num_col_blocks
++    col_block = pid % num_col_blocks
++    col_base = col_block * BLOCK_X
+ 
+-    # Base pointer for this (batch, col) slice
+-    # x[batch_idx, :, col_idx] has stride R=4096 in dim1, stride 1 in dim2
+-    # x_ptr + batch_idx * R * N + col_idx
+-    base = x_ptr + batch_idx * R * N + col_idx
++    # Column offsets and mask for this block
++    col_offs = col_base + tl.arange(0, BLOCK_X)   # [BLOCK_X]
++    col_mask = col_offs < N                         # [BLOCK_X]
+ 
+-    # Initialize max value and argmax index
+-    max_val = tl.full((), float('-inf'), dtype=tl.float32)
+-    max_idx = tl.full((), 0, dtype=tl.int64)
++    # Base pointer for this batch
++    batch_base = x_ptr + batch_idx * R * N
++
++    # Initialize per-column max value and argmax index
++    max_val = tl.full([BLOCK_X], float('-inf'), dtype=tl.float32)
++    max_idx = tl.zeros([BLOCK_X], dtype=tl.int64)
+ 
+     # Iterate over reduction dimension in blocks
+     for r_start in tl.range(0, R, BLOCK_R):
+-        r_offsets = r_start + tl.arange(0, BLOCK_R)
+-        mask = r_offsets < R
+-        # Load x[batch_idx, r_offsets, col_idx]
+-        ptrs = base + r_offsets * N
+-        vals = tl.load(ptrs, mask=mask, other=float('-inf'))
+-        vals = vals.to(tl.float32)
++        r_offs = r_start + tl.arange(0, BLOCK_R)   # [BLOCK_R]
++        r_mask = r_offs < R                          # [BLOCK_R]
+ 
+-        # Find local max and its index
+-        local_max = tl.max(vals, axis=0)
+-        # Find the index of the local max
+-        # Use argmax: find first occurrence of max
+-        is_max = (vals == local_max) & mask
+-        # Get the index: use a trick with where
+-        indices = tl.where(is_max, r_offsets.to(tl.int64), tl.full([BLOCK_R], R, dtype=tl.int64))
+-        local_idx = tl.min(indices, axis=0)
++        # Build 2D pointer array: [BLOCK_R, BLOCK_X]
++        # x[batch_idx, r_offs[i], col_offs[j]] = batch_base + r_offs[i]*N + col_offs[j]
++        ptrs = batch_base + tl.expand_dims(r_offs, 1) * N + tl.expand_dims(col_offs, 0)
++        mask2d = tl.expand_dims(r_mask, 1) & tl.expand_dims(col_mask, 0)  # [BLOCK_R, BLOCK_X]
+ 
+-        # Update global max
+-        if local_max > max_val:
+-            max_val = local_max
+-            max_idx = local_idx
+-        elif local_max == max_val:
+-            max_idx = tl.minimum(max_idx, local_idx)
++        # Coalesced load: innermost dim is col (stride-1 in memory)
++        tile = tl.load(ptrs, mask=mask2d, other=float('-inf'))  # [BLOCK_R, BLOCK_X]
++        tile = tile.to(tl.float32)
+ 
+-    tl.store(out_ptr + batch_idx * N + col_idx, max_idx)
++        # Per-column local max over BLOCK_R rows
++        local_max = tl.max(tile, axis=0)   # [BLOCK_X]
+ 
++        # Find smallest index achieving local_max per column
++        # is_max: [BLOCK_R, BLOCK_X]
++        is_max = (tile == tl.expand_dims(local_max, 0)) & tl.expand_dims(r_mask, 1)
++
++        # cand_idx: use R as sentinel for non-max positions
++        r_offs_2d = tl.broadcast_to(tl.expand_dims(r_offs.to(tl.int64), 1), [BLOCK_R, BLOCK_X])
++        sentinel = tl.full([BLOCK_R, BLOCK_X], R, dtype=tl.int64)
++        cand_idx = tl.where(is_max, r_offs_2d, sentinel)
++        local_idx = tl.min(cand_idx, axis=0)   # [BLOCK_X]
++
++        # Merge into running max per column
++        update_gt = local_max > max_val
++        update_eq = (local_max == max_val) & (local_idx < max_idx)
++        max_idx = tl.where(update_gt | update_eq, local_idx, max_idx)
++        max_val = tl.where(update_gt, local_max, max_val)
++
++    # Store results for all BLOCK_X columns (masked)
++    tl.store(out_ptr + batch_idx * N + col_offs, max_idx, mask=col_mask)
+ 
+ def kernel_function(x):
+     B, R, N = x.shape  # 128, 4096, 4095

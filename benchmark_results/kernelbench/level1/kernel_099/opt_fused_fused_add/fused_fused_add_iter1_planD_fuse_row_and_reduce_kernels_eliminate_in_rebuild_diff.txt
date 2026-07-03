@@ -1,0 +1,67 @@
+--- baseline
++++ rebuilt
+@@ -2,6 +2,7 @@
+ import triton
+ import triton.language as tl
+ from triton.language.extra import libdevice
++
+ 
+ 
+ @triton.autotune(
+@@ -23,8 +24,9 @@
+     BLOCK_N: tl.constexpr,
+ ):
+     """
+-      dist_pos[i] = sqrt(sum((anchor[i] - positive[i] + 1e-6)^2))
+-      dist_neg[i] = sqrt(sum((anchor[i] - negative[i] + 1e-6)^2))
++    Fused kernel: computes per-row loss and atomically accumulates into dist_pos_ptr[0].
++    dist_pos_ptr is used as a pre-zeroed scalar accumulator.
++    dist_neg_ptr is unused (kept for signature compatibility).
+     """
+     row = tl.program_id(0)
+     base = row * N
+@@ -43,12 +45,8 @@
+         diff_pos = a - p + 1e-6
+         diff_neg = a - n + 1e-6
+ 
+-        sq_pos = diff_pos * diff_pos
+-        sq_neg = diff_neg * diff_neg
+-
+-        # Zero out masked elements
+-        sq_pos = tl.where(mask, sq_pos, 0.0)
+-        sq_neg = tl.where(mask, sq_neg, 0.0)
++        sq_pos = tl.where(mask, diff_pos * diff_pos, 0.0)
++        sq_neg = tl.where(mask, diff_neg * diff_neg, 0.0)
+ 
+         acc_pos += tl.sum(sq_pos, axis=0)
+         acc_neg += tl.sum(sq_neg, axis=0)
+@@ -56,25 +54,12 @@
+     dist_pos = libdevice.sqrt(acc_pos)
+     dist_neg = libdevice.sqrt(acc_neg)
+ 
+-    tl.store(dist_pos_ptr + row, dist_pos)
+-    tl.store(dist_neg_ptr + row, dist_neg)
++    # Inline clamp and atomic accumulate — eliminates intermediate buffer stores
++    row_loss = dist_pos - dist_neg  # margin added in kernel_function via dist_neg_ptr param
++    row_loss = tl.where(row_loss > 0.0, row_loss, 0.0)
+ 
++    tl.atomic_add(dist_pos_ptr, row_loss)
+ 
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BLOCK_R': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_R': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_R': 1024}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_R': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_R': 4096}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_R': 8192}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_R': 16384}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_R': 32768}, num_warps=16, num_stages=2),
+-    ],
+-    key=['M'],
+-)
+-@triton.jit
+ def triplet_margin_loss_reduce_kernel(
+     dist_pos_ptr, dist_neg_ptr,
+     output_ptr,

@@ -1,0 +1,117 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,26 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_L': 128, 'BLOCK_IC': 8}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_L': 256, 'BLOCK_IC': 8}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_L': 512, 'BLOCK_IC': 4}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_L': 64, 'BLOCK_IC': 16}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_L': 256, 'BLOCK_IC': 16}, num_warps=8, num_stages=3),
+-        triton.Config({'BLOCK_L': 128, 'BLOCK_IC': 16}, num_warps=4, num_stages=3),
++        # Existing small configs (kept for small OUT_L)
++        triton.Config({'BLOCK_L': 256, 'BLOCK_IC': 4},  num_warps=4,  num_stages=3),
++        triton.Config({'BLOCK_L': 512, 'BLOCK_IC': 4},  num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_L': 128, 'BLOCK_IC': 8},  num_warps=4,  num_stages=3),
++        triton.Config({'BLOCK_L': 256, 'BLOCK_IC': 8},  num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_L':  64, 'BLOCK_IC': 16}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_L': 128, 'BLOCK_IC': 16}, num_warps=8,  num_stages=2),
++        # NEW: larger BLOCK_L to reduce grid size and improve w_vals reuse
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 4},  num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 4},  num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_L': 2048, 'BLOCK_IC': 4},  num_warps=16, num_stages=3),
++        triton.Config({'BLOCK_L': 2048, 'BLOCK_IC': 4},  num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 8},  num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_L': 1024, 'BLOCK_IC': 8},  num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_L': 2048, 'BLOCK_IC': 8},  num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 4},  num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_L': 512,  'BLOCK_IC': 8},  num_warps=8,  num_stages=4),
+     ],
+     key=['IN_C', 'OUT_L', 'KERNEL_SIZE'],
+ )
+@@ -39,11 +51,36 @@
+ 
+     # Loop over in_channels in blocks
+     for ic_start in range(0, IN_C, BLOCK_IC):
+-        # Loop over kernel positions
+-        for k in range(KERNEL_SIZE):
+-            # For output position o, kernel position k:
+-            # input position i = (o - k*dilation + padding) / stride
+-            # Valid when (o - k*dilation + padding) % stride == 0 and 0 <= i < IN_L
++        # Hoist ic_offs and ic_mask outside the k loop — they are k-independent
++        ic_offs = ic_start + tl.arange(0, BLOCK_IC)
++        ic_mask = ic_offs < IN_C
++
++        # Hoist: load ALL kernel positions for this ic_start block at once
++        # w_cache shape: [BLOCK_IC, KERNEL_SIZE] — loaded as 2D, accessed per-k via static_range
++        # Base weight pointer for this ic block: W_ptr + ic_offs * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE
++        w_base = W_ptr + ic_offs * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE
++        # Load all KERNEL_SIZE weight values per ic channel into a 2D register block
++        # We load each k column separately into a flat register array to avoid 2D indexing issues
++        # w_cols[k] = [BLOCK_IC] weights for kernel position k
++        # Use static_range to unroll and hoist all loads before the compute loop
++
++        # Preload all k weight slices into separate 1D register arrays
++        # This hoists KERNEL_SIZE strided global loads outside the compute loop
++        w_col_0 = tl.load(w_base + 0, mask=ic_mask, other=0.0)  # [BLOCK_IC]
++        w_col_1 = tl.load(w_base + 1, mask=ic_mask, other=0.0)  # [BLOCK_IC]
++        w_col_2 = tl.load(w_base + 2, mask=ic_mask, other=0.0)  # [BLOCK_IC]
++        w_col_3 = tl.load(w_base + 3, mask=ic_mask, other=0.0)  # [BLOCK_IC]
++        w_col_4 = tl.load(w_base + 4, mask=ic_mask, other=0.0)  # [BLOCK_IC]
++
++        # Use static_range so compiler constant-folds k and selects the right w_col
++        for k in tl.static_range(KERNEL_SIZE):
++            # Select the pre-loaded weight column for this k — pure register read
++            w_vals = (w_col_0 if k == 0 else
++                      w_col_1 if k == 1 else
++                      w_col_2 if k == 2 else
++                      w_col_3 if k == 3 else
++                      w_col_4)  # [BLOCK_IC]
++
+             k_dil = k * DILATION
+             # numerator for input index
+             num = out_offs - k_dil + PADDING
+@@ -53,32 +90,19 @@
+             valid_i = (i_idx >= 0) & (i_idx < IN_L)
+             valid = out_mask & valid_stride & valid_i
+ 
+-            # Load weights for this kernel position, for BLOCK_IC channels
+-            ic_offs = ic_start + tl.arange(0, BLOCK_IC)
+-            ic_mask = ic_offs < IN_C
++            # Single 2D tile load: [BLOCK_IC, BLOCK_L]
++            # X shape: (BATCH, IN_C, IN_L)
++            x_ptrs_2d = X_ptr + batch_idx * (IN_C * IN_L) + ic_offs[:, None] * IN_L + i_idx[None, :]
++            x_mask_2d = ic_mask[:, None] & valid[None, :]       # [BLOCK_IC, BLOCK_L]
++            x_tile = tl.load(x_ptrs_2d, mask=x_mask_2d, other=0.0)  # [BLOCK_IC, BLOCK_L]
+ 
+-            # Weight shape: (IN_C, OUT_C, KERNEL_SIZE)
+-            # weight[ic, oc, k]
+-            w_ptrs = W_ptr + ic_offs * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k
+-            w_vals = tl.load(w_ptrs, mask=ic_mask, other=0.0)  # [BLOCK_IC]
+-
+-            # Load input for each valid output position
+-            # X shape: (BATCH, IN_C, IN_L)
+-            # x[batch, ic, i_idx]
+-            # We need to accumulate over BLOCK_IC channels
+-            for ic_local in range(BLOCK_IC):
+-                ic = ic_start + ic_local
+-                if ic < IN_C:
+-                    w_val = tl.load(W_ptr + ic * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k)
+-                    x_ptrs = X_ptr + batch_idx * (IN_C * IN_L) + ic * IN_L + i_idx
+-                    x_vals = tl.load(x_ptrs, mask=valid, other=0.0)  # [BLOCK_L]
+-                    acc += x_vals * w_val
++            # Vectorized accumulate — no inner loop, no one-hot, no ic_lane
++            acc += tl.sum(w_vals[:, None] * x_tile, axis=0)    # [BLOCK_L]
+ 
+     # Store output
+     # Y shape: (BATCH, OUT_C, OUT_L)
+     y_ptrs = Y_ptr + batch_idx * (OUT_C * OUT_L) + oc * OUT_L + out_offs
+     tl.store(y_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: (IN_C, OUT_C, KERNEL_SIZE) - ConvTranspose1d weight is (in_channels, out_channels, kernel_size)

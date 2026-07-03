@@ -1,0 +1,109 @@
+import torch
+import triton
+import triton.language as tl
+
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 32},  num_warps=4,  num_stages=2),
+        triton.Config({'XBLOCK': 32},  num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 64},  num_warps=4,  num_stages=2),
+        triton.Config({'XBLOCK': 64},  num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 128}, num_warps=4,  num_stages=2),
+        triton.Config({'XBLOCK': 128}, num_warps=8,  num_stages=3),
+        triton.Config({'XBLOCK': 256}, num_warps=8,  num_stages=2),
+        triton.Config({'XBLOCK': 256}, num_warps=16, num_stages=3),
+    ],
+    key=['OW', 'ynumel'],
+)
+@triton.jit
+def avg_pool2d_kernel(
+    in_ptr, out_ptr,
+    B, C, H, W,
+    OH, OW,
+    KH, KW,
+    SH, SW,
+    ynumel,
+    XBLOCK: tl.constexpr,
+):
+    pid_x = tl.program_id(0).to(tl.int64)
+    pid_y = tl.program_id(1).to(tl.int64)
+
+    # [XBLOCK] consecutive ow values — adjacent threads access adjacent columns
+    ow = pid_x * XBLOCK + tl.arange(0, XBLOCK).to(tl.int64)
+    ow_mask = ow < OW
+
+    # Decode (b, c, oh) from pid_y
+    oh_val = pid_y % OH
+    c_val  = (pid_y // OH) % C
+    b_val  = pid_y // (OH * C)
+
+    # 1D accumulator — drastically reduces register pressure
+    acc = tl.zeros([XBLOCK], dtype=tl.float32)
+
+    for kh in range(KH):
+        ih = oh_val * SH + kh
+        for kw_i in range(KW):
+            # iw is [XBLOCK]: consecutive ow -> consecutive iw -> COALESCED loads
+            iw = ow * SW + kw_i
+            in_idx = b_val * (C * H * W) + c_val * (H * W) + ih * W + iw
+            val = tl.load(in_ptr + in_idx, mask=ow_mask, other=0.0)
+            acc += val
+
+    result = acc * (1.0 / (KH * KW))
+    out_idx = b_val * (C * OH * OW) + c_val * (OH * OW) + oh_val * OW + ow
+    tl.store(out_ptr + out_idx, result, mask=ow_mask)
+
+def kernel_function(x):
+    B, C, H, W = x.shape
+    KH, KW = 11, 11
+    SH, SW = 11, 11
+    pad_h, pad_w = 0, 0
+
+    OH = (H + 2 * pad_h - KH) // SH + 1
+    OW = (W + 2 * pad_w - KW) // SW + 1
+
+    out = torch.empty((B, C, OH, OW), dtype=x.dtype, device=x.device)
+
+    xnumel = B * C * OH * OW
+    rnumel = KH * KW
+
+    grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)
+
+    avg_pool2d_kernel[grid](
+        x, out,
+        B, C, H, W,
+        OH, OW,
+        KH, KW,
+        SH, SW,
+        xnumel, rnumel,
+    )
+
+    return out
+
+
+def get_inputs():
+    x = torch.rand(16, 64, 2048, 2048, device='cuda', dtype=torch.float32)
+    return [x]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+
+    inputs = get_inputs()
+    output = kernel_function(*inputs)
+    torch.cuda.synchronize()
+
+    if not args.profile_only:
+        # Verify correctness
+        import torch.nn as nn
+        ref_pool = nn.AvgPool2d(kernel_size=11, stride=11, padding=0)
+        ref_out = ref_pool(inputs[0])
+        max_diff = (output - ref_out).abs().max().item()
+        print(f"Max difference from reference: {max_diff}")
+        assert max_diff < 1e-3, f"Results don't match! Max diff: {max_diff}"
+        print("Kernel executed successfully and results match.")

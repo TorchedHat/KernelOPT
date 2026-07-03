@@ -1,0 +1,108 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,8 @@
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -27,12 +30,16 @@
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+     GROUP_M: tl.constexpr,
+ ):
+-    # M = N_batch * H * W (output spatial positions)
+-    # N = out_channels (Co)
+-    # K = in_channels (Ci)
+-    # x layout: (N_batch, Ci, H, W) with strides stride_xn, stride_xc, stride_xh, stride_xw
+-    # w layout: (Co, Ci) with strides stride_wco, stride_wci
+-    # out layout: (N_batch, Co, H, W) with strides stride_on, stride_oc, stride_oh, stride_ow
++    # x_ptr: (M, K) contiguous 2D layout (pre-flattened on host)
++    #   stride_xn = K (row stride = M-dim stride)
++    #   stride_xc = 1 (col stride = K-dim stride)
++    #   HW = 1 (so batch_idx = offs_m, hw_idx = 0, no division needed)
++    # w_ptr: (K, N) contiguous 2D layout (pre-transposed on host)
++    #   stride_wco = 1 (N-dim stride, was Co stride)
++    #   stride_wci = N (K-dim stride, was Ci stride)
++    # out_ptr: (M, N) contiguous 2D layout
++    #   stride_on = N (row stride)
++    #   stride_oc = 1 (col stride)
+ 
+     pid = tl.program_id(0).to(tl.int64)
+     grid_m = tl.cdiv(M, BLOCK_M)
+@@ -49,52 +56,35 @@
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+     offs_k = tl.arange(0, BLOCK_K)                     # [BLOCK_K]
+ 
+-    # Decode offs_m -> (batch_idx, hw_idx)
+-    # offs_m = batch_idx * HW + hw_idx
+-    batch_idx = offs_m // HW   # [BLOCK_M]
+-    hw_idx = offs_m % HW       # [BLOCK_M]
+-    h_idx = hw_idx // tl.cdiv(HW, HW)  # placeholder, compute properly
+-    # Actually HW = H*W, hw_idx = h*W + w
+-    # We need h and w for the x pointer
+-    # x_ptr[batch, ci, h, w] = x_ptr + batch*stride_xn + ci*stride_xc + h*stride_xh + w*stride_xw
+-    # Since stride_xh = W and stride_xw = 1 (NCHW contiguous):
+-    # x_ptr[batch, ci, hw] = x_ptr + batch*stride_xn + ci*stride_xc + hw  (since h*W+w = hw_idx)
+-    # This works because stride_xh * h + stride_xw * w = W*h + w = hw_idx when stride_xw=1
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    # With pre-flattened 2D layout:
++    # x[offs_m[m], k] = x_ptr + offs_m[m] * stride_xn + k * stride_xc
++    # w[k, offs_n[n]] = w_ptr + k * stride_wci + offs_n[n] * stride_wco
++    # No batch_idx//HW or hw_idx%HW needed since HW=1 and layout is flat
++
++    x_row_base = x_ptr + offs_m[:, None].to(tl.int64) * stride_xn
++    w_col_base = w_ptr + offs_n[None, :].to(tl.int64) * stride_wco
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+         k_offs = k * BLOCK_K + offs_k  # [BLOCK_K]
+ 
+         # Load x tile: shape [BLOCK_M, BLOCK_K]
+-        # x[batch_idx[m], k_offs[k], hw_idx[m]]
+-        # ptr = x_ptr + batch_idx[m]*stride_xn + k_offs[k]*stride_xc + hw_idx[m]
+-        x_batch = batch_idx[:, None]   # [BLOCK_M, 1]
+-        x_ci = k_offs[None, :]         # [1, BLOCK_K]
+-        x_hw = hw_idx[:, None]         # [BLOCK_M, 1]
+-        x_ptrs = x_ptr + x_batch.to(tl.int64) * stride_xn + x_ci.to(tl.int64) * stride_xc + x_hw.to(tl.int64)
++        x_ptrs = x_row_base + k_offs[None, :].to(tl.int64) * stride_xc
+         x_mask = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+ 
+         # Load w tile: shape [BLOCK_K, BLOCK_N]
+-        # w[offs_n[n], k_offs[k]] -> w_ptr + offs_n[n]*stride_wco + k_offs[k]*stride_wci
+-        w_ci = k_offs[:, None]         # [BLOCK_K, 1]
+-        w_co = offs_n[None, :]         # [1, BLOCK_N]
+-        w_ptrs = w_ptr + w_co.to(tl.int64) * stride_wco + w_ci.to(tl.int64) * stride_wci
++        w_ptrs = w_col_base + k_offs[:, None].to(tl.int64) * stride_wci
+         w_mask = (k_offs[:, None] < K) & (offs_n[None, :] < N)
+         w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+ 
+-        acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=False)
++        acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=True)
+ 
+-    # Store output: out[batch_idx[m], offs_n[n], hw_idx[m]]
+-    # out_ptr + batch_idx[m]*stride_on + offs_n[n]*stride_oc + hw_idx[m]
+-    out_batch = batch_idx[:, None]   # [BLOCK_M, 1]
+-    out_co = offs_n[None, :]         # [1, BLOCK_N]
+-    out_hw = hw_idx[:, None]         # [BLOCK_M, 1]
+-    out_ptrs = out_ptr + out_batch.to(tl.int64) * stride_on + out_co.to(tl.int64) * stride_oc + out_hw.to(tl.int64)
++    # Store output: out[offs_m[m], offs_n[n]] = out_ptr + offs_m[m]*stride_on + offs_n[n]*stride_oc
++    out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * stride_on + offs_n[None, :].to(tl.int64) * stride_oc
+     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     tl.store(out_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(w, x):
+     # w: (Co, Ci, 1, 1), x: (N, Ci, H, W)
