@@ -29,6 +29,7 @@ def run_summarizer(
     model: str = "claude-sonnet-4-6",
     project_id: str | None = None,
     region: str | None = None,
+    **llm_kwargs: object,
 ) -> tuple[dict, dict]:
     """
     Call the LLM to produce an experience item from before/after data.
@@ -44,6 +45,7 @@ def run_summarizer(
         temperature=0.2,
         project_id=project_id,
         region=region,
+        **llm_kwargs,
     )
 
     rewrite_type = "positive" if speedup >= 1.0 else "negative"
