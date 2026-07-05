@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from kernelopt.constants import VERTEX_API_TIMEOUT_S
+from kernelopt.constants import LLM_API_TIMEOUT_S, VERTEX_API_TIMEOUT_S
 
 if TYPE_CHECKING:
     from kernelopt.state import PipelineConfig
@@ -95,6 +95,7 @@ def _build_anthropic_api_llm(
         raise ValueError("Anthropic API: set ANTHROPIC_API_KEY or pass --api-key")
     return ChatAnthropic(
         model=model, api_key=key, max_tokens=max_tokens, temperature=temperature,
+        timeout=LLM_API_TIMEOUT_S,
     )
 
 
@@ -105,7 +106,13 @@ def _build_openai_llm(
     temperature: float,
     base_url: str | None,
 ) -> BaseChatModel:
-    from langchain_openai import ChatOpenAI
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError:
+        raise ImportError(
+            "langchain-openai is required for the 'openai' provider. "
+            "Install it with: pip install kernelopt[local]"
+        ) from None
 
     key = api_key or os.environ.get("OPENAI_API_KEY")
     if not key:
@@ -113,6 +120,7 @@ def _build_openai_llm(
     kwargs: dict = {
         "model": model, "api_key": key,
         "max_tokens": max_tokens, "temperature": temperature,
+        "timeout": LLM_API_TIMEOUT_S,
     }
     url = base_url or os.environ.get("OPENAI_BASE_URL")
     if url:
@@ -126,7 +134,13 @@ def _build_google_genai_llm(
     max_tokens: int,
     temperature: float,
 ) -> BaseChatModel:
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except ImportError:
+        raise ImportError(
+            "langchain-google-genai is required for the 'google_genai' provider. "
+            "Install it with: pip install kernelopt[all-providers]"
+        ) from None
 
     key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -134,6 +148,7 @@ def _build_google_genai_llm(
     return ChatGoogleGenerativeAI(
         model=model, google_api_key=key,
         max_output_tokens=max_tokens, temperature=temperature,
+        timeout=LLM_API_TIMEOUT_S,
     )
 
 
@@ -150,8 +165,14 @@ def _build_huggingface_llm(
     try:
         from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
     except ImportError:
-        from langchain_community.chat_models import ChatHuggingFace
-        from langchain_community.llms import HuggingFaceEndpoint
+        try:
+            from langchain_community.chat_models import ChatHuggingFace
+            from langchain_community.llms import HuggingFaceEndpoint
+        except ImportError:
+            raise ImportError(
+                "langchain-huggingface is required for the 'huggingface' provider. "
+                "Install it with: pip install kernelopt[all-providers]"
+            ) from None
 
     base_kw: dict = {
         "repo_id": model, "huggingfacehub_api_token": token,
@@ -180,13 +201,20 @@ def _build_local_llm(
     base_url: str | None,
     api_key: str | None,
 ) -> BaseChatModel:
-    from langchain_openai import ChatOpenAI
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError:
+        raise ImportError(
+            "langchain-openai is required for the 'local' provider. "
+            "Install it with: pip install kernelopt[local]"
+        ) from None
 
     url = base_url or os.environ.get("LOCAL_LLM_BASE_URL") or "http://localhost:8000/v1"
     key = api_key or os.environ.get("LOCAL_LLM_API_KEY") or "not-needed"
     return ChatOpenAI(
         model=model, api_key=key, base_url=url.strip(),
         max_tokens=max_tokens, temperature=temperature,
+        timeout=LLM_API_TIMEOUT_S,
     )
 
 
@@ -255,11 +283,20 @@ def build_llm(
 def strip_thinking(content: str) -> str:
     """Strip <think>...</think> blocks from thinking model output.
 
-    No-op when content has no <think> tags.
+    Handles nested blocks by repeatedly removing innermost blocks first.
+    Pattern uses negative lookahead (?!<think>) to match blocks with no
+    nested <think> tags inside them.
+
+    Examples:
+        - "A <think>B</think> C" → "A  C"
+        - "A <think>1</think> B <think>2</think> C" → "A  B  C"
+        - "A <think>outer <think>inner</think> outer</think> B" → "A  B"
     """
+    # Repeatedly remove innermost blocks (blocks with no nested <think>)
     while '<think>' in content:
         prev = content
+        # (?:(?!<think>)[\s\S])*? matches any char that's NOT start of <think>
         content = re.sub(r"<think>(?:(?!<think>)[\s\S])*?</think>", "", content)
-        if prev == content:
+        if prev == content:  # Safety: prevent infinite loop on malformed input
             break
     return content.strip()
