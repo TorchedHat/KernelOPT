@@ -63,6 +63,7 @@ def run_correctness_agent(
     project_id: str | None = None,
     region: str | None = None,
     kernel_args: list[str] | None = None,
+    **llm_kwargs: object,
 ) -> tuple[bool, str]:
     """
     Verify an optimized kernel against a CPU reference.
@@ -86,6 +87,7 @@ def run_correctness_agent(
         temperature=0.1,
         project_id=project_id,
         region=region,
+        **llm_kwargs,
     )
 
     config_note = ""

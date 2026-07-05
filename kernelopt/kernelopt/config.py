@@ -28,13 +28,24 @@ def load_config() -> dict:
         return {}
 
 
-def save_config(project_id: str, region: str) -> Path:
+def save_config(
+    project_id: str = "",
+    region: str = "us-east5",
+    provider: str = "vertex",
+    base_url: str = "",
+    model: str = "",
+) -> Path:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = (
-        "[vertex]\n"
-        f'project_id = "{project_id}"\n'
-        f'region = "{region}"\n'
-    )
-    path.write_text(content, encoding="utf-8")
+    lines = [
+        f'[provider]\nname = "{provider}"',
+    ]
+    if model:
+        lines.append(f'model = "{model}"')
+    if base_url:
+        lines.append(f'base_url = "{base_url}"')
+    lines.append("")
+    if project_id:
+        lines.append(f"[vertex]\nproject_id = \"{project_id}\"\nregion = \"{region}\"")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path

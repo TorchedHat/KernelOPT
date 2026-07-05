@@ -59,6 +59,9 @@ _RESUME_CKPT_FORBIDDEN = frozenset({
     "profiler_model",
     "verbose",
     "agentic_correctness",
+    "provider",
+    "base_url",
+    "hf_inference_provider",
     "entry_point",
     "input_shapes",
 })
@@ -261,6 +264,18 @@ def run(
         True, "--agentic-correctness/--no-agentic-correctness",
         help="Use Claude to generate CPU reference tests (default: True)"
     ),
+    provider: Optional[str] = typer.Option(
+        None, "--provider",
+        help="LLM provider: vertex, anthropic_api, openai, google_genai, huggingface, local (default: from config or 'vertex')",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url",
+        help="Base URL for OpenAI-compatible / local server (e.g. http://localhost:8000/v1)",
+    ),
+    hf_inference_provider: str = typer.Option(
+        "auto", "--hf-inference-provider",
+        help="Hugging Face inference provider (default: auto)",
+    ),
 ):
     """Run the full optimization pipeline.
 
@@ -275,16 +290,22 @@ def run(
         kernelopt run softmax.py -T 3 -N 4 --kernel-name 'softmax_kernel' --kernel-args '--profile-only'
     """
     from kernelopt.config import load_config as _load_config
-    _file_cfg = _load_config().get("vertex", {})
+    _file_cfg = _load_config()
+    _vertex_cfg = _file_cfg.get("vertex", {})
+    _provider_cfg = _file_cfg.get("provider", {})
     if not project_id:
-        project_id = _file_cfg.get("project_id") or ""
+        project_id = _vertex_cfg.get("project_id") or ""
     if (
         ctx.get_parameter_source("region") not in (
             ParameterSource.COMMANDLINE, ParameterSource.ENVIRONMENT
         )
-        and _file_cfg.get("region")
+        and _vertex_cfg.get("region")
     ):
-        region = _file_cfg["region"]
+        region = _vertex_cfg["region"]
+    if provider is None:
+        provider = _provider_cfg.get("name", "vertex")
+    if base_url is None:
+        base_url = _provider_cfg.get("base_url")
 
     from kernelopt.checkpoint import load_checkpoint_file, pipeline_config_from_checkpoint_dict
     from kernelopt.state import PipelineConfig, PipelineState
@@ -383,6 +404,9 @@ def run(
                 api_key=api_key,
                 project_id=project_id or "",
                 region=region,
+                llm_provider=provider,
+                openai_base_url=base_url,
+                hf_inference_provider=hf_inference_provider,
                 planner_model=planner_model,
                 summarizer_model=summarizer_model,
                 executor_model=executor_model,
@@ -420,6 +444,9 @@ def run(
             api_key=api_key,
             project_id=project_id or "",
             region=region,
+            llm_provider=provider,
+            openai_base_url=base_url,
+            hf_inference_provider=hf_inference_provider,
             planner_model=planner_model,
             summarizer_model=summarizer_model,
             executor_model=executor_model,
@@ -434,11 +461,11 @@ def run(
             entry_point=entry_point,
             input_shapes=_parse_shapes(input_shapes) if input_shapes else None,
             search_policy=search_policy,
-                beam_width=beam_width,
-                e2e_retries=e2e_retries,
-                e2e_perf_gate=e2e_perf_gate,
-                e2e_perf_margin=e2e_perf_margin,
-                e2e_correctness_timeout=e2e_correctness_timeout,
+            beam_width=beam_width,
+            e2e_retries=e2e_retries,
+            e2e_perf_gate=e2e_perf_gate,
+            e2e_perf_margin=e2e_perf_margin,
+            e2e_correctness_timeout=e2e_correctness_timeout,
         )
 
     cfg.hud = hud
@@ -474,7 +501,7 @@ def run(
         f"  T={cfg.T} iterations, N={cfg.N} plans/iter, "
         f"K={cfg.K} attempts/plan, TopK={cfg.TopK}\n"
         f"  Output: [cyan]{resolved_output}/[/]\n"
-        f"  Backend: [cyan]Claude on Vertex AI[/] ({cfg.model})"
+        f"  Backend: [cyan]{cfg.llm_provider}[/] ({cfg.model})"
         f"{extra}{hud_note}"
     )
 
@@ -515,12 +542,8 @@ def run(
             kernel_groups = merge_fusible_groups(kernel_groups)
             console.print(f"  [green]After fusion: {len(kernel_groups)} kernel group(s)[/]")
 
-            llm_config_dict = {
-                "model": cfg.model,
-                "api_key": cfg.api_key,
-                "project_id": cfg.project_id,
-                "region": cfg.region,
-            }
+            from kernelopt.llm import pipeline_llm_base_kwargs
+            llm_config_dict = {"model": cfg.model, **pipeline_llm_base_kwargs(cfg)}
 
             synth_dir = Path(resolved_output) / "synthesis"
             synth_dir.mkdir(parents=True, exist_ok=True)
@@ -624,6 +647,9 @@ def run(
                         T=cfg.T, N=cfg.N, K=cfg.K, TopK=cfg.TopK,
                         model=cfg.model, api_key=cfg.api_key,
                         project_id=cfg.project_id, region=cfg.region,
+                        llm_provider=cfg.llm_provider,
+                        openai_base_url=cfg.openai_base_url,
+                        hf_inference_provider=cfg.hf_inference_provider,
                         planner_model=cfg.planner_model,
                         executor_model=cfg.executor_model,
                         profiler_model=cfg.profiler_model,
@@ -926,6 +952,12 @@ def plan(
     region: str = typer.Option(
         "us-east5", "--region", help="Vertex AI region"
     ),
+    provider: str = typer.Option(
+        "vertex", "--provider", help="LLM provider"
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url", help="Base URL for OpenAI-compatible / local server"
+    ),
 ):
     """Generate optimization plan(s) from a profile CSV (no execution)."""
     import json
@@ -946,6 +978,8 @@ def plan(
         "api_key": api_key,
         "project_id": project_id,
         "region": region,
+        "provider": provider,
+        "openai_base_url": base_url,
     }
     plans = run_planner_agent(
         profiling_context=ctx,
@@ -982,7 +1016,7 @@ def kernels(
 
 @app.command()
 def setup():
-    """Interactive wizard — configure Vertex AI credentials and verify environment."""
+    """Interactive wizard — choose LLM provider, configure credentials, verify environment."""
     import shutil
     import subprocess as _sp
 
@@ -992,54 +1026,109 @@ def setup():
     from kernelopt.functions.setup import (
         check_auth,
         check_gpu,
+        check_local_connection,
         check_ncu,
         check_vertex_connection,
     )
+    from kernelopt.llm import PROVIDERS
 
     console.print("\n[bold green]kernelopt setup[/]\n")
-    console.print("Configures Vertex AI and verifies your environment.\n")
 
-    existing = load_config().get("vertex", {})
-    default_project = (
-        os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") or existing.get("project_id") or ""
+    # Step 1: Choose provider
+    existing = load_config()
+    existing_provider = existing.get("provider", {}).get("name", "vertex")
+
+    console.print("[bold]Choose your LLM provider:[/]\n")
+    for i, (pid, label) in enumerate(PROVIDERS, 1):
+        marker = " [dim](current)[/]" if pid == existing_provider else ""
+        console.print(f"  {i}. {label}{marker}")
+    console.print()
+
+    default_idx = next(
+        (i for i, (pid, _) in enumerate(PROVIDERS, 1) if pid == existing_provider), 1
     )
-    default_region = (
-        os.environ.get("VERTEX_REGION") or existing.get("region") or "us-east5"
+    choice = typer.prompt("Enter number", default=str(default_idx))
+    try:
+        chosen_provider = PROVIDERS[int(choice) - 1][0]
+    except (ValueError, IndexError):
+        console.print("[red]Invalid choice[/]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[green]✓[/] Provider: [cyan]{chosen_provider}[/]\n")
+
+    # Step 2: Provider-specific configuration
+    project_id = ""
+    region = "us-east5"
+    base_url = ""
+    model_name = ""
+
+    if chosen_provider == "vertex":
+        vertex_cfg = existing.get("vertex", {})
+        default_project = (
+            os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+            or vertex_cfg.get("project_id") or ""
+        )
+        default_region = (
+            os.environ.get("VERTEX_REGION")
+            or vertex_cfg.get("region") or "us-east5"
+        )
+        if default_project:
+            project_id = typer.prompt("Google Cloud project ID", default=default_project)
+        else:
+            project_id = typer.prompt("Google Cloud project ID")
+        region = typer.prompt("Vertex AI region", default=default_region)
+
+    elif chosen_provider == "local":
+        default_url = existing.get("provider", {}).get("base_url", "http://localhost:8000/v1")
+        base_url = typer.prompt("Local server URL", default=default_url)
+        model_name = typer.prompt("Model name (as served by vLLM/SGLang)", default="")
+
+    elif chosen_provider == "anthropic_api":
+        console.print("  Set [cyan]ANTHROPIC_API_KEY[/] in your environment.")
+
+    elif chosen_provider == "openai":
+        base_url = typer.prompt("Base URL (leave empty for api.openai.com)", default="")
+        console.print("  Set [cyan]OPENAI_API_KEY[/] in your environment.")
+
+    elif chosen_provider == "google_genai":
+        console.print("  Set [cyan]GOOGLE_API_KEY[/] or [cyan]GEMINI_API_KEY[/] in your environment.")
+
+    elif chosen_provider == "huggingface":
+        console.print("  Set [cyan]HF_TOKEN[/] in your environment.")
+
+    path = save_config(
+        project_id=project_id, region=region,
+        provider=chosen_provider, base_url=base_url, model=model_name,
     )
-
-    if default_project:
-        project_id = typer.prompt("Google Cloud project ID", default=default_project)
-    else:
-        project_id = typer.prompt("Google Cloud project ID")
-
-    region = typer.prompt("Vertex AI region", default=default_region)
-
-    path = save_config(project_id, region)
     console.print(f"\n[green]✓[/] Config saved → [cyan]{path}[/]\n")
 
-    console.print("[bold]Checking authentication...[/]")
-    auth_ok, auth_msg = check_auth()
-    if auth_ok:
-        console.print(f"[green]✓[/] {auth_msg}")
-    else:
-        console.print(f"[yellow]⚠[/] {auth_msg}")
-        if shutil.which("gcloud"):
-            console.print("\nLaunching: gcloud auth application-default login")
-            try:
-                _sp.run(["gcloud", "auth", "application-default", "login"], check=True)
-                auth_ok, auth_msg = check_auth()
-                if auth_ok:
-                    console.print("[green]✓[/] Authenticated")
-                else:
-                    console.print("[red]✗[/] Auth failed after gcloud login")
-            except _sp.CalledProcessError:
-                console.print("[red]✗[/] gcloud auth failed")
+    # Step 3: Provider-specific auth check
+    auth_ok = False
+    if chosen_provider == "vertex":
+        console.print("[bold]Checking authentication...[/]")
+        auth_ok, auth_msg = check_auth()
+        if auth_ok:
+            console.print(f"[green]✓[/] {auth_msg}")
         else:
-            console.print("\nOptions to set up credentials:")
-            console.print("  • Install gcloud: https://cloud.google.com/sdk/docs/install")
-            console.print("    Then run: gcloud auth application-default login")
-            console.print("  • Or set: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json")
+            console.print(f"[yellow]⚠[/] {auth_msg}")
+            if shutil.which("gcloud"):
+                console.print("\nLaunching: gcloud auth application-default login")
+                try:
+                    _sp.run(["gcloud", "auth", "application-default", "login"], check=True)
+                    auth_ok, auth_msg = check_auth()
+                    if auth_ok:
+                        console.print("[green]✓[/] Authenticated")
+                    else:
+                        console.print("[red]✗[/] Auth failed after gcloud login")
+                except _sp.CalledProcessError:
+                    console.print("[red]✗[/] gcloud auth failed")
+            else:
+                console.print("\nOptions to set up credentials:")
+                console.print("  • Install gcloud: https://cloud.google.com/sdk/docs/install")
+                console.print("    Then run: gcloud auth application-default login")
+                console.print("  • Or set: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json")
 
+    # Step 4: Environment checks
     console.print("\n[bold]Verifying environment...[/]\n")
 
     t = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
@@ -1056,9 +1145,12 @@ def setup():
     ok, msg = check_ncu()
     _row("NCU binary", ok, msg)
 
-    if auth_ok:
+    if chosen_provider == "vertex" and auth_ok:
         ok, msg = check_vertex_connection(project_id, region)
         _row("Vertex AI", ok, msg)
+    elif chosen_provider == "local" and base_url:
+        ok, msg = check_local_connection(base_url)
+        _row("Local server", ok, msg)
 
     console.print(t)
     console.print(f"\n[bold green]Ready![/] Run: [cyan]kernelopt run <kernel.py>[/]")
@@ -1066,21 +1158,25 @@ def setup():
 
 @app.command()
 def doctor():
-    """Check environment health — config, credentials, GPU, NCU, Vertex AI."""
+    """Check environment health — config, credentials, GPU, NCU, LLM provider."""
     from rich.table import Table
 
     from kernelopt.config import config_path, load_config
     from kernelopt.functions.setup import (
         check_auth,
         check_gpu,
+        check_local_connection,
         check_ncu,
         check_python_version,
         check_vertex_connection,
     )
 
-    cfg = load_config().get("vertex", {})
-    project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") or cfg.get("project_id", "")
-    region = os.environ.get("VERTEX_REGION") or cfg.get("region", "")
+    file_cfg = load_config()
+    vertex_cfg = file_cfg.get("vertex", {})
+    provider_cfg = file_cfg.get("provider", {})
+    chosen_provider = provider_cfg.get("name", "vertex")
+    project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") or vertex_cfg.get("project_id", "")
+    region = os.environ.get("VERTEX_REGION") or vertex_cfg.get("region", "")
 
     t = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
     t.add_column("Check", style="dim", min_width=22)
@@ -1097,14 +1193,10 @@ def doctor():
 
     cp = config_path()
     _row("Config file", cp.exists(), str(cp) if cp.exists() else "not found — run: kernelopt setup")
-    _row("project_id", bool(project_id), project_id or "not set — run: kernelopt setup")
-    _row("region", bool(region), region or "not set — run: kernelopt setup")
+    _row("Provider", True, chosen_provider)
 
     ok, msg = check_python_version()
     _row("Python", ok, msg)
-
-    ok, msg = check_auth()
-    _row("Auth credentials", ok, msg)
 
     ok, msg = check_gpu()
     _row("GPU", ok, msg)
@@ -1112,11 +1204,23 @@ def doctor():
     ok, msg = check_ncu()
     _row("NCU binary", ok, msg)
 
-    if project_id and region:
-        ok, msg = check_vertex_connection(project_id, region)
-        _row("Vertex AI", ok, msg)
-    else:
-        _row("Vertex AI", False, "skipped — project_id or region not set")
+    if chosen_provider == "vertex":
+        _row("project_id", bool(project_id), project_id or "not set — run: kernelopt setup")
+        _row("region", bool(region), region or "not set — run: kernelopt setup")
+        ok, msg = check_auth()
+        _row("Auth credentials", ok, msg)
+        if project_id and region:
+            ok, msg = check_vertex_connection(project_id, region)
+            _row("Vertex AI", ok, msg)
+        else:
+            _row("Vertex AI", False, "skipped — project_id or region not set")
+    elif chosen_provider == "local":
+        base_url = provider_cfg.get("base_url") or os.environ.get("LOCAL_LLM_BASE_URL", "")
+        if base_url:
+            ok, msg = check_local_connection(base_url)
+            _row("Local server", ok, msg)
+        else:
+            _row("Local server", False, "base_url not configured — run: kernelopt setup")
 
     console.print(t)
     raise typer.Exit(0 if all_ok else 1)

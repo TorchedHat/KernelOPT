@@ -589,7 +589,8 @@ def _generate_with_feedback(group, llm_config: dict) -> Optional[str]:
 
     try:
         response = llm.invoke(messages)
-        source = response.content
+        from kernelopt.llm import strip_thinking
+        source = strip_thinking(response.content) if response.content else ""
         if not source or not source.strip():
             pipe_print("[fusion] LLM retry returned empty response.")
             return None
