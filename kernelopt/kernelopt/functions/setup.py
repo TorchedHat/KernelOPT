@@ -65,22 +65,6 @@ def check_auth() -> tuple[bool, str]:
         return False, "no credentials — run: gcloud auth application-default login"
 
 
-def check_local_connection(base_url: str) -> tuple[bool, str]:
-    """Check if a local OpenAI-compatible server is reachable."""
-    import urllib.request
-    import urllib.error
-
-    url = base_url.rstrip("/") + "/models"
-    try:
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5):
-            return True, f"server reachable at {base_url}"
-    except urllib.error.URLError as exc:
-        return False, f"not reachable at {base_url}: {exc.reason}"
-    except Exception as exc:
-        return False, f"not reachable at {base_url}: {exc}"
-
-
 def check_vertex_connection(project_id: str, region: str) -> tuple[bool, str]:
     try:
         from anthropic import AnthropicVertex

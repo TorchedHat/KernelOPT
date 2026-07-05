@@ -412,8 +412,7 @@ def generate_triton_kernel(
             SystemMessage(content=CODEGEN_SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ])
-        from kernelopt.llm import strip_thinking
-        source = strip_thinking(response.content) if response.content else ""
+        source = response.content
         if not source or not source.strip():
             pipe_print("[codegen] LLM returned empty response.")
             return None

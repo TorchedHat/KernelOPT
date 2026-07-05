@@ -139,14 +139,12 @@ def _check_cuda_with_llm_reference(
     model: str,
     project_id: str | None,
     region: str | None,
-    **llm_kwargs: object,
 ) -> tuple[bool, str]:
     """Ask Claude to write a C test harness, compile it, run it, check exit code."""
     from kernelopt.agents.schemas import CudaCorrectnessSpec
 
     llm = build_llm(model=model, api_key=api_key, max_tokens=4096,
-                    temperature=0.1, project_id=project_id, region=region,
-                    **llm_kwargs)
+                    temperature=0.1, project_id=project_id, region=region)
     structured_llm = llm.with_structured_output(CudaCorrectnessSpec)
 
     try:
@@ -489,7 +487,6 @@ def check_correctness(
     binary_path: str | None = None,
     original_pytorch_path: str | None = None,
     debug: bool = False,
-    **llm_kwargs: object,
 ) -> tuple[bool, str]:
     """
     Verify an optimized kernel is correct.
@@ -528,7 +525,6 @@ def check_correctness(
             model=model,
             project_id=project_id,
             region=region,
-            **llm_kwargs,
         )
 
     # Python kernels (Triton / Helion)
@@ -562,7 +558,6 @@ def check_correctness(
         project_id=project_id,
         region=region,
         kernel_args=kernel_args,
-        **llm_kwargs,
     )
 
 

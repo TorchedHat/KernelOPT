@@ -24,8 +24,6 @@ from pathlib import Path
 
 from langgraph.graph import END, StateGraph
 
-from kernelopt.llm import pipeline_llm_base_kwargs
-
 try:
     from langgraph.graph import START
 except ImportError:  # pragma: no cover
@@ -175,7 +173,12 @@ def profile_baseline(state: GraphState) -> dict:
             )
         pipe_print(f"  [dim]Compiled baseline binary: {compiled_binary}[/]")
 
-    llm_config = {"model": cfg.profiler_model or cfg.model, **pipeline_llm_base_kwargs(cfg)}
+    llm_config = {
+        "model": cfg.profiler_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     if cfg.baseline_csv and Path(cfg.baseline_csv).exists():
         pipe_print("[dim]Using provided baseline CSV[/]")
@@ -623,11 +626,16 @@ def analyze_strategy(state: GraphState) -> dict:
             "ncu_tier": ncu_tier,
         }}
 
-    from kernelopt.llm import build_llm, strip_thinking
+    from kernelopt.llm import build_llm
     import json as _json
 
     cfg = state["config"]
-    llm_config = {"model": cfg.planner_model or cfg.model, **pipeline_llm_base_kwargs(cfg)}
+    llm_config = {
+        "model": cfg.planner_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     pipe_print("  Analyzing optimization strategy...")
 
@@ -687,7 +695,7 @@ def analyze_strategy(state: GraphState) -> dict:
             HumanMessage(content=user_msg),
         ])
 
-        text = strip_thinking(response.content)
+        text = response.content.strip()
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -777,7 +785,12 @@ def generate_plans(state: GraphState) -> dict:
                 + "\n".join(failure_lines)
             )
 
-    llm_config = {"model": cfg.planner_model or cfg.model, **pipeline_llm_base_kwargs(cfg)}
+    llm_config = {
+        "model": cfg.planner_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     # Inject strategy context into profiling context for the planner
     strategy = state.get("optimization_strategy", {})
@@ -1216,7 +1229,12 @@ def execute_plans(state: GraphState) -> dict:
     if ui:
         ui.set_phase("Execute + correctness", f"{len(plans)} plans")
 
-    llm_config = {"model": cfg.executor_model or cfg.model, **pipeline_llm_base_kwargs(cfg)}
+    llm_config = {
+        "model": cfg.executor_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     executor_context = _build_executor_context(state)
     benchmark_src = state.get("_benchmark_kernel_source")
@@ -1401,9 +1419,6 @@ def execute_plans(state: GraphState) -> dict:
             api_key=cfg.api_key,
             project_id=cfg.project_id,
             region=cfg.region,
-            provider=cfg.llm_provider,
-            openai_base_url=cfg.openai_base_url,
-            hf_inference_provider=cfg.hf_inference_provider,
             kernel_args=cfg.kernel_args,
             binary_path=compiled_binary,
             original_pytorch_path=state.get("_baseline_standalone_path") or (kernel_path if state.get("_original_pytorch_path") else None),
@@ -1593,7 +1608,12 @@ def profile_candidates(state: GraphState) -> dict:
     saved_ncu_config = state.get("ncu_config")  # reuse baseline config — full bypass
     is_multi_kernel = baseline_kernel_id != 0 or bool(state.get("_original_pytorch_path"))
 
-    llm_config = {"model": cfg.profiler_model or cfg.model, **pipeline_llm_base_kwargs(cfg)}
+    llm_config = {
+        "model": cfg.profiler_model or cfg.model,
+        "api_key": cfg.api_key,
+        "project_id": cfg.project_id,
+        "region": cfg.region,
+    }
 
     ui = get_pipeline_ui()
     if ui:
@@ -1798,9 +1818,6 @@ def summarize_results(state: GraphState) -> dict:
                 model=cfg.summarizer_model or cfg.model,
                 project_id=cfg.project_id,
                 region=cfg.region,
-                provider=cfg.llm_provider,
-                openai_base_url=cfg.openai_base_url,
-                hf_inference_provider=cfg.hf_inference_provider,
             )
             if _show_summarize_spinner:
                 with phase_spinner("summarize", f"plan {c.plan_letter}"):

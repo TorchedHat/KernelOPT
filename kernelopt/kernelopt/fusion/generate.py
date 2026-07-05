@@ -218,8 +218,7 @@ def generate_fused_kernel(
     pipe_print(f"[fusion] Generating fused kernel for {group.group_id} ...")
     try:
         response = llm.invoke(messages)
-        from kernelopt.llm import strip_thinking
-        source = strip_thinking(response.content) if response.content else ""
+        source = response.content
         if not source or not source.strip():
             pipe_print("[fusion] LLM returned empty response.")
             return None
@@ -272,8 +271,7 @@ def generate_from_pattern_match(
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_prompt),
         ])
-        from kernelopt.llm import strip_thinking
-        source = strip_thinking(response.content) if response.content else ""
+        source = response.content
         if not source or not source.strip():
             pipe_print("[fusion] LLM returned empty response.")
             return None

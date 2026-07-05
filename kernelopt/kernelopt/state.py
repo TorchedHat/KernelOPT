@@ -92,9 +92,6 @@ class PipelineConfig:
     api_key: str | None = None
     project_id: str = ""
     region: str = "us-east5"
-    llm_provider: str = "vertex"
-    openai_base_url: str | None = None
-    hf_inference_provider: str = "auto"
 
     # Per-agent model overrides
     planner_model: str | None = None
