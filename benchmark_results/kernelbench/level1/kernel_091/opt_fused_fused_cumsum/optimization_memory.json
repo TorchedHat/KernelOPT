@@ -1,0 +1,252 @@
+[
+  {
+    "item_id": "exp_001_reverse_cumsum_eliminate_double_load",
+    "iteration": 1,
+    "speedup": 14.3333,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "eliminate_redundant_forward_load_in_reverse_cumsum",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 40.42,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 60578.0,
+        "Launch Statistics.Block Size": 1024.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 49.92,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Instruction Statistics.Executed Instructions": 562560.0,
+        "Memory Workload Analysis.Memory Throughput": 2.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4196.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 47.0,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Instruction Statistics.Executed Instructions": 3632.0,
+        "Memory Workload Analysis.Memory Throughput": 2.27
+      }
+    },
+    "strategy_title": "Eliminate Redundant Load in Reverse Cumsum Block Loop",
+    "strategy_description": "In a block-wise reverse cumsum kernel, each block iteration previously loaded the input twice: once in forward order to compute the block total (vals), and once in reversed order to compute the local reverse cumsum (rev_vals). Since tl.sum is order-invariant, the block total can be computed directly from rev_vals, eliminating the redundant forward load. This halves per-block memory traffic and reduces instruction count (562K \u2192 3.6K executed instructions), contributing to a 14x end-to-end speedup alongside a reduction in num_warps (32\u21924) that lowered register pressure from 64 to 47 registers/thread and raised Block Limit Registers from 1 to 10.",
+    "slow_pseudocode": "for block_idx in range(num_blocks-1, -1, -1):\n    offsets = block_start + arange(BLOCK_N)\n    vals = load(in_ptr + offsets, mask)          # forward load\n    rev_offsets = block_start + (BLOCK_N-1) - arange(BLOCK_N)\n    rev_vals = load(in_ptr + rev_offsets, mask)  # reversed load\n    rev_cumsum = cumsum(rev_vals) + running_sum\n    block_total = sum(vals)                      # redundant: uses forward load\n    running_sum += block_total\n    store(out_ptr + rev_offsets, rev_cumsum)",
+    "fast_pseudocode": "for block_idx in range(num_blocks-1, -1, -1):\n    rev_offsets = block_start + (BLOCK_N-1) - arange(BLOCK_N)\n    rev_vals = load(in_ptr + rev_offsets, mask)  # single load\n    rev_cumsum = cumsum(rev_vals) + running_sum\n    block_total = sum(rev_vals)                  # reuse rev_vals, no extra load\n    running_sum += block_total\n    store(out_ptr + rev_offsets, rev_cumsum)",
+    "applicable_when": "A kernel loop body loads the same input data twice in different orders (forward and reversed) within the same iteration, where one load is used only for a reduction (sum/max/min) that is order-invariant. Profiling shows high executed instruction count and MemoryCacheAccessPattern warnings for local loads/stores.",
+    "do_not_apply_when": "The two loads serve genuinely different purposes (e.g., one is masked differently, or the reduction is order-sensitive like prefix scan with non-commutative ops). Also inapplicable when the block total must be computed from a different slice than the reversed slice.",
+    "framework_notes": "Triton-specific: tl.sum(rev_vals, axis=0) is order-invariant so it correctly replaces tl.sum(vals, axis=0). The autotune configs were also changed from num_warps=32/16/8 (large blocks) to num_warps=4/8 (smaller blocks), which reduced registers/thread from 64 to 47 and raised Block Limit Registers from 1 to 10, improving theoretical occupancy from 50% to 62.5%."
+  },
+  {
+    "item_id": "exp_reverse_cumsum_dedup_load_001",
+    "iteration": 1,
+    "speedup": 1.0631,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "eliminate_duplicate_block_load_in_reverse_scan",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 40.42,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 60578.0,
+        "Instruction Statistics.Executed Instructions": 562560.0,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 32430.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.23,
+        "Compute Workload Analysis.SM Busy": 61.67
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 38.02,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 56986.0,
+        "Instruction Statistics.Executed Instructions": 547840.0,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 30292.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.84,
+        "Compute Workload Analysis.SM Busy": 65.69
+      }
+    },
+    "strategy_title": "Eliminate Redundant Block Load in Reverse Cumulative Scan",
+    "strategy_description": "In a reverse cumsum kernel that loads each block twice (once forward to compute block_total via tl.sum, once reversed for the scan), the forward load is redundant because sum is order-invariant: tl.sum(rev_vals) == tl.sum(vals). Removing the forward load reduces total executed instructions (~2.6% fewer) and L2 sector traffic (~6.6% fewer sectors), yielding a modest but consistent latency reduction. This pattern applies to any scan kernel where a block aggregate (sum, max, etc.) is computed separately from the reversed/permuted load of the same data.",
+    "slow_pseudocode": "for block_idx in range(num_blocks-1, -1, -1):\n    offsets = block_start + arange(BLOCK_N)\n    vals = load(in_ptr + offsets, mask)          # forward load\n    rev_vals = load(in_ptr + rev_offsets, mask)  # reversed load\n    block_total = sum(vals)                       # redundant: uses forward load\n    rev_cumsum = cumsum(rev_vals) + running_sum\n    running_sum += block_total\n    store(out_ptr + rev_offsets, rev_cumsum)",
+    "fast_pseudocode": "for block_idx in range(num_blocks-1, -1, -1):\n    rev_vals = load(in_ptr + rev_offsets, mask)  # single load only\n    block_total = sum(rev_vals)                   # sum is order-invariant\n    rev_cumsum = cumsum(rev_vals) + running_sum\n    running_sum += block_total\n    store(out_ptr + rev_offsets, rev_cumsum)",
+    "applicable_when": "A scan kernel loads the same block of data twice per iteration \u2014 once in original order to compute an aggregate (sum/max/min), and once in reversed/permuted order for the scan itself. The aggregate is order-invariant (e.g., sum, max). Profiling shows elevated executed instruction count and L2 sector traffic relative to the amount of useful work.",
+    "do_not_apply_when": "The two loads access different data (e.g., different rows or different memory regions). The aggregate is order-sensitive (e.g., prefix product with masking that depends on position). The kernel is already memory-bound at near-peak bandwidth where instruction count is not the bottleneck.",
+    "framework_notes": "Triton-specific: tl.sum and tl.cumsum are both axis=0 reductions/scans over a 1D tensor; sum is commutative so tl.sum(rev_vals) == tl.sum(vals) for the same elements. The same principle applies in CUDA with warp-level reductions."
+  },
+  {
+    "item_id": "exp_003_reverse_cumsum_larger_block_n_autotune",
+    "iteration": 2,
+    "speedup": 15.026,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_with_larger_block_n_single_pass",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4196.0,
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Scheduler Statistics.No Eligible": 89.28,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.11,
+        "Scheduler Statistics.Active Warps Per Scheduler": 0.86,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.05
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.69,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4010.0,
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Scheduler Statistics.No Eligible": 86.25,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.14,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.01,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.34
+      }
+    },
+    "strategy_title": "Add Larger BLOCK_N Autotune Configs for Single-Pass Row Processing",
+    "strategy_description": "When a Triton kernel processes rows in a loop over BLOCK_N-sized chunks and profiling shows a severely underutilized grid (few blocks vs. SM count, achieved occupancy far below theoretical, schedulers idle >85% of cycles), adding larger BLOCK_N autotune configs (e.g. 8192, 16384, 32768) allows the autotuner to select a single-pass config that eliminates the serial loop entirely. The improvement here was modest (2.82\u21922.69 \u00b5s, ~4.7% duration reduction) because the kernel was already very short and the grid remained at 4 blocks \u2014 the fundamental LaunchConfiguration bottleneck (4 blocks vs. 132 SMs) was not resolved by this change alone. This strategy is most impactful when combined with grid expansion (more rows/batches) that fills the SM array.",
+    "slow_pseudocode": "# Autotune configs top out at BLOCK_N=4096\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_N': 512},  num_warps=4, num_stages=2),\n    triton.Config({'BLOCK_N': 1024}, num_warps=4, num_stages=2),\n    triton.Config({'BLOCK_N': 2048}, num_warps=8, num_stages=2),\n    triton.Config({'BLOCK_N': 4096}, num_warps=8, num_stages=2),\n], key=['N'])\ndef kernel(in_ptr, out_ptr, M, N, BLOCK_N: tl.constexpr):\n    num_blocks = cdiv(N, BLOCK_N)  # e.g. 8 iterations for N=32768\n    for block_idx in range(num_blocks - 1, -1, -1):\n        ...  # serial loop over chunks",
+    "fast_pseudocode": "# Add larger configs so autotuner can select single-pass\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_N': 512},   num_warps=4,  num_stages=2),\n    triton.Config({'BLOCK_N': 1024},  num_warps=4,  num_stages=2),\n    triton.Config({'BLOCK_N': 2048},  num_warps=8,  num_stages=2),\n    triton.Config({'BLOCK_N': 4096},  num_warps=8,  num_stages=2),\n    triton.Config({'BLOCK_N': 8192},  num_warps=8,  num_stages=3),\n    triton.Config({'BLOCK_N': 16384}, num_warps=16, num_stages=3),\n    triton.Config({'BLOCK_N': 32768}, num_warps=32, num_stages=3),\n], key=['N'])\ndef kernel(in_ptr, out_ptr, M, N, BLOCK_N: tl.constexpr):\n    num_blocks = cdiv(N, BLOCK_N)  # =1 for N=32768 with BLOCK_N=32768\n    for block_idx in range(num_blocks - 1, -1, -1):\n        ...  # loop collapses to single iteration",
+    "applicable_when": "Triton kernel processes fixed-size rows in a serial loop over BLOCK_N chunks; profiling shows LaunchConfiguration warning (grid << SM count), achieved occupancy far below theoretical (e.g. <10% vs 60%+), scheduler idle >85% of cycles, and N is large enough (e.g. N>=8192) that larger tiles are feasible within shared memory / register budgets.",
+    "do_not_apply_when": "The grid is already large enough to saturate SMs (waves_per_sm >= 1). BLOCK_N is already at or near N. Register pressure is high (registers_per_thread near 255) and larger tiles would spill. The serial loop has data-dependent inter-iteration dependencies that cannot be collapsed (e.g. non-trivial running state that changes the computation, not just an additive accumulator).",
+    "framework_notes": "Triton-specific: num_stages=3 enables software pipelining for larger tiles, hiding HBM latency. num_warps should scale with BLOCK_N (e.g. num_warps=32 for BLOCK_N=32768 at FP32 to keep warp-level parallelism). The loop naturally collapses when BLOCK_N >= N because cdiv(N, BLOCK_N)=1; existing boundary masks (mask = offsets < N) handle the BLOCK_N > N edge case correctly without code changes."
+  },
+  {
+    "item_id": "exp_003_reverse_cumsum_xblock_row_batching",
+    "iteration": 2,
+    "speedup": 1.4303,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "xblock_row_batching_to_increase_grid_parallelism",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4196.0,
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 47.0,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Scheduler Statistics.One or More Eligible": 10.72,
+        "Instruction Statistics.Executed Instructions": 3632.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 42.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 28.26,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 42355.0,
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.49,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Scheduler Statistics.One or More Eligible": 28.71,
+        "Instruction Statistics.Executed Instructions": 189280.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 51.93,
+        "Memory Workload Analysis.L2 Hit Rate": 86.01
+      }
+    },
+    "strategy_title": "XBLOCK Row Batching Backfired: Register Explosion Kills Occupancy",
+    "strategy_description": "Adding an XBLOCK outer loop (multiple rows per CTA) via tl.static_range caused Triton to unroll the loop body into the register file, exploding registers/thread from 47 to 255. This drove Block Limit Registers from 10 to 1 and theoretical occupancy from 62.5% to 12.5%, while the grid size remained at 4 blocks (unchanged from before). The net effect was a 10x increase in kernel duration (2.82us \u2192 28.26us) despite the intent to increase parallelism. The XBLOCK batching strategy is counterproductive when the inner loop body is register-heavy: static unrolling multiplies register pressure by XBLOCK, negating any grid-size benefit.",
+    "slow_pseudocode": "# BEFORE: single row per CTA, low register pressure\nrow_id = program_id(0)\nrunning_sum = zeros([1])\nfor block_idx in range(num_blocks-1, -1, -1):\n    rev_vals = load(in_ptr + rev_offsets, mask)\n    rev_cumsum = cumsum(rev_vals) + running_sum\n    running_sum += sum(rev_vals)\n    store(out_ptr + rev_offsets, rev_cumsum)\n# grid = (M,)",
+    "fast_pseudocode": "# AFTER (regressed): XBLOCK rows per CTA via static_range unrolling\npid = program_id(0)\nrow_start = pid * XBLOCK\nfor x_off in static_range(XBLOCK):  # unrolled -> XBLOCK x register copies\n    row_id = row_start + x_off\n    running_sum = zeros([1])\n    for block_idx in range(num_blocks-1, -1, -1):\n        rev_vals = load(in_ptr + rev_offsets, mask)\n        rev_cumsum = cumsum(rev_vals) + running_sum\n        running_sum += sum(rev_vals)\n        store(out_ptr + rev_offsets, rev_cumsum)\n# grid = (ceil(M/XBLOCK),)",
+    "applicable_when": "Never applicable when the inner loop body is register-heavy (>32 regs/thread before batching). XBLOCK batching via tl.static_range is only safe when the per-row register footprint is very small (e.g., <16 regs/thread) so that XBLOCK copies still fit within the 255-register hardware limit without triggering register spilling or Block Limit Registers = 1.",
+    "do_not_apply_when": "The kernel already uses >32 registers/thread per row. The inner loop contains large tl.cumsum or tl.load operations over wide BLOCK_N tiles (these consume many registers). The grid is already small (< 132 blocks) and the bottleneck is LaunchConfiguration \u2014 in this case, increasing grid size via smaller BLOCK_N or splitting the problem dimension is safer than XBLOCK batching.",
+    "framework_notes": "Triton-specific: tl.static_range causes compile-time loop unrolling, which multiplies the register footprint of the loop body by the unroll factor (XBLOCK). With XBLOCK=4 and a body using ~64 regs, the compiler needs ~256 regs/thread, hitting the hardware maximum and forcing Block Limit Registers to 1. In CUDA, __launch_bounds__ or manual loop unrolling with #pragma unroll would have the same effect."
+  },
+  {
+    "item_id": "exp_003_reverse_cumsum_large_block_autotune_register_spill",
+    "iteration": 2,
+    "speedup": 1.4113,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_to_large_block_sizes_for_reverse_cumsum",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4196.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 47.0,
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Waves Per SM": 0.0,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Instruction Statistics.Executed Instructions": 3632.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 42.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 28.64,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 42906.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.49,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Instruction Statistics.Executed Instructions": 189376.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 51.93,
+        "Memory Workload Analysis.L2 Hit Rate": 83.99
+      }
+    },
+    "strategy_title": "Large BLOCK_N Configs Cause Register Spill and Severe Slowdown",
+    "strategy_description": "Adding very large BLOCK_N configs (32768, 16384, 8192) to the Triton autotune list caused the autotuner to select a config that maxed out register usage at 255 registers/thread \u2014 the hardware maximum \u2014 triggering massive register spilling to local memory. This drove Block Limit Registers from 10 down to 1 (only 1 block per SM), collapsed theoretical occupancy from 62.5% to 12.5%, and increased elapsed cycles from 4196 to 42906 (10x regression) despite the grid size remaining at 4 blocks. The L1/TEX hit rate rose from 0% to 51.9% due to spill traffic, not useful data reuse. When adding large tile configs to reduce grid-induced underutilization, always verify that the selected config does not exceed the register file capacity (~255 registers/thread is the hard ceiling); prefer smaller num_warps or explicit register caps to prevent spill.",
+    "slow_pseudocode": "# Autotune configs include very large BLOCK_N\nconfigs = [\n    Config({'BLOCK_N': 32768, 'XBLOCK': 1}, num_warps=8, num_stages=1),  # 255 regs/thread -> spill\n    Config({'BLOCK_N': 16384, 'XBLOCK': 1}, num_warps=8, num_stages=1),\n    Config({'BLOCK_N': 8192,  'XBLOCK': 1}, num_warps=8, num_stages=1),\n    ...\n]\n# Autotuner picks BLOCK_N=32768 -> 255 registers/thread, Block Limit Registers=1",
+    "fast_pseudocode": "# Keep BLOCK_N small enough to avoid register spill\nconfigs = [\n    Config({'BLOCK_N': 512,  'XBLOCK': 1}, num_warps=4, num_stages=2),\n    Config({'BLOCK_N': 1024, 'XBLOCK': 1}, num_warps=4, num_stages=2),\n    Config({'BLOCK_N': 2048, 'XBLOCK': 1}, num_warps=8, num_stages=2),\n    Config({'BLOCK_N': 4096, 'XBLOCK': 1}, num_warps=8, num_stages=2),\n]\n# Autotuner picks config with ~47 registers/thread, Block Limit Registers=10",
+    "applicable_when": "Triton autotune configs include very large BLOCK_N values (>=8192) with num_warps>=8 in kernels with significant per-thread register state (e.g., running accumulators, cumsum state). Profiling shows registers_per_thread at or near 255 and Block Limit Registers=1.",
+    "do_not_apply_when": "The kernel has minimal per-thread register state (e.g., simple elementwise ops) where large BLOCK_N does not cause register pressure. Also inapplicable when the grid is large enough that SM utilization is not a concern.",
+    "framework_notes": "Triton-specific: the autotuner selects the fastest config during warmup, but if a large BLOCK_N config causes register spill (255 regs/thread), it will appear slow during autotuning and may still be selected if the warmup data is noisy. Always check registers_per_thread in NCU after autotuning. The 255 register ceiling is a hardware constraint on NVIDIA GPUs (H100/A100). Block Limit Registers = floor(65536 / (regs_per_thread * threads_per_block))."
+  },
+  {
+    "item_id": "exp_003_reverse_cumsum_large_block_register_spill",
+    "iteration": 2,
+    "speedup": 0.8144,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_by_simplifying_in_register_reversal",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4196.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 47.0,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Instruction Statistics.Executed Instructions": 3632.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.05
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 49.63,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 74418.0,
+        "Launch Statistics.Block Size": 512.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 24.98,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Instruction Statistics.Executed Instructions": 392320.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 29.66,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.71
+      }
+    },
+    "strategy_title": "Large BLOCK_N Autotune Configs Increase Register Pressure",
+    "strategy_description": "Switching autotune configs to favor very large BLOCK_N values (32768, 16384, 8192) with large num_warps caused the autotuner to select a configuration with 512 threads/block and 64 registers/thread, raising Block Limit Registers from 10 to 2 and increasing kernel duration from 2.82\u00b5s to 49.63\u00b5s (17.6x slower). The large block sizes forced the compiler to spill registers to local memory, triggering CPIStall warnings (30.2% of cycles stalled on L1TEX) and MemoryCacheAccessPattern warnings for uncoalesced local loads/stores. The structural anti-pattern is: adding large-BLOCK_N autotune configs to a kernel that is already register-pressure-limited causes the autotuner to select a config that maximizes register spill, not throughput.",
+    "slow_pseudocode": "@triton.autotune(configs=[\n    triton.Config({'BLOCK_N': 32768}, num_warps=16, num_stages=1),\n    triton.Config({'BLOCK_N': 16384}, num_warps=8,  num_stages=1),\n    triton.Config({'BLOCK_N': 8192},  num_warps=8,  num_stages=2),\n    triton.Config({'BLOCK_N': 4096},  num_warps=4,  num_stages=2),\n    triton.Config({'BLOCK_N': 2048},  num_warps=4,  num_stages=2),\n    triton.Config({'BLOCK_N': 1024},  num_warps=4,  num_stages=3),\n    triton.Config({'BLOCK_N': 512},   num_warps=4,  num_stages=3),\n], key=['N'])\n# Result: autotuner picks BLOCK_N=512, num_warps=4 (block_size=512 threads)\n# 64 regs/thread, Block Limit Registers=2, Duration=49.63us",
+    "fast_pseudocode": "@triton.autotune(configs=[\n    triton.Config({'BLOCK_N': 512},  num_warps=4, num_stages=2),\n    triton.Config({'BLOCK_N': 1024}, num_warps=4, num_stages=2),\n    triton.Config({'BLOCK_N': 2048}, num_warps=8, num_stages=2),\n    triton.Config({'BLOCK_N': 4096}, num_warps=8, num_stages=2),\n], key=['N'])\n# Result: autotuner picks small block, 47 regs/thread, Block Limit Registers=10, Duration=2.82us",
+    "applicable_when": "A Triton kernel regresses after adding large-BLOCK_N autotune configs; registers/thread increases and Block Limit Registers drops to 1-2; CPIStall and MemoryCacheAccessPattern rules fire for local loads/stores (register spill traffic); kernel duration increases by >5x.",
+    "do_not_apply_when": "The kernel is memory-bandwidth-bound (DRAM throughput >50%) and large tiles are needed to amortize memory latency; or the kernel has low register usage (<32 regs/thread) where large BLOCK_N does not cause spill.",
+    "framework_notes": "Triton autotune selects the fastest config at runtime, but if large-BLOCK_N configs cause register spill (local memory traffic), the autotuner may still select them if the benchmark measurement is noisy or the spill cost is not apparent in short runs. Always verify registers/thread and Block Limit Registers after adding new autotune configs. In Triton, num_warps * 32 * registers_per_thread must stay below the SM register file size (65536 on H100) to avoid Block Limit Registers=1."
+  }
+]

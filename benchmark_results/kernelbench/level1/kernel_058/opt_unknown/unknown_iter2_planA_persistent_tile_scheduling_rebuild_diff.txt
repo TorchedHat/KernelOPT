@@ -1,0 +1,140 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -11,6 +12,7 @@
+         triton.Config({'BLOCK_OW': 128, 'BLOCK_OH': 1}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_OW': 32, 'BLOCK_OH': 4}, num_warps=8, num_stages=3),
+         triton.Config({'BLOCK_OW': 64, 'BLOCK_OH': 4}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_OW': 128, 'BLOCK_OH': 2}, num_warps=8, num_stages=2),
+     ],
+     key=['OD', 'OH', 'OW', 'IC', 'KD', 'KH', 'KW'],
+ )
+@@ -29,64 +31,77 @@
+     BLOCK_OW: tl.constexpr,
+     BLOCK_OH: tl.constexpr,
+ ):
+-    pid0 = tl.program_id(0)
+-    pid1 = tl.program_id(1)
+-    pid2 = tl.program_id(2)
++    # Persistent kernel: each CTA strides over all tiles
++    pid = tl.program_id(0)
++    num_sms = tl.num_programs(0)
+ 
+-    b_oc_od = pid0
+-    od = b_oc_od % OD
+-    b_oc = b_oc_od // OD
+-    oc = b_oc % OC
+-    b = b_oc // OC
++    # Compute tile grid dimensions from kernel params
++    num_oh_blocks = tl.cdiv(OH, BLOCK_OH)
++    num_ow_blocks = tl.cdiv(OW, BLOCK_OW)
++    total_tiles = B * OC * OD * num_oh_blocks * num_ow_blocks
+ 
+-    oh_start = pid1 * BLOCK_OH
+-    ow_start = pid2 * BLOCK_OW
++    tile_id = pid
++    while tile_id < total_tiles:
++        # Decode flat tile_id into (b_oc_od, oh_block, ow_block)
++        ow_block = tile_id % num_ow_blocks
++        tmp = tile_id // num_ow_blocks
++        oh_block = tmp % num_oh_blocks
++        b_oc_od = tmp // num_oh_blocks
+ 
+-    oh_offs = oh_start + tl.arange(0, BLOCK_OH)  # [BLOCK_OH]
+-    ow_offs = ow_start + tl.arange(0, BLOCK_OW)  # [BLOCK_OW]
++        od = b_oc_od % OD
++        b_oc = b_oc_od // OD
++        oc = b_oc % OC
++        b = b_oc // OC
+ 
+-    oh_mask = oh_offs < OH  # [BLOCK_OH]
+-    ow_mask = ow_offs < OW  # [BLOCK_OW]
++        oh_start = oh_block * BLOCK_OH
++        ow_start = ow_block * BLOCK_OW
+ 
+-    acc = tl.zeros([BLOCK_OH, BLOCK_OW], dtype=tl.float32)
++        oh_offs = oh_start + tl.arange(0, BLOCK_OH)  # [BLOCK_OH]
++        ow_offs = ow_start + tl.arange(0, BLOCK_OW)  # [BLOCK_OW]
+ 
+-    for ic in range(IC):
+-        for kd in range(KD):
+-            # od = id * SD - PD + kd  =>  id = (od + PD - kd) / SD
+-            od_src = od + PD - kd
+-            id_val = od_src // SD
+-            id_valid = (od_src >= 0) & (od_src % SD == 0) & (id_val >= 0) & (id_val < ID)
++        oh_mask = oh_offs < OH  # [BLOCK_OH]
++        ow_mask = ow_offs < OW  # [BLOCK_OW]
+ 
+-            for kh in range(KH):
+-                for kw in range(KW):
+-                    w_val = tl.load(weight_ptr + ic * s_wic + oc * s_woc + kd * s_wkd + kh * s_wkh + kw * s_wkw)
++        acc = tl.zeros([BLOCK_OH, BLOCK_OW], dtype=tl.float32)
+ 
+-                    # oh = ih * SH - PH + kh => ih = (oh + PH - kh) / SH
+-                    oh_src = oh_offs + PH - kh  # [BLOCK_OH]
+-                    ih_vals = oh_src // SH       # [BLOCK_OH]
+-                    ih_valid = (oh_src >= 0) & (oh_src % SH == 0) & (ih_vals >= 0) & (ih_vals < IH) & oh_mask  # [BLOCK_OH]
++        for ic in range(IC):
++            for kd in range(KD):
++                # od = id * SD - PD + kd  =>  id = (od + PD - kd) / SD
++                od_src = od + PD - kd
++                id_val = od_src // SD
++                id_valid = (od_src >= 0) & (od_src % SD == 0) & (id_val >= 0) & (id_val < ID)
+ 
+-                    ow_src = ow_offs + PW - kw  # [BLOCK_OW]
+-                    iw_vals = ow_src // SW       # [BLOCK_OW]
+-                    iw_valid = (ow_src >= 0) & (ow_src % SW == 0) & (iw_vals >= 0) & (iw_vals < IW) & ow_mask  # [BLOCK_OW]
++                for kh in range(KH):
++                    for kw in range(KW):
++                        w_val = tl.load(weight_ptr + ic * s_wic + oc * s_woc + kd * s_wkd + kh * s_wkh + kw * s_wkw)
+ 
+-                    inp_base = b * s_ib + ic * s_iic + id_val * s_iid
+-                    ih_ptrs = ih_vals * s_iih   # [BLOCK_OH]
+-                    iw_ptrs = iw_vals * s_iiw   # [BLOCK_OW]
++                        # oh = ih * SH - PH + kh => ih = (oh + PH - kh) / SH
++                        oh_src = oh_offs + PH - kh  # [BLOCK_OH]
++                        ih_vals = oh_src // SH       # [BLOCK_OH]
++                        ih_valid = (oh_src >= 0) & (oh_src % SH == 0) & (ih_vals >= 0) & (ih_vals < IH) & oh_mask  # [BLOCK_OH]
+ 
+-                    full_mask = id_valid & ih_valid[:, None] & iw_valid[None, :]  # [BLOCK_OH, BLOCK_OW]
+-                    inp_ptrs = input_ptr + inp_base + ih_ptrs[:, None] + iw_ptrs[None, :]
+-                    inp_vals = tl.load(inp_ptrs, mask=full_mask, other=0.0)
++                        ow_src = ow_offs + PW - kw  # [BLOCK_OW]
++                        iw_vals = ow_src // SW       # [BLOCK_OW]
++                        iw_valid = (ow_src >= 0) & (ow_src % SW == 0) & (iw_vals >= 0) & (iw_vals < IW) & ow_mask  # [BLOCK_OW]
+ 
+-                    acc += inp_vals * w_val
++                        inp_base = b * s_ib + ic * s_iic + id_val * s_iid
++                        ih_ptrs = ih_vals * s_iih   # [BLOCK_OH]
++                        iw_ptrs = iw_vals * s_iiw   # [BLOCK_OW]
+ 
+-    out_base = b * s_ob + oc * s_ooc + od * s_ood
+-    out_oh_ptrs = oh_offs * s_ooh  # [BLOCK_OH]
+-    out_ow_ptrs = ow_offs * s_oow  # [BLOCK_OW]
+-    out_ptrs = output_ptr + out_base + out_oh_ptrs[:, None] + out_ow_ptrs[None, :]
+-    out_mask = oh_mask[:, None] & ow_mask[None, :]
+-    tl.store(out_ptrs, acc, mask=out_mask)
++                        full_mask = id_valid & ih_valid[:, None] & iw_valid[None, :]  # [BLOCK_OH, BLOCK_OW]
++                        inp_ptrs = input_ptr + inp_base + ih_ptrs[:, None] + iw_ptrs[None, :]
++                        inp_vals = tl.load(inp_ptrs, mask=full_mask, other=0.0)
+ 
++                        acc += inp_vals * w_val
++
++        out_base = b * s_ob + oc * s_ooc + od * s_ood
++        out_oh_ptrs = oh_offs * s_ooh  # [BLOCK_OH]
++        out_ow_ptrs = ow_offs * s_oow  # [BLOCK_OW]
++        out_ptrs = output_ptr + out_base + out_oh_ptrs[:, None] + out_ow_ptrs[None, :]
++        out_mask = oh_mask[:, None] & ow_mask[None, :]
++        tl.store(out_ptrs, acc, mask=out_mask)
++
++        tile_id += num_sms
+ 
+ def kernel_function(weight, x):
+     # weight: [IC, OC, KD, KH, KW]

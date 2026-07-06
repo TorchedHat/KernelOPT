@@ -108,10 +108,6 @@ class OptimizationPlan(BaseModel):
         None,
         description="Why this optimization works on detected GPU architecture"
     )
-    memory_item_used: str | None = Field(
-        None,
-        description="item_id from optimization memory if applicable"
-    )
     confidence: Literal["high", "medium", "low"] = Field(
         ...,
         description="Confidence level in this optimization"
@@ -199,15 +195,28 @@ class ExperienceItem(BaseModel):
 
 
 class TestInput(BaseModel):
-    """Specification for one input tensor passed to the kernel wrapper."""
-    shape: list[int] = Field(..., description="Tensor shape, e.g. [4096, 1024]")
-    dtype: str = Field(..., description="PyTorch dtype: 'float32', 'float16', 'bfloat16', 'int32', 'int64'")
+    """Specification for one input passed to the kernel wrapper.
+
+    Supports two kinds:
+      - "tensor" (default): generates a PyTorch tensor from shape/dtype/distribution.
+      - "scalar": passes a Python float/int/bool directly (e.g. scaling factors, dims).
+    """
+    kind: str = Field(
+        "tensor",
+        description="'tensor' for a PyTorch tensor, 'scalar' for a Python float/int/bool"
+    )
+    # --- Tensor fields (used when kind="tensor") ---
+    shape: list[int] | None = Field(None, description="Tensor shape, e.g. [4096, 1024]. Required for kind='tensor'.")
+    dtype: str | None = Field(None, description="PyTorch dtype: 'float32', 'float16', 'bfloat16', 'int32', 'int64'. Required for kind='tensor'.")
     distribution: str = Field(
         "randn",
         description="'randn' (normal), 'rand' (uniform 0-1), 'randint', 'ones', 'zeros'"
     )
     low: float | None = Field(None, description="Lower bound for randint")
     high: float | None = Field(None, description="Upper bound for randint")
+    # --- Scalar fields (used when kind="scalar") ---
+    value: float | int | bool | None = Field(None, description="The scalar value to pass (e.g. 1.0, 3, True). Required for kind='scalar'.")
+    scalar_dtype: str | None = Field(None, description="'float', 'int', or 'bool'. Defaults to 'float'.")
 
 
 class CorrectnessSpec(BaseModel):
@@ -234,7 +243,7 @@ class CorrectnessSpec(BaseModel):
         description="Ordered specs for each input tensor passed to wrapper_function"
     )
     atol: float = Field(1e-3, description="Absolute tolerance for torch.allclose")
-    rtol: float = Field(1e-2, description="Relative tolerance for torch.allclose")
+    rtol: float = Field(1e-3, description="Relative tolerance for torch.allclose")
     skip: bool = Field(False, description="True only if automated testing is impossible")
     skip_reason: str | None = Field(None, description="Required when skip=True")
 

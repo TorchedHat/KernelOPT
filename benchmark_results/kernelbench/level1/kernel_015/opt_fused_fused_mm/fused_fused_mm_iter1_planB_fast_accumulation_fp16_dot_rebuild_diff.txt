@@ -1,0 +1,74 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,8 @@
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -51,7 +54,9 @@
+     rn = col_start + tl.arange(0, BLOCK_N)
+ 
+     # Compute matmul for this tile
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    # Use FP16 accumulator inside the dot loop to reduce register pressure
++    # and enable the Tensor Core FP16 HMMA fast-path
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+ 
+     # For lower triangular result: C[i,j] = sum_k A[i,k]*B[k,j] where i >= j
+     # Since A and B are lower triangular:
+@@ -71,31 +76,33 @@
+         k_start = k * BLOCK_K
+         k_offs = k_start + offs_k
+ 
+-        # Load A tile: shape [BLOCK_M, BLOCK_K]
++        # Load A tile: shape [BLOCK_M, BLOCK_K], cast to FP16 for Tensor Core fast-path
+         a_ptrs = A_base + k_offs[None, :] * stride_ak
+         mask_a = (offs_am[:, None] < M) & (k_offs[None, :] < K)
+-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
++        a = tl.load(a_ptrs, mask=mask_a, other=0.0).to(tl.float16)
+ 
+-        # Load B tile: shape [BLOCK_K, BLOCK_N]
++        # Load B tile: shape [BLOCK_K, BLOCK_N], cast to FP16 for Tensor Core fast-path
+         b_ptrs = B_base + k_offs[:, None] * stride_bk
+         mask_b = (k_offs[:, None] < K) & (offs_bn[None, :] < N)
+-        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
++        b = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.float16)
+ 
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
++        acc = tl.dot(a, b, acc=acc, out_dtype=tl.float16, allow_tf32=False)
++
++    # Upcast accumulator to FP32 before applying tril mask and storing
++    acc_fp32 = acc.to(tl.float32)
+ 
+     # Apply tril: zero out elements where col > row
+     row_idx = rm[:, None]  # [BLOCK_M, 1]
+     col_idx = rn[None, :]  # [1, BLOCK_N]
+     tril_mask = col_idx <= row_idx
+ 
+-    # Zero out upper triangular part
+-    acc = tl.where(tril_mask, acc, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
++    # Zero out upper triangular part (on FP32 accumulator)
++    acc_fp32 = tl.where(tril_mask, acc_fp32, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
+ 
+-    # Store result
++    # Store result (FP32)
+     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+     mask_c = (rm[:, None] < M) & (rn[None, :] < N)
+-    tl.store(c_ptrs, acc.to(tl.float32), mask=mask_c)
+-
++    tl.store(c_ptrs, acc_fp32, mask=mask_c)
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

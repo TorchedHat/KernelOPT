@@ -1,0 +1,131 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,8 +14,22 @@
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        # New configs: BLOCK_K=128 and num_stages=2 variants for Hopper pipeline
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=1, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        # New BLOCK_K=64 num_stages=1 configs for single-pass K coverage without pipeline overhead
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -30,70 +45,49 @@
+ ):
+     # Program ID
+     pid = tl.program_id(0)
+-    
++
+     # Number of blocks in M and N dimensions
+     grid_m = tl.cdiv(M, BLOCK_M)
+     grid_n = tl.cdiv(N, BLOCK_N)
+-    
++
+     # L2 cache optimization: group programs for better cache reuse
+     width = GROUP_M * grid_n
+     group_id = pid // width
+     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+     pid_m = group_id * GROUP_M + (pid % group_size)
+     pid_n = (pid % width) // group_size
+-    
+-    # Starting row/col for this block
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    rk = tl.arange(0, BLOCK_K)
+-    
+-    # Pointers to A and B blocks
+-    # A: [M, K], B: [K, N]
+-    A_ptrs = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+-    B_ptrs = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+-    
++
++    # Raw pointer arithmetic (lower register pressure than tl.make_block_ptr)
++    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M]
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # [BLOCK_N]
++    rk = tl.arange(0, BLOCK_K)                      # [BLOCK_K]
++    mask_m = rm < M   # [BLOCK_M]
++    mask_n = rn < N   # [BLOCK_N]
++
++    A_ptrs = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)  # [BLOCK_M, BLOCK_K]
++    B_ptrs = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)  # [BLOCK_K, BLOCK_N]
++
+     # Accumulator in float32
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    
+-    # Masks for boundary checking
+-    mask_m = rm < M
+-    mask_n = rn < N
+-    
+-    # Main loop over K dimension
++
++    # Main loop over K dimension with explicit masks
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+         k_remaining = K - k * BLOCK_K
+         mask_k = rk < k_remaining
+-        
+-        # Load A tile with boundary masking
+-        a = tl.load(
+-            A_ptrs,
+-            mask=mask_m[:, None] & mask_k[None, :],
+-            other=0.0
+-        )
+-        
+-        # Load B tile with boundary masking
+-        b = tl.load(
+-            B_ptrs,
+-            mask=mask_k[:, None] & mask_n[None, :],
+-            other=0.0
+-        )
+-        
+-        # Matrix multiply accumulate
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
+-        
++        a = tl.load(A_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
++        b = tl.load(B_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
++
++        # Cast to FP16 for Tensor Core acceleration; accumulator stays FP32
++        acc = tl.dot(a.to(tl.float16), b.to(tl.float16), acc=acc)
++
+         # Advance pointers
+         A_ptrs += BLOCK_K * stride_ak
+         B_ptrs += BLOCK_K * stride_bk
+-    
+-    # Store result
+-    cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    
+-    C_ptrs = C_ptr + (cm[:, None] * stride_cm + cn[None, :] * stride_cn)
+-    mask = (cm[:, None] < M) & (cn[None, :] < N)
+-    
++
++    # Store result (reuse rm/rn already computed)
++    C_ptrs = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
++    mask = mask_m[:, None] & mask_n[None, :]
+     tl.store(C_ptrs, acc.to(tl.float32), mask=mask)
+-
+ 
+ def kernel_function(a, b):
+     # Get dimensions

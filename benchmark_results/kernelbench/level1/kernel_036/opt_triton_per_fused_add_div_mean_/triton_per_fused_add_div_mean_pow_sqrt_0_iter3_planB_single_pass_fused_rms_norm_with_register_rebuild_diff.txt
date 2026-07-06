@@ -1,0 +1,93 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'XBLOCK': 1, 'BLOCK_R': 64}, num_warps=2, num_stages=1),
+-        triton.Config({'XBLOCK': 4, 'BLOCK_R': 64}, num_warps=4, num_stages=1),
+-        triton.Config({'XBLOCK': 8, 'BLOCK_R': 64}, num_warps=4, num_stages=1),
+-        triton.Config({'XBLOCK': 16, 'BLOCK_R': 64}, num_warps=8, num_stages=1),
+-        triton.Config({'XBLOCK': 32, 'BLOCK_R': 64}, num_warps=8, num_stages=1),
+-        triton.Config({'XBLOCK': 64, 'BLOCK_R': 64}, num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'BLOCK_R': 64}, num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 128, 'BLOCK_R': 64}, num_warps=8,  num_stages=2),
++        triton.Config({'XBLOCK': 256, 'BLOCK_R': 64}, num_warps=8,  num_stages=3),
++        triton.Config({'XBLOCK': 512, 'BLOCK_R': 64}, num_warps=16, num_stages=3),
++        triton.Config({'XBLOCK': 256, 'BLOCK_R': 64}, num_warps=16, num_stages=4),
++        triton.Config({'XBLOCK': 512, 'BLOCK_R': 64}, num_warps=16, num_stages=4),
++        triton.Config({'XBLOCK': 1024,'BLOCK_R': 64}, num_warps=16, num_stages=3),
++        triton.Config({'XBLOCK': 2048,'BLOCK_R': 64}, num_warps=16, num_stages=3),
+     ],
+     key=['xnumel', 'rnumel'],
+ )
+@@ -31,50 +34,30 @@
+     x_offsets = x_start + tl.arange(0, XBLOCK)
+     x_mask = x_offsets < xnumel
+ 
+-    # x_offsets indexes into the [112, 512, 512] = 29360128 spatial positions
+-    # For each spatial position x, the features are at:
+-    #   in_ptr[batch * (rnumel * spatial) + feat * spatial + spatial_pos]
+-    # where spatial = 512*512 = 262144
+-    # x_offsets = batch * 262144 + spatial_pos (within [0, 262144))
+-
+     # Compute batch index and spatial position within batch
+     spatial_size = 262144  # 512 * 512
+     batch_idx = x_offsets // spatial_size  # [XBLOCK]
+     spatial_pos = x_offsets % spatial_size  # [XBLOCK]
+ 
+-    # Accumulate sum of squares over feature dimension
++    batch_base = batch_idx * 16777216  # [XBLOCK]  (16777216 = 64 * 262144)
++    sp_base = spatial_pos              # [XBLOCK]
++
++    # Single pass: load once into register cache, accumulate sum-of-squares with FMA
++    # Use tl.static_range(BLOCK_R) so the compiler can index the list at compile time
++    channels = [tl.zeros([XBLOCK], dtype=tl.float32)] * BLOCK_R
+     acc = tl.zeros([XBLOCK], dtype=tl.float32)
++    for r in tl.static_range(BLOCK_R):
++        idx = batch_base + r * 262144 + sp_base  # [XBLOCK], coalesced in spatial dim
++        v = tl.load(in_ptr + idx, mask=x_mask, other=0.0).to(tl.float32)
++        channels[r] = v  # cache in register — no second load needed
++        acc = tl.math.fma(v, v, acc)  # FMA: v*v + acc in one instruction
+ 
+-    r_offsets = tl.arange(0, BLOCK_R)  # [BLOCK_R]
++    rms_inv = 1.0 / tl.sqrt(acc / rnumel + eps)  # precompute reciprocal once [XBLOCK]
+ 
+-    # Load all features at once since BLOCK_R == rnumel == 64
+-    # in_ptr layout: [112, 64, 512, 512] with strides [16777216, 262144, 512, 1]
+-    # index = batch_idx * 16777216 + feat * 262144 + spatial_pos
+-    # = batch_idx[:, None] * 16777216 + r_offsets[None, :] * 262144 + spatial_pos[:, None]
+-
+-    batch_base = batch_idx * 16777216  # [XBLOCK]
+-    sp_base = spatial_pos  # [XBLOCK]
+-
+-    # 2D load: [XBLOCK, BLOCK_R]
+-    indices = (batch_base[:, None] + r_offsets[None, :] * 262144 + sp_base[:, None])
+-    r_mask = r_offsets < rnumel  # [BLOCK_R]
+-    mask_2d = x_mask[:, None] & r_mask[None, :]  # [XBLOCK, BLOCK_R]
+-
+-    vals = tl.load(in_ptr + indices, mask=mask_2d, other=0.0)  # [XBLOCK, BLOCK_R]
+-    vals_f32 = vals.to(tl.float32)
+-
+-    sq = vals_f32 * vals_f32  # [XBLOCK, BLOCK_R]
+-    sum_sq = tl.sum(sq, axis=1)  # [XBLOCK]
+-
+-    mean_sq = sum_sq / rnumel
+-    rms = tl.sqrt(mean_sq + eps)  # [XBLOCK]
+-
+-    # Normalize and store
+-    normalized = vals_f32 / rms[:, None]  # [XBLOCK, BLOCK_R]
+-
+-    # Store back
+-    tl.store(out_ptr + indices, normalized.to(tl.float32), mask=mask_2d)
+-
++    # Normalize from register cache — NO memory loads in this loop
++    for r in tl.static_range(BLOCK_R):
++        idx = batch_base + r * 262144 + sp_base  # [XBLOCK]
++        tl.store(out_ptr + idx, channels[r] * rms_inv, mask=x_mask, eviction_policy='evict_first')
+ 
+ def kernel_function(x):
+     # x: [112, 64, 512, 512]

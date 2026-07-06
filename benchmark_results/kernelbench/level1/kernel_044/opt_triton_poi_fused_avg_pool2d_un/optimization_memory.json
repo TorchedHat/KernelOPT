@@ -1,0 +1,219 @@
+[
+  {
+    "item_id": "aaad5ced",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_memory_layout_and_reduce_register_pressure",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_memory_layout_and_reduce_register_pressure \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_memory_layout_and_reduce_register_pressure' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses a flat 1D decomposition: offsets = pid * BLOCK_SIZE + arange(BLOCK_SIZE), then decomposes via offsets % output_length and offsets // output_length. When a warp spans a (batch, channel) row boundary, adjacent threads load from different rows separated by input_length=65536 elements, causing strided uncoalesced accesses (117M excessive sectors, 16% overhead). Additionally, per-thread vector divisions for out_pos/channel/batch consume many registers (56/thread), limiting occupancy to 56.25%. Restructuring to a 2D grid pins each CTA to one (batch, channel) row, making all loads and stores fully coalesced and replacing expensive per-lane vector divisions with cheap scalar CTA-level arithmetic.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_hoisting_base_ptr_register_pressure",
+    "iteration": 1,
+    "speedup": 0.8024,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "hoist_loop_invariant_base_pointer_to_reduce_alu",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 56.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 52.75,
+        "Compute Workload Analysis.SM Busy": 87.03,
+        "GPU Speed Of Light Throughput.Duration": 2.68,
+        "Instruction Statistics.Executed Instructions": 1843424736.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 80.0,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Occupancy.Achieved Occupancy": 35.48,
+        "Compute Workload Analysis.SM Busy": 81.0,
+        "GPU Speed Of Light Throughput.Duration": 3.34,
+        "Instruction Statistics.Executed Instructions": 2130738944.0
+      }
+    },
+    "strategy_title": "Hoisting Loop-Invariant Base Pointer Backfires in Triton",
+    "strategy_description": "Hoisting loop-invariant base pointer arithmetic out of a static inner loop in Triton, intended to reduce ALU pressure and register usage, instead caused registers per thread to increase from 56 to 80. This drove theoretical occupancy down from 56.25% to 37.5% and achieved occupancy from 52.75% to 35.48%, increasing kernel duration from 2.68ms to 3.34ms (0.8x speedup). The Triton compiler already performs loop-invariant code motion internally; manually hoisting scalar base offsets can introduce additional live variables that the register allocator cannot eliminate, worsening register pressure rather than relieving it. Adding num_stages=2 to autotune configs simultaneously may have contributed to the register increase by requiring the compiler to keep more values live for software pipelining.",
+    "slow_pseudocode": "# Inside kernel, per output element:\nfor k in static_range(0, 8):\n    in_pos = win_start + k\n    valid = (in_pos >= 0) & (in_pos < input_length) & mask\n    in_idx = batch * channels * input_length + channel * input_length + in_pos\n    val = load(input_ptr + in_idx, mask=valid)\n    acc += val\nout_idx = batch * channels * output_length + channel * output_length + out_pos\nstore(output_ptr + out_idx, result, mask=mask)",
+    "fast_pseudocode": "# Attempted optimization (REGRESSED):\nbase_in  = batch * (channels * input_length) + channel * input_length\nbase_out = batch * (channels * output_length) + channel * output_length\nfor k in static_range(0, 8):\n    in_pos = win_start + k\n    valid  = (in_pos >= 0) & (in_pos < input_length) & mask\n    val    = load(input_ptr + base_in + in_pos, mask=valid)\n    acc   += val\nstore(output_ptr + base_out + out_pos, result, mask=mask)",
+    "applicable_when": "Never \u2014 this specific pattern caused regression. Avoid manually hoisting scalar base offsets out of tl.static_range loops in Triton when the kernel is already register-pressure limited (registers/thread > 48, theoretical occupancy < 75%).",
+    "do_not_apply_when": "When the kernel is already register-pressure limited (TheoreticalOccupancy rule triggered, Block Limit Registers < Block Limit Warps). Triton's compiler handles loop-invariant code motion; manual hoisting of scalar offsets adds live variables and increases register count. Also avoid adding num_stages to autotune configs simultaneously with other changes, as num_stages increases register usage for software pipelining.",
+    "framework_notes": "Triton-specific: tl.static_range loops are fully unrolled by the compiler, which already performs LICM. Manually hoisting scalars out of such loops can increase register pressure because the hoisted values must remain live across the entire unrolled sequence. In CUDA, manual LICM is more reliably beneficial because the compiler has less visibility into the unrolled structure."
+  },
+  {
+    "item_id": "exp_002_large_block_register_spill_occupancy",
+    "iteration": 2,
+    "speedup": 0.7486,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_with_large_block_sizes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 25.0,
+        "Launch Statistics.Grid Size": 4194368.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 85.23,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Compute Workload Analysis.SM Busy": 92.67,
+        "GPU Speed Of Light Throughput.Duration": 2.87,
+        "Instruction Statistics.Executed Instructions": 2097184000.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 82.0,
+        "Launch Statistics.Grid Size": 524296.0,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 29.37,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Compute Workload Analysis.SM Busy": 78.21,
+        "GPU Speed Of Light Throughput.Duration": 3.58,
+        "Instruction Statistics.Executed Instructions": 2216723488.0
+      }
+    },
+    "strategy_title": "Large Autotune Block Sizes Inflate Registers, Crush Occupancy",
+    "strategy_description": "Adding large BLOCK_SIZE configs (1024, 2048, 4096) to the Triton autotune search space caused the autotuner to select a configuration that drove registers per thread from 25 to 82. This collapsed theoretical occupancy from 100% to 31.25% (Block Limit Registers dropped from 16 to 5 blocks/SM) and achieved occupancy from 85.23% to 29.37%, increasing kernel duration from 2.87ms to 3.58ms. When a kernel's register count is sensitive to the amount of work unrolled per thread (e.g., large BLOCK_SIZE with a static inner loop), adding large block size configs to the autotune search can backfire: the autotuner optimizes for throughput in isolation but the register blowup from unrolling more iterations per thread more than offsets any reduction in grid overhead.",
+    "slow_pseudocode": "# Autotune configs with large block sizes selected by autotuner:\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),\n    triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),\n    triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),\n    ...\n], key=['output_length'])\ndef kernel(...):\n    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    for k in tl.static_range(0, 8):\n        val = tl.load(input_ptr + ... + offsets + k, mask=...)\n        acc += val\n    tl.store(output_ptr + ... + offsets, acc * inv_ks, mask=mask)\n# Result: registers/thread=82, theoretical occupancy=31.25%",
+    "fast_pseudocode": "# Autotune configs with small/moderate block sizes:\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_SIZE': 128}, num_warps=4),\n    triton.Config({'BLOCK_SIZE': 256}, num_warps=4),\n    triton.Config({'BLOCK_SIZE': 512}, num_warps=8),\n], key=['output_length'])\ndef kernel(...):\n    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    for k in tl.static_range(0, 8):\n        val = tl.load(input_ptr + ... + offsets + k, mask=...)\n        acc += val\n    tl.store(output_ptr + ... + offsets, acc * inv_ks, mask=mask)\n# Result: registers/thread=25, theoretical occupancy=100%",
+    "applicable_when": "Kernel uses tl.static_range inner loops (fully unrolled by compiler) combined with large BLOCK_SIZE autotune configs; registers/thread is sensitive to BLOCK_SIZE; TheoreticalOccupancy rule fires with Block Limit Registers < Block Limit Warps after autotuner selects a large config.",
+    "do_not_apply_when": "When the kernel is memory-bandwidth bound and register count is insensitive to BLOCK_SIZE (e.g., simple elementwise ops with no inner loops). Also inapplicable when the kernel already has low register count (<32/thread) regardless of BLOCK_SIZE.",
+    "framework_notes": "Triton-specific: tl.static_range loops are fully unrolled at compile time. Larger BLOCK_SIZE means more vector lanes, which combined with unrolled loop bodies can dramatically increase the number of live values the register allocator must track. In CUDA, __launch_bounds__ can cap register usage; in Triton, the only lever is restricting autotune BLOCK_SIZE configs to values that keep registers/thread within the occupancy-safe range (e.g., <=32 registers/thread for 100% theoretical occupancy on H200 with block_size=128)."
+  },
+  {
+    "item_id": "0a6bad87",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_memory_coalescing_with_2d_grid_no_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_memory_coalescing_with_2d_grid_no_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_memory_coalescing_with_2d_grid_no_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/opt_triton_poi_fused_avg_pool2d_un/triton_poi_fused_avg_pool2d_unsqueeze_0_iter3_planA_fix_memory_coalescing_with_2d_grid_no_au.",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses a flat 1D grid where offsets = pid*BLOCK_SIZE + arange(BLOCK_SIZE). The decomposition is: out_pos = offsets % output_length, channel = (offsets // output_length) % channels, batch = offsets // (output_length * channels). When a warp spans a (batch, channel) row boundary, adjacent threads load from rows separated by input_length=65536 elements (256KB stride), causing fully uncoalesced accesses \u2014 117M excessive sectors (16% overhead). The fix is a 2D grid: axis-1 indexes (batch, channel) pairs as a scalar per-CTA, axis-0 tiles output_length positions. Consecutive threads then access consecutive out_pos values within the same (batch, channel) row, achieving full coalescing. This also eliminates the expensive per-thread integer division chains (batch, channel, out_pos decomposition), reducing ALU pressure. Prior 2D grid attempts crashed due to @triton.autotune interaction bugs. This plan removes @triton.autotune entirely and uses a fixed BLOCK_SIZE=256, num_warps=4 configuration to avoid the crash.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/opt_triton_poi_fused_avg_poo",
+    "framework_notes": null
+  },
+  {
+    "item_id": "24c42cd2",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_memory_coalescing_via_2d_grid_without_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_memory_coalescing_via_2d_grid_without_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_memory_coalescing_via_2d_grid_without_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/opt_triton_poi_fused_avg_pool2d_un/triton_poi_fused_avg_pool2d_unsqueeze_0_iter3_planD_fix_memory_coalescing_via_2d_grid_withou.",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses a flat 1D grid: offsets = pid * BLOCK_SIZE + arange(BLOCK_SIZE), then decomposes via out_pos = offsets % output_length, channel = (offsets // output_length) % channels, batch = offsets // (output_length * channels). When a warp's 32 threads straddle a (batch, channel) row boundary, adjacent threads load from rows separated by input_length=65536 floats (256KB), producing fully uncoalesced accesses \u2014 117M excessive sectors (16% overhead). The fix is a 2D grid: axis-1 (pid_bc) indexes (batch, channel) pairs as a scalar per-CTA, axis-0 (pid_l) tiles output_length positions. Consecutive threads then access consecutive out_pos values within the same row, achieving full coalescing. All three prior attempts (items aaad5ced, 79259730, b96b58da) crashed because they combined @triton.autotune with the 2D grid. The solution is to REMOVE @triton.autotune entirely and use a fixed BLOCK_SIZE=512, num_warps=4 \u2014 avoiding the autotuner crash while still gaining coalescing.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/opt_triton_poi_fused_avg_poo",
+    "framework_notes": null
+  },
+  {
+    "item_id": "22107c77",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_memory_coalescing_via_3d_grid_no_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_memory_coalescing_via_3d_grid_no_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_memory_coalescing_via_3d_grid_no_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/opt_triton_poi_fused_avg_pool2d_un/triton_poi_fused_avg_pool2d_unsqueeze_0_iter4_planA_fix_memory_coalescing_via_3d_grid_no_aut.",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses a flat 1D grid: offsets = pid*BLOCK_SIZE + arange(BLOCK_SIZE), then decomposes via out_pos = offsets % output_length, channel = (offsets//output_length) % channels, batch = offsets//(output_length*channels). When a warp straddles a (batch,channel) row boundary, adjacent threads load from rows separated by input_length=65536 floats (256KB stride), producing 117M excessive sectors (16% overhead). The fix is a 3D grid: axis-2=batch, axis-1=channel, axis-0=output_length tiles. Consecutive threads then access consecutive out_pos values within the same (batch,channel) row, achieving full coalescing. This also eliminates the expensive per-thread integer division chains. All prior 2D-grid attempts crashed due to @triton.autotune interaction bugs \u2014 this plan removes @triton.autotune entirely and uses a fixed BLOCK_SIZE=256, num_warps=4 to avoid the crash.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/opt_triton_poi_fused_avg_poo",
+    "framework_notes": null
+  },
+  {
+    "item_id": "69ff3399",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_memory_coalescing_via_3d_grid_no_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_memory_coalescing_via_3d_grid_no_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_memory_coalescing_via_3d_grid_no_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: kernel timed out after 60s",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The flat 1D grid decomposes each thread's linear offset into (batch, channel, out_pos) via integer division and modulo chains. When a warp's 32 threads straddle a (batch, channel) row boundary, adjacent threads load from rows separated by input_length=65536 floats (256KB stride), producing fully uncoalesced accesses \u2014 117M excessive sectors (16% overhead). The ALU pipeline is at 72% utilization primarily from these per-thread div/mod chains. The fix is a 3D grid: axis-0=batch, axis-1=channel, axis-2=output_length tiles. Each CTA is pinned to one (batch, channel) row; batch and channel are scalar CTA-level values from tl.program_id(0) and tl.program_id(1). Consecutive threads within a CTA access consecutive out_pos values in the same row, achieving full coalescing. @triton.autotune is REMOVED because all prior 2D grid attempts crashed due to autotune interaction bugs.",
+    "do_not_apply_when": "Dry-run failed: kernel timed out after 60s",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_004_scalar_decomposition_register_blowup",
+    "iteration": 4,
+    "speedup": 0.7813,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "scalar_cta_index_decomposition_to_reduce_alu_and_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 30.0,
+        "Launch Statistics.Grid Size": 4194368.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 85.94,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Compute Workload Analysis.SM Busy": 90.4,
+        "GPU Speed Of Light Throughput.Duration": 3.0,
+        "Instruction Statistics.Executed Instructions": 2147516416.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.07
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 96.0,
+        "Launch Statistics.Grid Size": 524296.0,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 29.34,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Compute Workload Analysis.SM Busy": 87.63,
+        "GPU Speed Of Light Throughput.Duration": 3.43,
+        "Instruction Statistics.Executed Instructions": 2382401024.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.34
+      }
+    },
+    "strategy_title": "Scalar CTA Decomposition Backfires: Register Blowup Crushes Occupancy",
+    "strategy_description": "Replacing per-element vector integer division chains (4 vector div/mod ops) with scalar CTA-level decomposition plus a persistent while loop was intended to reduce register pressure, but instead caused registers per thread to jump from 30 to 96. This collapsed theoretical occupancy from 100% to 31.25% (Block Limit Registers dropped from 16 to 5 blocks/SM) and achieved occupancy from 85.94% to 29.34%, increasing kernel duration from 3.0ms to 3.43ms. The persistent while loop pattern (tile_id += num_programs) forces the compiler to keep many more values live across loop iterations \u2014 including the scalar decomposition intermediates, the vector out_pos, channel_v, batch_v, win_start, and accumulator \u2014 dramatically inflating the register file. The warp cycles per issued instruction actually improved (15.07 \u2192 5.34) but the occupancy collapse more than offset any latency-hiding benefit.",
+    "slow_pseudocode": "# Before: flat 1D grid, no persistent loop, 30 registers/thread\npid = tl.program_id(0)\noffsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\nmask = offsets < total\nout_pos = offsets % output_length       # vector div/mod\ntmp = offsets // output_length\nchannel = tmp % channels\nbatch = tmp // channels\nwin_start = out_pos * stride - padding\nacc = tl.zeros([BLOCK_SIZE], tl.float32)\nfor k in tl.static_range(0, 8):\n    in_idx = batch * C * L + channel * L + (win_start + k)\n    acc = fma(load(in_idx, mask=...), inv_ks, acc)\nstore(out_idx, acc, mask=mask)",
+    "fast_pseudocode": "# After: persistent while loop + scalar decomposition, 96 registers/thread (REGRESSED)\ntile_id = tl.program_id(0)\nnum_programs = tl.num_programs(0)\nwhile tile_id < num_tiles:\n    tile_start = tile_id * BLOCK_SIZE          # scalar\n    out_start_s = tile_start % output_length   # scalar\n    tmp_s = tile_start // output_length        # scalar\n    channel_s = tmp_s % channels               # scalar\n    batch_s = tmp_s // channels                # scalar\n    local_off = tl.arange(0, BLOCK_SIZE)\n    out_pos = out_start_s + local_off\n    row_inc = out_pos // output_length\n    out_pos = out_pos % output_length\n    channel_v = channel_s + row_inc\n    batch_v = batch_s + (channel_v // channels)\n    channel_v = channel_v % channels\n    # ... inner loop, store ...\n    tile_id += num_programs",
+    "applicable_when": "Never \u2014 this specific pattern caused regression. Avoid combining persistent while loops with scalar CTA-level decomposition in Triton when the kernel is already register-pressure sensitive.",
+    "do_not_apply_when": "When the kernel is already at or near 100% theoretical occupancy with moderate register counts (30 registers/thread). Persistent while loops in Triton force the compiler to keep all live values across iterations, dramatically inflating register usage. The scalar decomposition intermediates (tile_start, out_start_s, tmp_s, channel_s, batch_s) plus the resulting vectors (out_pos, channel_v, batch_v, win_start, acc) all remain live simultaneously, causing register blowup. This pattern is especially harmful when the inner loop is a tl.static_range (fully unrolled), as all unrolled iterations' values must be live concurrently.",
+    "framework_notes": "Triton-specific: persistent kernel patterns (while tile_id < num_tiles: ... tile_id += num_programs) prevent the compiler from reusing registers across tiles because all loop-carried values must remain live. In CUDA, persistent kernels can be more register-efficient because the compiler has more control over register allocation across loop iterations. Also: adding large BLOCK_SIZE configs (2048, 4096) to autotune simultaneously with a persistent loop compounds the register pressure problem."
+  }
+]

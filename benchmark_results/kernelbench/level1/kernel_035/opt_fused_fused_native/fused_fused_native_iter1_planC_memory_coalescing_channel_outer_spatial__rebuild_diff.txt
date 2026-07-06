@@ -1,0 +1,115 @@
+--- baseline
++++ rebuilt
+@@ -4,16 +4,17 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_R': 1024}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_R': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_R': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_R': 1024}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_R': 2048}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_R': 4096}, num_warps=16, num_stages=2),
+         triton.Config({'BLOCK_R': 512},  num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_R': 256},  num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_R': 128},  num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_R': 2048}, num_warps=16, num_stages=2),
+         triton.Config({'BLOCK_R': 512},  num_warps=4, num_stages=4),
+-        triton.Config({'BLOCK_R': 1024}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_R': 256},  num_warps=8, num_stages=4),
+     ],
+     key=['C_per_group', 'HW'],
+ )
+@@ -36,59 +37,53 @@
+     batch_idx = pid // G
+     group_idx = pid % G
+ 
+-    # Total elements per group = C_per_group * HW
+-    group_size = C_per_group * HW
+-
+     # Base pointer for this (batch, group)
+     # X shape: [N, C, HW] logically
+     # group starts at channel: group_idx * C_per_group
+     base_offset = batch_idx * C * HW + group_idx * C_per_group * HW
+ 
+     # Pass 1: Compute mean and variance using Welford's online algorithm
++    # Restructured to channel-outer, spatial-inner for cache locality
+     mean = tl.zeros((), dtype=tl.float32)
+     m2 = tl.zeros((), dtype=tl.float32)
+     count = tl.zeros((), dtype=tl.float32)
+ 
+-    for start in tl.range(0, group_size, BLOCK_R):
+-        offsets = start + tl.arange(0, BLOCK_R)
+-        mask = offsets < group_size
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++    for c in tl.static_range(0, C_per_group):
++        base_offset_c = base_offset + c * HW
++        for hw_start in tl.range(0, HW, BLOCK_R):
++            hw_offsets = hw_start + tl.arange(0, BLOCK_R)
++            mask = hw_offsets < HW
++            x = tl.load(X_ptr + base_offset_c + hw_offsets, mask=mask, other=0.0).to(tl.float32)
+ 
+-        # Welford update
+-        block_count = tl.sum(mask.to(tl.float32), axis=0)
+-        block_mean = tl.sum(tl.where(mask, x, tl.zeros_like(x)), axis=0) / tl.maximum(block_count, 1.0)
+-        block_m2 = tl.sum(tl.where(mask, (x - block_mean) * (x - block_mean), tl.zeros_like(x)), axis=0)
++            # Welford update
++            block_count = tl.sum(mask.to(tl.float32), axis=0)
++            block_mean = tl.sum(tl.where(mask, x, tl.zeros_like(x)), axis=0) / tl.maximum(block_count, 1.0)
++            block_m2 = tl.sum(tl.where(mask, (x - block_mean) * (x - block_mean), tl.zeros_like(x)), axis=0)
+ 
+-        # Merge with running stats
+-        new_count = count + block_count
+-        delta = block_mean - mean
+-        mean = tl.where(new_count > 0, mean + delta * block_count / new_count, mean)
+-        m2 = m2 + block_m2 + delta * delta * count * block_count / tl.maximum(new_count, 1.0)
+-        count = new_count
++            # Merge with running stats
++            new_count = count + block_count
++            delta = block_mean - mean
++            mean = tl.where(new_count > 0, mean + delta * block_count / new_count, mean)
++            m2 = m2 + block_m2 + delta * delta * count * block_count / tl.maximum(new_count, 1.0)
++            count = new_count
+ 
+     variance = m2 / tl.maximum(count, 1.0)
+     inv_std = libdevice.rsqrt(variance + eps)
+ 
+     # Pass 2: Normalize and apply weight/bias
+-    for start in tl.range(0, group_size, BLOCK_R):
+-        offsets = start + tl.arange(0, BLOCK_R)
+-        mask = offsets < group_size
+-
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
+-
+-        # Compute channel index for weight/bias
+-        # offsets maps to: channel_in_group = offsets // HW, spatial = offsets % HW
+-        channel_in_group = offsets // HW
+-        channel_idx = group_idx * C_per_group + channel_in_group
+-
+-        w = tl.load(W_ptr + channel_idx, mask=mask, other=1.0).to(tl.float32)
+-        b = tl.load(B_ptr + channel_idx, mask=mask, other=0.0).to(tl.float32)
+-
+-        x_norm = (x - mean) * inv_std
+-        y = x_norm * w + b
+-
+-        tl.store(Y_ptr + base_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask)
+-
++    # channel-outer, spatial-inner: load w and b once per channel as scalars
++    for c in tl.static_range(0, C_per_group):
++        channel_idx = group_idx * C_per_group + c
++        w = tl.load(W_ptr + channel_idx).to(tl.float32)   # scalar, loaded once per channel
++        b = tl.load(B_ptr + channel_idx).to(tl.float32)   # scalar, loaded once per channel
++        base_offset_c = base_offset + c * HW
++        for hw_start in tl.range(0, HW, BLOCK_R):
++            hw_offsets = hw_start + tl.arange(0, BLOCK_R)
++            mask = hw_offsets < HW
++            x = tl.load(X_ptr + base_offset_c + hw_offsets, mask=mask, other=0.0).to(tl.float32)
++            x_norm = (x - mean) * inv_std
++            y = x_norm * w + b
++            tl.store(Y_ptr + base_offset_c + hw_offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask)
+ 
+ def kernel_function(weight, bias, x):
+     N, C, H, W = x.shape

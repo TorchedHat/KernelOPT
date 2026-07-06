@@ -1,0 +1,66 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,22 @@
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # New low-register-pressure configs
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        # New Tensor Core configs with larger BLOCK_K
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -50,6 +67,13 @@
+     rm = row_start + tl.arange(0, BLOCK_M)
+     rn = col_start + tl.arange(0, BLOCK_N)
+ 
++    # Early-exit: entire tile is above the diagonal (col_start >= row_start + BLOCK_M)
++    if col_start >= row_start + BLOCK_M:
++        c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
++        mask_c = (rm[:, None] < M) & (rn[None, :] < N)
++        tl.store(c_ptrs, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32), mask=mask_c)
++        return
++
+     # Compute matmul for this tile
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+@@ -81,7 +105,9 @@
+         mask_b = (k_offs[:, None] < K) & (offs_bn[None, :] < N)
+         b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+ 
+-        acc = tl.dot(a, b, acc=acc, allow_tf32=False)
++        a_fp16 = a.to(tl.float16)  # cast for Tensor Core
++        b_fp16 = b.to(tl.float16)  # cast for Tensor Core
++        acc = tl.dot(a_fp16, b_fp16, acc=acc)  # WGMMA.MMA_F32_F16, acc stays float32
+ 
+     # Apply tril: zero out elements where col > row
+     row_idx = rm[:, None]  # [BLOCK_M, 1]
+@@ -95,7 +121,6 @@
+     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+     mask_c = (rm[:, None] < M) & (rn[None, :] < N)
+     tl.store(c_ptrs, acc.to(tl.float32), mask=mask_c)
+-
+ 
+ def kernel_function(a, b):
+     M, K = a.shape

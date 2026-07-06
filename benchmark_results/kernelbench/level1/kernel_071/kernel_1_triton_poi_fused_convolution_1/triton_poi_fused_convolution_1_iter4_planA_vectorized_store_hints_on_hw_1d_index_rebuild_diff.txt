@@ -1,0 +1,105 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,79 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 64},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 16},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 256}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 256}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=4, num_stages=2),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    # ynumel = 4096 = N*C = 32*128
++    # xnumel = 31500 = H*W = 126*250
++    # YBLOCK tiles over N*C (channel dimension, stride=1 in input)
++    # XBLOCK tiles over H*W (spatial dimension, stride=1 in output)
++    # This makes loads coalesced (c stride=1) and stores coalesced (hw stride=1)
+ 
++    pid_hw = tl.program_id(0)   # spatial tile index
++    pid_nc = tl.program_id(1)   # N*C tile index
+ 
++    hw_start = pid_hw * XBLOCK
++    nc_start = pid_nc * YBLOCK
++
++    # c_idx varies along YBLOCK (fast axis for loads, stride=1 in input)
++    nc_idx = tl.arange(0, YBLOCK)   # [YBLOCK]
++    # hw_idx varies along XBLOCK (fast axis for stores, stride=1 in output)
++    hw_idx = tl.arange(0, XBLOCK)   # [XBLOCK]
++
++    nc = nc_start + nc_idx   # flat N*C index [YBLOCK]
++
++    # hw with XBLOCK-aligned contiguity hints for vectorized stores.
++    # hw_start = pid_hw * XBLOCK is always a multiple of XBLOCK (constexpr).
++    # arange(XBLOCK) produces XBLOCK consecutive integers starting at 0.
++    # These two facts make both assertions valid and enable float4 vectorized stores.
++    hw = tl.max_contiguous(
++        tl.multiple_of(hw_start + hw_idx, XBLOCK),
++        XBLOCK
++    )  # [XBLOCK] - 1D, hints applied BEFORE broadcast
++
++    n = nc // 128   # batch index [YBLOCK]
++    c = nc % 128    # channel index [YBLOCK]
++
++    nc_mask = nc < ynumel
++    hw_mask = hw < xnumel
++    mask2d  = nc_mask[:, None] & hw_mask[None, :]
++
++    # COALESCED LOAD: c varies with stride=1 in input (channels-last layout)
++    # Input stride: (4032000, 1, 32000, 128) -> flat = n*4032000 + hw*128 + c
++    # Do NOT apply contiguity hints to load_ptrs (hw[None,:]*128 is stride-128 in input)
++    load_ptrs = (in_ptr0
++                 + n[:, None]      * 4032000
++                 + hw[None, :]     * 128
++                 + c[:, None]      * 1)
++    tmp = tl.load(load_ptrs, mask=mask2d, other=0.0)
++
++    # COALESCED STORE: hw varies with stride=1 in output (contiguous layout)
++    # Output stride: (4032000, 31500, 250, 1) -> flat = n*4032000 + c*31500 + hw
++    # hw already has XBLOCK-aligned contiguity hints applied above (1D, before broadcast)
++    store_ptrs = (out_ptr0
++                  + n[:, None]     * 4032000
++                  + c[:, None]     * 31500
++                  + hw[None, :]    * 1)   # broadcast happens here, after hints
++    tl.store(store_ptrs, tmp, mask=mask2d)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +85,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

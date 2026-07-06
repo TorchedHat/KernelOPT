@@ -6,9 +6,14 @@ import json
 from pathlib import Path
 
 EXPN = 8        # queue capacity (default)
-T_POS = 1.04    # min speedup to store positive item
-T_NEG = 1.15    # min slowdown factor to store negative item
+T_POS = 1.04    # min speedup to store positive item (empirically tuned)
+T_NEG = 1.15    # min slowdown factor to store negative item (empirically tuned)
 TOP_K = 4       # max items added per iteration
+
+# Seeds for reproducible correctness testing.  Three random seeds plus
+# input diversity; used by both the agentic correctness agent and the
+# compiler-first correctness path.
+CORRECTNESS_SEEDS = [0, 42, 1337]
 
 
 def should_store(speedup: float, t_pos: float = T_POS, t_neg: float = T_NEG) -> bool:

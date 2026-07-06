@@ -1,0 +1,60 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -51,27 +52,33 @@
+     acc = tl.zeros([BLOCK_OH, BLOCK_OW], dtype=tl.float32)
+ 
+     for ic in range(IC):
++        # Hoist ic-level base outside kd+kh+kw loops
++        ic_base = b * s_ib + ic * s_iic
+         for kd in range(KD):
++            # Hoist kd-level scalars outside kh+kw loops
+             # od = id * SD - PD + kd  =>  id = (od + PD - kd) / SD
+             od_src = od + PD - kd
+             id_val = od_src // SD
+             id_valid = (od_src >= 0) & (od_src % SD == 0) & (id_val >= 0) & (id_val < ID)
++            # Use tl.where to guard pointer arithmetic when id_valid is False
++            safe_id_val = tl.where(id_valid, id_val, 0)
++            inp_base = ic_base + safe_id_val * s_iid  # hoist outside kh+kw
+ 
+             for kh in range(KH):
++                # Hoist kh-level vectors outside kw loop
++                # oh = ih * SH - PH + kh => ih = (oh + PH - kh) / SH
++                oh_src = oh_offs + PH - kh          # [BLOCK_OH]
++                ih_vals = oh_src // SH               # [BLOCK_OH]
++                ih_valid = (oh_src >= 0) & (oh_src % SH == 0) & (ih_vals >= 0) & (ih_vals < IH) & oh_mask  # [BLOCK_OH]
++                ih_ptrs = ih_vals * s_iih            # [BLOCK_OH]
++
+                 for kw in range(KW):
+                     w_val = tl.load(weight_ptr + ic * s_wic + oc * s_woc + kd * s_wkd + kh * s_wkh + kw * s_wkw)
+ 
+-                    # oh = ih * SH - PH + kh => ih = (oh + PH - kh) / SH
+-                    oh_src = oh_offs + PH - kh  # [BLOCK_OH]
+-                    ih_vals = oh_src // SH       # [BLOCK_OH]
+-                    ih_valid = (oh_src >= 0) & (oh_src % SH == 0) & (ih_vals >= 0) & (ih_vals < IH) & oh_mask  # [BLOCK_OH]
+-
++                    # Only kw-dependent computation remains here
+                     ow_src = ow_offs + PW - kw  # [BLOCK_OW]
+                     iw_vals = ow_src // SW       # [BLOCK_OW]
+                     iw_valid = (ow_src >= 0) & (ow_src % SW == 0) & (iw_vals >= 0) & (iw_vals < IW) & ow_mask  # [BLOCK_OW]
+-
+-                    inp_base = b * s_ib + ic * s_iic + id_val * s_iid
+-                    ih_ptrs = ih_vals * s_iih   # [BLOCK_OH]
+                     iw_ptrs = iw_vals * s_iiw   # [BLOCK_OW]
+ 
+                     full_mask = id_valid & ih_valid[:, None] & iw_valid[None, :]  # [BLOCK_OH, BLOCK_OW]
+@@ -86,7 +93,6 @@
+     out_ptrs = output_ptr + out_base + out_oh_ptrs[:, None] + out_ow_ptrs[None, :]
+     out_mask = oh_mask[:, None] & ow_mask[None, :]
+     tl.store(out_ptrs, acc, mask=out_mask)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: [IC, OC, KD, KH, KW]

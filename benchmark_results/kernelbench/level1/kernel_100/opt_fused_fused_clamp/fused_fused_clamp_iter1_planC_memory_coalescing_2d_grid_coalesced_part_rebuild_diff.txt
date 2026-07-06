@@ -1,0 +1,65 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,14 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_N': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_N': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_N': 512},  num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_N': 4096}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_N': 256},  num_warps=8, num_stages=2),
+     ],
+     key=['M', 'N'],
+ )
+@@ -21,22 +21,24 @@
+     pred_stride_m, pred_stride_n,
+     BLOCK_N: tl.constexpr,
+ ):
+-    row_id = tl.program_id(0)
+-    if row_id >= M:
+-        return
++    BLOCK_ROWS: tl.constexpr = 32
++    block_start = tl.program_id(0) * BLOCK_ROWS
++    row_ids = block_start + tl.arange(0, BLOCK_ROWS)
++    row_mask = row_ids < M
+ 
+-    acc = tl.zeros((), dtype=tl.float32)
++    acc = tl.zeros([BLOCK_ROWS], dtype=tl.float32)
+ 
+     for col_off in range(0, N, BLOCK_N):
+         cols = col_off + tl.arange(0, BLOCK_N)
+-        mask = cols < N
+-        pred = tl.load(pred_ptr + row_id * pred_stride_m + cols * pred_stride_n, mask=mask, other=0.0)
+-        tgt = tl.load(target_ptr + cols, mask=mask, other=0.0)
+-        val = 1.0 - pred * tgt
++        col_mask = cols < N
++        pred_ptrs = pred_ptr + row_ids[:, None] * pred_stride_m + cols[None, :] * pred_stride_n
++        pred = tl.load(pred_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=0.0)
++        tgt = tl.load(target_ptr + cols, mask=col_mask, other=0.0)
++        val = 1.0 - pred * tgt[None, :]
+         val = tl.where(val > 0.0, val, 0.0)
+-        acc += tl.sum(val, axis=0)
++        acc += tl.sum(val, axis=1)
+ 
+-    tl.store(partial_ptr + row_id, acc)
++    tl.store(partial_ptr + row_ids, acc, mask=row_mask)
+ 
+ 
+ @triton.autotune(
+@@ -49,6 +51,7 @@
+     key=['M'],
+ )
+ @triton.jit
++
+ def hinge_loss_reduce_kernel(
+     partial_ptr, out_ptr,
+     M, total_elements,

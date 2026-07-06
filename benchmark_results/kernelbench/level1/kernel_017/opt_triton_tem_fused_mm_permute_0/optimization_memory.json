@@ -1,0 +1,222 @@
+[
+  {
+    "item_id": "tf32_tensor_core_enable_triton_dot",
+    "iteration": 1,
+    "speedup": 25.6732,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "enable_tf32_in_triton_dot",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + TheoreticalOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 28.85,
+        "GPU Speed Of Light Throughput.Duration": 10850.0,
+        "GPU Speed Of Light Throughput.Memory Throughput": 42.55,
+        "Occupancy.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Memory Workload Analysis.Memory Throughput": 76.1,
+        "Scheduler Statistics.No Eligible": 70.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.43
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.43,
+        "GPU Speed Of Light Throughput.Duration": 422.62,
+        "GPU Speed Of Light Throughput.Memory Throughput": 72.46,
+        "Occupancy.Registers Per Thread": 202.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Memory Workload Analysis.Memory Throughput": 956.67,
+        "Scheduler Statistics.No Eligible": 67.66,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.37
+      }
+    },
+    "strategy_title": "Enable TF32 Tensor Cores in Triton dot product",
+    "strategy_description": "When a Triton matmul kernel uses `allow_tf32=False` in `tl.dot`, it forces scalar FP32 FFMA execution (~67 TFLOPS on H200) instead of TF32 Tensor Cores (~989 TFLOPS). Flipping `allow_tf32=True` routes the MMA through Tensor Core hardware, yielding a 25x speedup: compute SOL jumped from 28.85% to 92.43% and duration dropped from 10.85 ms to 0.42 ms. Register pressure also decreased (255 \u2192 202 registers/thread) as a side effect of using the Tensor Core pipeline instead of scalar FFMA units.",
+    "slow_pseudocode": "# Inside K-loop in Triton matmul kernel\nacc = tl.dot(a, tl.trans(b), acc=acc, allow_tf32=False)  # forces scalar FFMA",
+    "fast_pseudocode": "# Inside K-loop in Triton matmul kernel\nacc = tl.dot(a, tl.trans(b), acc=acc, allow_tf32=True)   # uses TF32 Tensor Cores",
+    "applicable_when": "Triton kernel uses tl.dot with allow_tf32=False; compute SOL is low (<40%) while occupancy is also low; GPU has high-throughput Tensor Core path (Volta/Turing/Ampere/Hopper); correctness tolerance allows TF32 precision (atol ~1e-3 for typical K dimensions up to ~8192)",
+    "do_not_apply_when": "Strict FP32 bit-exact results are required; accumulator dtype is not float32; problem requires double-precision (fp64) arithmetic; correctness check uses atol < 1e-3",
+    "framework_notes": "Triton-specific: the `allow_tf32` parameter in `tl.dot` controls whether the MMA instruction uses TF32 (10-bit mantissa) or full FP32 (23-bit mantissa). In CUDA, the equivalent is `cublasMath_t` with `CUBLAS_TF32_TENSOR_OP_MATH` or `__nv_bfloat16` accumulation. The accumulator tensor dtype (tl.float32) is unchanged; only the MMA hardware path changes."
+  },
+  {
+    "item_id": "eliminate_tl_trans_b_tile_reshape_bank_conflict_triton",
+    "iteration": 2,
+    "speedup": 25.6053,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "eliminate_shared_memory_bank_conflicts_via_b_tile_padding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 422.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.43,
+        "GPU Speed Of Light Throughput.Memory Throughput": 72.46,
+        "Memory Workload Analysis.Memory Throughput": 956.67,
+        "Memory Workload Analysis.L2 Hit Rate": 78.78,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Scheduler Statistics.No Eligible": 67.66,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.37,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 423.74,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.15,
+        "GPU Speed Of Light Throughput.Memory Throughput": 72.22,
+        "Memory Workload Analysis.Memory Throughput": 941.72,
+        "Memory Workload Analysis.L2 Hit Rate": 75.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Scheduler Statistics.No Eligible": 67.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.37,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.18
+      }
+    },
+    "strategy_title": "Reshape B tile pointer to eliminate tl.trans bank conflicts",
+    "strategy_description": "Restructuring the B tile pointer from (BLOCK_N, BLOCK_K) to (BLOCK_K, BLOCK_N) to eliminate `tl.trans(b)` in the tl.dot call produced no measurable improvement: duration changed by only +1.12 \u00b5s (422.62 \u2192 423.74 \u00b5s, effectively flat), and the SharedMemoryConflicts rule still reported 4.8-way average bank conflicts (36,554 conflicts, 11.57% of wavefronts) \u2014 nearly identical to before (4.7-way, 36,850 conflicts, 11.85%). All other metrics (compute SOL, occupancy, warp cycles per instruction, scheduler eligibility) were statistically unchanged. The kernel is already at 92%+ compute SOL and 95%+ Tensor pipeline utilization; at this ceiling, the bank conflict overhead is already absorbed by the Tensor Core pipeline and does not manifest as measurable latency. The NCU-reported 8.84% speedup estimate was not realized because the kernel is compute-bound, not shared-memory-load-bound.",
+    "slow_pseudocode": "# B loaded as (BLOCK_N, BLOCK_K), requires tl.trans\nb_ptrs = B_ptr + (offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk)\nb_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_remaining)\nb = tl.load(b_ptrs, mask=b_mask, other=0.0)  # (BLOCK_N, BLOCK_K)\nacc = tl.dot(a, tl.trans(b), acc=acc, allow_tf32=True)  # 4.7-way bank conflict",
+    "fast_pseudocode": "# B loaded as (BLOCK_K, BLOCK_N), no tl.trans needed\nb_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)\nb_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)\nb = tl.load(b_ptrs, mask=b_mask, other=0.0)  # (BLOCK_K, BLOCK_N)\nacc = tl.dot(a, b, acc=acc, allow_tf32=True)  # still 4.8-way bank conflict reported",
+    "applicable_when": "Never demonstrated to help in a compute-bound Triton matmul kernel already at >90% compute SOL and >90% Tensor pipeline utilization. The NCU SharedMemoryConflicts rule may overestimate the benefit when the kernel is Tensor Core throughput-limited.",
+    "do_not_apply_when": "When the kernel is already compute-bound (Compute SOL > 90%, Tensor pipeline > 90%): eliminating tl.trans via B pointer reshape does not reduce latency because the shared-memory bank conflict overhead is hidden by the Tensor Core pipeline. Do not apply when NCU SharedMemoryConflicts reports <15% of wavefronts as conflicted and the kernel is simultaneously at >90% compute SOL \u2014 the conflict cost is already absorbed.",
+    "framework_notes": "Triton on Hopper (sm_90a): even after removing tl.trans and restructuring the B pointer to (BLOCK_K, BLOCK_N), NCU still reported 4.8-way bank conflicts (slightly worse than 4.7-way before). This suggests Triton's compiler may still stage the load through shared memory in a conflict-prone layout regardless of the pointer shape, or the conflict is on the A tile rather than B. The pointer reshape is mathematically correct (tl.dot(a [M,K], b [K,N]) = (M,N)) but does not guarantee elimination of shared memory bank conflicts in the compiled PTX."
+  },
+  {
+    "item_id": "exp_block_ptr_order_column_major_regression_002",
+    "iteration": 2,
+    "speedup": 0.5729,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_block_ptr_eliminate_inline_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts + HighPipeUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 422.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 92.43,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 72.46,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Launch Statistics.Registers Per Thread": 202.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.37,
+        "Scheduler Statistics.No Eligible_%": 67.66,
+        "Memory Workload Analysis.Memory Throughput_Gbyte_s": 956.67,
+        "Instruction Statistics.Executed Instructions": 91162624.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 18.94,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 18.22,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 32.52,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.26,
+        "Scheduler Statistics.No Eligible_%": 81.27,
+        "Memory Workload Analysis.Memory Throughput_Gbyte_s": 629.26,
+        "Instruction Statistics.Executed Instructions": 2758733824.0
+      }
+    },
+    "strategy_title": "Changing block_ptr order to column-major causes severe regression",
+    "strategy_description": "Switching tl.make_block_ptr order from (1,0) to (0,1) for the B tile, combined with adding more autotune configs, caused a ~1.75x slowdown: duration jumped from 0.42ms to 18.94ms, compute SOL collapsed from 92.43% to 18.22%, and executed instructions exploded from 91M to 2.76B (~30x more). Register pressure increased from 202 to 255 registers/thread, dropping Block Limit Registers from 2 to 1 and worsening stalls (warp cycles per issued instruction: 6.03\u219210.65). The autotune selected a far worse configuration under the expanded search space, and the column-major order change did not reduce bank conflicts (SharedMemoryConflicts still reported 5.4-way average, 59% of wavefronts). This direction is a confirmed dead end: the block_ptr order parameter does not reliably control shared-memory bank conflict behavior in the Triton compiler on Hopper, and expanding the autotune config space risks selecting catastrophically worse tile configurations.",
+    "slow_pseudocode": "# BEFORE (fast): scalar ptrs + tl.trans, allow_tf32=True, 202 regs/thread\nb_ptrs = B_ptr + offs_n[:,None]*stride_bn + offs_k[None,:]*stride_bk\nb = tl.load(b_ptrs, mask=b_mask, other=0.0)\nacc = tl.dot(a, tl.trans(b), acc=acc, allow_tf32=True)\n# Duration: 0.42ms, Compute SOL: 92.43%, 91M instructions",
+    "fast_pseudocode": "# AFTER (regressed): block_ptr order=(0,1) + expanded autotune configs\nb_block_ptr = tl.make_block_ptr(\n    base=B_ptr, shape=(K, N),\n    strides=(stride_bk, stride_bn),\n    offsets=(0, pid_n * BLOCK_N),\n    block_shape=(BLOCK_K, BLOCK_N),\n    order=(0, 1),  # column-major: did NOT fix bank conflicts\n)\nb = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')\nacc = tl.dot(a, b, acc=acc, allow_tf32=False)  # TF32 also disabled!\n# Duration: 18.94ms, Compute SOL: 18.22%, 2.76B instructions",
+    "applicable_when": "Never: this direction has caused regression in both iteration 1 (0.586x) and iteration 2 (0.573x). Do not attempt tl.make_block_ptr stride-swap or order changes for NT matmul bank conflict reduction.",
+    "do_not_apply_when": "Always avoid when: (1) the kernel is already compute-bound with high Tensor Core utilization (Compute SOL >80%); (2) registers/thread is at or near 255 \u2014 block_ptr changes do not reduce register count; (3) the autotune search space is large \u2014 adding more configs risks selecting catastrophically worse tile sizes; (4) allow_tf32=True is already enabled \u2014 do not regress this critical optimization.",
+    "framework_notes": "Triton on Hopper (sm_90a): the order parameter in tl.make_block_ptr controls the preferred memory layout hint for TMA, but does NOT reliably eliminate shared-memory bank conflicts as reported by NCU. The Triton compiler's register allocator is not sensitive to this parameter \u2014 registers stayed at 255 in both attempts. Critically, this iteration also accidentally disabled allow_tf32=True (reverting to allow_tf32=False), which alone would cause a ~25x slowdown per iteration 1 findings. The instruction count explosion (91M\u21922.76B) is consistent with scalar FFMA execution replacing Tensor Core MMA."
+  },
+  {
+    "item_id": "wave_quantized_grid_autotune_triton_matmul_004",
+    "iteration": 3,
+    "speedup": 25.9619,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "wave_quantized_autotune_configs_eliminate_partial_wave",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 423.74,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.15,
+        "GPU Speed Of Light Throughput.Memory Throughput": 72.22,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 202.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 98.3,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.18,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Occupancy.Block Limit Shared Mem": 2.0,
+        "Memory Workload Analysis.L2 Hit Rate": 75.53,
+        "Memory Workload Analysis.Memory Throughput": 941.72,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Instruction Statistics.Executed Instructions": 91162624.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 417.92,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.75,
+        "GPU Speed Of Light Throughput.Memory Throughput": 61.23,
+        "Launch Statistics.Grid Size": 256.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 188.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 196.61,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.49,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Occupancy.Block Limit Shared Mem": 1.0,
+        "Memory Workload Analysis.L2 Hit Rate": 69.53,
+        "Memory Workload Analysis.Memory Throughput": 891.03,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.46,
+        "Instruction Statistics.Executed Instructions": 74358784.0
+      }
+    },
+    "strategy_title": "Autotune configs sized to eliminate partial-wave grid tail",
+    "strategy_description": "When a Triton matmul autotune selects a tile size (e.g. BLOCK_M=128, BLOCK_N=128) that produces a grid size (512 blocks) exceeding one full wave (132 SMs \u00d7 2 blocks/SM = 264 blocks), a large partial wave runs at reduced SM utilization. Replacing those configs with larger tiles (BLOCK_M=128\u00d7BLOCK_N=256 or BLOCK_M=256\u00d7BLOCK_N=128) that produce a wave-quantized grid (256 blocks \u2264 264) eliminates the tail: duration dropped from 423.7 \u00b5s to 417.9 \u00b5s (~1.4%) and executed instructions fell from 91M to 74M (~18% fewer), while compute SOL held at ~92%. The speedup here is modest because the kernel was already near-optimal; the primary benefit is fewer total instructions and slightly better register utilization (202 \u2192 188 regs/thread). Note: waves_per_sm remained at 1.94 rather than dropping to ~1.0 as predicted, suggesting the autotune selected a config that still spans nearly two waves \u2014 the partial-wave tail was reduced but not fully eliminated.",
+    "slow_pseudocode": "# Autotune includes BLOCK_M=128, BLOCK_N=128 configs \u2192 grid=512 blocks\n# 512 blocks on 264-block wave = 1 full wave + 248-block partial wave\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    # ... other configs\n], key=['M', 'N', 'K'])",
+    "fast_pseudocode": "# Replace 128x128 configs with wave-quantized larger tiles \u2192 grid=256 blocks\n# 256 blocks on 264-block wave = fits in 1 wave, zero tail\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=8),\n    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    # ... other non-128x128 configs\n], key=['M', 'N', 'K'])",
+    "applicable_when": "NCU LaunchConfiguration rule fires with speedup_pct \u2265 20%; grid_size > full_wave_size (SM_count \u00d7 blocks_per_SM); the kernel is already compute-bound (Compute SOL > 85%); autotune is selecting small tile configs (BLOCK_M \u00d7 BLOCK_N \u2264 128\u00d7128) that produce oversized grids; blocks_per_SM is register- or shared-memory-limited to 1-2",
+    "do_not_apply_when": "Grid size is already \u2264 full_wave_size (waves_per_sm \u2264 1.0); the kernel is memory-bandwidth-bound rather than compute-bound; problem sizes vary widely across M/N/K such that wave-quantized configs for one size create severe underutilization for others; removing small tile configs eliminates coverage for small problem sizes that need them",
+    "framework_notes": "Triton-specific: the autotune key=['M','N','K'] means the selected config is cached per problem size. Wave quantization must be computed per problem size: full_wave = SM_count \u00d7 floor(max_smem_per_sm / smem_per_block). On H200 (132 SMs, register-limited to 2 blocks/SM at ~200 regs/thread), full_wave = 264. For M=2048, N=4096: BLOCK_M=128\u00d7BLOCK_N=256 \u2192 grid=16\u00d716=256 \u2264 264. The num_stages parameter (3, 4, 5) controls Triton's software pipeline depth for hiding global memory latency; on Hopper, num_stages=4 or 5 is often optimal for BLOCK_K=64 tiles."
+  },
+  {
+    "item_id": "wave_alignment_autotune_configs_regression_003",
+    "iteration": 3,
+    "speedup": 0.4637,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "grid_wave_alignment_via_group_m_and_tile_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + UncoalescedSharedAccess + HighPipeUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 423.74,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 92.15,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 72.22,
+        "Launch Statistics.Registers Per Thread": 202.0,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Launch Statistics.Grid Size": 512.0,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Instruction Statistics.Executed Instructions": 91162624.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 23.4,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 15.12,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 28.87,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Launch Statistics.Grid Size": 128.0,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Instruction Statistics.Executed Instructions": 2778889216.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.82
+      }
+    },
+    "strategy_title": "Adding large-tile autotune configs causes catastrophic regression",
+    "strategy_description": "Adding large-tile autotune configs (BLOCK_M=256, BLOCK_N=256; BLOCK_M=512, BLOCK_N=128) intended to reduce grid waves from 1.94 to 0.97 caused a ~2.15x slowdown: duration jumped from 0.42ms to 23.4ms, compute SOL collapsed from 92.15% to 15.12%, and executed instructions exploded from 91M to 2.78B (~30x more). The autotune selected a large-tile config that pushed registers/thread from 202 to 255, dropping Block Limit Registers from 2 to 1, which also triggered uncoalesced local loads/stores (MemoryCacheAccessPattern rule: only 1 of 32 bytes utilized per sector) \u2014 a sign of register spilling to local memory. Critically, the diff also accidentally re-introduced `allow_tf32=False` in the tl.dot call, reverting the 25x speedup from iteration 1; the instruction count explosion is consistent with scalar FFMA replacing Tensor Core MMA. Wave-alignment via larger tiles is counterproductive when register pressure is already at the ceiling (255 regs/thread) and allow_tf32=True must be preserved.",
+    "slow_pseudocode": "# BEFORE (fast): 202 regs/thread, allow_tf32=True, 512 blocks, 1.94 waves\n@triton.autotune(configs=[...20 original configs...])\ndef matmul_nt_kernel(...):\n    acc = tl.dot(a, b, acc=acc, allow_tf32=True)\n# Duration: 0.42ms, Compute SOL: 92.15%, 91M instructions",
+    "fast_pseudocode": "# AFTER (regressed): 255 regs/thread, allow_tf32=False, 128 blocks, 0.97 waves\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    triton.Config({'BLOCK_M': 512, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    # ... + 20 original configs\n])\ndef matmul_nt_kernel(...):\n    acc = tl.dot(a, b_T, acc=acc, allow_tf32=False)  # TF32 accidentally disabled!\n# Duration: 23.4ms, Compute SOL: 15.12%, 2.78B instructions",
+    "applicable_when": "Never: adding large-tile configs (BLOCK_M>=256, BLOCK_N>=256) to autotune when registers/thread is already at 255 causes register spilling (MemoryCacheAccessPattern: 1/32 bytes utilized per sector) and the autotune selects the catastrophically worse config. Wave-alignment via tile enlargement is only safe when register headroom exists.",
+    "do_not_apply_when": "Always avoid when: (1) registers/thread is already at or near 255 \u2014 larger tiles push into register spilling territory; (2) allow_tf32=True is already enabled \u2014 any diff that touches tl.dot risks accidentally disabling it; (3) the kernel is already compute-bound at >90% Tensor Core utilization \u2014 wave-alignment savings are dwarfed by the cost of register spilling or TF32 regression; (4) Block Limit Registers is already 1 or 2 \u2014 there is no occupancy headroom to absorb larger tiles.",
+    "framework_notes": "Triton autotune on Hopper (sm_90a): when large-tile configs are added to the autotune search space, the compiler may select them even if they cause register spilling. The MemoryCacheAccessPattern rule (only 1/32 bytes utilized per sector for local loads/stores) is a reliable indicator of register spilling in Triton kernels. Additionally, any code diff touching the tl.dot call must explicitly verify allow_tf32=True is preserved \u2014 it is easy to accidentally revert this critical parameter."
+  }
+]

@@ -1,0 +1,69 @@
+--- baseline
++++ rebuilt
+@@ -2,6 +2,7 @@
+ import triton
+ import triton.language as tl
+ from triton.language.extra import libdevice
++
+ 
+ 
+ @triton.autotune(
+@@ -14,6 +15,10 @@
+         triton.Config({'BLOCK_R': 512},  num_warps=4, num_stages=4),
+         triton.Config({'BLOCK_R': 1024}, num_warps=16, num_stages=2),
+         triton.Config({'BLOCK_R': 256},  num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_R': 1024}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_R': 512},  num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_R': 2048}, num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_R': 256},  num_warps=4, num_stages=4),
+     ],
+     key=['C_per_group', 'HW'],
+ )
+@@ -52,7 +57,7 @@
+     for start in tl.range(0, group_size, BLOCK_R):
+         offsets = start + tl.arange(0, BLOCK_R)
+         mask = offsets < group_size
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+ 
+         # Welford update
+         block_count = tl.sum(mask.to(tl.float32), axis=0)
+@@ -69,26 +74,31 @@
+     variance = m2 / tl.maximum(count, 1.0)
+     inv_std = libdevice.rsqrt(variance + eps)
+ 
++    # Hoist W/B loads before Pass 2 loop — load all C_per_group weights/biases once into registers
++    wb_offsets = group_idx * C_per_group + tl.arange(0, C_per_group)
++    wb_mask = tl.arange(0, C_per_group) < C_per_group
++    w_reg = tl.load(W_ptr + wb_offsets, mask=wb_mask, other=1.0, eviction_policy='evict_last').to(tl.float32)
++    b_reg = tl.load(B_ptr + wb_offsets, mask=wb_mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
++
+     # Pass 2: Normalize and apply weight/bias
+     for start in tl.range(0, group_size, BLOCK_R):
+         offsets = start + tl.arange(0, BLOCK_R)
+         mask = offsets < group_size
+ 
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+ 
+-        # Compute channel index for weight/bias
++        # Compute channel index for weight/bias using register gather
+         # offsets maps to: channel_in_group = offsets // HW, spatial = offsets % HW
+         channel_in_group = offsets // HW
+-        channel_idx = group_idx * C_per_group + channel_in_group
+ 
+-        w = tl.load(W_ptr + channel_idx, mask=mask, other=1.0).to(tl.float32)
+-        b = tl.load(B_ptr + channel_idx, mask=mask, other=0.0).to(tl.float32)
++        # Use tl.gather to index into pre-loaded register arrays
++        w = tl.gather(w_reg, channel_in_group, axis=0)
++        b = tl.gather(b_reg, channel_in_group, axis=0)
+ 
+         x_norm = (x - mean) * inv_std
+         y = x_norm * w + b
+ 
+-        tl.store(Y_ptr + base_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask)
+-
++        tl.store(Y_ptr + base_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask, eviction_policy='evict_first')
+ 
+ def kernel_function(weight, bias, x):
+     N, C, H, W = x.shape

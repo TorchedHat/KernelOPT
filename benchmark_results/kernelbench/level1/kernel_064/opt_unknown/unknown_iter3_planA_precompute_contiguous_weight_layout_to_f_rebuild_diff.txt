@@ -1,0 +1,66 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,7 @@
+ # ConvTranspose1d: weight shape [in_channels, out_channels, kernel_size]
+ # Input: [batch, in_channels, L_in]
+ # Output: [batch, out_channels, L_out] where L_out = L_in + kernel_size - 1 (stride=1, padding=0)
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -31,6 +32,10 @@
+ ):
+     # Grid: (batch, cdiv(L_out, BLOCK_M), cdiv(out_channels, BLOCK_N))
+     # M = L_out, N = out_channels, K = in_channels * kernel_size
++    # W_ptr points to W_flat[K, N] where W_flat = weight.permute(0,2,1).reshape(K,N).contiguous()
++    # W_flat[ic*kernel_size + kk, oc] = weight[ic, oc, kk]
++    # stride_wb is repurposed as stride_wf = N (stride of flat K dimension)
++    # stride_wc and stride_wk are unused (W_flat has stride (N, 1))
+     pid_b = tl.program_id(0)
+     pid_m = tl.program_id(1)
+     pid_n = tl.program_id(2)
+@@ -49,7 +54,7 @@
+ 
+     for k_start in range(0, K, BLOCK_K):
+         offs_k = k_start + tl.arange(0, BLOCK_K)
+-        # Decode k into (ic, kk)
++        # Decode k into (ic, kk) - used for X load
+         ic = offs_k // kernel_size
+         kk = offs_k % kernel_size
+ 
+@@ -66,24 +71,27 @@
+ 
+         # Load X[b, ic, l_in]: stride_xb * pid_b + stride_xc * ic + stride_xl * l_in
+         x_ptrs = X_ptr + pid_b * stride_xb + ic[None, :] * stride_xc + l_in * stride_xl
+-        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)  # [BLOCK_M, BLOCK_K]
++        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0, eviction_policy='evict_first')  # [BLOCK_M, BLOCK_K]
+ 
+-        # Load W[ic, oc, kk]: stride_wb * ic + stride_wc * oc + stride_wk * kk
++        # Load W_flat[offs_k, offs_n]: fully coalesced (offs_n is stride-1 axis)
++        # W_flat[ic*kernel_size + kk, oc] = weight[ic, oc, kk]
++        # stride_wb is repurposed as stride_wf = N (W_flat row stride)
++        # w_ptrs = W_ptr + offs_k * stride_wf + offs_n  (stride-1 on offs_n axis)
+         # Shape: [BLOCK_K, BLOCK_N]
+         valid_n = offs_n < N  # [BLOCK_N]
+         mask_w = valid_k[:, None] & valid_n[None, :]
+-        w_ptrs = W_ptr + ic[:, None] * stride_wb + offs_n[None, :] * stride_wc + kk[:, None] * stride_wk
+-        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)  # [BLOCK_K, BLOCK_N]
++        w_ptrs = W_ptr + offs_k[:, None] * stride_wb + offs_n[None, :]
++        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0, eviction_policy='evict_last')  # [BLOCK_K, BLOCK_N]
+ 
+         acc = tl.dot(x_tile, w_tile, acc=acc)
+ 
+     # Store output Y[b, oc, l_out]
++    # Coalesced store: transpose acc so offs_m (stride_yl=1) is the fast (column) axis
+     valid_m = offs_m < M
+     valid_n = offs_n < N
+-    mask_y = valid_m[:, None] & valid_n[None, :]
+-    y_ptrs = Y_ptr + pid_b * stride_yb + offs_n[None, :] * stride_yc + offs_m[:, None] * stride_yl
+-    tl.store(y_ptrs, acc.to(tl.float32), mask=mask_y)
+-
++    mask_y = valid_n[:, None] & valid_m[None, :]   # [BLOCK_N, BLOCK_M]
++    y_ptrs = Y_ptr + pid_b * stride_yb + offs_n[:, None] * stride_yc + offs_m[None, :] * stride_yl
++    tl.store(y_ptrs, tl.trans(acc).to(tl.float32), mask=mask_y, eviction_policy='evict_first')
+ 
+ def kernel_function(weight, x):
+     # weight: [in_channels, out_channels, kernel_size]

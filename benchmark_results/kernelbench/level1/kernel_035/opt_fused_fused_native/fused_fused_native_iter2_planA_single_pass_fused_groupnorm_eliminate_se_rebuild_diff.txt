@@ -1,0 +1,94 @@
+--- baseline
++++ rebuilt
+@@ -2,6 +2,7 @@
+ import triton
+ import triton.language as tl
+ from triton.language.extra import libdevice
++
+ 
+ 
+ @triton.autotune(
+@@ -45,50 +46,54 @@
+     base_offset = batch_idx * C * HW + group_idx * C_per_group * HW
+ 
+     # Pass 1: Compute mean and variance using Welford's online algorithm
++    # Restructured to channel-outer / spatial-inner for better memory access
+     mean = tl.zeros((), dtype=tl.float32)
+     m2 = tl.zeros((), dtype=tl.float32)
+     count = tl.zeros((), dtype=tl.float32)
+ 
+-    for start in tl.range(0, group_size, BLOCK_R):
+-        offsets = start + tl.arange(0, BLOCK_R)
+-        mask = offsets < group_size
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++    for c in tl.range(0, C_per_group):
++        c_offset = c * HW
++        for s_start in tl.range(0, HW, BLOCK_R):
++            offsets = s_start + tl.arange(0, BLOCK_R)
++            mask = offsets < HW
++            x = tl.load(X_ptr + base_offset + c_offset + offsets, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+ 
+-        # Welford update
+-        block_count = tl.sum(mask.to(tl.float32), axis=0)
+-        block_mean = tl.sum(tl.where(mask, x, tl.zeros_like(x)), axis=0) / tl.maximum(block_count, 1.0)
+-        block_m2 = tl.sum(tl.where(mask, (x - block_mean) * (x - block_mean), tl.zeros_like(x)), axis=0)
++            # Welford update
++            block_count = tl.sum(mask.to(tl.float32), axis=0)
++            block_mean = tl.sum(tl.where(mask, x, tl.zeros_like(x)), axis=0) / tl.maximum(block_count, 1.0)
++            block_m2 = tl.sum(tl.where(mask, (x - block_mean) * (x - block_mean), tl.zeros_like(x)), axis=0)
+ 
+-        # Merge with running stats
+-        new_count = count + block_count
+-        delta = block_mean - mean
+-        mean = tl.where(new_count > 0, mean + delta * block_count / new_count, mean)
+-        m2 = m2 + block_m2 + delta * delta * count * block_count / tl.maximum(new_count, 1.0)
+-        count = new_count
++            # Merge with running stats
++            new_count = count + block_count
++            delta = block_mean - mean
++            mean = tl.where(new_count > 0, mean + delta * block_count / new_count, mean)
++            m2 = m2 + block_m2 + delta * delta * count * block_count / tl.maximum(new_count, 1.0)
++            count = new_count
+ 
+     variance = m2 / tl.maximum(count, 1.0)
+     inv_std = libdevice.rsqrt(variance + eps)
+ 
+     # Pass 2: Normalize and apply weight/bias
+-    for start in tl.range(0, group_size, BLOCK_R):
+-        offsets = start + tl.arange(0, BLOCK_R)
+-        mask = offsets < group_size
++    # Channel-outer / spatial-inner: w_val and b_val are scalar per channel iteration
++    # This eliminates ~2048 redundant W/B global loads (one per BLOCK_R iteration)
++    for c in tl.range(0, C_per_group):
++        channel_idx = group_idx * C_per_group + c
++        # Load w and b once per channel (scalar), hoisted out of spatial loop
++        # channel_idx is always valid: mask=True (scalar load, always in-bounds)
++        w_val = tl.load(W_ptr + channel_idx, mask=True, other=1.0).to(tl.float32)
++        b_val = tl.load(B_ptr + channel_idx, mask=True, other=0.0).to(tl.float32)
+ 
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++        c_offset = c * HW
++        for s_start in tl.range(0, HW, BLOCK_R):
++            offsets = s_start + tl.arange(0, BLOCK_R)
++            mask = offsets < HW
+ 
+-        # Compute channel index for weight/bias
+-        # offsets maps to: channel_in_group = offsets // HW, spatial = offsets % HW
+-        channel_in_group = offsets // HW
+-        channel_idx = group_idx * C_per_group + channel_in_group
++            x = tl.load(X_ptr + base_offset + c_offset + offsets, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
+ 
+-        w = tl.load(W_ptr + channel_idx, mask=mask, other=1.0).to(tl.float32)
+-        b = tl.load(B_ptr + channel_idx, mask=mask, other=0.0).to(tl.float32)
++            x_norm = (x - mean) * inv_std
++            y = x_norm * w_val + b_val
+ 
+-        x_norm = (x - mean) * inv_std
+-        y = x_norm * w + b
+-
+-        tl.store(Y_ptr + base_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask)
+-
++            tl.store(Y_ptr + base_offset + c_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask, eviction_policy='evict_first')
+ 
+ def kernel_function(weight, bias, x):
+     N, C, H, W = x.shape

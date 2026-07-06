@@ -1,0 +1,64 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -13,6 +14,14 @@
+         triton.Config({'BLOCK_N': 2048, 'num_stages': 3}, num_warps=16),
+         triton.Config({'BLOCK_N': 4096, 'num_stages': 3}, num_warps=16),
+         triton.Config({'BLOCK_N': 8192, 'num_stages': 2}, num_warps=32),
++        triton.Config({'BLOCK_N': 1024, 'num_stages': 4}, num_warps=32),
++        triton.Config({'BLOCK_N': 2048, 'num_stages': 4}, num_warps=32),
++        triton.Config({'BLOCK_N': 4096, 'num_stages': 4}, num_warps=32),
++        triton.Config({'BLOCK_N': 8192, 'num_stages': 4}, num_warps=32),
++        triton.Config({'BLOCK_N': 1024, 'num_stages': 4}, num_warps=16),
++        triton.Config({'BLOCK_N': 2048, 'num_stages': 4}, num_warps=16),
++        triton.Config({'BLOCK_N': 4096, 'num_stages': 4}, num_warps=16),
++        triton.Config({'BLOCK_N': 8192, 'num_stages': 4}, num_warps=16),
+     ],
+     key=['N'],
+ )
+@@ -25,6 +34,9 @@
+     BLOCK_N: tl.constexpr,
+     num_stages: tl.constexpr,
+ ):
++    # log2(e) constant for fast exp2-based approximation
++    LOG2E: tl.constexpr = 1.4426950408889634
++
+     # Each program handles one row
+     row_idx = tl.program_id(0)
+     
+@@ -44,20 +56,24 @@
+         new_max = tl.maximum(row_max, block_max)
+         
+         # Update sum: scale old sum by exp(old_max - new_max), add new block's contribution
+-        row_sum = row_sum * tl.exp(row_max - new_max) + tl.sum(tl.exp(x - new_max), axis=0)
++        # Use tl.exp2(x * log2(e)) = exp(x), maps to fast MUFU.EX2 instruction
++        row_sum = row_sum * tl.exp2((row_max - new_max) * LOG2E) + tl.sum(tl.exp2((x - new_max) * LOG2E), axis=0)
+         row_max = new_max
+     
+     # Pass 2: normalize and store
+     out_row_start = output_ptr + row_idx * N
+     
++    # Hoist reciprocal computation outside the loop to replace per-iteration FDIV with FMUL
++    inv_sum = 1.0 / row_sum
++    
+     for col_off in tl.range(0, N, BLOCK_N, num_stages=num_stages):
+         col_idx = col_off + tl.arange(0, BLOCK_N)
+         mask = col_idx < N
++        # Removed eviction_policy='evict_last' — rows are 1.5 MB, far exceeding L1 capacity
+         x = tl.load(row_start + col_idx, mask=mask, other=float('-inf')).to(tl.float32)
+         
+-        out = tl.exp(x - row_max) / row_sum
+-        tl.store(out_row_start + col_idx, out.to(tl.float32), mask=mask)
+-
++        out = tl.exp2((x - row_max) * LOG2E) * inv_sum
++        tl.store(out_row_start + col_idx, out, mask=mask)
+ 
+ def kernel_function(*inputs):
+     x, = inputs

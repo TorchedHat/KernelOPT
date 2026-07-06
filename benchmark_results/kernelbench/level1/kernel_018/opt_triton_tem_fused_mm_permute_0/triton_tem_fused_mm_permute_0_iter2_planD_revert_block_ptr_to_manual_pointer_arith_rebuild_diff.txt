@@ -1,0 +1,112 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -36,62 +37,47 @@
+ ):
+     """
+     Computes C = A.T @ B.T where:
+-    
++
+     A.T[m, k] = A[k, m] -> access A at row=k, col=m
+     B.T[k, n] = B[n, k] -> access B at row=n, col=k
+     """
+     pid = tl.program_id(0)
+-    
++
+     grid_m = tl.cdiv(M, BLOCK_M)
+     grid_n = tl.cdiv(N, BLOCK_N)
+-    
++
+     # L2 cache optimization: group programs
+     width = GROUP_M * grid_n
+     group_id = pid // width
+     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+     pid_m = group_id * GROUP_M + (pid % group_size)
+     pid_n = (pid % width) // group_size
+-    
+-    # Row/col offsets for this tile
+-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    offs_k = tl.arange(0, BLOCK_K)
+-    
++
+     # Initialize accumulator
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    
+-    # A has shape [K, M]: A.T[m, k] = A[k, m]
+-    # For a tile: A_tile[BLOCK_M, BLOCK_K] where A_tile[i, j] = A[offs_k[j], offs_m[i]]
+-    # Pointer: A_ptr + offs_k[j] * stride_a_row + offs_m[i] * stride_a_col
+-    
+-    # B has shape [N, K]: B.T[k, n] = B[n, k]
+-    # For a tile: B_tile[BLOCK_K, BLOCK_N] where B_tile[j, l] = B[offs_n[l], offs_k[j]]
+-    # Pointer: B_ptr + offs_n[l] * stride_b_row + offs_k[j] * stride_b_col
+-    
++
++    # Compute base offsets once outside the loop
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # shape [BLOCK_M]
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # shape [BLOCK_N]
++
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_offs = k * BLOCK_K + offs_k
+-        
+-        # Load A tile: shape [BLOCK_M, BLOCK_K]
+-        # A.T[offs_m, k_offs] = A[k_offs, offs_m]
+-        a_ptrs = A_ptr + k_offs[None, :] * stride_a_row + offs_m[:, None] * stride_a_col
+-        mask_a = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+-        
+-        # Load B tile: shape [BLOCK_K, BLOCK_N]
+-        # B.T[k_offs, offs_n] = B[offs_n, k_offs]
+-        b_ptrs = B_ptr + offs_n[None, :] * stride_b_row + k_offs[:, None] * stride_b_col
+-        mask_b = (k_offs[:, None] < K) & (offs_n[None, :] < N)
+-        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+-        
++        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)  # shape [BLOCK_K]
++        # A has physical shape [K, M]: A.T[m, k] = A[k, m]
++        # a_ptrs[m, k] = A_ptr + offs_k[k]*stride_a_row + offs_m[m]*stride_a_col
++        a_ptrs = A_ptr + offs_k[None, :] * stride_a_row + offs_m[:, None] * stride_a_col
++        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
++        a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # shape [BLOCK_M, BLOCK_K]
++        # B has physical shape [N, K]: B.T[k, n] = B[n, k]
++        # b_ptrs[k, n] = B_ptr + offs_n[n]*stride_b_row + offs_k[k]*stride_b_col
++        b_ptrs = B_ptr + offs_n[None, :] * stride_b_row + offs_k[:, None] * stride_b_col
++        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
++        b = tl.load(b_ptrs, mask=b_mask, other=0.0)  # shape [BLOCK_K, BLOCK_N]
+         acc = tl.dot(a, b, acc=acc, allow_tf32=False)
+-    
+-    # Store result
+-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++
++    # Store result — reuse offs_m and offs_n computed before the loop
+     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     tl.store(c_ptrs, acc.to(tl.float32), mask=mask_c)
+-
+ 
+ def kernel_function(a, b):
+     """

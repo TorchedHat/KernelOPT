@@ -1,0 +1,88 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,20 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 128}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 16, 'RBLOCK': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 4, 'RBLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 8, 'RBLOCK': 256}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 8},   num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 16},  num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 16},  num_warps=8,  num_stages=2),
++        triton.Config({'XBLOCK': 32},  num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 32},  num_warps=8,  num_stages=2),
++        triton.Config({'XBLOCK': 32},  num_warps=16, num_stages=2),
++        triton.Config({'XBLOCK': 64},  num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 64},  num_warps=8,  num_stages=2),
++        triton.Config({'XBLOCK': 64},  num_warps=16, num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=4,  num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=8,  num_stages=2),
+     ],
+     key=['xnumel', 'rnumel'],
+ )
+@@ -25,12 +29,11 @@
+     SH, SW,
+     xnumel, rnumel,
+     XBLOCK: tl.constexpr,
+-    RBLOCK: tl.constexpr,
+ ):
+     # Each program handles XBLOCK output elements
+-    # Reduction over KH*KW elements
++    # Reduction over KH*KW elements (scalar loop, no RBLOCK)
+     xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None].to(tl.int64)
++    xindex = xoffset + tl.arange(0, XBLOCK).to(tl.int64)
+     xmask = xindex < xnumel
+ 
+     # Decode output indices
+@@ -39,31 +42,22 @@
+     c  = (xindex // (OW * OH)) % C
+     b  = xindex // (OW * OH * C)
+ 
+-    # Accumulator
+-    acc = tl.zeros([XBLOCK, RBLOCK], dtype=tl.float32)
++    # 1D accumulator — eliminates RBLOCK from register file
++    acc = tl.zeros([XBLOCK], dtype=tl.float32)
+ 
+-    for r_offset in range(0, rnumel, RBLOCK):
+-        rindex = r_offset + tl.arange(0, RBLOCK)[None, :].to(tl.int64)
+-        rmask = rindex < rnumel
+-
+-        kw = rindex % KW
+-        kh = rindex // KW
+-
+-        ih = oh * SH + kh
+-        iw = ow * SW + kw
+-
+-        # Compute flat input index
+-        in_idx = b * (C * H * W) + c * (H * W) + ih * W + iw
+-
+-        val = tl.load(in_ptr + in_idx, mask=(xmask & rmask), other=0.0)
++    for r in range(rnumel):  # rnumel=121, compiler fully unrolls this
++        kw = r % KW          # scalar at compile time
++        kh = r // KW         # scalar at compile time
++        ih = oh * SH + kh    # shape [XBLOCK]
++        iw = ow * SW + kw    # shape [XBLOCK]
++        in_idx = b * (C * H * W) + c * (H * W) + ih * W + iw  # [XBLOCK]
++        val = tl.load(in_ptr + in_idx, mask=xmask, other=0.0)  # [XBLOCK]
+         acc += val
+ 
+-    total = tl.sum(acc, axis=1)[:, None]
+     inv_count = 1.0 / (KH * KW)
+-    result = total * inv_count
++    result = acc * inv_count  # no tl.sum needed, acc is already 1D
+ 
+     tl.store(out_ptr + xindex, result, mask=xmask)
+-
+ 
+ def kernel_function(x):
+     B, C, H, W = x.shape

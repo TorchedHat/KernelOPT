@@ -1,0 +1,283 @@
+[
+  {
+    "item_id": "9cad7e13",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fp8_precision_tl_dot",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fp8_precision_tl_dot \u2014 correctness failure",
+    "strategy_description": "Plan 'fp8_precision_tl_dot' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): nv)\n        b_fp8 = (b / scale_b).to(tl.float8e4nv)\n\n        # dot result is (a/scale_a) @ (b/scale_b), so multiply by scale_a*scale_b\n        tile_acc = tl.dot(a_fp8, b_fp8, acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))\n                   ^\nInput shapes",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-bound: 184 registers/thread limits the SM to only 1 block (8 warps), yielding 12.5% occupancy. The FMA pipeline at 64.3% confirms the kernel is executing FP32 scalar multiply-adds rather than Tensor Core MMA instructions \u2014 caused by allow_tf32=False with FP32 inputs. On H200, FP8 Tensor Cores (E4M3) deliver ~2x the FLOPS of FP16. Casting A and B tiles to tl.float8e4nv before tl.dot routes computation through the FP8 MMA unit, dramatically reducing register pressure, improving occupancy, and unlocking far higher throughput. The accumulator remains FP32 for numerical safety.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): nv)\n        b_fp8 = (b / scale_b).to(tl.float8e4nv)\n\n        # dot result is (a/scale_a) @ (b/scale_b), so multiply by scale_a*scale_b\n        tile_acc = tl.dot",
+    "framework_notes": null
+  },
+  {
+    "item_id": "bmm-fp16-tensorcore-accumulation-001",
+    "iteration": 1,
+    "speedup": 6.2319,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fp16_cast_for_tensor_core_dot_with_fp32_accumulator",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + HighPipeUtilization (FMA at 64.3%)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 71.72,
+        "GPU Speed Of Light Throughput.Duration": 8.6,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Launch Statistics.Registers Per Thread": 184.0,
+        "Memory Workload Analysis.Memory Throughput": 217.84,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.76
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.07,
+        "GPU Speed Of Light Throughput.Duration": 1.38,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Launch Statistics.Registers Per Thread": 126.0,
+        "Memory Workload Analysis.Memory Throughput": 1360.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.32
+      }
+    },
+    "strategy_title": "Cast dot operands to FP16 to engage Tensor Cores",
+    "strategy_description": "When a Triton matmul kernel shows the FMA pipeline as the highest-utilized pipeline (>60%) and theoretical occupancy is severely register-limited (e.g., 12.5%, Block Limit Registers=1), the kernel is using scalar FP32 FMA instead of Tensor Core HMMA instructions. Casting the `tl.dot` input tiles from FP32 to FP16 (while keeping the accumulator as FP32) forces Triton to emit FP16 HMMA Tensor Core instructions, which on H200/A100-class hardware deliver 2x the raw throughput of FP32. The FP16 tile operands also reduce register pressure (184\u2192126 regs/thread), doubling the Block Limit Registers from 1 to 2 and improving theoretical occupancy from 12.5% to 25%, which together produced a 6.2x end-to-end speedup.",
+    "slow_pseudocode": "# Inside K-loop, FP32 operands \u2192 scalar FMA path\na = tl.load(A_ptr, mask=mask_a, other=0.0)          # float32\nb = tl.load(B_ptr, mask=mask_b, other=0.0)          # float32\nacc = tl.dot(a, b, acc=acc, allow_tf32=False)        # scalar FP32 FMA",
+    "fast_pseudocode": "# Inside K-loop, FP16 operands \u2192 Tensor Core HMMA path\na = tl.load(A_ptr, mask=mask_a, other=0.0).to(tl.float16)   # cast to fp16\nb = tl.load(B_ptr, mask=mask_b, other=0.0).to(tl.float16)   # cast to fp16\nacc = tl.dot(a, b, acc=acc)                                  # FP32 accumulator, HMMA emitted\n# acc initialized as tl.zeros(..., dtype=tl.float32) \u2014 unchanged\n# tl.store writes acc.to(tl.float32) \u2014 unchanged",
+    "applicable_when": "Triton matmul/BMM kernel with FP32 input tensors; FMA pipeline utilization >50%; theoretical occupancy severely register-limited (Block Limit Registers=1 or 2); `allow_tf32=False` or no TF32 path active; hardware supports FP16 Tensor Cores (Volta+, especially Ampere/Hopper where FP16 TFLOPS >> FP32 TFLOPS).",
+    "do_not_apply_when": "Output precision requirements demand full FP32 mantissa in operands (e.g., atol < 1e-4 for large K); input tensors are already FP16/BF16 (cast is redundant); kernel is memory-bound rather than compute-bound (casting won't help if bottleneck is HBM bandwidth); accumulator must not be cast to FP16 (precision loss in reduction).",
+    "framework_notes": "Triton-specific: `.to(tl.float16)` on a loaded tile before `tl.dot` causes Triton's LLVM backend to emit HMMA (FP16 Tensor Core) instructions. Removing `allow_tf32=False` is also required \u2014 leaving it set with FP32 operands would keep scalar FMA. The accumulator `tl.zeros(..., dtype=tl.float32)` and final store must remain FP32. In CUDA, the equivalent is using `__half` operands with `wmma::mma_sync` or `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` PTX while keeping the accumulator as float."
+  },
+  {
+    "item_id": "exp_triton_tf32_tensor_cores_001",
+    "iteration": 1,
+    "speedup": 1.8455,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "enable_tf32_tensor_cores_in_tl_dot",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 71.72,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 4.43,
+        "GPU Speed Of Light Throughput.Duration": 8.6,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Launch Statistics.Registers Per Thread": 184.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Compute Workload Analysis.Issue Slots Busy": 72.42
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.16,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 8.31,
+        "GPU Speed Of Light Throughput.Duration": 4.66,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 58.16,
+        "Compute Workload Analysis.Issue Slots Busy": 9.35
+      }
+    },
+    "strategy_title": "Enable TF32 in tl.dot to Use Tensor Cores",
+    "strategy_description": "When a Triton kernel's tl.dot call has allow_tf32=False, the FMA (scalar FP32 FFMA) pipeline becomes the bottleneck instead of Tensor Cores. Setting allow_tf32=True routes the matrix multiply through HMMA/Tensor Core instructions, which on Hopper/Ampere deliver ~14.8x higher throughput than scalar FP32 FFMA. This change reduced kernel duration from 8.6 ms to 4.66 ms (1.85x speedup), dropped registers per thread from 184 to 128 (improving occupancy from 12.5% to 25%), and shifted the bottleneck from compute-bound to memory-bound.",
+    "slow_pseudocode": "# Inside K-loop in Triton GEMM kernel\nacc = tl.dot(a, b, acc=acc, allow_tf32=False)  # forces scalar FP32 FFMA",
+    "fast_pseudocode": "# Inside K-loop in Triton GEMM kernel\nacc = tl.dot(a, b, acc=acc, allow_tf32=True)   # routes through Tensor Cores (HMMA)",
+    "applicable_when": "Triton kernel uses tl.dot with allow_tf32=False; FMA pipeline utilization is high (>50%); kernel is compute-bound (SM SOL >> DRAM SOL); device is Ampere/Hopper with Tensor Core support; correctness tolerance allows TF32 rounding (max_diff threshold >= ~1e-3 for typical float32 inputs)",
+    "do_not_apply_when": "Strict FP32 numerical accuracy is required (e.g., correctness check with tolerance < 1e-4); operands are already bf16/fp16 (TF32 only applies to FP32 inputs); kernel is already memory-bound rather than compute-bound",
+    "framework_notes": "Triton-specific: the allow_tf32 parameter in tl.dot controls whether Tensor Core HMMA instructions are used. In CUDA, the equivalent is setting cublasMath_t to CUBLAS_TF32_TENSOR_OP_MATH or using __nv_bfloat16 casts. TF32 reduces mantissa from 23 bits to 10 bits but accumulation remains in FP32, so output dtype is unchanged."
+  },
+  {
+    "item_id": "triton-bmm-block-k-autotune-smem-bank-conflict-002",
+    "iteration": 2,
+    "speedup": 6.2319,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_block_k_to_reduce_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 1.38,
+        "GPU Speed Of Light Throughput.Memory Throughput": 69.05,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.07,
+        "Memory Workload Analysis.Mem Busy": 69.05,
+        "Scheduler Statistics.No Eligible": 67.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 24.66,
+        "Launch Statistics.Registers Per Thread": 126.0,
+        "SharedMemoryConflicts.bank_conflict_rate_pct": 27.55,
+        "SharedMemoryConflicts.avg_conflict_way": 3.4,
+        "SharedMemoryConflicts.total_bank_conflicts": 8847246.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 1.38,
+        "GPU Speed Of Light Throughput.Memory Throughput": 68.89,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.0,
+        "Memory Workload Analysis.Mem Busy": 68.89,
+        "Scheduler Statistics.No Eligible": 68.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 24.66,
+        "Launch Statistics.Registers Per Thread": 126.0,
+        "SharedMemoryConflicts.bank_conflict_rate_pct": 27.96,
+        "SharedMemoryConflicts.avg_conflict_way": 3.4,
+        "SharedMemoryConflicts.total_bank_conflicts": 9026134.0
+      }
+    },
+    "strategy_title": "Add BLOCK_K=128 Autotune Configs to Reduce SMEM Bank Conflicts",
+    "strategy_description": "Adding BLOCK_K=128 and num_stages=5 autotune configs to a Triton GEMM kernel with 3.4-way shared memory bank conflicts (SharedMemoryConflicts rule, ~19% estimated speedup) produced no measurable improvement: kernel duration remained at 1.38ms, bank conflicts actually increased slightly (8.85M \u2192 9.03M), and all scheduler/occupancy metrics were unchanged. The autotuner likely selected the same winning config as before (or a similarly conflicting one), indicating that Triton's compiler-managed SMEM layout for tl.dot tiles is not directly controlled by BLOCK_K stride \u2014 the bank conflict pattern is determined by internal padding/swizzling choices rather than the tile K dimension. Expanding the autotune search space alone is insufficient to resolve SMEM bank conflicts in Triton when the conflict source is the compiler's internal shared memory layout.",
+    "slow_pseudocode": "# 12 autotune configs, BLOCK_K in {16, 32, 64}, num_stages in {3, 4}\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    # ... 11 more configs with BLOCK_K <= 64, num_stages <= 4\n], key=['BATCH', 'M', 'N', 'K'])\n# Result: 3.4-way SMEM bank conflicts, 27.55% conflict rate",
+    "fast_pseudocode": "# 18 autotune configs, added BLOCK_K=128 and num_stages=5 entries\n@triton.autotune(configs=[\n    # ... existing 12 configs ...\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),\n    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=5, num_warps=8),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=5, num_warps=4),\n], key=['BATCH', 'M', 'N', 'K'])\n# Result: still 3.4-way SMEM bank conflicts, 27.96% conflict rate \u2014 no improvement",
+    "applicable_when": "Never \u2014 this strategy did not work. Do not apply when SharedMemoryConflicts is the NCU-flagged bottleneck in a Triton tl.dot kernel and the proposed fix is only expanding BLOCK_K in the autotune config list.",
+    "do_not_apply_when": "Triton tl.dot kernels with SharedMemoryConflicts rule triggered: expanding BLOCK_K in autotune configs does not resolve the conflict because Triton's internal SMEM layout for tl.dot is compiler-managed and independent of BLOCK_K stride. The conflict originates from fixed internal padding/swizzling, not from the tile K dimension chosen by the user.",
+    "framework_notes": "Triton's tl.dot operator manages shared memory layout internally via the LLVM/MLIR backend. The SMEM bank conflict pattern for tl.dot tiles is determined by the compiler's swizzling/padding decisions, not by the user-specified BLOCK_K parameter. Changing BLOCK_K in the autotune config list changes tile sizes but does not override the internal SMEM layout algorithm. To fix SMEM bank conflicts in Triton tl.dot, one would need to use explicit swizzled shared memory layouts (e.g., via triton-lang's experimental swizzle primitives) or rely on future compiler improvements."
+  },
+  {
+    "item_id": "triton-bmm-autotune-larger-block-k-num-stages-001",
+    "iteration": 2,
+    "speedup": 1.8455,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_software_pipeline_depth_and_block_k_to_hide_l1tex_stalls",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + UncoalescedGlobalAccess + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 1.38,
+        "GPU Speed Of Light Throughput.Memory Throughput": 69.05,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 70.05,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.07,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Scheduler Statistics.No Eligible": 67.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.32,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 73.73,
+        "Launch Statistics.Registers Per Thread": 126.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Shared Mem": 3.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.66,
+        "GPU Speed Of Light Throughput.Memory Throughput": 88.3,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 89.65,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.2,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 58.16,
+        "Scheduler Statistics.No Eligible": 90.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.15,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 42.45,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 98.3,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Shared Mem": 2.0
+      }
+    },
+    "strategy_title": "Adding Larger BLOCK_K + num_stages=5 Configs Causes Regression",
+    "strategy_description": "Adding autotune configs with BLOCK_K=128 and num_stages=5 caused the autotuner to select a config that dramatically increased shared memory usage (73.7 KB \u2192 98.3 KB/block), reducing Block Limit Shared Mem from 3 to 2. Despite the intent to hide L1TEX latency via deeper pipelining, the selected config worsened the situation: Warp Cycles Per Issued Instruction jumped from 12.32 to 42.45, No Eligible Warp rate rose from 68% to 90.65%, and kernel duration increased 3.4x (1.38 ms \u2192 4.66 ms). The deeper pipeline consumed more shared memory and registers without providing sufficient latency hiding, as UncoalescedSharedAccess (75% excessive wavefronts) and UncoalescedGlobalAccess (59% excessive sectors) became dominant bottlenecks in the new config. The net result was a 1.85x regression relative to the pre-iteration-2 baseline.",
+    "slow_pseudocode": "# Autotune configs: added BLOCK_K=128, num_stages=5\ntriton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=8),\ntriton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=4),\n# Inside K-loop: loads without fp16 cast, allow_tf32=True\na = tl.load(A, mask=..., other=0.0)   # float32, no cast\nb = tl.load(B, mask=..., other=0.0)   # float32, no cast\nacc = tl.dot(a, b, acc=acc, allow_tf32=True)",
+    "fast_pseudocode": "# Keep autotune configs with BLOCK_K<=64, num_stages<=4\n# Avoid BLOCK_K=128 with num_stages=5 \u2014 causes smem pressure\ntriton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),\ntriton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),\n# Inside K-loop: fp16 cast to engage Tensor Cores\na = tl.load(A, mask=..., other=0.0).to(tl.float16)\nb = tl.load(B, mask=..., other=0.0).to(tl.float16)\nacc = tl.dot(a, b, acc=acc)",
+    "applicable_when": "Never \u2014 this specific combination (BLOCK_K=128 + num_stages=5 added to autotune pool when Block Limit Shared Mem is already at 2-3) consistently causes regression by increasing shared memory pressure and worsening L1TEX stalls.",
+    "do_not_apply_when": "Always avoid adding BLOCK_K=128 + num_stages>=5 configs when the kernel already has Block Limit Shared Mem <= 3 and dynamic shared memory per block >= 70 KB. The autotuner will select these configs and the increased smem footprint reduces blocks-per-SM, worsening latency hiding rather than improving it.",
+    "framework_notes": "Triton-specific: num_stages controls the async copy pipeline depth; each additional stage allocates extra shared memory buffers of size BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N elements. With BLOCK_K=128 and num_stages=5, the smem per block grows to ~98 KB, pushing Block Limit Shared Mem from 3 to 2. On H200 with 228 KB shared memory per SM, this leaves insufficient room for latency hiding. The also-applied change of removing .to(tl.float16) casts (reverting to FP32 loads) further hurt performance by disabling Tensor Core HMMA instructions."
+  },
+  {
+    "item_id": "triton-bmm-num-stages2-occupancy-lift-003",
+    "iteration": 3,
+    "speedup": 3.4538,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_autotune_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 1.38,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 24.66,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Launch Statistics.Registers Per Thread": 126.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 73.73,
+        "Scheduler Statistics.No Eligible": 68.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.31,
+        "Memory Workload Analysis.L2 Hit Rate": 73.28
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.49,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.4,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 30.95,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Launch Statistics.Registers Per Thread": 86.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 20.48,
+        "Scheduler Statistics.No Eligible": 69.0,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.48,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.99,
+        "Memory Workload Analysis.L2 Hit Rate": 85.37
+      }
+    },
+    "strategy_title": "Add num_stages=2 Autotune Configs to Reduce Register Pressure",
+    "strategy_description": "When a Triton GEMM/BMM kernel is register-limited (Block Limit Registers \u2264 2, registers/thread \u2265 120) due to all autotune configs using num_stages \u2265 3, adding num_stages=2 configs with smaller tiles (BLOCK_M/BLOCK_N \u2264 128) allows the autotuner to select a config that reduces registers/thread (126 \u2192 86) and raises Block Limit Registers from 2 to 5, improving theoretical occupancy from 25% to 31.25%. The L2 hit rate also improved (73% \u2192 85%) as smaller tiles fit better in cache. Note that despite the occupancy improvement, the kernel duration increased (1.38 ms \u2192 2.49 ms) in absolute terms because the baseline was already fast from a prior FP16 Tensor Core optimization \u2014 the 3.45x speedup is relative to a different (slower) baseline, so this strategy's value depends on the starting point.",
+    "slow_pseudocode": "@triton.autotune(configs=[\n    # All configs have num_stages in {3, 4, 5} \u2014 high register pressure\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),\n    # ... all num_stages >= 3\n], key=['BATCH', 'M', 'N', 'K'])\n# Result: 126 regs/thread, Block Limit Registers=2, 25% occupancy",
+    "fast_pseudocode": "@triton.autotune(configs=[\n    # NEW: num_stages=2 low-register-pressure configs\n    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),\n    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),\n    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=2, num_warps=2),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=2, num_warps=4),\n    # Keep existing num_stages >= 3 configs as fallback\n    ...\n], key=['BATCH', 'M', 'N', 'K'])\n# Result: 86 regs/thread, Block Limit Registers=5, 31.25% occupancy",
+    "applicable_when": "Triton GEMM/BMM kernel where Block Limit Registers \u2264 2, registers/thread \u2265 120, theoretical occupancy \u2264 25%, and all autotune configs use num_stages \u2265 3. TheoreticalOccupancy and IssueSlotUtilization NCU rules are triggered. SMEM per block is not the binding constraint (Block Limit Shared Mem > Block Limit Registers).",
+    "do_not_apply_when": "Kernel is already at Block Limit Registers \u2265 4 (occupancy not register-limited); SMEM is the binding occupancy constraint (Block Limit Shared Mem \u2264 Block Limit Registers); the kernel is compute-throughput-bound rather than latency-hiding-bound; smaller tiles would cause significant arithmetic intensity loss that outweighs occupancy gains; SharedMemoryConflicts is the primary bottleneck (this strategy worsened bank conflicts from 3.4-way to 5.3-way).",
+    "framework_notes": "Triton-specific: num_stages controls software pipelining depth; each additional stage adds register buffers for prefetched tiles. Reducing num_stages from 3 to 2 with BLOCK_M=128, BLOCK_N=128 dropped registers from 126 to 86 in this case. The strategy is purely additive (no kernel body changes needed). However, the selected num_stages=2 config worsened SharedMemoryConflicts (3.4-way \u2192 5.3-way, 27.96% \u2192 53.81% conflict rate), suggesting a trade-off between register pressure and SMEM bank conflicts. In CUDA, the equivalent is reducing __launch_bounds__ or tiling parameters."
+  },
+  {
+    "item_id": "triton-bmm-block-ptr-coalesced-loads-003",
+    "iteration": 3,
+    "speedup": 1.8534,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "coalesced_block_ptr_loads_to_eliminate_uncoalesced_global_and_shared_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 1.38,
+        "GPU Speed Of Light Throughput.Memory Throughput": 68.89,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 70.06,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.0,
+        "Memory Workload Analysis.Mem Busy": 68.89,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Scheduler Statistics.No Eligible": 68.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.31,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 73.73,
+        "Launch Statistics.Registers Per Thread": 126.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Shared Mem": 3.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.64,
+        "GPU Speed Of Light Throughput.Memory Throughput": 88.58,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 90.15,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.24,
+        "Memory Workload Analysis.Mem Busy": 88.58,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 58.02,
+        "Scheduler Statistics.No Eligible": 89.54,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 37.92,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 98.3,
+        "Launch Statistics.Registers Per Thread": 116.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Shared Mem": 2.0
+      }
+    },
+    "strategy_title": "tl.make_block_ptr Causes Regression When SMEM Already Pressure-Limited",
+    "strategy_description": "Replacing manual strided pointer arithmetic with tl.make_block_ptr() + tl.advance() in a Triton BMM kernel caused a 3.4x duration increase (1.38 ms \u2192 4.64 ms), yielding a net speedup of only 1.85x relative to the original baseline \u2014 a regression versus the iteration-2 kernel. The block pointer path increased dynamic shared memory per block from 73.7 KB to 98.3 KB, reducing Block Limit Shared Mem from 3 to 2. Despite L1/TEX Hit Rate improving from 0% to 58% (confirming better cache reuse), the No Eligible Warp rate jumped from 68% to 89.5% and Warp Cycles Per Issued Instruction tripled from 12.3 to 37.9, indicating severe latency stalls from the increased SMEM footprint crowding out blocks. The UncoalescedSharedAccess rule appeared in the AFTER profile (75% excessive wavefronts, 73.5% estimated speedup), showing the block pointer path did not resolve shared memory access conflicts and instead introduced new LG-queue stalls (CPIStall: 35.3% of cycles). When Block Limit Shared Mem is already at 2-3 and dynamic SMEM per block is \u226570 KB, tl.make_block_ptr's additional SMEM allocation for TMA staging buffers reduces blocks-per-SM and worsens latency hiding more than it improves coalescing.",
+    "slow_pseudocode": "# Manual strided pointer arithmetic \u2014 before\nA = A_ptr + batch_id * stride_ab + (rm[:, None] * stride_am + rk[None, :] * stride_ak)\nB = B_ptr + batch_id * stride_bb + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A, mask=mask_a, other=0.0).to(tl.float16)\n    b = tl.load(B, mask=mask_b, other=0.0).to(tl.float16)\n    acc = tl.dot(a, b, acc=acc)\n    A += BLOCK_K * stride_ak\n    B += BLOCK_K * stride_bk\n# Duration: 1.38 ms, SMEM: 73.7 KB/block, Block Limit Shared Mem: 3",
+    "fast_pseudocode": "# tl.make_block_ptr \u2014 after (REGRESSION)\nA_block_ptr = tl.make_block_ptr(base=A_ptr + batch_id*stride_ab,\n    shape=(M,K), strides=(stride_am, stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1,0))\nB_block_ptr = tl.make_block_ptr(base=B_ptr + batch_id*stride_bb,\n    shape=(K,N), strides=(stride_bk, stride_bn),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1,0))\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(B_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc = tl.dot(a, b, acc=acc, allow_tf32=True)\n    A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))\n    B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))\n# Duration: 4.64 ms, SMEM: 98.3 KB/block, Block Limit Shared Mem: 2 \u2014 WORSE",
+    "applicable_when": "Never apply when Block Limit Shared Mem is already \u2264 3 and dynamic SMEM per block is \u2265 70 KB. The block pointer path allocates additional TMA staging buffers that push SMEM over the threshold, reducing blocks-per-SM and worsening latency hiding.",
+    "do_not_apply_when": "Triton BMM/GEMM kernels where dynamic SMEM per block is already \u2265 70 KB and Block Limit Shared Mem \u2264 3; kernels where the autotuner may select configs with BLOCK_K=128 + num_stages\u22654 alongside block pointers (compounding SMEM pressure); any kernel where the primary bottleneck is UncoalescedSharedAccess rather than UncoalescedGlobalAccess (block pointers do not fix SMEM bank conflicts and may worsen LG-queue stalls).",
+    "framework_notes": "Triton-specific: tl.make_block_ptr with order=(1,0) on Hopper triggers TMA (Tensor Memory Accelerator) bulk-copy instructions, which allocate additional shared memory staging buffers beyond the num_stages pipeline buffers. This increases dynamic SMEM per block even when the tile sizes are unchanged. The L1/TEX Hit Rate improvement (0% \u2192 58%) confirms TMA is working, but the SMEM pressure increase from 73.7 KB \u2192 98.3 KB reduced Block Limit Shared Mem from 3 \u2192 2, causing the net regression. The UncoalescedSharedAccess rule persisted in the AFTER profile, indicating block pointers do not resolve Triton's internal SMEM bank conflict layout for tl.dot tiles."
+  }
+]

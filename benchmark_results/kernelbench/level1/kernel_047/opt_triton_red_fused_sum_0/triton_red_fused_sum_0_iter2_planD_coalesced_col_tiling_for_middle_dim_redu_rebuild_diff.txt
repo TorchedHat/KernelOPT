@@ -1,0 +1,95 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 128,  'BLOCK_R': 1}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_M': 256,  'BLOCK_R': 1}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_M': 512,  'BLOCK_R': 1}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_M': 1024, 'BLOCK_R': 1}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_M': 2048, 'BLOCK_R': 1}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_M': 256,  'BLOCK_R': 1}, num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_M': 512,  'BLOCK_R': 1}, num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_M': 1024, 'BLOCK_R': 1}, num_warps=16, num_stages=3),
+     ],
+     key=['batch', 'reduce_dim', 'last_dim'],
+ )
+@@ -26,48 +27,28 @@
+     BLOCK_M: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+ ):
+-    # Grid: (batch * last_dim / BLOCK_M,)
+-    # Each program handles BLOCK_M output elements along last_dim
+-    # and reduces over reduce_dim
+-    pid = tl.program_id(0)
++    # Grid: (cdiv(last_dim, BLOCK_M), batch)
++    # BLOCK_M tiles over col_idx (stride=1, fully coalesced)
++    # BLOCK_R is unused (we loop scalar over r for coalesced access)
++    pid_c = tl.program_id(0)   # col chunk index
++    pid_b = tl.program_id(1)   # batch index
+ 
+-    # Each pid handles BLOCK_M consecutive last_dim positions for a given batch
+-    # We flatten: output index = batch_idx * last_dim + col_idx
+-    # pid covers BLOCK_M output elements
+-    out_start = pid * BLOCK_M
++    col_offsets = pid_c * BLOCK_M + tl.arange(0, BLOCK_M)  # stride=1 in memory
++    col_mask = col_offsets < last_dim
+ 
+-    # Compute batch index and column index
+-    col_offsets = out_start + tl.arange(0, BLOCK_M)
+-    batch_idx = col_offsets // last_dim
+-    col_idx = col_offsets % last_dim
++    acc = tl.zeros([BLOCK_M], dtype=tl.float32)
++    base = pid_b * (reduce_dim * last_dim)
+ 
+-    mask_out = (batch_idx < batch) & (col_idx < last_dim)
++    for r in range(0, reduce_dim):
++        # Load x[pid_b, r, col_offsets]: contiguous along last_dim (stride=1)
++        # -> fully coalesced 128-bit loads
++        linear_idx = base + r * last_dim + col_offsets  # [BLOCK_M]
++        vals = tl.load(in_ptr + linear_idx, mask=col_mask, other=0.0)
++        acc += vals
+ 
+-    # Accumulate sum over reduce_dim
+-    acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+-
+-    for r_start in range(0, reduce_dim, BLOCK_R):
+-        r_offsets = r_start + tl.arange(0, BLOCK_R)
+-        r_mask = r_offsets < reduce_dim
+-
+-        # Load: in_ptr[batch_idx, r_offsets, col_idx]
+-        # Shape: [BLOCK_M, BLOCK_R]
+-        # in_ptr stride: [reduce_dim * last_dim, last_dim, 1]
+-        # Linear index: batch_idx * reduce_dim * last_dim + r * last_dim + col_idx
+-
+-        b_idx = batch_idx[:, None]  # [BLOCK_M, 1]
+-        r_idx = r_offsets[None, :]  # [1, BLOCK_R]
+-        c_idx = col_idx[:, None]    # [BLOCK_M, 1]
+-
+-        linear_idx = b_idx * (reduce_dim * last_dim) + r_idx * last_dim + c_idx
+-
+-        combined_mask = mask_out[:, None] & r_mask[None, :]
+-
+-        vals = tl.load(in_ptr + linear_idx, mask=combined_mask, other=0.0)
+-        acc += tl.sum(vals, axis=1)
+-
+-    tl.store(out_ptr + col_offsets, acc, mask=mask_out)
+-
++    # Store: out[pid_b * last_dim + col_offsets]
++    out_offsets = pid_b * last_dim + col_offsets
++    tl.store(out_ptr + out_offsets, acc, mask=col_mask)
+ 
+ def kernel_function(x):
+     # x: [128, 4096, 4095], reduce over dim=1, keepdim=True -> [128, 1, 4095]

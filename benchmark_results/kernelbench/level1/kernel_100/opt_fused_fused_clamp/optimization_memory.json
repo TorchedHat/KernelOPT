@@ -1,0 +1,236 @@
+[
+  {
+    "item_id": "exp_001_register_spill_2d_tile_triton",
+    "iteration": 1,
+    "speedup": 0.0815,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "2d_tile_grid_coalesced_stores_register_spill",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 25.0,
+        "Occupancy.Achieved Occupancy": 98.54,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration_ms": 1.16,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 44.35,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 75.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.74
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 255.0,
+        "Occupancy.Achieved Occupancy": 12.47,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "GPU Speed Of Light Throughput.Duration_ms": 14.24,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 88.22,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 6.49,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.35
+      }
+    },
+    "strategy_title": "2D Tile Grid for Coalesced Stores Causes Register Spill",
+    "strategy_description": "Restructuring a 1D-per-row kernel into a 2D-tile kernel (each CTA handles BLOCK_ROWS rows simultaneously) to coalesce partial stores can catastrophically increase register pressure. When BLOCK_ROWS is a compile-time constexpr embedded in the kernel body, Triton allocates BLOCK_ROWS-sized vector registers for accumulators and 2D index arrays; in this case registers_per_thread jumped from 25 to 255, collapsing theoretical occupancy from 100% to 12.5% and increasing kernel duration from 1.16ms to 14.24ms (12x regression). The coalescing benefit (DRAM throughput dropped from 75% to 6%) was completely overwhelmed by the occupancy collapse and resulting local-memory spill traffic (MemoryCacheAccessPattern flagged 1/32 bytes/sector for local loads/stores).",
+    "slow_pseudocode": "# BEFORE: 1D grid, one CTA per row, scalar accumulator\nrow_id = program_id(0)\nacc = zeros((), float32)  # scalar\nfor col_off in range(0, N, BLOCK_N):\n    pred = load(pred_ptr + row_id * stride_m + cols * stride_n)\n    val = clamp(1.0 - pred * tgt, min=0)\n    acc += sum(val, axis=0)  # scalar reduction\nstore(partial_ptr + row_id, acc)  # uncoalesced scalar store",
+    "fast_pseudocode": "# AFTER (REGRESSED): 2D tile, BLOCK_ROWS rows per CTA, vector accumulator\n# BLOCK_ROWS=32 as constexpr -> 255 registers/thread -> 12.5% occupancy\nblock_start = program_id(0) * BLOCK_ROWS\nrow_ids = block_start + arange(0, BLOCK_ROWS)  # [BLOCK_ROWS]\nacc = zeros([BLOCK_ROWS], float32)  # vector -> huge register pressure\nfor col_off in range(0, N, BLOCK_N):\n    pred = load(pred_ptr + row_ids[:,None]*stride_m + cols[None,:]*stride_n)  # [BLOCK_ROWS, BLOCK_N]\n    val = clamp(1.0 - pred * tgt[None,:], min=0)\n    acc += sum(val, axis=1)  # [BLOCK_ROWS]\nstore(partial_ptr + row_ids, acc, mask=row_mask)  # coalesced but moot",
+    "applicable_when": "Never in this form. The 2D-tile coalescing idea is sound in principle but the implementation caused catastrophic register spill.",
+    "do_not_apply_when": "When BLOCK_ROWS * BLOCK_N register footprint per thread exceeds ~32 registers; when the kernel already has high occupancy (>90%) and low register count (<32); when the 2D tile size causes registers_per_thread to exceed ~64, which will collapse occupancy below 50% on SM90 hardware. Do not use large constexpr BLOCK_ROWS values (e.g. 32) combined with large BLOCK_N (e.g. 1024) in a single Triton kernel body.",
+    "framework_notes": "In Triton, constexpr tile dimensions directly determine the size of statically-allocated register arrays. A [BLOCK_ROWS, BLOCK_N] load tile with BLOCK_ROWS=32 and BLOCK_N=1024 requires 32768 elements per CTA, forcing massive register allocation and spill to local memory. The MemoryCacheAccessPattern rule firing on 'local loads/stores' (not global) is the diagnostic signal that register spill is occurring. CUDA equivalent: __launch_bounds__ or reducing shared-memory tile size to control occupancy."
+  },
+  {
+    "item_id": "07c6407b",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fuse_two_kernels_into_single_pass_atomic_reduction",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fuse_two_kernels_into_single_pass_atomic_reduction \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fuse_two_kernels_into_single_pass_atomic_reduction' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_100/opt_fused_fused_clamp/fused_fused_clamp_iter2_planA_fuse_two_kernels_into_single_pass_atomic.py\", line 122, in <module>\n    outp",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The two-kernel design (hinge_loss_row_kernel + hinge_loss_reduce_kernel) forces 32,768 scalar stores to partial_ptr \u2014 one per row \u2014 each writing exactly 4 bytes into a 32-byte sector (4/32 bytes/sector utilization, matching the NCU MemoryCacheAccessPattern finding). These 32K scalar stores are the primary source of uncoalesced global traffic. The partial buffer (32K floats = 128 KB) then must be re-read by the reduce kernel with L2 hit rate of only 1.26%, meaning nearly all traffic hits DRAM twice: once for the write, once for the read. Eliminating the partial buffer via a single-pass kernel that uses tl.atomic_add to accumulate directly into a single output scalar removes both the uncoalesced store pattern and the intermediate DRAM round-trip. The 2D-tile approach was already tried and caused catastrophic register spill (exp_001); atomic_add keeps the scalar accumulator and avoids that failure mode entirely.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_100/opt_fused_fused_clamp/fused_",
+    "framework_notes": null
+  },
+  {
+    "item_id": "0571cc53",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "atomic_add_single_pass_eliminate_partial_buffer",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "atomic_add_single_pass_eliminate_partial_buffer \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'atomic_add_single_pass_eliminate_partial_buffer' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_100/opt_fused_fused_clamp/fused_fused_clamp_iter2_planB_atomic_add_single_pass_eliminate_partial.py\", line 118, in <module>\n    outp",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The hinge_loss_row_kernel issues one scalar tl.store(partial_ptr + row_id, acc) per CTA. With 32768 CTAs each writing a single float32, consecutive warps write to non-adjacent addresses, so only 4 of 32 bytes per cache sector are utilized \u2014 matching the MemoryCacheAccessPattern rule exactly. The L2 hit rate of 6.23% confirms the 32768-element partial[] buffer (128 KB) is written cold and then read cold by hinge_loss_reduce_kernel, incurring two full DRAM round-trips for the intermediate buffer. Eliminating partial[] via tl.atomic_add directly onto a single output scalar removes: (1) the uncoalesced store bottleneck, (2) the entire reduce_kernel launch, (3) the 128 KB intermediate DRAM write+read. The 2D-tile coalescing approach was already tried (exp_001) and caused 12x regression due to register spill \u2014 atomic_add avoids that entirely since the accumulator remains scalar.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nTraceback (most recent call last):\n  File \"/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_100/opt_fused_fused_clamp/fused_",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_scalar_accumulator_1d_grid_triton",
+    "iteration": 2,
+    "speedup": 1.2045,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "scalar_accumulator_1d_grid_low_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 25.0,
+        "Occupancy.Achieved Occupancy": 98.53,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration_ms": 1.16,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 75.54,
+        "Memory Workload Analysis.Memory Throughput_TBs": 3.71,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.64,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 49.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 30.0,
+        "Occupancy.Achieved Occupancy": 98.11,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration_ms": 0.963,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 90.87,
+        "Memory Workload Analysis.Memory Throughput_TBs": 4.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.28,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 46.31
+      }
+    },
+    "strategy_title": "Reduce Block Size to Push Kernel Toward DRAM Saturation",
+    "strategy_description": "Reducing block size from 256 to 128 threads (while keeping the same 1D-per-row grid) in a memory-bandwidth-bound kernel shifted the bottleneck from L2/L1 contention toward full DRAM saturation, increasing DRAM throughput from 75.5% to 90.9% and memory throughput from 3.71 TB/s to 4.47 TB/s. The kernel moved from a mixed L1/L2/DRAM bottleneck (SOLBottleneck flagging memory) to a fully DRAM-bound regime, yielding a 1.20x speedup. Removing eviction policy hints (evict_first/evict_last) and expanding autotune configs to cover more BLOCK_N/num_warps combinations also contributed by allowing the autotuner to find a better configuration.",
+    "slow_pseudocode": "# block_size=256, eviction hints on loads\n@autotune(configs=[BLOCK_N=1024/num_warps=8, BLOCK_N=512/num_warps=4, ...])\nrow_id = program_id(0)\nacc = zeros((), float32)\nfor col_off in range(0, N, BLOCK_N):\n    pred = load(pred_ptr + row_id*stride_m + cols*stride_n, eviction_policy='evict_first')\n    tgt  = load(target_ptr + cols, eviction_policy='evict_last')\n    val  = clamp(1.0 - pred * tgt, min=0)\n    acc += sum(val, axis=0)\nstore(partial_ptr + row_id, acc)",
+    "fast_pseudocode": "# block_size=128, no eviction hints, expanded autotune\n@autotune(configs=[BLOCK_N=1024/num_warps=4, BLOCK_N=1024/num_warps=8,\n                   BLOCK_N=2048/num_warps=8, BLOCK_N=2048/num_warps=16,\n                   BLOCK_N=512/num_warps=4,  BLOCK_N=512/num_warps=8,\n                   BLOCK_N=4096/num_warps=16])\nrow_id = program_id(0)\nacc = zeros((), float32)\nfor col_off in range(0, N, BLOCK_N):\n    pred = load(pred_ptr + row_id*stride_m + cols*stride_n)\n    tgt  = load(target_ptr + cols)\n    val  = clamp(1.0 - pred * tgt, min=0)\n    acc += sum(val, axis=0)\nstore(partial_ptr + row_id, acc)",
+    "applicable_when": "Kernel is memory-bandwidth-bound with DRAM throughput below ~85% and L2 throughput near saturation; block size is 256 and register count is low enough that halving block size does not reduce occupancy; autotune config space does not cover smaller num_warps options; eviction policy hints are present but not demonstrably beneficial.",
+    "do_not_apply_when": "Kernel is already DRAM-saturated (>90% DRAM throughput) \u2014 further block size reduction will only increase warp stall cycles without bandwidth gain; when reducing block size would drop theoretical occupancy below 100% due to register pressure; when the kernel is compute-bound rather than memory-bound.",
+    "framework_notes": "In Triton, block size (num_warps * 32) affects how many threads compete for L1/L2 cache lines per SM. Removing eviction_policy hints ('evict_first', 'evict_last') lets the hardware manage cache replacement, which can be beneficial when the access pattern is already streaming. Expanding autotune configs to include lower num_warps (e.g. 4) alongside higher BLOCK_N values allows the autotuner to find configurations that better saturate DRAM bandwidth."
+  },
+  {
+    "item_id": "exp_003_tl_maximum_fused_fma_num_stages3_triton",
+    "iteration": 3,
+    "speedup": 1.2269,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fused_fma_tl_maximum_plus_num_stages3_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 963.04,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 90.87,
+        "Memory Workload Analysis.Memory Throughput_TBs": 4.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.28,
+        "Instruction Statistics.Executed Instructions": 332267520.0,
+        "Launch.block_size": 128.0,
+        "Launch.registers_per_thread": 30.0,
+        "Occupancy.Achieved Occupancy": 98.11,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 46.31
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 945.44,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 92.5,
+        "Memory Workload Analysis.Memory Throughput_TBs": 4.55,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 26.67,
+        "Instruction Statistics.Executed Instructions": 324861952.0,
+        "Launch.block_size": 256.0,
+        "Launch.registers_per_thread": 40.0,
+        "Occupancy.Achieved Occupancy": 74.01,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 49.56
+      }
+    },
+    "strategy_title": "Replace tl.where Clamp with tl.maximum for Fused FMA",
+    "strategy_description": "Replacing a two-statement clamp pattern (`val = 1.0 - pred * tgt; val = tl.where(val > 0.0, val, 0.0)`) with a single `tl.maximum(0.0, 1.0 - pred * tgt)` allows the Triton compiler to emit a fused FMA instruction for the multiply-subtract and a single FMAX for the clamp, reducing total executed instructions from 332M to 325M and cutting Warp Cycles Per Issued Instruction from 35.3 to 26.7 cycles. Adding num_stages=3 autotune configs alongside num_stages=2 enables the autotuner to select software-pipelined configurations that overlap memory loads with compute, further reducing L1TEX scoreboard stall cycles. The combined effect yielded a 1.23x speedup even though occupancy dropped from 98% to 74% due to higher register pressure (30\u219240 registers/thread) from the larger block size selected by the autotuner.",
+    "slow_pseudocode": "# Two-statement clamp: emits FMUL + FADD + FSEL (3 non-fused ops)\nfor col_off in range(0, N, BLOCK_N):\n    pred = load(pred_ptr + row_id*stride_m + cols*stride_n, mask=mask)\n    tgt  = load(target_ptr + cols, mask=mask)\n    val  = 1.0 - pred * tgt       # FMUL + FADD\n    val  = tl.where(val > 0.0, val, 0.0)  # FSEL\n    acc += tl.sum(val, axis=0)",
+    "fast_pseudocode": "# Single tl.maximum: emits FFMA + FMAX (2 fused ops)\n# autotune configs include num_stages=3 variants\nfor col_off in range(0, N, BLOCK_N):\n    pred = load(pred_ptr + row_id*stride_m + cols*stride_n, mask=mask, eviction_policy='evict_first')\n    tgt  = load(target_ptr + cols, mask=mask, eviction_policy='evict_last')\n    val  = tl.maximum(0.0, 1.0 - pred * tgt)  # FFMA + FMAX\n    acc += tl.sum(val, axis=0)",
+    "applicable_when": "FPInstructions NCU rule is triggered with a high ratio of non-fused to fused FP32 instructions (e.g. <50% fusion rate); kernel contains a two-step pattern of multiply-add followed by tl.where clamp-to-zero; Warp Cycles Per Issued Instruction is elevated (>25) due to L1TEX scoreboard stalls; kernel is memory-bandwidth-bound and near DRAM saturation.",
+    "do_not_apply_when": "Kernel already uses tl.maximum or equivalent fused idioms; register pressure is already near the limit causing occupancy below 75% \u2014 adding num_stages=3 may increase registers further and collapse occupancy; kernel is compute-bound rather than memory-bound, where instruction count reduction has diminishing returns.",
+    "framework_notes": "In Triton, `tl.maximum(0.0, a*b + c)` in a single expression allows the backend to schedule FFMA (fused multiply-add) for the inner expression and FMAX for the clamp, whereas splitting into two statements forces separate FMUL+FADD+FSEL. Adding num_stages=3 to autotune configs enables async prefetch on SM80+ (Ampere/Hopper), overlapping memory loads with compute to hide L1TEX latency. The autotuner may select a larger block_size (e.g. 256 vs 128) with num_stages=3, which increases registers_per_thread and reduces theoretical occupancy \u2014 this trade-off is beneficial when the kernel is DRAM-saturated and instruction throughput is the bottleneck."
+  },
+  {
+    "item_id": "exp_003_vectorized_loads_contiguous_hints_triton",
+    "iteration": 3,
+    "speedup": 1.2065,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_loads_max_contiguous_multiple_of_hints",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 963.04,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 90.87,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 46.31,
+        "Memory Workload Analysis.L2 Hit Rate": 4.76,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.28,
+        "Scheduler Statistics.No Eligible": 55.34,
+        "Memory Workload Analysis.bytes_per_sector_utilized": 4.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 961.47,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 91.02,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 46.07,
+        "Memory Workload Analysis.L2 Hit Rate": 4.74,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.21,
+        "Scheduler Statistics.No Eligible": 55.48,
+        "Memory Workload Analysis.bytes_per_sector_utilized": 4.0
+      }
+    },
+    "strategy_title": "tl.max_contiguous + tl.multiple_of Hints for Vectorized Loads",
+    "strategy_description": "Adding tl.max_contiguous and tl.multiple_of alignment hints to the inner-loop column index in a Triton kernel produced a marginal 1.2065x speedup, but the profiling metrics before and after are nearly identical: DRAM throughput moved from 90.87% to 91.02%, L1TEX hit rate from 46.31% to 46.07%, bytes-per-sector utilization remained at 4.0/32, and warp cycles per issued instruction barely changed (35.28 \u2192 35.21). The kernel was already fully DRAM-saturated (>90% DRAM throughput) before the change, meaning the vectorization hints did not materially reduce transaction count or stall cycles \u2014 the speedup is within measurement noise and the MemoryCacheAccessPattern bottleneck remains unresolved.",
+    "slow_pseudocode": "# BEFORE: plain arange, no alignment hints\nfor col_off in range(0, N, BLOCK_N):\n    cols = col_off + tl.arange(0, BLOCK_N)\n    pred = tl.load(pred_ptr + row_id * stride_m + cols * stride_n, mask=cols < N)\n    tgt  = tl.load(target_ptr + cols, mask=cols < N)",
+    "fast_pseudocode": "# AFTER: alignment hints added\nfor col_off in range(0, N, BLOCK_N):\n    cols = tl.max_contiguous(tl.multiple_of(col_off + tl.arange(0, BLOCK_N), BLOCK_N), BLOCK_N)\n    pred = tl.load(pred_ptr + row_id * stride_m + cols * stride_n, mask=cols < N)\n    tgt  = tl.load(target_ptr + cols, mask=cols < N)",
+    "applicable_when": "Kernel is NOT yet DRAM-saturated (<85% DRAM throughput); MemoryCacheAccessPattern rule fires with low bytes-per-sector utilization on global loads; the inner-loop index is provably aligned (loop step equals BLOCK_N, starts at 0); stride_n == 1 (row-major contiguous tensor). In that regime, the hints can enable 128-bit vectorized loads and reduce transaction count.",
+    "do_not_apply_when": "Kernel is already DRAM-saturated (>90% DRAM throughput) \u2014 the hints will not reduce bandwidth consumption further and any speedup will be within noise. Also ineffective when the MemoryCacheAccessPattern bottleneck is on global stores (not loads), or when stride_n != 1 (non-contiguous memory layout prevents vectorization regardless of hints).",
+    "framework_notes": "In Triton, tl.multiple_of(x, n) asserts x is divisible by n (alignment hint) and tl.max_contiguous(x, n) asserts x contains n contiguous values. Together they allow the Triton backend to emit ld.global.v4.f32 (128-bit) instead of ld.global.f32 (32-bit). Valid only when col_off is always a multiple of BLOCK_N (loop step == BLOCK_N, starting at 0) and tl.arange(0, BLOCK_N) is always contiguous. CUDA equivalent: __ldg with 128-bit aligned pointers or vectorized float4 loads."
+  },
+  {
+    "item_id": "exp_003_block_rows_2_target_amortization_triton",
+    "iteration": 3,
+    "speedup": 1.1154,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "small_block_rows_scalar_accumulators_target_load_amortization",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 30.0,
+        "Occupancy.Achieved Occupancy": 98.11,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration_us": 963.04,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 90.87,
+        "Memory Workload Analysis.L2 Hit Rate": 4.76,
+        "Memory Workload Analysis.Memory Throughput_TBs": 4.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.28,
+        "Launch.grid_size": 32768.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 28.0,
+        "Occupancy.Achieved Occupancy": 99.25,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration_us": 1040.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 84.17,
+        "Memory Workload Analysis.L2 Hit Rate": 3.29,
+        "Memory Workload Analysis.Memory Throughput_TBs": 4.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 38.61,
+        "Launch.grid_size": 16384.0
+      }
+    },
+    "strategy_title": "BLOCK_ROWS=2 Scalar Accumulators Amortize Shared Target Loads",
+    "strategy_description": "Processing 2 rows per CTA using separate scalar accumulators (not vector registers) halves the number of target-vector DRAM loads and reduces grid size by 2x, but when the kernel is already at >90% DRAM saturation the reduced bandwidth does not translate to lower duration \u2014 warp stall cycles per instruction actually increased (35.3 \u2192 38.6) and DRAM throughput dropped from 90.9% to 84.2%, resulting in a modest 1.12x speedup rather than the predicted 10\u201325%. The strategy avoids the register-spill failure mode of large BLOCK_ROWS (registers dropped from 30 to 28, occupancy improved slightly from 98.1% to 99.3%), but the L2 hit rate did not improve (4.76% \u2192 3.29%), suggesting the target vector is not being reused within the reduced CTA count as expected \u2014 likely because the L2 is still overwhelmed by the concurrent pred loads from the halved-but-still-large grid.",
+    "slow_pseudocode": "# 1 CTA per row, target loaded M times total\nrow_id = program_id(0)\nacc = zeros((), float32)\nfor col_off in range(0, N, BLOCK_N):\n    tgt  = load(target_ptr + cols, mask=col_mask)\n    pred = load(pred_ptr + row_id*stride_m + cols*stride_n, mask=col_mask)\n    val  = clamp(1.0 - pred * tgt, min=0)\n    acc += sum(val, axis=0)\nstore(partial_ptr + row_id, acc)",
+    "fast_pseudocode": "# 2 rows per CTA, target loaded M/2 times total, two scalar accumulators\nblock_id = program_id(0)\nrow0, row1 = block_id*2, block_id*2+1\nvalid0, valid1 = row0 < M, row1 < M\nacc0 = zeros((), float32)  # scalar \u2014 no register spill\nacc1 = zeros((), float32)  # scalar \u2014 no register spill\nfor col_off in range(0, N, BLOCK_N):\n    tgt = load(target_ptr + cols, mask=col_mask)  # loaded ONCE, reused for both rows\n    if valid0:\n        pred0 = load(pred_ptr + row0*stride_m + cols*stride_n, mask=col_mask)\n        acc0 += sum(clamp(1.0 - pred0*tgt, min=0), axis=0)\n    if valid1:\n        pred1 = load(pred_ptr + row1*stride_m + cols*stride_n, mask=col_mask)\n        acc1 += sum(clamp(1.0 - pred1*tgt, min=0), axis=0)\nif valid0: store(partial_ptr + row0, acc0)\nif valid1: store(partial_ptr + row1, acc1)\n# Grid: (cdiv(M, 2),) via lambda meta: (cdiv(M, meta['BLOCK_ROWS']),)",
+    "applicable_when": "Kernel has a shared read-only vector (e.g. target/label array) loaded once per CTA per tile iteration, with very low L2 hit rate (<10%) indicating no cross-CTA reuse; DRAM throughput is below ~85% (some headroom remains); registers per thread are low enough that adding 1-2 scalar accumulators does not push past a register-limit boundary; grid size is large (>8K CTAs).",
+    "do_not_apply_when": "Kernel is already at >90% DRAM saturation \u2014 the bandwidth reduction from halving target loads does not translate to lower duration when DRAM is the hard bottleneck; when L2 hit rate does not improve after the change (indicating the shared vector is still not being reused, likely due to concurrent pred-load pressure); do not use BLOCK_ROWS > 4 or vector accumulators (tl.zeros([BLOCK_ROWS])) as this causes catastrophic register spill (see exp_001).",
+    "framework_notes": "In Triton, BLOCK_ROWS must be a tl.constexpr to enable compile-time unrolling. Use separate scalar accumulators (acc0, acc1, ...) rather than a vector tl.zeros([BLOCK_ROWS]) to avoid register spill. The grid must use a lambda: lambda meta: (triton.cdiv(M, meta['BLOCK_ROWS']),) so the autotuner can vary BLOCK_ROWS across configs. The if valid0 / if valid1 guards handle boundary rows when M is not divisible by BLOCK_ROWS."
+  }
+]

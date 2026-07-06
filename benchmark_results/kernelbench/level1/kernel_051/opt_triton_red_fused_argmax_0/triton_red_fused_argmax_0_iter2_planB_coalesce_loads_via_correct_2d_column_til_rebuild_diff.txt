@@ -1,0 +1,104 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_R': 128, 'BLOCK_X': 1}, num_warps=4),
+-        triton.Config({'BLOCK_R': 256, 'BLOCK_X': 1}, num_warps=4),
+-        triton.Config({'BLOCK_R': 512, 'BLOCK_X': 1}, num_warps=8),
+-        triton.Config({'BLOCK_R': 1024, 'BLOCK_X': 1}, num_warps=8),
+-        triton.Config({'BLOCK_R': 2048, 'BLOCK_X': 1}, num_warps=16),
+-        triton.Config({'BLOCK_R': 4096, 'BLOCK_X': 1}, num_warps=16),
++        triton.Config({'BLOCK_R': 128,  'BLOCK_X': 16}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_R': 128,  'BLOCK_X': 32}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_R': 256,  'BLOCK_X': 16}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_R': 256,  'BLOCK_X': 32}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_R': 512,  'BLOCK_X': 16}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_R': 512,  'BLOCK_X': 32}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_R': 1024, 'BLOCK_X': 16}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_R': 1024, 'BLOCK_X': 32}, num_warps=16, num_stages=2),
+     ],
+     key=['R', 'N'],
+ )
+@@ -24,48 +27,43 @@
+     BLOCK_R: tl.constexpr,
+     BLOCK_X: tl.constexpr,
+ ):
+-    # Each program handles one (batch, col) pair
+-    pid = tl.program_id(0)
+-    # pid indexes over B * N output elements
+-    batch_idx = pid // N
+-    col_idx = pid % N
++    pid           = tl.program_id(0)
++    num_col_tiles = tl.cdiv(N, BLOCK_X)   # must match grid formula
++    batch_idx     = pid // num_col_tiles
++    col_tile      = pid % num_col_tiles
++    col_base      = col_tile * BLOCK_X
++    col_offsets   = col_base + tl.arange(0, BLOCK_X)  # [BLOCK_X]
++    col_mask      = col_offsets < N                    # tail guard for N=4095
+ 
+-    # Base pointer for this (batch, col) slice
+-    # x[batch_idx, :, col_idx] has stride R=4096 in dim1, stride 1 in dim2
+-    # x_ptr + batch_idx * R * N + col_idx
+-    base = x_ptr + batch_idx * R * N + col_idx
++    max_val = tl.full([BLOCK_X], float('-inf'), dtype=tl.float32)  # [BLOCK_X]
++    max_idx = tl.zeros([BLOCK_X], dtype=tl.int64)                  # [BLOCK_X]
+ 
+-    # Initialize max value and argmax index
+-    max_val = tl.full((), float('-inf'), dtype=tl.float32)
+-    max_idx = tl.full((), 0, dtype=tl.int64)
++    # Use int64 arithmetic to avoid overflow: batch_idx * R * N can exceed 2^31
++    batch_base = x_ptr + batch_idx.to(tl.int64) * R.to(tl.int64) * N.to(tl.int64)
+ 
+-    # Iterate over reduction dimension in blocks
+     for r_start in tl.range(0, R, BLOCK_R):
+-        r_offsets = r_start + tl.arange(0, BLOCK_R)
+-        mask = r_offsets < R
+-        # Load x[batch_idx, r_offsets, col_idx]
+-        ptrs = base + r_offsets * N
+-        vals = tl.load(ptrs, mask=mask, other=float('-inf'))
++        r_offsets = r_start + tl.arange(0, BLOCK_R)  # [BLOCK_R]
++        r_mask    = r_offsets < R                      # [BLOCK_R]
++        # 2D pointer: [BLOCK_R, BLOCK_X]; innermost dim is col (stride-1) — COALESCED
++        ptrs = batch_base + r_offsets[:, None].to(tl.int64) * N.to(tl.int64) + col_offsets[None, :].to(tl.int64)
++        mask = r_mask[:, None] & col_mask[None, :]
++        vals = tl.load(ptrs, mask=mask, other=float('-inf'))  # [BLOCK_R, BLOCK_X]
+         vals = vals.to(tl.float32)
+ 
+-        # Find local max and its index
+-        local_max = tl.max(vals, axis=0)
+-        # Find the index of the local max
+-        # Use argmax: find first occurrence of max
+-        is_max = (vals == local_max) & mask
+-        # Get the index: use a trick with where
+-        indices = tl.where(is_max, r_offsets.to(tl.int64), tl.full([BLOCK_R], R, dtype=tl.int64))
+-        local_idx = tl.min(indices, axis=0)
++        local_max = tl.max(vals, axis=0)   # [BLOCK_X] — max over rows
++        is_max    = (vals == local_max[None, :]) & mask  # [BLOCK_R, BLOCK_X]
++        r_idx_2d  = tl.where(is_max, r_offsets[:, None].to(tl.int64),
++                              tl.full([BLOCK_R, BLOCK_X], R, dtype=tl.int64))
++        local_idx = tl.min(r_idx_2d, axis=0)  # [BLOCK_X] — first occurrence
+ 
+-        # Update global max
+-        if local_max > max_val:
+-            max_val = local_max
+-            max_idx = local_idx
+-        elif local_max == max_val:
+-            max_idx = tl.minimum(max_idx, local_idx)
++        improved  = local_max > max_val
++        tied      = (local_max == max_val) & ~improved
++        max_val   = tl.where(improved, local_max, max_val)
++        max_idx   = tl.where(improved, local_idx,
++                    tl.where(tied, tl.minimum(max_idx, local_idx), max_idx))
+ 
+-    tl.store(out_ptr + batch_idx * N + col_idx, max_idx)
+-
++    out_ptrs = out_ptr + batch_idx.to(tl.int64) * N.to(tl.int64) + col_offsets.to(tl.int64)
++    tl.store(out_ptrs, max_idx, mask=col_mask)
+ 
+ def kernel_function(x):
+     B, R, N = x.shape  # 128, 4096, 4095

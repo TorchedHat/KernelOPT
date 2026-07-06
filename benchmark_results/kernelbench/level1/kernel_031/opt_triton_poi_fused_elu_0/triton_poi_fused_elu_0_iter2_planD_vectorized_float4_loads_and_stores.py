@@ -1,0 +1,91 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8,  num_stages=1),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8,  num_stages=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=4),
+    ],
+    key=['numel'],
+)
+@triton.jit
+def elu_kernel(
+    in_ptr,
+    out_ptr,
+    numel,
+    alpha,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    VEC: tl.constexpr = 4
+    # Each program handles BLOCK_SIZE "vectors" of 4 floats each
+    vec_offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    elem_offsets = vec_offsets * VEC
+    lane_offsets = elem_offsets[:, None] + tl.arange(0, VEC)[None, :]
+    mask = lane_offsets < numel
+
+    x = tl.load(in_ptr + lane_offsets, mask=mask, other=0.0, eviction_policy='evict_last')
+
+    # ELU: x if x > 0 else alpha * (exp(x) - 1)
+    is_positive = x > 0.0
+    # For negative branch: alpha * expm1(x)
+    neg_val = alpha * libdevice.expm1(x)
+    result = tl.where(is_positive, x, neg_val)
+
+    tl.store(out_ptr + lane_offsets, result, mask=mask)
+
+def kernel_function(*inputs):
+    x = inputs[0]
+    alpha = 1.0
+
+    output = torch.empty_like(x)
+    numel = x.numel()
+
+    grid = lambda meta: (triton.cdiv(numel, meta['BLOCK_SIZE']),)
+    elu_kernel[grid](
+        x,
+        output,
+        numel,
+        alpha,
+    )
+
+    return output
+
+
+def get_inputs():
+    x = torch.rand(4096, 393216, device='cuda', dtype=torch.float32)
+    return [x]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    output = kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        # Verify correctness
+        import torch.nn.functional as F
+        ref = F.elu(inputs[0], alpha=1.0)
+        max_diff = (output - ref).abs().max().item()
+        print(f"Max difference from reference: {max_diff}")
+        assert max_diff < 1e-3, f"Results don't match! Max diff: {max_diff}"
+        print("Kernel executed successfully.")

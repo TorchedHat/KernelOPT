@@ -1,0 +1,94 @@
+--- baseline
++++ rebuilt
+@@ -2,8 +2,10 @@
+ import triton
+ import triton.language as tl
+ 
++
+ @triton.autotune(
+     configs=[
++        # Original 8 configs (large tiles)
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+@@ -12,6 +14,19 @@
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_warps=8, num_stages=3),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_warps=4, num_stages=4),
+         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
++        # New 8 small-tile configs targeting lower register pressure
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_warps=2, num_stages=5),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=5),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_warps=2, num_stages=4),
++        # New larger-BLOCK_N configs for coalesced transposed weight loads
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+     ],
+     key=['M_TOTAL', 'OUT_C', 'TOTAL_K'],
+ )
+@@ -36,10 +51,10 @@
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+ 
+-    # Decode M index -> (batch, out_h, out_w)
+-    out_w = offs_m % OUT_W
+-    out_h = (offs_m // OUT_W) % OUT_H
+-    batch = offs_m // (OUT_W * OUT_H)
++    # HOISTED: M-dimension decodes — loop-invariant, compute once before K-loop
++    out_w_1d = offs_m % OUT_W                    # [BLOCK_M]
++    out_h_1d = (offs_m // OUT_W) % OUT_H        # [BLOCK_M]
++    batch_1d = offs_m // (OUT_W * OUT_H)        # [BLOCK_M]
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+@@ -51,32 +66,33 @@
+         kh = (offs_k // KW) % KH
+         in_c = offs_k // (KH * KW)
+ 
+-        # Compute input coordinates
+-        ih = out_h[:, None] * STRIDE_H + kh[None, :] * DIL_H - PAD_H
+-        iw = out_w[:, None] * STRIDE_W + kw[None, :] * DIL_W - PAD_W
++        # Compute input coordinates using hoisted 1D vectors
++        ih = out_h_1d[:, None] * STRIDE_H + kh[None, :] * DIL_H - PAD_H
++        iw = out_w_1d[:, None] * STRIDE_W + kw[None, :] * DIL_W - PAD_W
+ 
+         valid_m = offs_m[:, None] < M_TOTAL
+         valid_k = offs_k[None, :] < TOTAL_K
+         valid_spatial = (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+         valid_x = valid_m & valid_k & valid_spatial
+ 
+-        x_ptrs = X_ptr + batch[:, None] * s_xn + in_c[None, :] * s_xc + ih * s_xh + iw * s_xw
++        x_ptrs = X_ptr + batch_1d[:, None] * s_xn + in_c[None, :] * s_xc + ih * s_xh + iw * s_xw
+         x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
+ 
+-        valid_wk = offs_k[:, None] < TOTAL_K
+-        valid_wn = offs_n[None, :] < OUT_C
+-        w_ptrs = W_ptr + offs_n[None, :] * s_wn + in_c[:, None] * s_wc + kh[:, None] * s_wh + kw[:, None] * s_ww
+-        w_tile = tl.load(w_ptrs, mask=valid_wk & valid_wn, other=0.0)
++        # Transposed weight load: shape [BLOCK_N, BLOCK_K] for coalesced K-dimension access
++        # offs_n[:, None] -> [BLOCK_N, 1], offs_k[None, :] -> [1, BLOCK_K]
++        valid_wn_col = offs_n[:, None] < OUT_C   # [BLOCK_N, 1]
++        valid_wk_row = offs_k[None, :] < TOTAL_K  # [1, BLOCK_K]
++        w_ptrs_T = W_ptr + offs_n[:, None] * s_wn + in_c[None, :] * s_wc + kh[None, :] * s_wh + kw[None, :] * s_ww
++        w_tile_T = tl.load(w_ptrs_T, mask=valid_wn_col & valid_wk_row, other=0.0)  # [BLOCK_N, BLOCK_K]
+ 
+-        acc = tl.dot(x_tile, w_tile, acc)
++        acc = tl.dot(x_tile, tl.trans(w_tile_T), acc)
+ 
+-    # Store output
++    # Store output — use hoisted names
+     valid_out_m = offs_m[:, None] < M_TOTAL
+     valid_out_n = offs_n[None, :] < OUT_C
+ 
+-    y_ptrs = Y_ptr + batch[:, None] * s_yn + offs_n[None, :] * s_yc + out_h[:, None] * s_yh + out_w[:, None] * s_yw
++    y_ptrs = Y_ptr + batch_1d[:, None] * s_yn + offs_n[None, :] * s_yc + out_h_1d[:, None] * s_yh + out_w_1d[:, None] * s_yw
+     tl.store(y_ptrs, acc.to(tl.float32), mask=valid_out_m & valid_out_n)
+-
+ 
+ def kernel_function(weight, x):
+     N, IN_C, IN_H, IN_W = x.shape

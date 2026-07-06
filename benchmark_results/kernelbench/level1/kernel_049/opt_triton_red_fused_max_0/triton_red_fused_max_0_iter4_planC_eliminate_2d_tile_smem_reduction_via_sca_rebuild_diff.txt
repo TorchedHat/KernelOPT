@@ -1,0 +1,86 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 4096}, num_warps=8, num_stages=1),
+-        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8, num_stages=1),
+-        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=8, num_stages=1),
+-        triton.Config({'XBLOCK': 8, 'R0_BLOCK': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 16, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 4096}, num_warps=16, num_stages=1),
+-        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 2048}, num_warps=16, num_stages=1),
+-        triton.Config({'XBLOCK': 8, 'R0_BLOCK': 1024}, num_warps=16, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 16}, num_warps=2, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 16}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 16}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=4),
++        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 32}, num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 512, 'R0_BLOCK': 8},  num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 32}, num_warps=2, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 8},  num_warps=4, num_stages=4),
+     ],
+     key=['xnumel', 'r0_numel'],
+ )
+@@ -27,38 +28,29 @@
+ ):
+     # x dimension: batch * dim2 = 128 * 4095 = 524160
+     # r0 dimension: dim1 = 4096 (reduction dimension)
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+-    xmask = xindex < xnumel
++    pid = tl.program_id(0)
++    num_x0_progs = tl.cdiv(4095, XBLOCK)
++    x1_index = pid // num_x0_progs          # batch index (scalar)
++    x0_offset = (pid % num_x0_progs) * XBLOCK
++    x0_range = x0_offset + tl.arange(0, XBLOCK)   # [XBLOCK], stride-1
++    x0_hints = tl.max_contiguous(tl.multiple_of(x0_range, 4), 4)  # vectorization hint
++    x0_mask = x0_range < 4095
+ 
+-    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+-
+-    # Decode x index: x0 = col index (dim2), x1 = batch index
+-    x0 = xindex % 4095   # dim2 index
+-    x1 = xindex // 4095  # batch index
+-
+-    # Initialize accumulator with -inf
+-    _max_val = tl.full([XBLOCK, R0_BLOCK], float("-inf"), tl.float32)
++    # Initialize 1D accumulator with -inf
++    acc = tl.full([XBLOCK], float('-inf'), tl.float32)
+ 
+     for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+-        r0_index = r0_offset + r0_base
+-        r0_mask = r0_index < r0_numel
++        for r0_inner in tl.static_range(R0_BLOCK):
++            r0_idx = r0_offset + r0_inner
++            r0_mask_scalar = r0_idx < r0_numel
++            # 1D load: [XBLOCK] -- no 2D tile, no smem reduction
++            ptrs = in_ptr0 + x1_index * 16773120 + r0_idx * 4095 + x0_hints
++            row = tl.load(ptrs, mask=r0_mask_scalar & x0_mask,
++                          eviction_policy='evict_first', other=float('-inf'))  # [XBLOCK]
++            acc = tl.maximum(acc, row)   # [XBLOCK] -- pure register op, no smem
+ 
+-        # Input layout: [128, 4096, 4095] with strides [16773120, 4095, 1]
+-        # ptr = x1 * 16773120 + r0_index * 4095 + x0
+-        tmp0 = tl.load(
+-            in_ptr0 + (x0 + 4095 * r0_index + 16773120 * x1),
+-            r0_mask & xmask,
+-            eviction_policy='evict_first',
+-            other=float("-inf"),
+-        )
+-        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+-        _max_val = tl.where(r0_mask & xmask, tl.maximum(_max_val, tmp1), _max_val)
+-
+-    # Reduce across R0_BLOCK dimension
+-    result = tl.max(_max_val, axis=1)[:, None]
+-    tl.store(out_ptr0 + xindex, result, xmask)
+-
++    # Store result
++    tl.store(out_ptr0 + x1_index * 4095 + x0_range, acc, mask=x0_mask)
+ 
+ def kernel_function(x):
+     # x: [128, 4096, 4095], reduce along dim=1

@@ -1,0 +1,207 @@
+import torch
+import triton
+import triton.language as tl
+
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512}, num_warps=4, num_stages=3),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256}, num_warps=4, num_stages=4),
+        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 512}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['xnumel', 'r0_numel'],
+)
+@triton.jit
+def cumprod_kernel(
+    in_ptr0,
+    out_ptr0,
+    xnumel,
+    r0_numel,
+    XBLOCK: tl.constexpr,
+    R0_BLOCK: tl.constexpr,
+):
+    # Each program handles XBLOCK rows, iterating over columns in chunks of R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+
+    # Running product accumulator for each row in XBLOCK
+    # Initialize to NaN sentinel; we'll handle first iteration specially
+    running_prod = tl.full([XBLOCK, 1], float('nan'), tl.float32)
+
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        combined_mask = xmask & r0_mask
+
+        # Load input chunk: shape [XBLOCK, R0_BLOCK]
+        tmp0 = tl.load(in_ptr0 + (r0_index + r0_numel * xindex), mask=combined_mask, other=1.0, eviction_policy='evict_first')
+        tmp1 = tmp0.to(tl.float32)
+
+        # Compute associative scan (prefix product) within this chunk
+        tmp_scan, = tl.associative_scan((tmp1,), 1, _mul_combine)
+
+        # The last element of the scan for each row (the product of this chunk)
+        # shape: [XBLOCK, 1]
+        chunk_prod = tl.sum(
+            tl.where(r0_base == (R0_BLOCK - 1), tmp_scan, tl.zeros_like(tmp_scan)),
+            axis=1,
+            keep_dims=True,
+        )
+
+        # Scale the scan results by the running product from previous chunks
+        # For the first chunk (r0_offset == 0), running_prod is NaN, so we skip scaling
+        scaled_scan = tl.where(r0_offset > 0, running_prod * tmp_scan, tmp_scan)
+
+        # Update running product
+        new_running = tl.where(r0_offset > 0, running_prod * chunk_prod, chunk_prod)
+        running_prod = new_running
+
+        # Store results
+        tl.store(out_ptr0 + (r0_index + r0_numel * xindex), scaled_scan, mask=combined_mask)
+
+
+@triton.jit
+
+def _mul_combine(a, b):
+    return a * b
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512}, num_warps=4, num_stages=3),
+        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256}, num_warps=4, num_stages=4),
+        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 512}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['xnumel', 'r0_numel'],
+)
+@triton.jit
+def cumprod_kernel_v2(
+    in_ptr0,
+    out_ptr0,
+    xnumel,
+    r0_numel,
+    XBLOCK: tl.constexpr,
+    R0_BLOCK: tl.constexpr,
+):
+    """
+    Cumulative product along the inner dimension (dim=1).
+    """
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # [XBLOCK, 1]
+    xmask = xindex < xnumel  # [XBLOCK, 1]
+
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]  # [1, R0_BLOCK]
+
+    # Running product per row, initialized to 1.0
+    running_prod = tl.full([XBLOCK, 1], 1.0, tl.float32)
+
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base  # [1, R0_BLOCK]
+        r0_mask = r0_index < r0_numel  # [1, R0_BLOCK]
+
+        combined_mask = xmask & r0_mask  # [XBLOCK, R0_BLOCK]
+
+        # Load input chunk: shape [XBLOCK, R0_BLOCK]
+        vals = tl.load(
+            in_ptr0 + (r0_index + r0_numel * xindex),
+            mask=combined_mask,
+            other=1.0,
+            eviction_policy='evict_first',
+        ).to(tl.float32)
+
+        # Compute prefix product within this chunk using associative scan
+        prefix, = tl.associative_scan((vals,), 1, _mul_combine)
+
+        # Scale by running product from previous chunks
+        result = running_prod * prefix
+
+        # Update running product: multiply by the product of this entire chunk
+        # The product of the chunk is the last element of the prefix scan
+        # We need to extract it carefully
+        # Use a mask to select the last valid element
+        last_mask = (r0_base == (R0_BLOCK - 1)) & r0_mask  # [1, R0_BLOCK]
+        # chunk_prod shape: [XBLOCK, 1]
+        chunk_prod = tl.sum(
+            tl.where(last_mask, prefix, tl.zeros_like(prefix)),
+            axis=1,
+            keep_dims=True,
+        )
+        running_prod = running_prod * chunk_prod
+
+        # Store results
+        tl.store(
+            out_ptr0 + (r0_index + r0_numel * xindex),
+            result,
+            mask=combined_mask,
+        )
+
+
+def kernel_function(x):
+    assert x.is_cuda, "Input must be on CUDA"
+    assert x.dtype == torch.float32, "Input must be float32"
+
+    rows, cols = x.shape
+    out = torch.empty_like(x)
+
+    # Grid: number of row-blocks
+    def grid(meta):
+        return (triton.cdiv(rows, meta['XBLOCK']),)
+
+    cumprod_kernel_v2[grid](
+        x,
+        out,
+        rows,
+        cols,
+    )
+
+    return out
+
+
+def get_inputs():
+    return [torch.rand(32768, 32768, device='cuda', dtype=torch.float32)]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+
+    inputs = get_inputs()
+
+    # Verify correctness on a small example first
+    if not args.profile_only:
+        x_small = torch.rand(4, 8, device='cuda', dtype=torch.float32)
+        ref = torch.cumprod(x_small, dim=1)
+        out = kernel_function(x_small)
+        max_err = (ref - out).abs().max().item()
+        print(f"Small test max error: {max_err:.6f}")
+        assert max_err < 1e-3, f"Correctness check failed: {max_err}"
+        print("Small test passed!")
+
+    output = kernel_function(*inputs)
+    torch.cuda.synchronize()
+
+    if not args.profile_only:
+        # Verify against PyTorch
+        ref_output = torch.cumprod(inputs[0], dim=1)
+        max_err = (ref_output - output).abs().max().item()
+        print(f"Large test max error: {max_err:.6f}")
+        assert max_err < 1e-3, f"Correctness check failed: {max_err}"
+        print("Kernel executed successfully.")
+    else:
+        print("Kernel executed successfully (profile-only mode).")

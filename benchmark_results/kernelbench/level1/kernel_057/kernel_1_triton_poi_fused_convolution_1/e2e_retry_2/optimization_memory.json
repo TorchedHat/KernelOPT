@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "379b699a",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_contiguous_hints",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_contiguous_hints \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_contiguous_hints' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "This kernel performs a layout permutation: input has stride (4032000, 1, 32000, 128) and output has stride (4032000, 31500, 250, 1). The load address is `in_ptr0 + (y0 + 128*x2 + 4032000*y1)`. With XBLOCK=128 and YBLOCK=8, the warp iterates over xindex (x2) in the innermost dimension, but the load stride for x2 is 128 floats (512 bytes), making loads non-contiguous across threads. This causes L1 to be bypassed entirely (0% hit rate) and saturates L2 at 96.95%. Applying tl.max_contiguous and tl.multiple_of hints on the yindex array (which maps to y0, stride-1 in input) tells the compiler that the access pattern is contiguous and aligned, enabling 128-bit (float4) vectorized loads. Swapping the tile layout so YBLOCK=128 covers the channel dimension (y0, stride-1 in input) makes warp-level loads contiguous in memory.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_tile_coalescing_transpose",
+    "iteration": 1,
+    "speedup": 2.451,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_coalesced_memory_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + HighPipeUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 20.21,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 96.95,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 72.19,
+        "GPU Speed Of Light Throughput.Duration": 285.89,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 66.65,
+        "Scheduler Statistics.No Eligible": 80.2,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.28,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 75.86,
+        "Compute Workload Analysis.Executed Ipc Active": 0.79
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 58.92,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 30.42,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 19.95,
+        "GPU Speed Of Light Throughput.Duration": 116.64,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.03,
+        "Memory Workload Analysis.L2 Hit Rate": 57.02,
+        "Scheduler Statistics.No Eligible": 44.66,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.37,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 25.76,
+        "Compute Workload Analysis.Executed Ipc Active": 2.26
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Fix Strided Transpose Coalescing",
+    "strategy_description": "When a Triton kernel performs a layout transpose where threads in a warp stride across a non-unit dimension (e.g., input stride of 128 elements per thread), L2 throughput saturates near 97% and L1 hit rate is 0%, with scheduler stall cycles exceeding 75 cycles/instruction due to L1TEX dependency stalls. Adding @triton.autotune with configs that vary XBLOCK and YBLOCK allows the autotuner to discover tile shapes where threads in a warp access contiguous (stride-1) memory, collapsing L2 throughput from 97% to 30% and reducing warp stall cycles from 75.9 to 25.8. The compute throughput rises from 20% to 59% and kernel duration drops by ~2.5x as memory bottleneck is resolved.",
+    "slow_pseudocode": "# Fixed tile: XBLOCK=128, YBLOCK=8\n# Threads vary along x-dim; input stride along x = 128 floats \u2192 uncoalesced\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    y0 = yindex % 128  # stride-1 dim in input\n    y1 = yindex // 128\n    tmp0 = tl.load(in_ptr + (y0 + 128*xindex + large_stride*y1), xmask)\n    tl.store(out_ptr + (xindex + out_stride*yindex), tmp0, xmask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned: best config found YBLOCK large (e.g. 64), XBLOCK small (e.g. 16)\n# Threads vary along y-dim; y0 = yindex%128 has stride-1 in input \u2192 coalesced\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 64},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 128}, num_warps=4, num_stages=4),\n        # ... more configs ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    ymask = yindex < ynumel\n    xmask = xindex < xnumel\n    y0 = yindex % 128\n    y1 = yindex // 128\n    tmp0 = tl.load(in_ptr + (y0 + 128*xindex + large_stride*y1), xmask & ymask)\n    tl.store(out_ptr + (xindex + out_stride*yindex), tmp0, xmask & ymask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel performs a 2D layout transpose or permutation; L2 Cache Throughput > 80%, L1 hit rate ~0%, Warp Cycles Per Issued Instruction > 50, Scheduler 'No Eligible' > 70%, Compute throughput < 30%; the slow access dimension has a large stride (many elements) while a fast stride-1 dimension exists but is not aligned with the thread-varying axis.",
+    "do_not_apply_when": "Kernel is already compute-bound (Compute SM Throughput > 70%); access pattern is inherently non-contiguous in all dimensions with no stride-1 axis to exploit; problem size is too small for autotune overhead to amortize; XBLOCK/YBLOCK are already optimal or constrained by shared memory usage.",
+    "framework_notes": "Triton-specific: @triton.autotune requires all tile parameters (XBLOCK, YBLOCK) to be tl.constexpr. The grid must be a lambda using meta['XBLOCK'] and meta['YBLOCK'] when autotuning. All tile sizes must be powers of two for tl.arange. The ymask must be added when YBLOCK is no longer guaranteed to evenly divide ynumel. Equivalent in CUDA: use template parameters for tile sizes and launch multiple configurations via a host-side tuning loop."
+  }
+]

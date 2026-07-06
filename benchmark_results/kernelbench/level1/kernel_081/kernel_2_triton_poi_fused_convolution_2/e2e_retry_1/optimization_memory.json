@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "72237fcc",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_contiguous_hints",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_contiguous_hints \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_contiguous_hints' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout-transpose + bias-add fused op: it reads in_ptr0 with non-contiguous strides (y0 + 96*x2 + 290400*y1) where the spatial x-dimension has stride 96 in the source tensor (NHWC-like input), causing non-coalesced L1TEX loads. The L2 is saturated at 96.29% while compute is only 28.67%, confirming memory is the bottleneck. The XBLOCK=128 dimension iterates over spatial positions (xnumel=3025) but the load address increments by 96 per x-step, so consecutive threads in a warp access addresses 96 floats apart \u2014 a stride-96 pattern that prevents 128-bit vectorized loads. Adding tl.max_contiguous and tl.multiple_of hints on the contiguous xindex range tells the Triton compiler that the index range is contiguous and aligned, enabling it to emit 128-bit (float4) vectorized loads for the store path and improve coalescing analysis. Additionally, switching to @triton.autotune allows exploration of XBLOCK/YBLOCK combinations that better match the memory access pattern.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_tile_swap_coalesce_channels_last",
+    "iteration": 1,
+    "speedup": 3.3354,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "swap_tile_dims_to_coalesce_stride1_channel_axis",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 96.29,
+        "GPU Speed Of Light Throughput.Memory Throughput": 81.37,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 28.67,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 17.55,
+        "Scheduler Statistics.No Eligible": 71.58,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 52.49,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4096.0,
+        "Source Counters.Avg. Divergent Branches": 11.64,
+        "GPU Speed Of Light Throughput.Duration": 175.14
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 14.68,
+        "GPU Speed Of Light Throughput.Memory Throughput": 14.68,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 23.54,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 13.67,
+        "Scheduler Statistics.No Eligible": 70.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.96,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Source Counters.Avg. Divergent Branches": 0.0,
+        "GPU Speed Of Light Throughput.Duration": 52.51
+      }
+    },
+    "strategy_title": "Swap Tile Axes to Coalesce Stride-1 Memory Dimension",
+    "strategy_description": "When a Triton kernel tiles a 2D index space (X, Y) and the input tensor's stride-1 dimension maps to Y but XBLOCK is large (e.g. 128) while YBLOCK is small (e.g. 8), adjacent threads in a warp traverse the high-stride X axis, causing uncoalesced global loads and L2 saturation (96% throughput, 52 warp cycles/instruction). Swapping to large YBLOCK (128) and small XBLOCK (1\u20134) via @triton.autotune makes adjacent threads traverse the stride-1 Y axis, collapsing warp cycles/instruction from 52 to 13 and reducing L2 throughput from 96% to 15%, yielding a 3.3x speedup. This pattern applies to any layout-transpose or permutation kernel where the input's contiguous dimension is orthogonal to the dimension that the large tile block iterates over.",
+    "slow_pseudocode": "# XBLOCK=128, YBLOCK=8 \u2014 threads vary along x (stride-96 in input = uncoalesced)\n@triton.jit\ndef kernel(in_ptr0, ..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]  # no y-guard\n    y0 = yindex % 96   # stride-1 dim in input\n    x2 = xindex        # stride-96 dim in input\n    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + ...), xmask)  # uncoalesced\n    tl.store(out_ptr0 + (x2 + 3025*y3), tmp0+bias, xmask)\n\ngrid = (cdiv(xnumel,128), cdiv(ynumel,8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune finds YBLOCK=128, XBLOCK=1 \u2014 threads vary along y (stride-1 = coalesced)\n@triton.autotune(configs=[\n    triton.Config({'YBLOCK': 128, 'XBLOCK': 1}, num_warps=4),\n    triton.Config({'YBLOCK': 64,  'XBLOCK': 4}, num_warps=4),\n    triton.Config({'YBLOCK': 32,  'XBLOCK': 16}, num_warps=4),\n    triton.Config({'YBLOCK': 8,   'XBLOCK': 128}, num_warps=4),\n    # ... more configs\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr0, ..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    ymask = yindex < ynumel   # proper y-guard\n    xmask = xindex < xnumel\n    y0 = yindex % 96   # stride-1 dim in input\n    x2 = xindex        # stride-96 dim in input\n    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + ...), mask=xmask & ymask)  # coalesced\n    tl.store(out_ptr0 + (x2 + 3025*y3), tmp0+bias, mask=xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](..., ynumel, xnumel)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "L2 Cache Throughput > 80%, UncoalescedGlobalAccess rule triggered, Warp Cycles Per Issued Instruction > 30, CPIStall on L1TEX > 20 cycles, and the kernel tiles a 2D index space where the input tensor's stride-1 dimension is mapped to the small-tile axis while the large-tile axis traverses a high-stride dimension.",
+    "do_not_apply_when": "The input tensor's stride-1 dimension already aligns with the large-tile (XBLOCK) axis, or the kernel is compute-bound rather than memory-bound (Compute SM Throughput > 70%). Also avoid if the Y dimension is not evenly divisible and the original ymask was intentionally omitted for performance (though adding ymask is required for correctness when YBLOCK changes).",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] and a lambda grid to let autotuner control both XBLOCK and YBLOCK. The ymask must be changed from tl.full([YBLOCK], True, tl.int1)[:, None] to yindex < ynumel when YBLOCK no longer evenly divides ynumel. Registers per thread dropped from 32 to 16 as a side effect of the simpler access pattern, and dynamic shared memory dropped from 4KB to 0."
+  }
+]

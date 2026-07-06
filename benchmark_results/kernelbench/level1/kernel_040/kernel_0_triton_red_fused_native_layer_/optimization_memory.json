@@ -1,0 +1,195 @@
+[
+  {
+    "item_id": "exp_triton_xblock1_only_autotune_evict_last_negative_001",
+    "iteration": 2,
+    "speedup": 0.3709,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "restrict_autotune_to_xblock1_and_add_evict_last_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 93.31,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 59.09,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 44.55,
+        "Occupancy.Achieved Occupancy": 23.9,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "Launch Statistics.Block Size": 128.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.79,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.68,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.06,
+        "Memory Workload Analysis.Memory Throughput": 2.9
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 261.66,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 21.04,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 18.94,
+        "Occupancy.Achieved Occupancy": 12.04,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Launch Statistics.Block Size": 64.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.94,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.91,
+        "Memory Workload Analysis.Memory Throughput": 1.03
+      }
+    },
+    "strategy_title": "Removing XBLOCK>1 Configs Halves Occupancy and Throughput",
+    "strategy_description": "Restricting a Triton reduction kernel's autotune search space to XBLOCK=1-only configs (to eliminate strided output stores) caused a 2.7x regression. The removal of XBLOCK>1 configs forced autotune to select a smaller block size (64 vs 128 threads), cutting waves_per_sm from 0.24 to 0.12, achieved occupancy from 23.9% to 12.0%, and active warps per scheduler from 3.79 to 1.94. This halved the GPU's ability to hide L1TEX latency, causing DRAM throughput to collapse from 59% to 21% and duration to balloon from 93us to 262us. The MemoryCacheAccessPattern rule's 63.67% speedup estimate was misleading: with XBLOCK=1 the stores are already scalar (one thread per CTA), so the 'stride between threads' NCU reports is an inter-CTA pattern that cannot be fixed by restricting XBLOCK \u2014 the real fix requires restructuring the output tensor layout, not the autotune config.",
+    "slow_pseudocode": "# AFTER (regressed): XBLOCK=1 only, block_size=64, waves_per_sm=0.12\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=2,  num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),\n        # ... XBLOCK=1 only configs ...\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=16, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\ndef kernel(...):\n    ...\n    tl.store(out_ptr0 + x0, tmp2, xmask, eviction_policy='evict_last')\n    tl.store(out_ptr1 + x0, tmp6, xmask, eviction_policy='evict_last')\n    tl.store(out_ptr2 + x0, tmp7, xmask, eviction_policy='evict_last')",
+    "fast_pseudocode": "# BEFORE (baseline): XBLOCK=1,2,4,8 configs, block_size=128, waves_per_sm=0.24\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 512},  num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 256},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512},  num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 8, 'R0_BLOCK': 256},  num_warps=8,  num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\ndef kernel(...):\n    ...\n    tl.store(out_ptr0 + x0, tmp2, xmask)\n    tl.store(out_ptr1 + x0, tmp6, xmask)\n    tl.store(out_ptr2 + x0, tmp7, xmask)",
+    "applicable_when": "Never: this specific change (removing XBLOCK>1 configs to fix MemoryCacheAccessPattern on scalar per-CTA stores) is always harmful when the grid is already small (waves_per_sm < 0.5) and occupancy is the binding constraint.",
+    "do_not_apply_when": "Any kernel where waves_per_sm < 0.5 and achieved occupancy < 30% \u2014 removing XBLOCK>1 configs further reduces block size, halving occupancy and active warps, which collapses memory throughput. Do not apply when MemoryCacheAccessPattern fires on output stores that are already scalar (one element per CTA with XBLOCK=1): the NCU rule is measuring inter-CTA stride which cannot be fixed via autotune config restriction. Do not add evict_last to stores when the output tensor is tiny (< 10KB) and already L2-resident \u2014 it has no measurable effect.",
+    "framework_notes": "Triton-specific: when a reduction kernel has XBLOCK>1 configs in autotune, those configs increase block_size (more threads per CTA), which increases waves_per_sm and active warps per scheduler. Removing them forces smaller blocks and fewer warps, directly reducing the GPU's latency-hiding capacity. The MemoryCacheAccessPattern NCU rule can fire on inter-CTA store patterns (stride between CTAs, not threads within a warp) \u2014 this cannot be fixed by restricting XBLOCK in autotune. The eviction_policy='evict_last' hint on tiny scalar stores has negligible effect."
+  },
+  {
+    "item_id": "exp_triton_two_pass_welford_replacement_negative_001",
+    "iteration": 3,
+    "speedup": 0.4145,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "replace_welford_with_two_pass_variance",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 96.58,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 63.77,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 57.07,
+        "Launch Statistics.Registers Per Thread": 124.0,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 23.26,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.52,
+        "Scheduler Statistics.No Eligible": 32.88,
+        "Instruction Statistics.Executed Instructions": 46684160.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 234.14,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 9.3,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 45.34,
+        "Launch Statistics.Registers Per Thread": 21.0,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 24.04,
+        "Occupancy.Block Limit Registers": 21.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.84,
+        "Scheduler Statistics.No Eligible": 90.41,
+        "Instruction Statistics.Executed Instructions": 16995840.0
+      }
+    },
+    "strategy_title": "Two-Pass Variance Doubles Memory Reads, Collapses Throughput",
+    "strategy_description": "Replacing a single-pass Welford online reduction with a two-pass mean+variance approach reduced register pressure dramatically (124\u219221 regs/thread) and raised theoretical occupancy from 25% to 100%, but caused a 2.4x regression. The two-pass approach reads the input tensor twice, and with a small grid (waves_per_sm dropped from 0.97 to 0.24), the GPU could not hide the doubled memory latency: Warp Cycles Per Issued Instruction exploded from 5.52 to 39.84, scheduler eligible warps collapsed from 1.5 to 0.1, and achieved occupancy barely changed (23.26%\u219224.04%) despite the theoretical improvement. The FPInstructions rule's predicted 39% speedup from FMA fusion was completely overwhelmed by the 7x increase in per-instruction stall cycles caused by the second memory pass over a large tensor with near-zero L2 hit rate (0.32%\u21920.16%).",
+    "slow_pseudocode": "# Two-pass (regressed): reads input twice, waves_per_sm=0.24\n# Pass 1: mean\ntmp_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    tmp0 = tl.load(in_ptr0 + (r0_1 + r0_numel*x0), xmask, eviction_policy='evict_first')\n    tmp_sum += tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\ntmp_mean_vec = tl.sum(tmp_sum, axis=1)[:, None] / r0_numel\n\n# Pass 2: variance (reads input again)\ntmp_sq = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    tmp0 = tl.load(in_ptr0 + (r0_1 + r0_numel*x0), xmask, eviction_policy='evict_first')\n    diff = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK]) - tmp_mean_vec\n    tmp_sq += diff * diff  # FFMA\ntmp_m2 = tl.sum(tmp_sq, axis=1)[:, None]",
+    "fast_pseudocode": "# Single-pass Welford (baseline): reads input once, waves_per_sm=0.97\ntmp2_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\ntmp2_m2   = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\ntmp2_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    tmp0 = tl.load(in_ptr0 + (r0_1 + r0_numel*x0), xmask, eviction_policy='evict_first')\n    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    tmp2_mean, tmp2_m2, tmp2_weight = triton_helpers.welford_reduce(\n        tmp1, tmp2_mean, tmp2_m2, tmp2_weight, roffset == 0)\ntmp3, tmp4, tmp5 = triton_helpers.welford(tmp2_mean, tmp2_m2, tmp2_weight, 1)",
+    "applicable_when": "Never applicable as a standalone optimization for large reduction kernels where the input tensor does not fit in L2 cache (L2 hit rate < 5%) and the grid already fills the GPU (waves_per_sm \u2248 1). The FPInstructions rule may suggest FMA fusion potential, but if the kernel is already near the compute-memory balance point, doubling memory reads will dominate.",
+    "do_not_apply_when": "Any kernel where: (1) the reduction dimension is large enough that the input does not fit in L2 cache (L2 hit rate < 10%), (2) waves_per_sm would drop significantly after the change (e.g., from ~1.0 to < 0.5) due to autotune config pruning, or (3) the FPInstructions NCU rule speedup estimate is < 20% \u2014 the doubled DRAM traffic will always outweigh FMA instruction savings in these cases. Do not apply when Warp Cycles Per Issued Instruction is already low (< 10) and the kernel is compute-memory balanced.",
+    "framework_notes": "Triton-specific: the two-pass approach also interacted with a simultaneous autotune config reduction (removing large R0_BLOCK configs), which dropped waves_per_sm from 0.97 to 0.24. This compounded the regression \u2014 the config pruning alone was responsible for part of the throughput collapse. When evaluating two-pass variance, keep the autotune config space identical to isolate the algorithmic change's effect. The Welford online algorithm, despite higher register usage, is preferable for large reductions over HBM because it reads data exactly once."
+  },
+  {
+    "item_id": "exp_triton_inline_welford_fma_loop_unroll_003",
+    "iteration": 3,
+    "speedup": 1.1941,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "inline_welford_with_fma_and_loop_unroll",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 96.58,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 63.77,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 57.07,
+        "Instruction Statistics.Executed Instructions": 46684160.0,
+        "Launch Statistics.Registers Per Thread": 124.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 23.26,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Source Counters.Branch Instructions": 269312.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 81.28,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.68,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 67.84,
+        "Instruction Statistics.Executed Instructions": 39135232.0,
+        "Launch Statistics.Registers Per Thread": 95.0,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 23.29,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Source Counters.Branch Instructions": 72704.0
+      }
+    },
+    "strategy_title": "Inline Welford with libdevice.fma and Loop Unrolling",
+    "strategy_description": "Replacing a helper-function Welford reduction (triton_helpers.welford_reduce) with an inlined version using libdevice.fma() for the mean and m2 accumulation steps reduces total executed instructions by ~16% (46.7M \u2192 39.1M) and cuts branch instructions by ~73% (269K \u2192 73K). The inlining also reduces per-thread register usage from 124 to 95, raising Block Limit Registers from 4 to 5 and theoretical occupancy from 25% to 31.25%. Adding loop_unroll_factor=2 to tl.range exposes more ILP and further reduces loop overhead. The combined effect is a 15% reduction in kernel duration (96.6us \u2192 81.3us) with DRAM throughput increasing from 57% to 68%, indicating the kernel became more memory-efficient per unit time.",
+    "slow_pseudocode": "# Helper-function Welford: high register pressure, many branch instructions\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    r0_index = r0_offset + r0_base\n    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]\n    roffset = r0_offset\n    rindex = r0_index\n    tmp0 = tl.load(in_ptr0 + (r0_1 + stride*x0), xmask, eviction_policy='evict_first')\n    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    tmp2_mean_next, tmp2_m2_next, tmp2_weight_next = triton_helpers.welford_reduce(\n        tmp1, tmp2_mean, tmp2_m2, tmp2_weight, roffset == 0\n    )\n    tmp2_mean   = tl.where(xmask, tmp2_mean_next,   tmp2_mean)\n    tmp2_m2     = tl.where(xmask, tmp2_m2_next,     tmp2_m2)\n    tmp2_weight = tl.where(xmask, tmp2_weight_next, tmp2_weight)",
+    "fast_pseudocode": "# Inlined FMA Welford: lower register pressure, fewer branches, more ILP\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK, loop_unroll_factor=2):\n    r0_index = r0_offset + r0_base\n    tmp0 = tl.load(in_ptr0 + (r0_index + stride*x0), xmask, eviction_policy='evict_first')\n    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    tmp2_weight_next = tmp2_weight + tl.full([XBLOCK, R0_BLOCK], 1.0, tl.float32)\n    _delta = tmp1 - tmp2_mean\n    _inv_w = 1.0 / tmp2_weight_next\n    tmp2_mean_next = libdevice.fma(_delta, _inv_w, tmp2_mean)   # mean + delta/n\n    _delta2 = tmp1 - tmp2_mean_next\n    tmp2_m2_next = libdevice.fma(_delta, _delta2, tmp2_m2)      # m2 + delta*delta2\n    tmp2_mean   = tl.where(xmask, tmp2_mean_next,   tmp2_mean)\n    tmp2_m2     = tl.where(xmask, tmp2_m2_next,     tmp2_m2)\n    tmp2_weight = tl.where(xmask, tmp2_weight_next, tmp2_weight)\n# from triton.language.extra import libdevice  # required import",
+    "applicable_when": "Triton reduction kernel uses triton_helpers.welford_reduce() in a loop, FPInstructions NCU rule fires with high non-fused FP32 instruction count (>10M non-fused vs <5M fused), registers_per_thread > 80 limited by Block Limit Registers, and branch instruction count is high relative to total instructions. The Welford accumulator loop is the dominant compute region.",
+    "do_not_apply_when": "Kernel is already memory-bandwidth-bound at >90% DRAM throughput (instruction reduction won't help). Do not apply if libdevice.fma() is not available in the Triton version in use. Avoid if the Welford loop has a first-iteration special case (roffset==0 branch) that cannot be safely removed \u2014 verify accumulators are initialized to zeros before the loop. Do not use loop_unroll_factor > 2 if registers_per_thread is already near the hardware limit, as unrolling increases register pressure.",
+    "framework_notes": "Triton-specific: libdevice.fma(a, b, c) = a*b+c as a single FFMA PTX instruction; requires 'from triton.language.extra import libdevice'. loop_unroll_factor=2 is a tl.range hint in Triton 2.x that unrolls the loop body twice per iteration, exposing more ILP for the compiler scheduler. The roffset==0 branch in triton_helpers.welford_reduce() handles first-iteration initialization; it can be safely removed when accumulators are pre-initialized with tl.zeros(). Equivalent in CUDA: use __fmaf_rn() intrinsic and #pragma unroll 2."
+  },
+  {
+    "item_id": "afb17404",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "hoist_vector_reciprocal_to_scalar_in_welford_loop",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "hoist_vector_reciprocal_to_scalar_in_welford_loop \u2014 correctness failure",
+    "strategy_description": "Plan 'hoist_vector_reciprocal_to_scalar_in_welford_loop' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.336e+08 > atol=0.001\nseed=42 output[0]: max_diff=1.336e+08 > atol=0.001\nseed=1337 output[0]: max_diff=1.336e+08 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has 14.8M non-fused vs 4.2M fused FP32 instructions. The dominant source of non-fused FP32 is the per-element vector division `_inv_w = 1.0 / tmp2_weight_next` inside the Welford loop, computed on a full [XBLOCK, R0_BLOCK] tile every iteration. However, `tmp2_weight_next` is a uniform scalar counter (1.0, 2.0, 3.0, ...) identical across all tile elements. This means the reciprocal can be computed once per loop iteration as a scalar, then broadcast, replacing R0_BLOCK*XBLOCK parallel divisions with a single scalar reciprocal. With 29 registers/thread (well below hardware limit), there is no register pressure concern. The L1TEX stall (72.1% of stall cycles) is driven by the large input tensor (268MB) that cannot fit in any cache. Reducing instruction count per loop iteration frees scheduler slots and reduces the compute-to-memory ratio, allowing more memory requests to be in-flight simultaneously.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.336e+08 > atol=0.001\nseed=42 output[0]: max_diff=1.336e+08 > atol=0.001\nseed=1337 output[0]: max_diff=1.336e+08 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_hoist_welford_scalar_weight_negative_005",
+    "iteration": 5,
+    "speedup": 0.7583,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "hoist_welford_reciprocal_to_scalar_mufu_rcp_per_iteration",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 95.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 56.02,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 57.67,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Launch Statistics.Waves Per SM": 0.32,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 23.8,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.41,
+        "Scheduler Statistics.No Eligible": 40.44,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.9,
+        "Instruction Statistics.Executed Instructions": 40385536.0,
+        "Memory Workload Analysis.Memory Throughput": 2.83
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 128.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.02,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 43.06,
+        "Launch Statistics.Registers Per Thread": 25.0,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 23.99,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.46,
+        "Scheduler Statistics.No Eligible": 66.46,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.43,
+        "Instruction Statistics.Executed Instructions": 31916032.0,
+        "Memory Workload Analysis.Memory Throughput": 2.12
+      }
+    },
+    "strategy_title": "Hoisting Welford Scalar Reciprocal Hurts Despite Fewer Instructions",
+    "strategy_description": "Replacing the per-tile `1.0 / tmp2_weight_next` FDIV with a scalar `1.0 / scalar_weight` computed once per loop iteration reduced total executed instructions by ~21% (40.4M \u2192 31.9M) and register pressure from 40 to 25 regs/thread, raising theoretical occupancy from 75% to 100%. However, achieved occupancy barely changed (23.8% \u2192 24.0%) because the grid was already too small (waves_per_sm dropped from 0.32 to 0.24 due to expanded autotune configs selecting larger tiles), and Warp Cycles Per Issued Instruction nearly doubled (6.41 \u2192 11.46 cycles), with scheduler no-eligible rate rising from 40% to 66%. The instruction reduction freed no additional latency-hiding capacity because the kernel is L1TEX-stall-dominated (CPIStall L1TEX stalls grew from 3.7 to 9.0 cycles/warp), and the simultaneous expansion of the autotune config space (adding larger R0_BLOCK=1024 and XBLOCK=16 configs) likely caused autotune to select a config with more work per block but fewer waves, compounding the regression.",
+    "slow_pseudocode": "# AFTER (regressed): scalar weight, expanded autotune configs, 128us\n# Autotune includes XBLOCK=16, R0_BLOCK=1024 configs\ntmp2_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\ntmp2_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\nscalar_weight = 0.0\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK, loop_unroll_factor=2):\n    tmp0 = tl.load(in_ptr0 + (r0_index + 131072*x0), xmask, eviction_policy='evict_first')\n    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    scalar_weight = scalar_weight + 1.0\n    _inv_w_scalar = 1.0 / scalar_weight  # scalar FDIV, once per iteration\n    _delta = tmp1 - tmp2_mean\n    tmp2_mean_next = libdevice.fma(_delta, _inv_w_scalar, tmp2_mean)\n    _delta2 = tmp1 - tmp2_mean_next\n    tmp2_m2_next = libdevice.fma(_delta, _delta2, tmp2_m2)\n    tmp2_mean = tl.where(xmask, tmp2_mean_next, tmp2_mean)\n    tmp2_m2 = tl.where(xmask, tmp2_m2_next, tmp2_m2)\ntmp_weight_tile = tl.full([XBLOCK, R0_BLOCK], scalar_weight, tl.float32)\ntmp3, tmp4, tmp5 = triton_helpers.welford(tmp2_mean, tmp2_m2, tmp_weight_tile, 1)",
+    "fast_pseudocode": "# BEFORE (baseline): tile weight accumulator, original autotune configs, 95us\n# Autotune: XBLOCK up to 8, R0_BLOCK up to 512\ntmp2_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\ntmp2_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\ntmp2_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK, loop_unroll_factor=2):\n    tmp0 = tl.load(in_ptr0 + (r0_index + 131072*x0), xmask, eviction_policy='evict_first')\n    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    tmp2_weight_next = tmp2_weight + tl.full([XBLOCK, R0_BLOCK], 1.0, tl.float32)\n    _delta = tmp1 - tmp2_mean\n    _inv_w = 1.0 / tmp2_weight_next  # tile FDIV\n    tmp2_mean_next = libdevice.fma(_delta, _inv_w, tmp2_mean)\n    _delta2 = tmp1 - tmp2_mean_next\n    tmp2_m2_next = libdevice.fma(_delta, _delta2, tmp2_m2)\n    tmp2_mean = tl.where(xmask, tmp2_mean_next, tmp2_mean)\n    tmp2_m2 = tl.where(xmask, tmp2_m2_next, tmp2_m2)\n    tmp2_weight = tl.where(xmask, tmp2_weight_next, tmp2_weight)\ntmp3, tmp4, tmp5 = triton_helpers.welford(tmp2_mean, tmp2_m2, tmp2_weight, 1)",
+    "applicable_when": "Never: hoisting the Welford weight reciprocal to a scalar is mathematically sound but does not improve performance when the kernel is already L1TEX-stall-dominated (CPIStall L1TEX > 50% of stall cycles) and the grid is small (waves_per_sm < 0.5). Reducing instruction count does not help when the bottleneck is memory latency, not compute throughput.",
+    "do_not_apply_when": "Any kernel where: (1) CPIStall L1TEX stalls account for >50% of warp cycles (the bottleneck is memory latency, not compute), (2) waves_per_sm < 0.5 and achieved occupancy is already near its practical ceiling (~24%), meaning theoretical occupancy improvements from lower register pressure do not translate to higher achieved occupancy, or (3) the autotune config space is being simultaneously expanded \u2014 the interaction between scalar weight hoisting and larger tile configs can cause autotune to select configs with fewer waves, compounding the regression. Do not conflate instruction count reduction with latency reduction in memory-bound kernels.",
+    "framework_notes": "Triton-specific: the diff also expanded the autotune config space (added XBLOCK=16, R0_BLOCK=1024 configs), which likely caused autotune to select a larger-tile config with fewer waves_per_sm (0.32 \u2192 0.24). This config change is a confounding factor \u2014 the scalar weight hoisting and the autotune expansion were applied together, making it impossible to isolate which change caused more regression. Future experiments should change only one variable at a time. The eviction_policy='evict_last' added to output stores is a minor change with negligible effect on this kernel."
+  }
+]

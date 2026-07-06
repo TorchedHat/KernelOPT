@@ -8,6 +8,6 @@ Zero LLM calls -- the entire pipeline is deterministic:
 """
 
 from .compile_extract import extract_triton_from_pytorch
-from .wrap_kernel import wrap_inductor_output
+from .wrap_kernel import wrap_inductor_output, build_benchmark_standalone, rebuild_standalone_from_body
 
-__all__ = ["extract_triton_from_pytorch", "wrap_inductor_output"]
+__all__ = ["extract_triton_from_pytorch", "wrap_inductor_output", "build_benchmark_standalone", "rebuild_standalone_from_body"]

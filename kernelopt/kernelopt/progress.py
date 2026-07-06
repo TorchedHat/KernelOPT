@@ -106,7 +106,12 @@ def print_run_header(
     """Print a structured run header at pipeline start."""
     c = console or _console
     c.print()
-    c.print("[bold]kernelopt[/] [dim]v0.1.0[/]")
+    try:
+        from importlib.metadata import version as _pkg_version
+        _ver = _pkg_version("kernelopt")
+    except Exception:
+        _ver = "dev"
+    c.print(f"[bold]kernelopt[/] [dim]v{_ver}[/]")
     c.print(f"  Kernel:    [cyan]{kernel_name}[/]")
     c.print(f"  GPU:       [cyan]{gpu_name}[/]")
     c.print(f"  Config:    T={T} iterations, N={N} plans, K={K} attempts")

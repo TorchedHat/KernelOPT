@@ -1,0 +1,93 @@
+--- baseline
++++ rebuilt
+@@ -4,16 +4,15 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 1024}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_N': 512},  num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_N': 1024}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_N': 2048}, num_warps=8,  num_stages=2),
+         triton.Config({'BLOCK_N': 4096}, num_warps=16, num_stages=2),
+     ],
+-    key=['N'],
++    key=['M', 'N'],
+ )
+ @triton.jit
+ def triplet_margin_loss_row_kernel(
+@@ -26,19 +25,26 @@
+       dist_pos[i] = sqrt(sum((anchor[i] - positive[i] + 1e-6)^2))
+       dist_neg[i] = sqrt(sum((anchor[i] - negative[i] + 1e-6)^2))
+     """
+-    row = tl.program_id(0)
+-    base = row * N
++    BLOCK_ROWS: tl.constexpr = 8
+ 
+-    acc_pos = tl.zeros((), dtype=tl.float32)
+-    acc_neg = tl.zeros((), dtype=tl.float32)
++    block_row = tl.program_id(0)
++    row_start = block_row * BLOCK_ROWS
++    rows = row_start + tl.arange(0, BLOCK_ROWS)  # shape [BLOCK_ROWS]
++    row_mask = rows < M
++
++    acc_pos = tl.zeros([BLOCK_ROWS], dtype=tl.float32)
++    acc_neg = tl.zeros([BLOCK_ROWS], dtype=tl.float32)
+ 
+     for off in range(0, N, BLOCK_N):
+-        cols = off + tl.arange(0, BLOCK_N)
+-        mask = cols < N
++        cols = off + tl.arange(0, BLOCK_N)  # shape [BLOCK_N]
++        col_mask = cols < N
+ 
+-        a = tl.load(anchor_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+-        p = tl.load(positive_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+-        n = tl.load(negative_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
++        idx = rows[:, None] * N + cols[None, :]  # [BLOCK_ROWS, BLOCK_N]
++        mask2d = row_mask[:, None] & col_mask[None, :]
++
++        a = tl.load(anchor_ptr   + idx, mask=mask2d, other=0.0).to(tl.float32)
++        p = tl.load(positive_ptr + idx, mask=mask2d, other=0.0).to(tl.float32)
++        n = tl.load(negative_ptr + idx, mask=mask2d, other=0.0).to(tl.float32)
+ 
+         diff_pos = a - p + 1e-6
+         diff_neg = a - n + 1e-6
+@@ -46,18 +52,14 @@
+         sq_pos = diff_pos * diff_pos
+         sq_neg = diff_neg * diff_neg
+ 
+-        # Zero out masked elements
+-        sq_pos = tl.where(mask, sq_pos, 0.0)
+-        sq_neg = tl.where(mask, sq_neg, 0.0)
++        acc_pos += tl.sum(tl.where(mask2d, sq_pos, 0.0), axis=1)  # reduce cols -> [BLOCK_ROWS]
++        acc_neg += tl.sum(tl.where(mask2d, sq_neg, 0.0), axis=1)
+ 
+-        acc_pos += tl.sum(sq_pos, axis=0)
+-        acc_neg += tl.sum(sq_neg, axis=0)
++    dist_pos = tl.math.sqrt(acc_pos)  # native PTX, no MIO stall
++    dist_neg = tl.math.sqrt(acc_neg)
+ 
+-    dist_pos = libdevice.sqrt(acc_pos)
+-    dist_neg = libdevice.sqrt(acc_neg)
+-
+-    tl.store(dist_pos_ptr + row, dist_pos)
+-    tl.store(dist_neg_ptr + row, dist_neg)
++    tl.store(dist_pos_ptr + rows, dist_pos, mask=row_mask)  # coalesced BLOCK_ROWS-float store
++    tl.store(dist_neg_ptr + rows, dist_neg, mask=row_mask)
+ 
+ 
+ @triton.autotune(
+@@ -75,6 +77,7 @@
+     key=['M'],
+ )
+ @triton.jit
++
+ def triplet_margin_loss_reduce_kernel(
+     dist_pos_ptr, dist_neg_ptr,
+     output_ptr,

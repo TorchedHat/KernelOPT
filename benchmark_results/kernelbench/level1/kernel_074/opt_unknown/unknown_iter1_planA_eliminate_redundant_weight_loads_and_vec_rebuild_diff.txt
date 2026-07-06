@@ -1,0 +1,62 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ 
+ @triton.autotune(
+@@ -39,6 +40,10 @@
+ 
+     # Loop over in_channels in blocks
+     for ic_start in range(0, IN_C, BLOCK_IC):
++        # Hoist ic_offs and ic_mask outside the k loop — they are k-independent
++        ic_offs = ic_start + tl.arange(0, BLOCK_IC)
++        ic_mask = ic_offs < IN_C
++
+         # Loop over kernel positions
+         for k in range(KERNEL_SIZE):
+             # For output position o, kernel position k:
+@@ -53,32 +58,27 @@
+             valid_i = (i_idx >= 0) & (i_idx < IN_L)
+             valid = out_mask & valid_stride & valid_i
+ 
+-            # Load weights for this kernel position, for BLOCK_IC channels
+-            ic_offs = ic_start + tl.arange(0, BLOCK_IC)
+-            ic_mask = ic_offs < IN_C
+-
+             # Weight shape: (IN_C, OUT_C, KERNEL_SIZE)
+-            # weight[ic, oc, k]
++            # weight[ic, oc, k] — single coalesced load for all BLOCK_IC channels
+             w_ptrs = W_ptr + ic_offs * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k
+             w_vals = tl.load(w_ptrs, mask=ic_mask, other=0.0)  # [BLOCK_IC]
+ 
+-            # Load input for each valid output position
++            # Inner loop: extract each weight scalar from pre-loaded w_vals via one-hot mask
+             # X shape: (BATCH, IN_C, IN_L)
+             # x[batch, ic, i_idx]
+-            # We need to accumulate over BLOCK_IC channels
++            ic_lane = tl.arange(0, BLOCK_IC)
+             for ic_local in range(BLOCK_IC):
+                 ic = ic_start + ic_local
+-                if ic < IN_C:
+-                    w_val = tl.load(W_ptr + ic * (OUT_C * KERNEL_SIZE) + oc * KERNEL_SIZE + k)
+-                    x_ptrs = X_ptr + batch_idx * (IN_C * IN_L) + ic * IN_L + i_idx
+-                    x_vals = tl.load(x_ptrs, mask=valid, other=0.0)  # [BLOCK_L]
+-                    acc += x_vals * w_val
++                # Extract w_vals[ic_local] as a scalar using one-hot reduction (register read only)
++                w_val = tl.sum(w_vals * (ic_lane == ic_local))
++                x_ptrs = X_ptr + batch_idx * (IN_C * IN_L) + ic * IN_L + i_idx
++                x_vals = tl.load(x_ptrs, mask=valid & (ic < IN_C), other=0.0)  # [BLOCK_L]
++                acc += x_vals * w_val
+ 
+     # Store output
+     # Y shape: (BATCH, OUT_C, OUT_L)
+     y_ptrs = Y_ptr + batch_idx * (OUT_C * OUT_L) + oc * OUT_L + out_offs
+     tl.store(y_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(weight, x):
+     # weight: (IN_C, OUT_C, KERNEL_SIZE) - ConvTranspose1d weight is (in_channels, out_channels, kernel_size)

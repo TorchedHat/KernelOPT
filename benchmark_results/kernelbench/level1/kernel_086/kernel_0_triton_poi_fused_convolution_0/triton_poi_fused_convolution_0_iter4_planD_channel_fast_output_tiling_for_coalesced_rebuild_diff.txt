@@ -1,0 +1,68 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,43 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 128}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 256}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 256}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 512}, num_warps=8, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_0(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+     ynumel = 30
+     xnumel = 50176
++    # XBLOCK tiles the CHANNEL*BATCH dim (fast output axis, stride=1 in NHWC)
++    xoffset = tl.program_id(0) * XBLOCK
++    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # [1, XBLOCK] fast
++    xmask = xindex < ynumel  # guard against xindex >= 30
++    # YBLOCK tiles the SPATIAL dim (slow output axis, stride=3 in NHWC)
+     yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = yindex < ynumel
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y3 = yindex
+-    y0 = (yindex % 3)
+-    y1 = yindex // 3
+-    tmp0 = tl.load(in_ptr0 + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (y0 + 3*x2 + 150528*y1), tmp0, xmask & ymask)
+-
+-
++    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # [YBLOCK, 1] slow
++    ymask = yindex < xnumel  # guard against yindex >= 50176
++    # Decompose xindex into channel c and batch n
++    c = xindex % 3   # [1, XBLOCK] channel index (0..2)
++    n = xindex // 3  # [1, XBLOCK] batch index (0..9)
++    # Load from NCHW input: strides (150528, 50176, 224, 1)
++    # NCHW offset = n*150528 + c*50176 + spatial_pixel
++    load_idx = n * 150528 + c * 50176 + yindex  # [YBLOCK, XBLOCK] broadcast
++    val = tl.load(in_ptr0 + load_idx, mask=xmask & ymask, other=0.0,
++                  eviction_policy='evict_first')
++    # Store to NHWC output: strides (150528, 1, 672, 3)
++    # NHWC offset = n*150528 + spatial_pixel*3 + c
++    # c is the FAST axis (stride=1) -> consecutive threads write consecutive addrs
++    store_idx = n * 150528 + yindex * 3 + c  # [YBLOCK, XBLOCK] broadcast
++    tl.store(out_ptr0 + store_idx, val, mask=xmask & ymask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +49,7 @@
+     ynumel = 30
+     xnumel = 50176
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176)
+     return arg_1
+ 
+ def get_inputs():

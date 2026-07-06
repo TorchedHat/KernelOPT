@@ -1,0 +1,113 @@
+--- baseline
++++ rebuilt
+@@ -11,14 +11,21 @@
+ #   4. loss_i = -log_softmax[i, targets[i]] (if targets[i] != -100, else 0)
+ # Final: mean(loss_i) over valid samples
+ 
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=2),
+         triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 4096}, num_warps=32, num_stages=1),
++        triton.Config({'BLOCK_N': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_N': 4096}, num_warps=8, num_stages=1),
+         triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_N': 2048}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_N': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=3),
+     ],
+     key=['N'],
+ )
+@@ -33,56 +40,57 @@
+     BLOCK_N: tl.constexpr,
+ ):
+     """
++    One program per row. Two-pass cross entropy with coalesced loads.
+     """
+     row = tl.program_id(0)
+-    
++
+     # Load target for this row
+     target = tl.load(targets_ptr + row)
+-    
++
+     # Pass 1: compute max over the row
+     row_max = tl.full((), float('-inf'), dtype=tl.float32)
+-    
++
+     for off in tl.range(0, N, BLOCK_N):
+         cols = off + tl.arange(0, BLOCK_N)
+         mask = cols < N
+-        x = tl.load(predictions_ptr + row * N + cols, mask=mask, other=float('-inf'))
++        x = tl.load(predictions_ptr + row * N + cols, mask=mask, other=float('-inf'), eviction_policy='evict_last')
+         x = x.to(tl.float32)
+         block_max = tl.max(x, axis=0)
+         row_max = tl.maximum(row_max, block_max)
+-    
++
+     # Pass 2: compute sum of exp(x - max)
+     row_sum = tl.zeros((), dtype=tl.float32)
+-    
++
+     for off in tl.range(0, N, BLOCK_N):
+         cols = off + tl.arange(0, BLOCK_N)
+         mask = cols < N
+-        x = tl.load(predictions_ptr + row * N + cols, mask=mask, other=float('-inf'))
++        x = tl.load(predictions_ptr + row * N + cols, mask=mask, other=float('-inf'), eviction_policy='evict_last')
+         x = x.to(tl.float32)
+         exp_x = tl.exp(x - row_max)
+         exp_x = tl.where(mask, exp_x, 0.0)
+         row_sum += tl.sum(exp_x, axis=0)
+-    
++
+     log_sum_exp = libdevice.log(row_sum) + row_max
+-    
++
+     # Compute loss for this row
+     is_valid = target != -100
+-    
++
+     # Clamp target to valid range for indexing
+     safe_target = tl.where(is_valid, target, tl.zeros_like(target))
+     # Handle negative indices
+     safe_target = tl.where(safe_target < 0, safe_target + N, safe_target)
+-    
++
+     # Load the prediction at the target class
+     pred_at_target = tl.load(predictions_ptr + row * N + safe_target).to(tl.float32)
+-    
++
+     # log_softmax at target = pred_at_target - log_sum_exp
+     log_prob = pred_at_target - log_sum_exp
+     loss = -log_prob
+-    
++
+     # Zero out loss for invalid targets
+     loss = tl.where(is_valid, loss, 0.0)
+     valid_int = tl.where(is_valid, 1, 0)
+-    
++
+     tl.store(per_row_loss_ptr + row, loss)
+     tl.store(per_row_valid_ptr + row, valid_int)
+ 
+@@ -91,12 +99,12 @@
+     configs=[
+         triton.Config({'BLOCK_M': 256}, num_warps=4),
+         triton.Config({'BLOCK_M': 512}, num_warps=8),
+-        triton.Config({'BLOCK_M': 1024}, num_warps=16),
+-        triton.Config({'BLOCK_M': 2048}, num_warps=32),
++        triton.Config({'BLOCK_M': 1024}, num_warps=8),
+     ],
+     key=['M'],
+ )
+ @triton.jit
++
+ def reduce_loss_kernel(
+     per_row_loss_ptr,
+     per_row_valid_ptr,

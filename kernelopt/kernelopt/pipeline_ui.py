@@ -501,13 +501,25 @@ class PipelineUI:
                 )
 
     def render(self) -> RenderableType:
+        from rich.spinner import Spinner as _Spinner
+        from rich.table import Table as _Table
+
         sys_block = self._render_system_block()
-        sub = Text()
-        sub.append("Phase: ", style="bold")
-        sub.append(self.phase, style="cyan")
+
+        # Phase line with animated braille spinner
+        phase_table = _Table.grid(padding=(0, 1))
+        phase_table.add_column(width=3)
+        phase_table.add_column()
+        phase_label = Text()
+        phase_label.append(self.phase, style="cyan")
         if self.detail:
-            sub.append(" — ")
-            sub.append(self.detail, style="dim")
+            phase_label.append(" — ", style="dim")
+            phase_label.append(self.detail, style="dim")
+        phase_table.add_row(
+            _Spinner("dots", style="bold cyan"),
+            phase_label,
+        )
+        sub = phase_table
 
         iter_line = Text()
         iter_line.append("Iteration: ", style="bold")

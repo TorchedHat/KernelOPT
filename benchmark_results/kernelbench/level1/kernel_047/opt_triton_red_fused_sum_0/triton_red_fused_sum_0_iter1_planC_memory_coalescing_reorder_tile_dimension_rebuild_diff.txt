@@ -1,0 +1,96 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,17 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_R': 256},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_R': 256},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_R': 512},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_R': 256},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_R': 512},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 512, 'BLOCK_R': 128},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_R': 512},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_R': 1024}, num_warps=8, num_stages=3),
+     ],
+     key=['batch', 'reduce_dim', 'last_dim'],
+ )
+@@ -26,22 +27,19 @@
+     BLOCK_M: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+ ):
+-    # Grid: (batch * last_dim / BLOCK_M,)
+-    # Each program handles BLOCK_M output elements along last_dim
++    # Grid: (batch * cdiv(last_dim, BLOCK_M),)
++    # Each program handles BLOCK_M contiguous columns for one batch element
+     # and reduces over reduce_dim
+     pid = tl.program_id(0)
+ 
+-    # Each pid handles BLOCK_M consecutive last_dim positions for a given batch
+-    # We flatten: output index = batch_idx * last_dim + col_idx
+-    # pid covers BLOCK_M output elements
+-    out_start = pid * BLOCK_M
++    # Decompose pid into (batch_idx, col_tile)
++    num_col_tiles = tl.cdiv(last_dim, BLOCK_M)
++    pid_batch = pid // num_col_tiles
++    pid_col   = pid %  num_col_tiles
+ 
+-    # Compute batch index and column index
+-    col_offsets = out_start + tl.arange(0, BLOCK_M)
+-    batch_idx = col_offsets // last_dim
+-    col_idx = col_offsets % last_dim
+-
+-    mask_out = (batch_idx < batch) & (col_idx < last_dim)
++    # BLOCK_M consecutive column offsets — contiguous in memory (stride-1)
++    col_offsets = pid_col * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
++    mask_col = (col_offsets < last_dim) & (pid_batch < batch)
+ 
+     # Accumulate sum over reduce_dim
+     acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+@@ -50,24 +48,23 @@
+         r_offsets = r_start + tl.arange(0, BLOCK_R)
+         r_mask = r_offsets < reduce_dim
+ 
+-        # Load: in_ptr[batch_idx, r_offsets, col_idx]
+-        # Shape: [BLOCK_M, BLOCK_R]
++        # Load: in_ptr[pid_batch, r_offsets, col_offsets]
++        # Shape: [BLOCK_R, BLOCK_M] — innermost dim is contiguous col_offsets
+         # in_ptr stride: [reduce_dim * last_dim, last_dim, 1]
+-        # Linear index: batch_idx * reduce_dim * last_dim + r * last_dim + col_idx
++        # Linear index: pid_batch*(reduce_dim*last_dim) + r_idx*last_dim + c_idx
+ 
+-        b_idx = batch_idx[:, None]  # [BLOCK_M, 1]
+-        r_idx = r_offsets[None, :]  # [1, BLOCK_R]
+-        c_idx = col_idx[:, None]    # [BLOCK_M, 1]
++        r_idx = r_offsets[:, None]    # [BLOCK_R, 1]
++        c_idx = col_offsets[None, :]  # [1, BLOCK_M]
+ 
+-        linear_idx = b_idx * (reduce_dim * last_dim) + r_idx * last_dim + c_idx
++        linear_idx = pid_batch * (reduce_dim * last_dim) + r_idx * last_dim + c_idx  # [BLOCK_R, BLOCK_M]
+ 
+-        combined_mask = mask_out[:, None] & r_mask[None, :]
++        combined_mask = r_mask[:, None] & mask_col[None, :]
+ 
+-        vals = tl.load(in_ptr + linear_idx, mask=combined_mask, other=0.0)
+-        acc += tl.sum(vals, axis=1)
++        vals = tl.load(in_ptr + linear_idx, mask=combined_mask, other=0.0)  # [BLOCK_R, BLOCK_M]
++        acc += tl.sum(vals, axis=0)  # reduce over BLOCK_R -> [BLOCK_M]
+ 
+-    tl.store(out_ptr + col_offsets, acc, mask=mask_out)
+-
++    out_offsets = pid_batch * last_dim + col_offsets
++    tl.store(out_ptr + out_offsets, acc, mask=mask_col)
+ 
+ def kernel_function(x):
+     # x: [128, 4096, 4095], reduce over dim=1, keepdim=True -> [128, 1, 4095]

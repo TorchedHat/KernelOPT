@@ -1,0 +1,66 @@
+--- baseline
++++ rebuilt
+@@ -2,6 +2,7 @@
+ import triton
+ import triton.language as tl
+ from triton.language.extra import libdevice
++
+ 
+ 
+ @triton.autotune(
+@@ -14,6 +15,10 @@
+         triton.Config({'BLOCK_R': 512},  num_warps=4, num_stages=4),
+         triton.Config({'BLOCK_R': 1024}, num_warps=16, num_stages=2),
+         triton.Config({'BLOCK_R': 256},  num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_R': 1024}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_R': 512},  num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_R': 2048}, num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_R': 256},  num_warps=4, num_stages=4),
+     ],
+     key=['C_per_group', 'HW'],
+ )
+@@ -52,7 +57,7 @@
+     for start in tl.range(0, group_size, BLOCK_R):
+         offsets = start + tl.arange(0, BLOCK_R)
+         mask = offsets < group_size
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+ 
+         # Welford update
+         block_count = tl.sum(mask.to(tl.float32), axis=0)
+@@ -70,25 +75,29 @@
+     inv_std = libdevice.rsqrt(variance + eps)
+ 
+     # Pass 2: Normalize and apply weight/bias
++    # Load W/B directly from global memory per element using channel index
++    # (eliminates tl.gather shared-memory barrier)
+     for start in tl.range(0, group_size, BLOCK_R):
+         offsets = start + tl.arange(0, BLOCK_R)
+         mask = offsets < group_size
+ 
+-        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0).to(tl.float32)
++        x = tl.load(X_ptr + base_offset + offsets, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+ 
+         # Compute channel index for weight/bias
+         # offsets maps to: channel_in_group = offsets // HW, spatial = offsets % HW
+         channel_in_group = offsets // HW
+-        channel_idx = group_idx * C_per_group + channel_in_group
+ 
+-        w = tl.load(W_ptr + channel_idx, mask=mask, other=1.0).to(tl.float32)
+-        b = tl.load(B_ptr + channel_idx, mask=mask, other=0.0).to(tl.float32)
++        # Direct global memory loads — no shared memory barrier needed
++        # W/B are 64 floats = 256 bytes, will be L2-resident after first access
++        w_offsets = group_idx * C_per_group + channel_in_group
++        b_offsets = group_idx * C_per_group + channel_in_group
++        w = tl.load(W_ptr + w_offsets, mask=mask, other=1.0, eviction_policy='evict_last').to(tl.float32)
++        b = tl.load(B_ptr + b_offsets, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
+ 
+         x_norm = (x - mean) * inv_std
+         y = x_norm * w + b
+ 
+-        tl.store(Y_ptr + base_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask)
+-
++        tl.store(Y_ptr + base_offset + offsets, y.to(tl.float16 if Y_ptr.dtype.element_ty == tl.float16 else tl.float32), mask=mask, eviction_policy='evict_first')
+ 
+ def kernel_function(weight, bias, x):
+     N, C, H, W = x.shape

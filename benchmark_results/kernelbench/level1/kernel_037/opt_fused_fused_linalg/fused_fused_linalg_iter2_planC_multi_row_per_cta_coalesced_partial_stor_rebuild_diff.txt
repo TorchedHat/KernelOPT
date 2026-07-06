@@ -1,0 +1,68 @@
+--- baseline
++++ rebuilt
+@@ -3,31 +3,45 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_N': 4096}, num_warps=16, num_stages=4),
++        triton.Config({'BLOCK_N': 1024,  'ROWS_PER_CTA': 4},  num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_N': 2048,  'ROWS_PER_CTA': 4},  num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_N': 4096,  'ROWS_PER_CTA': 8},  num_warps=16, num_stages=3),
++        triton.Config({'BLOCK_N': 4096,  'ROWS_PER_CTA': 8},  num_warps=32, num_stages=3),
++        triton.Config({'BLOCK_N': 8192,  'ROWS_PER_CTA': 8},  num_warps=32, num_stages=3),
++        triton.Config({'BLOCK_N': 8192,  'ROWS_PER_CTA': 16}, num_warps=32, num_stages=3),
++        triton.Config({'BLOCK_N': 16384, 'ROWS_PER_CTA': 8},  num_warps=32, num_stages=3),
++        triton.Config({'BLOCK_N': 16384, 'ROWS_PER_CTA': 16}, num_warps=32, num_stages=4),
+     ],
+-    key=['N_PER_ROW'],
++    key=['N_PER_ROW', 'N_ROWS'],
+ )
+ @triton.jit
+ def partial_sum_sq_kernel(
+     x_ptr,
+     partial_ptr,
+     N_PER_ROW: tl.constexpr,
++    N_ROWS: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    ROWS_PER_CTA: tl.constexpr,
+ ):
+-    row_id = tl.program_id(0)
+-    row_start = row_id * N_PER_ROW
+-    acc = tl.zeros((), dtype=tl.float32)
++    cta_id = tl.program_id(0)
++    row_block_start = cta_id * ROWS_PER_CTA
++    acc = tl.zeros([ROWS_PER_CTA], dtype=tl.float32)
+     for off in range(0, N_PER_ROW, BLOCK_N):
+         cols = off + tl.arange(0, BLOCK_N)
+-        mask = cols < N_PER_ROW
+-        x = tl.load(x_ptr + row_start + cols, mask=mask, other=0.0).to(tl.float32)
+-        acc += tl.sum(x * x, axis=0)
+-    tl.store(partial_ptr + row_id, acc)
++        cols = tl.max_contiguous(tl.multiple_of(cols, BLOCK_N), BLOCK_N)
++        col_mask = cols < N_PER_ROW
++        rows = row_block_start + tl.arange(0, ROWS_PER_CTA)
++        row_mask = rows < N_ROWS
++        ptrs = x_ptr + rows[:, None] * N_PER_ROW + cols[None, :]
++        mask2d = row_mask[:, None] & col_mask[None, :]
++        x = tl.load(ptrs, mask=mask2d, other=0.0, eviction_policy='evict_first').to(tl.float32)
++        acc += tl.sum(x * x, axis=1)
++    out_rows = row_block_start + tl.arange(0, ROWS_PER_CTA)
++    out_mask = out_rows < N_ROWS
++    tl.store(partial_ptr + out_rows, acc, mask=out_mask)
+ 
+ 
+ @triton.autotune(
+@@ -40,6 +54,7 @@
+     key=['N_ROWS'],
+ )
+ @triton.jit
++
+ def final_reduce_kernel(
+     partial_ptr,
+     norm_sq_ptr,

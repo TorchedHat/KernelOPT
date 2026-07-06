@@ -1,0 +1,76 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,18 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=3),
++        triton.Config({'BLOCK_N': 4096}, num_warps=16, num_stages=3),
+         triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_N': 1024}, num_warps=16, num_stages=2),
+         triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_N': 4096}, num_warps=16, num_stages=2),
+     ],
+     key=['N'],
+ )
+@@ -23,20 +27,27 @@
+     BLOCK_N: tl.constexpr,
+ ):
+     """
+-      dist_pos[i] = sqrt(sum((anchor[i] - positive[i] + 1e-6)^2))
+-      dist_neg[i] = sqrt(sum((anchor[i] - negative[i] + 1e-6)^2))
++    Computes per-row loss = clamp(sqrt(sum((a-p+eps)^2)) + margin - sqrt(sum((a-n+eps)^2)), 0)
++    Stores ONE float per row to dist_pos_ptr (repurposed as loss_per_row).
++    margin is read from dist_neg_ptr[0] (a scalar pointer).
++    dist_neg_ptr is repurposed to carry the margin scalar.
+     """
+     row = tl.program_id(0)
+     base = row * N
++
++    # Read margin from dist_neg_ptr[0]
++    margin = tl.load(dist_neg_ptr).to(tl.float32)
+ 
+     acc_pos = tl.zeros((), dtype=tl.float32)
+     acc_neg = tl.zeros((), dtype=tl.float32)
+ 
+     for off in range(0, N, BLOCK_N):
+         cols = off + tl.arange(0, BLOCK_N)
++        # Annotate contiguity and alignment so compiler emits 128-bit LDG transactions
++        cols = tl.max_contiguous(tl.multiple_of(cols, BLOCK_N), BLOCK_N)
+         mask = cols < N
+ 
+-        a = tl.load(anchor_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
++        a = tl.load(anchor_ptr   + base + cols, mask=mask, other=0.0).to(tl.float32)
+         p = tl.load(positive_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+         n = tl.load(negative_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+ 
+@@ -56,8 +67,10 @@
+     dist_pos = libdevice.sqrt(acc_pos)
+     dist_neg = libdevice.sqrt(acc_neg)
+ 
+-    tl.store(dist_pos_ptr + row, dist_pos)
+-    tl.store(dist_neg_ptr + row, dist_neg)
++    loss_row = dist_pos + margin - dist_neg
++    loss_row = tl.where(loss_row > 0.0, loss_row, 0.0)
++    # Store loss per row into dist_pos_ptr (repurposed as loss_per_row)
++    tl.store(dist_pos_ptr + row, loss_row)
+ 
+ 
+ @triton.autotune(
+@@ -75,6 +88,7 @@
+     key=['M'],
+ )
+ @triton.jit
++
+ def triplet_margin_loss_reduce_kernel(
+     dist_pos_ptr, dist_neg_ptr,
+     output_ptr,

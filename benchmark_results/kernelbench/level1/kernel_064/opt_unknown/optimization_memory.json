@@ -1,0 +1,199 @@
+[
+  {
+    "item_id": "exp_conv_transpose1d_nested_loop_regression_001",
+    "iteration": 1,
+    "speedup": 0.5821,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "nested_kk_ic_loop_to_fix_uncoalesced_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 16.23,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 48.88,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 65.62,
+        "Occupancy.Registers Per Thread": 139.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 18.68,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.32,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.71,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.99,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 76.75,
+        "Memory Workload Analysis.L2 Hit Rate": 65.46
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 27.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 11.02,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 85.31,
+        "Occupancy.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.08,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.12,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.99,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 74.96,
+        "Memory Workload Analysis.L2 Hit Rate": 80.69
+      }
+    },
+    "strategy_title": "Nested kk/ic Loop Restructure Worsens Register Pressure",
+    "strategy_description": "Replacing a flat K-loop (iterating over in_channels * kernel_size) with nested loops (outer over kernel positions, inner over in_channels blocks) was intended to eliminate uncoalesced access from mixed ic+kk indexing. However, the restructuring caused registers per thread to jump from 139 to 255 (the hardware maximum), reducing theoretical occupancy from 18.75% to 12.5% and warp cycles per issued instruction from 6.32 to 18.08. The L1/TEX throughput increased from 65.6% to 85.3% while compute throughput collapsed from 48.9% to 11.0%, indicating the kernel became even more severely memory-stall-bound due to the occupancy collapse preventing latency hiding. The nested loop structure with two tl.arange calls and additional mask computations per inner iteration inflated the register file beyond what the compiler could spill efficiently, making this transformation counterproductive for this kernel shape.",
+    "slow_pseudocode": "# BEFORE: flat K-loop with in-loop // and % (139 regs/thread, 18.75% occupancy)\nfor k_start in range(0, K, BLOCK_K):\n    offs_k = k_start + tl.arange(0, BLOCK_K)\n    ic = offs_k // kernel_size   # mixed ic+kk -> scatter\n    kk = offs_k % kernel_size\n    l_in = offs_m[:, None] - kk[None, :]  # [BLOCK_M, BLOCK_K]\n    x_tile = tl.load(X_ptr + ic[None,:]*stride_xc + l_in*stride_xl, ...)\n    w_tile = tl.load(W_ptr + ic[:,None]*stride_wb + kk[:,None]*stride_wk + ..., ...)\n    acc = tl.dot(x_tile, w_tile, acc=acc)",
+    "fast_pseudocode": "# AFTER: nested loops (255 regs/thread, 12.5% occupancy) -- REGRESSION\nfor kk_idx in range(kernel_size):          # outer: scalar kernel position\n    l_in = offs_m - kk_idx                 # [BLOCK_M]\n    valid_l_in = (l_in >= 0) & (l_in < L_in)\n    for ic_start in range(0, in_channels, BLOCK_K):  # inner: block over channels\n        offs_ic = ic_start + tl.arange(0, BLOCK_K)\n        mask_x = (valid_m & valid_l_in)[:, None] & (offs_ic < in_channels)[None, :]\n        x_tile = tl.load(X_ptr + offs_ic[None,:]*stride_xc + l_in[:,None]*stride_xl, ...)\n        mask_w = (offs_ic < in_channels)[:,None] & valid_n[None,:]\n        w_tile = tl.load(W_ptr + offs_ic[:,None]*stride_wb + offs_n[None,:]*stride_wc + kk_idx*stride_wk, ...)\n        acc = tl.dot(x_tile, w_tile, acc=acc)",
+    "applicable_when": "Never \u2014 this specific transformation is a net negative. The general idea of separating kernel-position and channel loops is sound, but the Triton compiler cannot reduce register pressure when the inner loop body still requires multiple live tl.arange vectors, 2D masks, and pointer arithmetic simultaneously.",
+    "do_not_apply_when": "When the kernel already has high register pressure (>100 regs/thread) and low occupancy (<25%): adding a nested loop structure with multiple tl.arange calls and 2D mask computations per inner iteration will push registers to the hardware maximum (255), further collapsing occupancy and worsening latency hiding. The resulting kernel will be more memory-stall-bound despite better theoretical access patterns.",
+    "framework_notes": "In Triton, nested loops with tl.arange inside the inner loop body create additional live tensor variables that the compiler must keep in registers simultaneously. Unlike CUDA where the programmer controls register allocation explicitly, Triton's compiler may not be able to spill these efficiently, causing register counts to hit the 255/thread ceiling. When restructuring loops to improve coalescing in Triton, verify that the total number of simultaneously live tl.arange-derived tensors does not increase."
+  },
+  {
+    "item_id": "exp_triton_small_tile_autotune_regression_001",
+    "iteration": 1,
+    "speedup": 0.7233,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_small_tile_autotune_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 18.68,
+        "Launch Statistics.Registers Per Thread": 139.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 131200.0,
+        "GPU Speed Of Light Throughput.Duration": 16.23,
+        "GPU Speed Of Light Throughput.Memory Throughput": 65.57,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 65.62,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 76.75,
+        "Memory Workload Analysis.L2 Hit Rate": 65.46,
+        "Instruction Statistics.Executed Instructions": 5464741888.0,
+        "Scheduler Statistics.No Eligible": 52.7,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.71
+      },
+      "key_metric_after": {
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 24.85,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 524544.0,
+        "GPU Speed Of Light Throughput.Duration": 22.44,
+        "GPU Speed Of Light Throughput.Memory Throughput": 89.58,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 89.65,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 84.69,
+        "Memory Workload Analysis.L2 Hit Rate": 48.25,
+        "Instruction Statistics.Executed Instructions": 9173225472.0,
+        "Scheduler Statistics.No Eligible": 42.55,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.1
+      }
+    },
+    "strategy_title": "Small Tile Autotune Configs Worsen Uncoalesced Access Kernels",
+    "strategy_description": "Adding small-tile, num_stages=1 autotune configs to reduce register pressure and raise occupancy backfired when the autotuner selected a smaller block size (64 vs 128 threads), which quadrupled the grid size (524K vs 131K blocks) and nearly doubled total executed instructions (9.17B vs 5.46B). Although occupancy improved modestly (25% vs 18.75%) and L1/TEX hit rate increased (84.7% vs 76.75%), the L2 hit rate dropped sharply (48.25% vs 65.46%), uncoalesced global access remained at ~56% excessive sectors, and the MemoryCacheAccessPattern penalty for global loads worsened dramatically (13.8 bytes/sector utilized vs no load warning before). The net effect was a 38% slower kernel: when the kernel is already bottlenecked by uncoalesced memory access patterns rather than pure occupancy, reducing tile size increases total work and memory traffic without fixing the root access-pattern problem.",
+    "slow_pseudocode": "# Before: 8 configs, all BLOCK_M/N >= 64, num_stages >= 2\n@triton.autotune(configs=[\n    Config(BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=2),\n    Config(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=8, num_stages=3),\n    # ... 6 more large-tile configs\n], key=['M','N','K'])\ndef kernel(...): ...",
+    "fast_pseudocode": "# After (WORSE): 16 configs including small tiles and num_stages=1\n# Autotuner selected block_size=64, grid=524K (4x larger)\n@triton.autotune(configs=[\n    Config(BLOCK_M=32, BLOCK_N=32, BLOCK_K=32, num_warps=2, num_stages=1),  # <-- selected\n    Config(BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=2),\n    # ... 14 more configs\n], key=['M','N','K'])\ndef kernel(...): ...",
+    "applicable_when": "Kernel is register-pressure limited (Block Limit Registers << Block Limit Warps) AND memory access patterns are already well-coalesced AND the bottleneck is purely latency hiding from low occupancy.",
+    "do_not_apply_when": "Kernel has significant uncoalesced global or shared memory access (UncoalescedGlobalAccess rule triggered with >50% excessive sectors); reducing tile size in this case increases total instruction count and grid size without fixing the access pattern, causing regression. Also avoid when L2 hit rate is already moderate (>60%) and reducing tile size would shrink the working set reuse footprint.",
+    "framework_notes": "Triton autotune: when the autotuner selects a smaller block size config, the grid size grows proportionally (grid = ceil(M/BLOCK_M) * ceil(N/BLOCK_N) * batch), multiplying total kernel overhead. The winning config may not be the one intended by the developer. In this case the autotuner chose a small-tile config that increased grid from 131K to 524K blocks, quadrupling launch overhead and total instructions."
+  },
+  {
+    "item_id": "c2f5c27d",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "precompute_contiguous_weight_layout_to_fix_uncoalesced_w_load_corrected",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "precompute_contiguous_weight_layout_to_fix_uncoalesced_w_load_corrected \u2014 correctness failure",
+    "strategy_description": "Plan 'precompute_contiguous_weight_layout_to_fix_uncoalesced_w_load_corrected' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The weight tensor W has shape [in_channels, out_channels, kernel_size] with stride_wc = kernel_size = 3. In the K-loop, the w_tile load uses offs_n[None,:] (out_channels) as the fast axis, but consecutive out_channel values are 3 floats apart in memory (stride=3), causing 3x sector waste and triggering both UncoalescedGlobalAccess (55% excessive sectors) and UncoalescedSharedAccess (75% excessive wavefronts). The fix is to pre-permute weight to [in_channels, kernel_size, out_channels] and reshape to [K, out_channels] in the host function, making out_channels the contiguous (stride-1) dimension. The kernel then loads W_flat[offs_k, offs_n] with a simple 2D pointer, fully coalesced. The previous attempt (item ee8c011f) failed correctness because the kernel still used the old stride variables (stride_wb, stride_wc, stride_wk) instead of the new flat layout. This plan passes a new W_flat pointer and a single stride (N = out_channels) to the kernel, replacing all three old weight strides.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "9404b264",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_weight_layout_for_coalesced_w_load_corrected",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_weight_layout_for_coalesced_w_load_corrected \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_weight_layout_for_coalesced_w_load_corrected' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.003e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.432e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.127e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The weight tensor has shape [in_channels, out_channels, kernel_size] with strides [out_channels*kernel_size, kernel_size, 1]. In the K-loop, the W tile is loaded as W[ic, oc, kk] where the oc dimension (BLOCK_N columns) has stride_wc=kernel_size=3. Consecutive threads loading consecutive oc values access addresses 3 floats apart, wasting 3x the memory bandwidth and causing 74% excessive wavefronts (UncoalescedSharedAccess) and 55% excessive sectors (UncoalescedGlobalAccess). The fix is to pre-permute weight to W_flat[K, N] = weight.permute(0,2,1).reshape(-1, out_channels).contiguous() in kernel_function(), then load W_flat[k, oc] with stride-1 access over oc. This makes the W tile load fully coalesced without adding any new tl.arange tensors inside the loop body, keeping register pressure at ~134. The previous attempt (item ee8c011f) had a correctness bug likely due to wrong permutation order, not a fundamental algorithmic flaw.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.003e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.432e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.127e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "2a6fa74a",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_weight_coalescing_via_verified_ic_kk_oc_flat_layout",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_weight_coalescing_via_verified_ic_kk_oc_flat_layout \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_weight_coalescing_via_verified_ic_kk_oc_flat_layout' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The weight tensor W has shape [in_channels=128, out_channels=128, kernel_size=3] with strides [384, 3, 1]. In the K-loop, w_ptrs = W_ptr + ic[:,None]*stride_wb + offs_n[None,:]*stride_wc + kk[:,None]*stride_wk. The fast (column) axis is offs_n with stride_wc=3, meaning consecutive threads loading consecutive out_channel values access addresses 3 floats apart, causing 3x sector waste and 75% excessive wavefronts. The fix is to pre-permute weight to [ic, kk, oc] = weight.permute(0,2,1) then reshape to [K=384, N=128].contiguous() in the host. This makes oc the stride-1 dimension. Prior attempts (items c2f5c27d, 9404b264) failed correctness because they used wrong permutation order or still passed old stride_wb/wc/wk variables to the kernel. This plan uses the correct permutation (0,2,1) and completely replaces the three weight strides with a single flat stride.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "9545641b",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_weight_layout_coalesced_w_load_with_verified_permutation",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_weight_layout_coalesced_w_load_with_verified_permutation \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_weight_layout_coalesced_w_load_with_verified_permutation' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The weight tensor has shape [in_channels=128, out_channels=128, kernel_size=3] with strides [384, 3, 1]. In the K-loop, w_ptrs uses offs_n[None,:] (out_channels, BLOCK_N columns) with stride_wc=3, so consecutive threads loading consecutive out_channel indices access memory 3 floats apart, causing 3x sector waste and triggering both UncoalescedGlobalAccess (55% excessive sectors) and UncoalescedSharedAccess (75% excessive wavefronts). The fix is to pre-permute weight in the host to W_flat = weight.permute(0,2,1).reshape(-1, out_channels).contiguous(), producing shape [K=384, N=128] with strides [128, 1]. The kernel K-loop row index is offs_k where ic=offs_k//kernel_size and kk=offs_k%kernel_size, so W_flat[offs_k, offs_n] = weight[ic, offs_n, kk] = the correct weight value. Prior attempts (items c2f5c27d, 9404b264) failed correctness because the kernel still used old stride variables instead of the new flat layout. This plan replaces all three weight stride arguments with a single stride_wf=N.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "73263fe5",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "precompute_weight_layout_ic_kk_oc_for_coalesced_w_load",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "precompute_weight_layout_ic_kk_oc_for_coalesced_w_load \u2014 correctness failure",
+    "strategy_description": "Plan 'precompute_weight_layout_ic_kk_oc_for_coalesced_w_load' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The weight tensor W has shape [in_channels, out_channels, kernel_size] with strides [out_channels*kernel_size, kernel_size, 1]. In the K-loop, the w_tile load uses offs_n[None,:] (out_channels, BLOCK_N columns) with stride_wc=kernel_size=3. Consecutive threads loading consecutive out_channel values access addresses 3 floats apart in memory, wasting 3x the memory bandwidth and causing 75% excessive shared wavefronts and 55% excessive global sectors. The fix is to pre-permute weight to [IC, KK, OC] = weight.permute(0,2,1) then reshape to [K, N] = [IC*KK, OC] in kernel_function(), making OC the stride-1 (contiguous) dimension. The kernel then loads W_flat[k_idx, oc] with a simple 2D pointer where consecutive oc values are 1 float apart \u2014 fully coalesced. This does NOT add any new tl.arange tensors inside the loop body, so register pressure stays near current levels. Previous attempts (items c2f5c27d, 9404b264) failed correctness due to wrong permutation order or stale stride variables \u2014 this plan uses the correct permutation (0,2,1) and passes a single flat stride N to the kernel, replacing all three old weight strides.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.812e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.537e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.407e+01 > atol=0.001",
+    "framework_notes": null
+  }
+]

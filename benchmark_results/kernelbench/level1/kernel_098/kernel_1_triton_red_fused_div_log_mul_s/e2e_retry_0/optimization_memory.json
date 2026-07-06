@@ -1,0 +1,80 @@
+[
+  {
+    "item_id": "exp_triton_xblock1_register_pressure_reduction_001",
+    "iteration": 1,
+    "speedup": 1.4032,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_xblock_to_match_xnumel_for_scalar_output_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 135.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 3.0,
+        "GPU Speed Of Light Throughput.Duration": 3.55,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5289.0,
+        "Instruction Statistics.Executed Instructions": 1544.0,
+        "Scheduler Statistics.No Eligible": 87.5
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 24.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 5.93,
+        "Occupancy.Block Limit Registers": 21.0,
+        "GPU Speed Of Light Throughput.Duration": 2.53,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3728.0,
+        "Instruction Statistics.Executed Instructions": 401.0,
+        "Scheduler Statistics.No Eligible": 93.15
+      }
+    },
+    "strategy_title": "Set XBLOCK=1 When xnumel=1 to Cut Register Pressure",
+    "strategy_description": "When a Triton reduction kernel has xnumel=1 (scalar output), using XBLOCK=128 wastes 127 threads in the x-dimension and inflates register usage (135/thread \u2192 24/thread after fix), which caps theoretical occupancy at 18.75% and block-limit-registers at 3. Setting XBLOCK=1 (matching xnumel) eliminates the dead x-dimension threads, dramatically reducing register pressure and raising theoretical occupancy from 18.75% to 100%. The kernel duration dropped from 3.55 \u00b5s to 2.53 \u00b5s (1.40x speedup) primarily due to the 5.6x reduction in register count enabling a leaner compiled kernel with 74% fewer executed instructions.",
+    "slow_pseudocode": "# XBLOCK=128 but xnumel=1 \u2192 127 threads idle in x-dim, 135 regs/thread\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, xnumel, r0_numel,\n           XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xnumel = 1  # scalar output\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # shape [128, 1]\n    xmask = tl.full([XBLOCK], True, tl.int1)[:, None]  # all True, no masking\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        tmp0 = tl.load(in_ptr0 + r0_index, r0_mask, ...)\n        _acc += tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    result = tl.sum(_acc, 1)[:, None] * scale\n    tl.store(in_out_ptr0 + 0, result, None)  # no xmask\n\ngrid = (triton.cdiv(1, 128),)  # = (1,)\nkernel[grid](arg0, arg1, 1, 2048, XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# XBLOCK=1 matching xnumel=1 \u2192 24 regs/thread, 100% theoretical occupancy\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=2),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 128},  num_warps=2),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, xnumel, r0_numel,\n           XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xnumel = 1\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # shape [1, 1]\n    xmask = xindex < xnumel  # proper masking\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        tmp0 = tl.load(in_ptr0 + r0_index, xmask & r0_mask, ...)\n        _acc += tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])\n    result = tl.sum(_acc, 1)[:, None] * scale\n    tl.debug_barrier()\n    tl.store(in_out_ptr0 + 0, result, xmask)  # with xmask\n\ngrid = lambda meta: (triton.cdiv(1, meta['XBLOCK']),)\nkernel[grid](arg0, arg1, 1, 2048)  # autotune selects XBLOCK/R0_BLOCK",
+    "applicable_when": "Triton reduction kernel has xnumel=1 (scalar output) but XBLOCK >> 1; registers/thread is high (>80) due to large XBLOCK inflating the x-dimension tensor shapes; TheoreticalOccupancy rule fires with Block Limit Registers << Block Limit Warps; achieved occupancy is far below theoretical occupancy.",
+    "do_not_apply_when": "xnumel > 1 (multiple output elements exist and XBLOCK parallelism is genuinely needed); kernel is already memory-bandwidth bound rather than register-pressure limited; XBLOCK reduction would cause the grid to have fewer blocks than SMs, further reducing parallelism.",
+    "framework_notes": "Triton-specific: XBLOCK is a tl.constexpr that shapes intermediate tensors [XBLOCK, R0_BLOCK]; setting XBLOCK=128 when xnumel=1 forces the compiler to allocate registers for a 128-wide x-dimension that is never used. The fix requires updating xmask from tl.full([XBLOCK], True) to xindex < xnumel, and applying xmask to both loads and stores. Use @triton.autotune to explore R0_BLOCK values since optimal tile size may vary. CUDA equivalent: __launch_bounds__ to cap register usage, but the root cause (oversized block dimension for scalar output) is Triton-specific."
+  },
+  {
+    "item_id": "exp_triton_xblock1_autotune_small_reduction_001",
+    "iteration": 1,
+    "speedup": 1.3346,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock1_for_scalar_output_reduction",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 135.0,
+        "Occupancy.Block Limit Registers": 3.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5289.0,
+        "GPU Speed Of Light Throughput.Duration": 3.55,
+        "Warp State Statistics.Avg. Not Predicated Off Threads Per Warp": 21.47,
+        "Instruction Statistics.Executed Instructions": 1544.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Occupancy.Block Limit Registers": 28.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3939.0,
+        "GPU Speed Of Light Throughput.Duration": 2.66,
+        "Warp State Statistics.Avg. Not Predicated Off Threads Per Warp": 30.92,
+        "Instruction Statistics.Executed Instructions": 173.0
+      }
+    },
+    "strategy_title": "Set XBLOCK=1 for scalar-output reductions to cut wasted threads",
+    "strategy_description": "When a Triton reduction kernel has xnumel=1 (scalar output), using XBLOCK=128 wastes 127 of 128 threads in the X dimension via predication, inflating register pressure (135 regs/thread) and limiting Block Limit Registers to 3. Switching to XBLOCK=1 via autotune eliminates the masked-out X threads, halves register usage (135\u219266 regs/thread), raises Block Limit Registers from 3 to 28, and reduces executed instructions by ~9x (1544\u2192173), cutting kernel duration from 3.55\u00b5s to 2.66\u00b5s. Apply @triton.autotune with XBLOCK=1 configs and a lambda grid so the block count matches xnumel correctly.",
+    "slow_pseudocode": "# XBLOCK=128 but xnumel=1 \u2192 127/128 X threads masked out\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xnumel = 1\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel  # only 1/128 threads active\n    _tmp2 = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    for r0_offset in range(0, r0_numel, R0_BLOCK):  # 4 iterations\n        ...\n    tl.store(out + ..., result, None)\n\ngrid = (triton.cdiv(xnumel, 128),)  # always 1\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# XBLOCK=1 \u2192 all threads active in X; autotune picks best R0_BLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xnumel = 1\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel  # all 1 thread active\n    _tmp2 = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    for r0_offset in range(0, r0_numel, R0_BLOCK):  # 1 iteration when R0_BLOCK=r0_numel\n        tmp0 = tl.load(..., mask=r0_mask & xmask, ...)\n        ...\n    tl.store(out + ..., result, mask=xmask)\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](..., xnumel, r0_numel)  # no hardcoded tile params",
+    "applicable_when": "Triton reduction kernel with xnumel=1 (scalar output); XBLOCK >> xnumel causing most X-dimension threads to be predicated off; high registers-per-thread (>100) limiting Block Limit Registers to \u22643; Avg. Not Predicated Off Threads Per Warp significantly below 32 (e.g. ~21); LaunchConfiguration NCU rule triggered with grid_size=1 and block_size >> xnumel.",
+    "do_not_apply_when": "xnumel > 1 (non-scalar output) where XBLOCK parallelism is needed; kernels where the grid spans multiple SMs and occupancy is already high; cases where reducing num_warps would starve memory latency hiding in bandwidth-bound kernels.",
+    "framework_notes": "Triton-specific: use @triton.autotune with XBLOCK as a constexpr config key. The grid must be a lambda using META['XBLOCK'] rather than a static tuple. Apply xmask to both tl.load and tl.store when XBLOCK=1 to ensure correctness. Equivalent in CUDA: set blockDim.x=1 for scalar-output reductions and use __launch_bounds__ to reduce register spilling."
+  }
+]

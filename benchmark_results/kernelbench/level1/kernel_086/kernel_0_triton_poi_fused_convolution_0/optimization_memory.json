@@ -1,0 +1,179 @@
+[
+  {
+    "item_id": "c7a2f891",
+    "iteration": 2,
+    "speedup": 1.1394,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "shared_memory_transpose_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.08,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9096.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.47,
+        "Compute Workload Analysis.Issue Slots Busy": 28.9,
+        "Compute Workload Analysis.Executed Ipc Active": 1.14,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Occupancy.Achieved Occupancy": 55.21
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.31,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 7947.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 26.27,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 43.97,
+        "Compute Workload Analysis.Issue Slots Busy": 34.18,
+        "Compute Workload Analysis.Executed Ipc Active": 1.34,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.19,
+        "Occupancy.Achieved Occupancy": 52.04
+      }
+    },
+    "strategy_title": "Use tl.trans() to Coalesce Strided Transpose Stores",
+    "strategy_description": "When a Triton kernel performs a layout transpose (e.g. NCHW\u2192NHWC) where the store address has a stride > 1 in the fast thread dimension, consecutive threads write to non-contiguous addresses causing excessive L1TEX sectors and high CPIStall from scoreboard dependencies. The fix is to load a [YBLOCK, XBLOCK] tile with the spatial (contiguous) dimension as the fast thread axis, apply tl.trans() to get [XBLOCK, YBLOCK], then store with the channel (previously strided) dimension as the fast thread axis \u2014 making consecutive threads write to consecutive output addresses. This reduced L1TEX stall cycles from 14.6 to 9.3 cycles per warp, improved IPC active from 1.14 to 1.34, and cut kernel duration from 6.08 \u00b5s to 5.31 \u00b5s (1.14x speedup).",
+    "slow_pseudocode": "# Uncoalesced: consecutive threads stride over channel dim on store\nyindex = yoffset + arange(YBLOCK)[:, None]  # slow\nxindex = xoffset + arange(XBLOCK)[None, :]  # fast\ntmp0 = load(in_ptr + xindex + X_stride * yindex)  # coalesced load\nstore(out_ptr + (yindex % C) + C * xindex + batch_stride * (yindex // C), tmp0)  # strided store",
+    "fast_pseudocode": "# Coalesced: load tile, transpose in smem, store with channel as fast dim\nyindex = yoffset + arange(YBLOCK)[:, None]  # slow\nxindex = xoffset + arange(XBLOCK)[None, :]  # fast\ntmp0 = load(in_ptr + xindex + X_stride * yindex, eviction_policy='evict_first')  # [YBLOCK, XBLOCK]\ntmp0_T = tl.trans(tmp0)  # [XBLOCK, YBLOCK] \u2014 shared-mem transpose\nyindex2 = yoffset + arange(YBLOCK)[None, :]  # now fast dim\nxindex2 = xoffset + arange(XBLOCK)[:, None]  # now slow dim\nstore(out_ptr + (yindex2 % C) + C * xindex2 + batch_stride * (yindex2 // C), tmp0_T)  # coalesced store",
+    "applicable_when": "NCU reports UncoalescedGlobalAccess on stores with >15% excessive sectors and CPIStall on L1TEX >10 cycles/warp; the kernel performs a layout permutation where the output address has a stride > 1 in the fast thread dimension (e.g. NCHW\u2192NHWC where channel stride = 1 but threads iterate over spatial first); YBLOCK and XBLOCK are both constexpr (required for tl.trans()).",
+    "do_not_apply_when": "Simply reordering tile dimensions without tl.trans() causes correctness failures (max_diff > 1e-3) \u2014 the transpose must be explicit. Do not apply when the store is already coalesced or when the shared-memory round-trip cost of tl.trans() exceeds the store coalescing benefit (low uncoalesced sector %, small tiles).",
+    "framework_notes": "tl.trans() is Triton-specific and lowers to a shared-memory transpose. Both XBLOCK and YBLOCK must be tl.constexpr. Use evict_first on the load to avoid polluting L1 cache with streaming data. Reduce num_stages to 2 in autotune configs when using tl.trans() to avoid excessive shared memory pressure. Equivalent in CUDA: use a shared-memory tile with padding to avoid bank conflicts, load row-major, store column-major."
+  },
+  {
+    "item_id": "4a526430",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "flat_output_tiling_for_coalesced_nhwc_stores",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "flat_output_tiling_for_coalesced_nhwc_stores \u2014 correctness failure",
+    "strategy_description": "Plan 'flat_output_tiling_for_coalesced_nhwc_stores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs NCHW->NHWC layout conversion. The output tensor has strides (150528, 1, 672, 3) \u2014 NHWC where channel stride=1. The current 2D tiling uses YBLOCK over the 30-element (batch\u00d7channel) dimension and XBLOCK over the 50176-element spatial dimension. After tl.trans(), the store address is (yindex2%3) + 3*xindex2 + 150528*(yindex2//3). The XBLOCK dimension (128 threads) iterates over spatial pixels with output stride=3 (12 bytes apart), causing 3x sector waste \u2014 128 threads write 512 bytes but touch 1536 bytes of output address space. NCU confirms 50% excessive sectors and only 10.7/32 bytes utilized per sector. The fix is to tile over the FLAT output index (0..N*H*W*C = 1,505,280 elements) so consecutive threads write to consecutive output addresses (stride=1), eliminating the stride-3 scatter. The input is read via the inverse mapping: flat_out_idx -> (n, h, w, c) -> input NCHW offset = c*50176 + hw_pixel + n*150528.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "453f8025",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "output_tiled_coalesced_nhwc_store_via_channel_as_xblock",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "output_tiled_coalesced_nhwc_store_via_channel_as_xblock \u2014 correctness failure",
+    "strategy_description": "Plan 'output_tiled_coalesced_nhwc_store_via_channel_as_xblock' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.306e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs NCHW->NHWC layout conversion. Output tensor has strides (150528, 1, 672, 3) \u2014 NHWC where channel stride=1 and spatial stride=3. The current tiling uses YBLOCK over ynumel=30 (batch*channel=10*3) and XBLOCK over xnumel=50176 (spatial). After tl.trans(), the store address is (yindex2%3) + 3*xindex2 + 150528*(yindex2//3). The XBLOCK dimension (128 threads) iterates over spatial pixels (xindex2) with output stride=3 (12 bytes apart), so 128 threads scatter across 1536 bytes of output space while only writing 512 bytes \u2014 causing 50% excessive sectors and only 10.7/32 bytes utilized per sector. The fix is to restructure the tiling so XBLOCK iterates over the channel dimension (C=3, stride=1 in NHWC output) and YBLOCK iterates over batch*spatial (10*50176=501760), making consecutive threads write to consecutive output addresses (stride=1). The input read becomes strided (NCHW: channel stride=50176) but reads are cached in L1 and the load pattern is less critical than the store pattern for this kernel.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.306e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6b683f08",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "flat_nhwc_output_tiling_with_correct_nchw_index_mapping",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + SOLBottleneck + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "flat_nhwc_output_tiling_with_correct_nchw_index_mapping \u2014 correctness failure",
+    "strategy_description": "Plan 'flat_nhwc_output_tiling_with_correct_nchw_index_mapping' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel converts NCHW (strides 150528,50176,224,1) to NHWC (strides 150528,1,672,3). The output has channel-stride=1 but only C=3 channels, so after tl.trans() the store address 'y0b + 3*x2b + 150528*y1b' has stride=3 in the fast XBLOCK thread dimension. Consecutive threads write 12 bytes apart, wasting 2/3 of every 32-byte sector \u2014 confirmed by NCU's 10.7/32 bytes utilized per sector and 50% excessive sectors. The tl.trans() approach (already applied, item c7a2f891) cannot fix this because C=3 is too narrow to fill a cache line regardless of tile orientation. The only way to make stores coalesced is to tile over the FLAT output index (N*H*W*C = 1,505,280 elements) so consecutive threads write to consecutive output addresses (stride=1 in NHWC). Additionally, the grid (1568 blocks, 0.74 waves on 132 SMs) is too small, causing SOLBottleneck. A 1D flat kernel with XBLOCK=1024 produces ceil(1505280/1024)=1470 blocks \u2014 ~11.1 waves vs current 0.74 waves. The previous flat_output_tiling attempt (item 4a526430) failed due to an index mapping bug; this plan provides the verified correct mapping.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "824f0e9f",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "flat_nhwc_output_tiling_coalesced_stores_correct_index",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "flat_nhwc_output_tiling_coalesced_stores_correct_index \u2014 correctness failure",
+    "strategy_description": "Plan 'flat_nhwc_output_tiling_coalesced_stores_correct_index' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel converts NCHW to NHWC layout. The output tensor has strides (150528, 1, 672, 3) where the spatial (HW) stride is 3. The current tl.trans() approach tiles [YBLOCK=channel x batch, XBLOCK=spatial], transposes, then stores with address y0_s + 3*xindex_store + 150528*y1_s. The XBLOCK dimension (spatial pixels) still has stride 3 in the output, so 128 consecutive threads write to addresses 12 bytes apart, using only 10.7/32 bytes per sector and causing 50% excessive sectors. The fix is to tile directly over the flat NHWC output space (N x H x W x C = 1,505,280 elements) where consecutive threads write to consecutive output addresses (stride=1). The NCHW input address is computed via inverse mapping: flat_out -> (n, hw, c) -> input = n*150528 + c*50176 + hw. This eliminates the stride-3 scatter entirely.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "abfe5f34",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "channel_fast_output_tiling_for_coalesced_nhwc_stores",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "channel_fast_output_tiling_for_coalesced_nhwc_stores \u2014 correctness failure",
+    "strategy_description": "Plan 'channel_fast_output_tiling_for_coalesced_nhwc_stores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.306e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel tiles YBLOCK over the 30-element (batch*channel) dimension and XBLOCK over the 50176-element spatial dimension. After tl.trans(), the store address is (yindex2%3) + 3*xindex2 + 150528*(yindex2//3). The XBLOCK (spatial) dimension has output stride=3 in NHWC \u2014 consecutive threads write 12 bytes apart, wasting 3x the sector bandwidth. NCU confirms only 10.7/32 bytes utilized per sector. The fix is to SWAP the tiling axes: tile XBLOCK over the 30-element channel*batch dimension (fast output axis, stride=1 in NHWC) and YBLOCK over the 50176-element spatial dimension (slow output axis, stride=3 in NHWC). This makes consecutive threads write to consecutive output addresses (stride=1 channel dimension), eliminating the 3x sector waste. No tl.trans() is needed. This is distinct from the failed flat_output_tiling approach (item 4a526430) which used a 1D flat index with complex modular arithmetic; this approach uses a clean 2D tiling with swapped axes.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.306e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "b3e1d742",
+    "iteration": 4,
+    "speedup": 1.1183,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_config_space",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 5.31,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 7902.0,
+        "Occupancy.Achieved Occupancy": 53.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.52,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.22,
+        "Compute Workload Analysis.Issue Slots Busy": 34.26
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.41,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8041.0,
+        "Occupancy.Achieved Occupancy": 52.59,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.51,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.18,
+        "Compute Workload Analysis.Issue Slots Busy": 34.96
+      }
+    },
+    "strategy_title": "Expanding Autotune Config Space Yields Marginal Gains",
+    "strategy_description": "Adding more autotune configurations (larger XBLOCK values of 1024, and swapping num_warps assignments between configs) produced a 1.12x speedup, but the NCU profiling metrics are nearly identical before and after \u2014 duration changed from 5.31 \u00b5s to 5.41 \u00b5s (slightly worse per-kernel), suggesting the speedup comes from the autotuner selecting a better config at runtime rather than from any structural code change. When the kernel is already near a local optimum and NCU metrics show no meaningful change, expanding the autotune search space provides only marginal benefit and may even show slightly worse profiled metrics if the winning config differs from the profiled one.",
+    "slow_pseudocode": "# Autotune with 6 configs: XBLOCK in {128, 256, 512}, num_warps in {4, 8}\n@triton.autotune(configs=[\n    Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=2),\n    Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=2),\n    Config({'XBLOCK': 256, 'YBLOCK': 8},  num_warps=4, num_stages=2),\n    Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=8, num_stages=2),\n    Config({'XBLOCK': 512, 'YBLOCK': 4},  num_warps=4, num_stages=2),\n    Config({'XBLOCK': 512, 'YBLOCK': 8},  num_warps=8, num_stages=2),\n], key=['ynumel', 'xnumel'])",
+    "fast_pseudocode": "# Autotune with 8 configs: XBLOCK in {128, 256, 512, 1024}, num_warps reassigned\n@triton.autotune(configs=[\n    Config({'XBLOCK': 128,  'YBLOCK': 8},  num_warps=4, num_stages=2),\n    Config({'XBLOCK': 128,  'YBLOCK': 16}, num_warps=4, num_stages=2),\n    Config({'XBLOCK': 256,  'YBLOCK': 8},  num_warps=4, num_stages=2),\n    Config({'XBLOCK': 256,  'YBLOCK': 16}, num_warps=4, num_stages=2),  # num_warps 8->4\n    Config({'XBLOCK': 512,  'YBLOCK': 4},  num_warps=8, num_stages=2),  # num_warps 4->8\n    Config({'XBLOCK': 512,  'YBLOCK': 8},  num_warps=8, num_stages=2),\n    Config({'XBLOCK': 1024, 'YBLOCK': 4},  num_warps=8, num_stages=2),  # new\n    Config({'XBLOCK': 1024, 'YBLOCK': 8},  num_warps=8, num_stages=2),  # new\n], key=['ynumel', 'xnumel'])",
+    "applicable_when": "Kernel already has an autotune decorator with a limited config set; NCU shows the kernel is memory-bound with low waves_per_sm (<1.0) and the current config space does not include large XBLOCK values; the kernel body is correct and the bottleneck is tile sizing rather than algorithmic structure.",
+    "do_not_apply_when": "NCU profiling metrics are already near-optimal and the kernel duration is not improving \u2014 expanding configs adds autotuning overhead without structural benefit. Do not apply when the kernel has uncoalesced access patterns that require algorithmic fixes (e.g. tl.trans() for layout transposes); config tuning alone cannot fix stride-induced uncoalesced stores.",
+    "framework_notes": "Triton-specific: @triton.autotune selects the best Config at first run and caches it. The profiled kernel may not be the winning config, so NCU metrics can appear worse even when end-to-end latency improves. Larger XBLOCK with num_warps=8 is generally preferred for memory-bound kernels on H100/H200 with high SM counts."
+  }
+]

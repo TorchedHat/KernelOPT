@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "edf6e7a8",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_contiguous_hints",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_contiguous_hints \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_contiguous_hints' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a tensor layout permutation (transpose from channels-last stride (4032000,1,32000,128) to contiguous stride (4032000,31500,250,1)). L2 is saturated at 96.8% while compute is only 19.63% \u2014 purely memory-bound. L1 hit rate is 0%, meaning every load goes to L2/DRAM. The load index y0 + 128*x2 + 4032000*y1 has a stride-128 pattern in the y0 dimension, preventing the compiler from emitting 128-bit (float4) vectorized loads. Adding tl.max_contiguous and tl.multiple_of hints on the XBLOCK dimension (which IS contiguous in the output and has stride-128 in the input) will signal to the Triton compiler that the x-dimension accesses are aligned and contiguous, enabling 128-bit vectorized loads (4 floats per instruction instead of 1). This directly reduces the number of L2 transactions and alleviates the L2 bottleneck.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_coalesced_tile_transpose_triton",
+    "iteration": 1,
+    "speedup": 3.2235,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "coalesce_strided_loads_via_tile_axis_swap",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + HighPipeUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 286.05,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput (%)": 96.8,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 72.14,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 19.63,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 66.6,
+        "Scheduler Statistics.No Eligible (%)": 79.76,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 73.96,
+        "Launch Statistics.Registers Per Thread": 25.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 4.1
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 88.74,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput (%)": 14.8,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 1.13,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 18.86,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 5.67,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 89.86,
+        "Scheduler Statistics.No Eligible (%)": 73.11,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.79,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 0.0
+      }
+    },
+    "strategy_title": "Swap Tile Axis to Coalesce Strided Memory Loads",
+    "strategy_description": "When a Triton kernel's load address has a large stride along the thread-parallel (XBLOCK) dimension and stride-1 access along the block-parallel (YBLOCK) dimension, the warp issues scattered cache-line requests causing 0% L1 hit rate and near-100% L2 saturation. Swapping the tile orientation so that the stride-1 memory dimension is covered by the innermost thread index (YBLOCK=128 covering the contiguous channel axis) converts scattered loads into fully coalesced transactions, collapsing L2 throughput from 96.8% to 14.8% and warp stall cycles per instruction from 74 to 16. Adding @triton.autotune over XBLOCK/YBLOCK/num_warps/num_stages combinations lets the compiler select the optimal tile shape for the new coalesced access pattern.",
+    "slow_pseudocode": "# XBLOCK=128 threads iterate over x2 (stride-128 in memory) \u2192 scattered loads\n@triton.jit\ndef kernel(in_ptr, out_ptr, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0,YBLOCK)[:,None]  # YBLOCK=8\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0,XBLOCK)[None,:]  # XBLOCK=128\n    y0 = yindex % 128\n    y1 = yindex // 128\n    # stride between consecutive x-threads = 128 floats \u2192 non-coalesced\n    tmp = tl.load(in_ptr + (y0 + 128*xindex + 4032000*y1), xmask)\n    tl.store(out_ptr + (xindex + 31500*yindex), tmp, xmask)\n\ngrid = (cdiv(xnumel,128), cdiv(ynumel,8))\nkernel[grid](in_ptr, out_ptr, 4096, 31500, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# YBLOCK=128 threads iterate over y0 (stride-1 in memory) \u2192 coalesced loads\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK':1,  'YBLOCK':128}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK':4,  'YBLOCK':128}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK':8,  'YBLOCK':128}, num_warps=8, num_stages=4),\n        triton.Config({'XBLOCK':16, 'YBLOCK':128}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK':64, 'YBLOCK':128}, num_warps=8, num_stages=3),\n        # keep baseline as fallback\n        triton.Config({'XBLOCK':128,'YBLOCK':8},   num_warps=4, num_stages=3),\n    ],\n    key=['ynumel','xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0,YBLOCK)[:,None]  # YBLOCK=128\n    ymask  = yindex < ynumel\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0,XBLOCK)[None,:]\n    xmask  = xindex < xnumel\n    y0 = yindex % 128\n    y1 = yindex // 128\n    # consecutive y0 at stride-1 \u2192 fully coalesced\n    tmp = tl.load(in_ptr + (y0 + 128*xindex + 4032000*y1), xmask & ymask)\n    tl.store(out_ptr + (xindex + 31500*yindex), tmp, xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "L1/TEX Hit Rate \u2248 0%, L2 Cache Throughput > 80%, Warp Cycles Per Issued Instruction > 50, CPIStall rule triggered with L1TEX stall as dominant reason, and the load address formula shows that the XBLOCK (thread-parallel) dimension maps to a large stride in memory while the YBLOCK dimension maps to stride-1 or small stride.",
+    "do_not_apply_when": "The XBLOCK dimension already maps to the stride-1 (contiguous) memory axis; or when L2/DRAM throughput is already low and the bottleneck is compute or occupancy; or when YBLOCK cannot be set to match the contiguous dimension size without exceeding shared memory or register limits.",
+    "framework_notes": "Triton-specific: use @triton.autotune with configs varying XBLOCK and YBLOCK, and update the grid lambda to use META['XBLOCK'] and META['YBLOCK']. The ymask must be recomputed as `yindex < ynumel` (not tl.full) when YBLOCK varies across configs. Equivalent in CUDA: choose threadblock dimensions so that threadIdx.x indexes the contiguous memory dimension."
+  }
+]

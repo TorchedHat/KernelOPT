@@ -1,0 +1,109 @@
+[
+  {
+    "item_id": "02a72677",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "split_k_parallelism_with_atomic_reduction",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + SOLBottleneck + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "split_k_parallelism_with_atomic_reduction \u2014 correctness failure",
+    "strategy_description": "Plan 'split_k_parallelism_with_atomic_reduction' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.544e+05 > atol=0.001\nseed=42 output[0]: max_diff=2.545e+05 > atol=0.001\nseed=1337 output[0]: max_diff=2.546e+05 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 2048 CTAs across 132 SMs (1.29 waves), meaning the K=1,048,576 reduction is entirely serialized within each CTA. This leaves most SMs idle during the tail wave and prevents the GPU from saturating HBM bandwidth. The scheduler shows 77.41% cycles with no eligible warp, driven by L1TEX scoreboard stalls (78.2% of all stalls) \u2014 DRAM latency is not hidden because num_stages=2 provides insufficient prefetch depth and there are too few warps in flight per SM. Split-K restructures the grid to add a K_SPLITS dimension: each (row, k_split) CTA handles K/K_SPLITS elements and atomically accumulates into the output. This multiplies active CTAs by K_SPLITS (e.g., 16x to 32,768 CTAs), fully saturating all 132 SMs across many waves and enabling true HBM bandwidth utilization.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.544e+05 > atol=0.001\nseed=42 output[0]: max_diff=2.545e+05 > atol=0.001\nseed=1337 output[0]: max_diff=2.546e+05 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_matvec_tl_dot_tensor_core_grid_collapse",
+    "iteration": 2,
+    "speedup": 0.2151,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tl_dot_tensor_core_accumulation",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck (grid too small) + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 91.57,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.24,
+        "Occupancy.Achieved Occupancy": 96.61,
+        "Launch Statistics.Grid Size": 2048.0,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Scheduler Statistics.One or More Eligible": 26.86,
+        "Scheduler Statistics.Active Warps Per Scheduler": 15.23,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 56.69,
+        "GPU Speed Of Light Throughput.Duration": 1.91
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 17.09,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 5.38,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Grid Size": 128.0,
+        "Launch Statistics.Waves Per SM": 0.06,
+        "Scheduler Statistics.One or More Eligible": 5.64,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.72,
+        "GPU Speed Of Light Throughput.Duration": 10.23
+      }
+    },
+    "strategy_title": "tl.dot Tensor Core Accumulation Collapses Grid, Kills Occupancy",
+    "strategy_description": "Switching from BLOCK_M=1 scalar FMA accumulation to BLOCK_M=16/32 with tl.dot for tensor core MMA reduced the grid from 2048 to 128 blocks (16x fewer CTAs), causing waves_per_SM to collapse from 0.97 to 0.06 and achieved occupancy to drop from 96.6% to 6.25%. DRAM throughput fell from 91.57% to 17.09% because only 128 of 132 SMs were active and each SM had only 1 active warp per scheduler instead of 15. The kernel duration increased 5.4x (1.91ms \u2192 10.23ms) because the GPU was massively underutilized: the grid was too small to fill the device, and the tl.dot approach did not compensate for the catastrophic loss of parallelism.",
+    "slow_pseudocode": "# BLOCK_M=16/32, BLOCK_K=64..512 \u2014 grid = ceil(M/BLOCK_M) = 128 blocks\nacc = tl.zeros([BLOCK_M, 1], dtype=tl.float32)\nfor k_start in range(0, K, BLOCK_K):\n    b = load(B + k_offsets)          # [BLOCK_K]\n    b_col = b[:, None]               # [BLOCK_K, 1]\n    a = load(A + rows[:,None]*stride + k_offsets)  # [BLOCK_M, BLOCK_K]\n    acc = tl.dot(a, b_col, acc)      # tensor core MMA\nstore(C + rows, acc[:, 0], mask=row_mask)",
+    "fast_pseudocode": "# BLOCK_M=1, BLOCK_K=4096..32768 \u2014 grid = M = 2048 blocks\nacc = tl.zeros([BLOCK_M], dtype=tl.float32)\nfor k_start in range(0, K, BLOCK_K):\n    b = load(B + k_offsets, eviction_policy='evict_last')\n    a = load(A + rows[:,None]*stride + k_offsets, eviction_policy='evict_first')\n    acc += tl.sum(a * b[None, :], axis=1)\nstore(C + rows, acc, mask=row_mask)",
+    "applicable_when": "Never: this strategy caused a 4.65x regression. Do not apply tl.dot with BLOCK_M>=16 to a matvec kernel where M is small (e.g., M=2048) and the baseline already achieves near-full occupancy with BLOCK_M=1.",
+    "do_not_apply_when": "When the kernel is already bandwidth-saturated (DRAM SOL >85%) with high occupancy (>90%) and a large grid (waves_per_SM ~1.0). Increasing BLOCK_M to satisfy tl.dot's >=16 constraint reduces grid size proportionally, collapsing occupancy and DRAM utilization. The tensor core throughput gain cannot compensate for the loss of parallelism when M is small relative to SM count.",
+    "framework_notes": "Triton tl.dot requires both tile dimensions >= 16 and powers of 2. For a matvec with M=2048 and 132 SMs, BLOCK_M=1 gives 2048 CTAs (~1 wave); BLOCK_M=16 gives only 128 CTAs (0.06 waves), starving the GPU. The tl.dot [BLOCK_M, BLOCK_K] x [BLOCK_K, 1] pattern is valid Triton syntax but is counterproductive when M/BLOCK_M < SM_count."
+  },
+  {
+    "item_id": "triton_matvec_evict_last_b_expanded_autotune",
+    "iteration": 2,
+    "speedup": 1.1579,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_uncoalesced_stores_vectorize_loads_deepen_pipeline",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 91.57,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.24,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 46.26,
+        "Memory Workload Analysis.L2 Hit Rate": 2.88,
+        "Memory Workload Analysis.Memory Throughput": 4.5,
+        "Occupancy.Achieved Occupancy": 96.61,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 56.69,
+        "Scheduler Statistics.One or More Eligible": 26.86,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 44.48,
+        "Compute Workload Analysis.Executed Ipc Active": 1.09,
+        "Compute Workload Analysis.Issue Slots Busy": 27.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 92.04,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 38.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 45.42,
+        "Memory Workload Analysis.L2 Hit Rate": 5.41,
+        "Memory Workload Analysis.Memory Throughput": 4.52,
+        "Occupancy.Achieved Occupancy": 96.12,
+        "Launch Statistics.Registers Per Thread": 29.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 38.58,
+        "Scheduler Statistics.One or More Eligible": 38.96,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 66.11,
+        "Compute Workload Analysis.Executed Ipc Active": 1.58,
+        "Compute Workload Analysis.Issue Slots Busy": 39.39
+      }
+    },
+    "strategy_title": "Expand Autotune Configs + evict_last on Reused Vector",
+    "strategy_description": "In a bandwidth-bound Triton matvec kernel already at BLOCK_M=1, expanding the autotune config space (adding larger BLOCK_K up to 32768, more num_warps/num_stages combinations) allows the autotuner to find a configuration that reduces register pressure (32\u219229 registers/thread) and dramatically improves instruction throughput (IPC active 1.09\u21921.58, Issue Slots Busy 27%\u219239%, Warp Cycles Per Issued Instruction 56.7\u219238.6). Adding eviction_policy='evict_last' to loads of the reused B vector modestly improves L2 hit rate (2.88%\u21925.41%) and L1/TEX cache throughput (44%\u219266%). The combined effect is a 15.8% speedup despite DRAM throughput remaining near-saturated (~92%), indicating the gain comes primarily from better instruction-level pipelining hiding memory latency.",
+    "slow_pseudocode": "@triton.autotune(configs=[\n  Config(BLOCK_M=1, BLOCK_K=4096, num_warps=4, num_stages=2),\n  Config(BLOCK_M=1, BLOCK_K=4096, num_warps=4, num_stages=3),\n  Config(BLOCK_M=1, BLOCK_K=4096, num_warps=4, num_stages=4),\n  Config(BLOCK_M=1, BLOCK_K=8192, num_warps=8, num_stages=2..5),\n  Config(BLOCK_M=1, BLOCK_K=16384, num_warps=8..16, num_stages=3..4),\n  Config(BLOCK_M=1, BLOCK_K=32768, num_warps=16, num_stages=3..4),\n])\ndef matvec_kernel(...):\n  for k_start in range(0, K, BLOCK_K):\n    k_offsets = k_start + arange(BLOCK_K)\n    k_offsets = max_contiguous(multiple_of(k_offsets, BLOCK_K), BLOCK_K)\n    b = load(B + k_offsets, mask=k_mask, other=0.0)  # no eviction hint on B\n    a = load(A + rows*stride_am + k_offsets, eviction_policy='evict_first')\n    acc += sum(a * b)\n  store(C + rows, acc)",
+    "fast_pseudocode": "@triton.autotune(configs=[\n  Config(BLOCK_M=1, BLOCK_K=1024,  num_warps=4,  num_stages=2),\n  Config(BLOCK_M=1, BLOCK_K=2048,  num_warps=4,  num_stages=2),\n  Config(BLOCK_M=1, BLOCK_K=4096,  num_warps=8,  num_stages=2),\n  Config(BLOCK_M=1, BLOCK_K=8192,  num_warps=8,  num_stages=2..5),\n  Config(BLOCK_M=1, BLOCK_K=16384, num_warps=8..16, num_stages=3..5),\n  Config(BLOCK_M=1, BLOCK_K=32768, num_warps=16, num_stages=3..5),\n  # ... ~14 configs total covering wider BLOCK_K x num_warps x num_stages space\n])\ndef matvec_kernel(...):\n  for k_start in range(0, K, BLOCK_K):\n    k_offsets = max_contiguous(multiple_of(k_start + arange(BLOCK_K), BLOCK_K), BLOCK_K)\n    b = load(B + k_offsets, mask=k_mask, other=0.0, eviction_policy='evict_last')  # retain reused vector\n    a = load(A + rows*stride_am + k_offsets, eviction_policy='evict_first')\n    acc += sum(a * b)\n  store(C + rows, acc)",
+    "applicable_when": "Triton matvec/gemv kernel with BLOCK_M=1 already applied; CPIStall rule fires with L1TEX scoreboard stalls >50% of warp cycles; Issue Slots Busy <35%; a small reused vector (fits in L2) is loaded every iteration without eviction hint; autotune config space is narrow (fewer than 10 configs, limited BLOCK_K range).",
+    "do_not_apply_when": "Kernel is compute-bound (Compute SM Throughput >70%); the reused vector does not fit in L2 cache (evict_last would evict useful data); BLOCK_K is already at maximum hardware-supported size; register pressure is already minimal (<24 registers/thread) and occupancy is the binding constraint.",
+    "framework_notes": "Triton-specific: eviction_policy='evict_last' on tl.load instructs the L2 to retain these cache lines longer, beneficial for data reused across many CTAs (e.g., a vector in gemv). The autotune config expansion is the primary driver \u2014 the autotuner selected a config with fewer registers (29 vs 32) that better hides memory latency. Combining max_contiguous+multiple_of hints on a single line (vs two separate lines) is a minor code simplification with no functional difference."
+  }
+]

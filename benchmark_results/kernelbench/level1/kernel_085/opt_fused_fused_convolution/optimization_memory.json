@@ -1,0 +1,237 @@
+[
+  {
+    "item_id": "exp_persistent_tile_scheduling_triton_001",
+    "iteration": 1,
+    "speedup": 0.0073,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + TheoreticalOccupancy + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 1.58,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2362156.0,
+        "Launch Statistics.Grid Size": 504064.0,
+        "Launch Statistics.Waves Per SM": 318.22,
+        "Instruction Statistics.Executed Instructions": 929492992.0,
+        "Occupancy.Achieved Occupancy": 70.55,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 87.3,
+        "Memory Workload Analysis.L2 Hit Rate": 69.67
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 217.6,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 326397296.0,
+        "Launch Statistics.Grid Size": 504064.0,
+        "Launch Statistics.Waves Per SM": 318.22,
+        "Instruction Statistics.Executed Instructions": 129893260288.0,
+        "Occupancy.Achieved Occupancy": 74.87,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 86.03,
+        "Memory Workload Analysis.L2 Hit Rate": 70.45
+      }
+    },
+    "strategy_title": "Persistent Tile Scheduling Causes Massive Instruction Explosion",
+    "strategy_description": "Replacing a large 2D grid (504,064 CTAs) with a small persistent 1D grid that loops over tiles inside the kernel caused executed instructions to increase by 140x (from 929M to 129.9B), inflating kernel duration from 1.58ms to 217.6ms. The root cause is that computing `tl.cdiv(M, BLOCK_M)` and `num_tiles_total` inside the kernel body using runtime values (not constexpr) forces Triton to emit scalar integer division and modulo for every iteration of the persistent loop, and the loop itself is not unrolled \u2014 creating enormous per-iteration overhead. The grid size did not actually shrink (still 504,064) because the persistent grid cap was not correctly applied in the launch configuration, meaning the kernel ran the same number of CTAs but each executed the full tile loop, multiplying work by the number of tiles.",
+    "slow_pseudocode": "# BEFORE: simple 2D grid, one CTA per tile\npid_m = tl.program_id(0)\npid_c = tl.program_id(1)\noffs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n# ... single tile computation ...",
+    "fast_pseudocode": "# AFTER (REGRESSED): persistent loop inside kernel\ncta_id = tl.program_id(0)\nnum_ctas = tl.num_programs(0)\nnum_tiles_m = tl.cdiv(M, BLOCK_M)  # runtime division \u2014 expensive!\nnum_tiles_total = num_tiles_m * C\nfor tile_idx in tl.range(cta_id, num_tiles_total, num_ctas):\n    pid_m = tile_idx % num_tiles_m  # runtime modulo per iteration\n    pid_c = tile_idx // num_tiles_m  # runtime division per iteration\n    # ... tile computation ...",
+    "applicable_when": "Never applicable in this form. Persistent scheduling in Triton requires the grid to actually be reduced (e.g., grid = NUM_SMS * TILES_PER_CTA, not the original full grid size). The tile count arithmetic must use constexpr values or be passed as kernel arguments, not computed via runtime tl.cdiv inside the kernel.",
+    "do_not_apply_when": "Do not use tl.cdiv(M, BLOCK_M) inside the kernel body to compute loop bounds when BLOCK_M is a constexpr but M is a runtime value \u2014 this generates expensive scalar integer ops per loop iteration. Do not apply persistent scheduling when the grid size is not actually reduced (the original grid size was preserved at 504,064 in this case, negating any benefit). Do not apply when the inner loop body contains many memory accesses that would be replicated across all iterations.",
+    "framework_notes": "In Triton, persistent kernels require: (1) the grid lambda to cap grid size at NUM_SMS * TILES_PER_CTA, (2) num_tiles_m and num_tiles_total passed as kernel arguments (not computed inside the kernel), and (3) the loop stride equal to num_ctas = tl.num_programs(0). Computing tl.cdiv inside the kernel loop body is a critical anti-pattern that generates O(num_tiles) scalar integer divisions."
+  },
+  {
+    "item_id": "exp_001_eviction_policy_only_no_2d_tiling",
+    "iteration": 1,
+    "speedup": 0.7596,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "eviction_policy_hints_without_structural_coalescing_fix",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 74.55,
+        "GPU Speed Of Light Throughput.Memory Throughput": 50.66,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 70.55,
+        "Occupancy.Block Limit Registers": 12.0,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Instruction Statistics.Executed Instructions": 929492992.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.08,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 87.3,
+        "GPU Speed Of Light Throughput.Duration": 1.58
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 82.11,
+        "GPU Speed Of Light Throughput.Memory Throughput": 38.01,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 58.9,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Launch Statistics.Registers Per Thread": 42.0,
+        "Instruction Statistics.Executed Instructions": 1354923008.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.43,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 84.08,
+        "GPU Speed Of Light Throughput.Duration": 2.08
+      }
+    },
+    "strategy_title": "Eviction Policy Hints Alone Cannot Fix Uncoalesced Access",
+    "strategy_description": "Adding eviction_policy='evict_first' to input loads and eviction_policy='evict_last' to weight loads without changing the underlying 1D tiling structure caused a regression (0.76x). The actual diff shows the 2D tiling refactor was NOT applied \u2014 only the eviction policy annotations were added. This increased register pressure from 40 to 42 regs/thread, dropping theoretical occupancy from 75% to 62.5% and achieved occupancy from 70.55% to 58.9%, while also increasing total executed instructions by ~46% (929M \u2192 1355M). The uncoalesced access pattern (82M excess sectors, 23.9 bytes/sector utilization) remained completely unchanged, confirming that eviction hints alone do not fix coalescing issues.",
+    "slow_pseudocode": "# 1D tiling \u2014 no eviction hints\nx_val = tl.load(x_ptrs, mask=valid, other=0.0)\nw_val = tl.load(w_base + kh * KW + kw)",
+    "fast_pseudocode": "# 1D tiling \u2014 eviction hints added but no structural change\nx_val = tl.load(x_ptrs, mask=valid, other=0.0, eviction_policy='evict_first')\nw_val = tl.load(w_base + kh * KW + kw, eviction_policy='evict_last')",
+    "applicable_when": "Never beneficial in isolation when the root cause is uncoalesced memory access due to strided indexing patterns.",
+    "do_not_apply_when": "When the kernel has uncoalesced global accesses (NCU UncoalescedGlobalAccess rule triggered, excess sectors >10% of total, load bytes-per-sector <28/32). Eviction hints without fixing the access pattern increase register pressure and reduce occupancy without improving coalescing. Do not apply eviction policy changes as a standalone fix for coalescing problems.",
+    "framework_notes": "In Triton, eviction_policy='evict_last' and 'evict_first' are hints to the L1/L2 cache eviction policy. They add register/metadata overhead and can reduce occupancy if register pressure is already near the block limit. These hints are only beneficial when the access pattern is already coalesced and cache reuse is the bottleneck, not when the fundamental issue is strided/uncoalesced memory access."
+  },
+  {
+    "item_id": "exp_triton_evict_last_regression_001",
+    "iteration": 1,
+    "speedup": 0.8681,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "evict_last_on_strided_input_loads_in_depthwise_conv",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2362156.0,
+        "GPU Speed Of Light Throughput.Duration": 1.58,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 74.55,
+        "GPU Speed Of Light Throughput.Memory Throughput": 50.66,
+        "Instruction Statistics.Executed Instructions": 929492992.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.08,
+        "Scheduler Statistics.No Eligible": 25.31
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2723220.0,
+        "GPU Speed Of Light Throughput.Duration": 1.82,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 79.41,
+        "GPU Speed Of Light Throughput.Memory Throughput": 43.79,
+        "Instruction Statistics.Executed Instructions": 1141199872.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.23,
+        "Scheduler Statistics.No Eligible": 20.48
+      }
+    },
+    "strategy_title": "Adding evict_last to strided loads increases instruction count",
+    "strategy_description": "Adding `eviction_policy='evict_last'` to strided global loads in a depthwise convolution kernel caused a 15% regression. The executed instruction count increased by ~23% (929M \u2192 1141M instructions) while memory throughput dropped from 50.7% to 43.8%, indicating the eviction hint added overhead without improving cache reuse for these access patterns. The actual code change did not implement the planned channel-blocking (BLOCK_C) optimization \u2014 only the eviction policy hint and two extra autotune configs were added \u2014 so the regression is attributable to the eviction policy change on strided, uncoalesced loads where L1 hit rate was already high (87.3%) and eviction policy manipulation provides no benefit.",
+    "slow_pseudocode": "x_val = tl.load(x_ptrs, mask=valid, other=0.0)",
+    "fast_pseudocode": "# Do NOT add eviction_policy='evict_last' to strided loads with already-high L1 hit rate\nx_val = tl.load(x_ptrs, mask=valid, other=0.0)",
+    "applicable_when": "Never: adding evict_last to strided/uncoalesced loads when L1 hit rate is already \u226587% does not help and may hurt by increasing instruction overhead.",
+    "do_not_apply_when": "When L1/TEX hit rate is already high (\u226585%), adding eviction policy hints to strided global loads causes instruction count inflation and memory throughput reduction without reducing uncoalesced access sectors.",
+    "framework_notes": "Triton's eviction_policy='evict_last' is intended to keep data in L1 longer; it is counterproductive when the access pattern is strided/uncoalesced (the root cause is sector waste, not eviction) and when L1 hit rate is already near-optimal. The planned BLOCK_C channel-blocking was not actually implemented in the diff \u2014 only the eviction hint was added."
+  },
+  {
+    "item_id": "a60cedc7",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "2d_spatial_tiling_coalesced_width_dimension",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + TheoreticalOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "2d_spatial_tiling_coalesced_width_dimension \u2014 correctness failure",
+    "strategy_description": "Plan '2d_spatial_tiling_coalesced_width_dimension' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.276e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.536e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.001e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel uses a 1D BLOCK_M tile that flattens batch*out_h*out_w together. Within a warp, threads access x[batch, c, ih, iw] where iw = out_w*STRIDE_W + kw. When BLOCK_M spans multiple (batch, out_h) rows, adjacent threads in the same warp can have different batch or out_h values, causing large strides between their iw addresses and producing uncoalesced sector reads (82M excess sectors, 23.9/32 bytes utilization). The fix is to introduce a dedicated BLOCK_W dimension that tiles only the out_w axis, so all threads in a warp always access consecutive iw values, guaranteeing coalesced 128-byte transactions. A separate BLOCK_H dimension tiles out_h. The grid becomes 3D: (ceil(OUT_W/BLOCK_W), ceil(N*OUT_H/BLOCK_H), C). This structural change directly eliminates the uncoalesced access root cause without touching eviction policies, maxnreg, or persistent scheduling (all of which regressed in prior iterations).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.276e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.536e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.001e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_channel_loop_inside_cta_regression_003",
+    "iteration": 3,
+    "speedup": 0.0094,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "amortize_spatial_index_decode_by_looping_channels_inside_cta",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 1.56,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2341467.0,
+        "Launch Statistics.Grid Size": 2016000.0,
+        "Launch Statistics.Waves Per SM": 477.27,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 46.85,
+        "Occupancy.Block Limit Registers": 32.0,
+        "Instruction Statistics.Executed Instructions": 913248000.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.09,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 84.57,
+        "Memory Workload Analysis.L2 Hit Rate": 71.66,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 73.9
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 167.38,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 251076716.0,
+        "Launch Statistics.Grid Size": 2016000.0,
+        "Launch Statistics.Waves Per SM": 1272.73,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 18.72,
+        "Occupancy.Block Limit Registers": 12.0,
+        "Instruction Statistics.Executed Instructions": 79853760000.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.97,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 85.57,
+        "Memory Workload Analysis.L2 Hit Rate": 72.38,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 60.25
+      }
+    },
+    "strategy_title": "Runtime Channel Loop Inside CTA Explodes Register Pressure",
+    "strategy_description": "Moving the channel dimension from the grid (2D grid with pid_c = tl.program_id(1)) into a runtime tl.range(C) loop inside the kernel body caused a catastrophic 106x regression (1.56ms \u2192 167ms). The root cause is that the runtime channel loop prevented Triton's compiler from unrolling or statically scheduling the loop, causing registers per thread to explode from 64 to 168 \u2014 far exceeding the hardware register file budget per warp. This crushed theoretical occupancy from 50% to 18.75% (Block Limit Registers dropped from 32 to 12 blocks/SM), and total executed instructions ballooned from 913M to 79.85B (~87x increase), indicating massive register spill traffic and loop overhead. The grid size did not actually shrink (remained 2,016,000) because the grid lambda was not correctly updated to remove the channel dimension, meaning each CTA now executed the full C=128 channel loop on top of the original per-channel work.",
+    "slow_pseudocode": "# BEFORE: 2D grid, one channel per CTA, 64 regs/thread\npid_m = tl.program_id(0)\npid_c = tl.program_id(1)  # channel from grid dim 1\noffs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\nout_w = offs_m % OUT_W\ntmp = offs_m // OUT_W\nout_h = tmp % OUT_H\nbatch = tmp // OUT_H\nc = pid_c\nacc = tl.zeros([BLOCK_M], dtype=tl.float32)\nfor kh in tl.static_range(KH):\n    for kw in tl.static_range(KW):\n        acc += x_val * w_val\ntl.store(y_ptrs, acc, mask=mask_m)\n# grid = (cdiv(M, BLOCK_M), C)",
+    "fast_pseudocode": "# AFTER (REGRESSED): runtime channel loop inside CTA, 168 regs/thread\npid_m = tl.program_id(0)  # 1D grid intended, but grid NOT changed\noffs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\nout_w = offs_m % OUT_W\ntmp = offs_m // OUT_W\nout_h = tmp % OUT_H\nbatch = tmp // OUT_H\nfor c in tl.range(C):  # runtime loop \u2014 NOT unrolled, causes register explosion\n    acc = tl.zeros([BLOCK_M], dtype=tl.float32)\n    for kh in tl.static_range(KH):\n        for kw in tl.static_range(KW):\n            acc += x_val * w_val\n    tl.store(y_ptrs, acc, mask=mask_m)\n# grid = (cdiv(M, BLOCK_M), C)  \u2014 channel dim NOT removed from grid!",
+    "applicable_when": "Never in this form. A runtime tl.range(C) loop over a large dimension (C=128) inside a Triton kernel body causes register pressure to scale with C, not remain constant, because the compiler cannot statically schedule or pipeline the loop body.",
+    "do_not_apply_when": "Do not move a grid dimension into a runtime tl.range() loop inside the kernel when: (1) the loop trip count is large (e.g., C=128), (2) the loop body contains many live values (accumulators, pointer arithmetic), or (3) the grid lambda is not simultaneously updated to remove that dimension. The combination of a large runtime loop and unchanged grid size means each CTA does C times more work than intended, multiplying total work by C. Register pressure scales with the number of live values across loop iterations, and Triton cannot spill-free compile a 128-iteration loop with 21 FMAs per iteration and a BLOCK_M-sized accumulator.",
+    "framework_notes": "In Triton, tl.range() creates a runtime loop that the compiler must handle conservatively \u2014 it cannot unroll or pipeline across iterations the way tl.static_range() can. When the loop body contains vector accumulators of size BLOCK_M and multiple pointer computations, registers per thread can grow proportionally to the loop body's live variable count. The grid lambda must be updated simultaneously with the kernel body when removing a grid dimension; failing to do so means the original number of CTAs is launched, each now executing the full channel loop, multiplying total work by C=128."
+  },
+  {
+    "item_id": "exp_triton_tl_sum_where_weight_extract_regression_003",
+    "iteration": 3,
+    "speedup": 0.693,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_weight_preload_and_maxnreg",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + TheoreticalOccupancy + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 1.56,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2341467.0,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Grid Size": 2016000.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 46.85,
+        "Occupancy.Block Limit Registers": 32.0,
+        "Instruction Statistics.Executed Instructions": 913248000.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.09,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 84.57,
+        "Memory Workload Analysis.Mem Busy": 51.42,
+        "Memory Workload Analysis.Max Bandwidth": 46.94,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 73.9
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 2.28,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3422173.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 504064.0,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 70.95,
+        "Occupancy.Block Limit Registers": 12.0,
+        "Instruction Statistics.Executed Instructions": 1403313152.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.56,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 86.3,
+        "Memory Workload Analysis.Mem Busy": 72.5,
+        "Memory Workload Analysis.Max Bandwidth": 69.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 77.7
+      }
+    },
+    "strategy_title": "tl.sum(tl.where) Weight Extraction Inflates Instruction Count",
+    "strategy_description": "Replacing 21 scalar global weight loads with a single vectorized preload followed by `tl.sum(tl.where(w_offs == (kh*KW+kw), w_vals, 0.0))` to extract each scalar caused a 31% regression (0.69x). Despite the plan explicitly warning against this anti-pattern, the diff shows it was applied anyway: executed instructions ballooned from 913M to 1403M (+54%), Warp Cycles Per Issued Instruction rose from 10.09 to 14.56, and kernel duration increased from 1.56ms to 2.28ms. The tl.sum(tl.where(...)) idiom generates a full vector comparison and reduction per weight access rather than a register read, negating any benefit from reducing global load count. This is the same anti-pattern documented in exp_triton_maxnreg_weight_preload_regression_002 and must not be used for scalar extraction from preloaded vectors.",
+    "slow_pseudocode": "# BEFORE: scalar weight load per KH*KW iteration\nfor kh in tl.static_range(KH):\n    for kw in tl.static_range(KW):\n        w_val = tl.load(w_base + kh * KW + kw)  # 21 scalar global loads\n        acc += x_val * w_val",
+    "fast_pseudocode": "# AFTER (REGRESSED): vectorized preload + one-hot sum extraction\nw_offs = tl.arange(0, 32)  # KHW_NEXT_POW2=32\nw_vals = tl.load(w_base + w_offs, mask=w_offs < KH * KW, other=0.0)\nfor kh in tl.static_range(KH):\n    for kw in tl.static_range(KW):\n        # one-hot sum \u2014 does NOT compile to register read, generates vector ops\n        w_val = tl.sum(tl.where(w_offs == (kh * KW + kw), w_vals, 0.0))\n        acc += x_val * w_val",
+    "applicable_when": "Never. The tl.sum(tl.where(vector == const_idx, vector, 0.0)) pattern for scalar extraction is always an anti-pattern in Triton regardless of whether the index is a compile-time constant.",
+    "do_not_apply_when": "Do not use tl.sum(tl.where(offs == idx, buf, 0.0)) to extract scalar values from a preloaded vector register in any Triton kernel. This pattern generates a full vector comparison and reduction per extraction, inflating instruction count by 50%+ and increasing Warp Cycles Per Issued Instruction. The compiler cannot optimize this to a register read even when idx is a compile-time constant derived from tl.static_range induction variables.",
+    "framework_notes": "In Triton, direct compile-time-constant indexing of a vector (e.g., w_vals[kh*KW+kw] where kh and kw are tl.static_range variables) is the correct approach for register-file reads. The tl.sum(tl.where(...)) idiom is a workaround that does not lower to a register read and instead emits vector comparison + reduction instructions. This anti-pattern has now caused regressions in iterations 2 and 3 of this optimization session."
+  }
+]

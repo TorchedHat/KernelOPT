@@ -1,0 +1,70 @@
+--- baseline
++++ rebuilt
+@@ -5,26 +5,41 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 64}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 64, 'YBLOCK': 64}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 64}, num_warps=8, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 24576
+-    xnumel = 3025
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 96)
+-    y1 = yindex // 96
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), xmask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
++    # XBLOCK covers channel y0 (stride=1 in in_ptr0) -> COALESCED loads
++    # YBLOCK covers spatial*batch (x2, y1)
++    ch_offset = tl.program_id(0) * XBLOCK
++    ch_index = ch_offset + tl.arange(0, XBLOCK)[None, :]  # shape [1, XBLOCK]
++    ch_mask = ch_index < 96
++    sb_offset = tl.program_id(1) * YBLOCK
++    sb_index = sb_offset + tl.arange(0, YBLOCK)[:, None]  # shape [YBLOCK, 1]
++    sb_mask = sb_index < (256 * 3025)
++    x2 = sb_index % 3025   # spatial index
++    y1 = sb_index // 3025  # batch index
++    y0 = ch_index          # channel index (innermost, stride=1)
++    y3 = y1 * 96 + y0     # flattened batch*channel
++    mask = ch_mask & sb_mask
++    # LOAD: consecutive threads vary y0 (channel, stride=1) -> COALESCED
++    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), mask, eviction_policy='evict_last')
++    tmp1 = tl.load(in_ptr1 + y0, mask, eviction_policy='evict_last')
+     tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, xmask)
+-
+-
++    # STORE: address x2 + 3025*y3; consecutive threads vary y0 with stride 3025
++    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -33,7 +48,7 @@
+     ynumel = 24576
+     xnumel = 3025
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025)
+     return arg_2
+ 
+ def get_inputs():

@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "cf52b1bf",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_autotune \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_autotune' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout-transpose (NCHW to NHWC-like) pointwise kernel. Loads from in_ptr0 are perfectly contiguous (stride-1 in x), but stores to out_ptr0 use stride 3 in the innermost dimension (y0 + 3*x2), causing 3x sector amplification and 23% excess sectors. The grid has only 0.74 waves/SM (1568 CTAs across 132 SMs), leaving the GPU underutilized. Adding tl.max_contiguous/tl.multiple_of hints on the load pointer enables the compiler to emit 128-bit (float4) vectorized loads. Adding @triton.autotune explores larger XBLOCK values to increase waves/SM and improve occupancy.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_c",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_autotune_block_size_wave_coverage_001",
+    "iteration": 1,
+    "speedup": 1.5036,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_block_size_for_wave_coverage_and_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.74,
+        "Occupancy.Achieved Occupancy": 55.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.97,
+        "Scheduler Statistics.No Eligible": 70.51,
+        "GPU Speed Of Light Throughput.Duration": 6.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.31,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.73
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 1.48,
+        "Occupancy.Achieved Occupancy": 71.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.96,
+        "Scheduler Statistics.No Eligible": 37.6,
+        "GPU Speed Of Light Throughput.Duration": 4.19,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 27.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.62
+      }
+    },
+    "strategy_title": "Autotune Block Size to Improve Wave Coverage and Warp Eligibility",
+    "strategy_description": "When a Triton pointwise kernel launches fewer than 1 full wave across SMs (waves_per_sm < 1.0) and shows high no-eligible-warp cycles (>60%), adding @triton.autotune with larger XBLOCK configs (256\u20131024) and higher num_warps (8) allows the runtime to select tile shapes that increase work per block, double wave coverage, and raise eligible warps per scheduler from ~1 to ~4. This directly reduces warp stall cycles from L1TEX scoreboard dependencies by providing more in-flight warps to hide latency, improving compute throughput from 16% to 27% and cutting kernel duration by ~33%.",
+    "slow_pseudocode": "# Fixed block size, under-fills GPU\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    ...\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned block size, runtime selects best config\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=3),\n        Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=8, num_stages=3),\n        Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=8, num_stages=3),\n        Config({'XBLOCK': 256,  'YBLOCK': 4}, num_warps=8, num_stages=3),\n        Config({'XBLOCK': 256,  'YBLOCK': 2}, num_warps=4, num_stages=3),\n        Config({'XBLOCK': 128,  'YBLOCK': 8}, num_warps=4, num_stages=3),\n        Config({'XBLOCK': 64,   'YBLOCK': 8}, num_warps=4, num_stages=3),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    ...\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no XBLOCK/YBLOCK kwargs",
+    "applicable_when": "Triton pointwise or elementwise kernel with waves_per_sm < 1.0, no-eligible-warp cycles > 60%, eligible warps per scheduler < 1.5, and L1TEX scoreboard stall contributing >40% of warp cycles. Grid is too small to saturate all SMs.",
+    "do_not_apply_when": "Kernel is already achieving >1.5 waves/SM or eligible warps per scheduler > 3. Also avoid when shared memory usage per block is high and larger blocks would reduce occupancy below current levels. Not useful when the bottleneck is DRAM bandwidth saturation (DRAM throughput > 80%).",
+    "framework_notes": "Triton-specific: use @triton.autotune decorator with key=['ynumel', 'xnumel'] so configs are cached per problem size. The grid must be a lambda META: (...) to pick up autotuned XBLOCK/YBLOCK. Remove explicit XBLOCK/YBLOCK kwargs from the call site. In CUDA, the equivalent is launching with larger block dimensions and using __launch_bounds__ or occupancy calculators."
+  }
+]

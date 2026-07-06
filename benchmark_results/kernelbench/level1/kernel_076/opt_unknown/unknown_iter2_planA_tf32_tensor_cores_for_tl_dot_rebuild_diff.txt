@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -9,6 +9,7 @@
+ # Output length: (524280 - 4*(3-1) - 1) // 3 + 1 = (524280 - 9) // 3 + 1 = 174757 + 1 = 174758
+ # Output: (64, 128, 174758)
+ 
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+@@ -19,6 +20,12 @@
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=8, num_stages=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -46,10 +53,14 @@
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+     
+-    # Decode M index: batch and output position
++    # HOISTED outside K-loop: Decode M index: batch and output position
+     batch = offs_m // L_out
+     out_pos = offs_m % L_out
+-    
++    # Precompute base pointer for X (includes batch offset and out_pos*stride)
++    x_base = X_ptr + batch * (Ci * L_in) + out_pos * stride
++    # Precompute valid_m mask (replaces valid_m & valid_batch inside loop)
++    valid_m = offs_m < M
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+     
+     # Iterate over K = Ci * KERNEL_SIZE in blocks
+@@ -60,19 +71,18 @@
+         ci = offs_k // KERNEL_SIZE
+         kpos = offs_k % KERNEL_SIZE
+         
+-        # Input position
++        # Input position (with padding subtracted for boundary check)
+         in_pos = out_pos[:, None] * stride + kpos[None, :] * dilation - padding
+         
+-        # Validity mask
+-        valid_m = offs_m[:, None] < M
++        # Validity mask (valid_batch is redundant since M = N * L_out bounds batch)
+         valid_k = offs_k[None, :] < K
+         valid_in = (in_pos >= 0) & (in_pos < L_in)
+-        valid_batch = batch[:, None] < N
+-        mask_x = valid_m & valid_k & valid_in & valid_batch
++        mask_x = valid_m[:, None] & valid_k & valid_in
+         
+         # Load X: shape [BLOCK_M, BLOCK_K]
+         # X is (N, Ci, L_in), stride: Ci*L_in, L_in, 1
+-        x_ptrs = X_ptr + batch[:, None] * (Ci * L_in) + ci[None, :] * L_in + in_pos
++        # x_base already includes batch * (Ci * L_in) + out_pos * stride
++        x_ptrs = x_base[:, None] + ci[None, :] * L_in + kpos[None, :] * dilation
+         x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)
+         
+         # Load W: shape [BLOCK_K, BLOCK_N]
+@@ -81,14 +91,13 @@
+         w_ptrs = W_ptr + offs_n[None, :] * (Ci * KERNEL_SIZE) + ci[:, None] * KERNEL_SIZE + kpos[:, None]
+         w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)
+         
+-        acc = tl.dot(x_tile, w_tile, acc)
++        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=True)
+     
+     # Store output: Y is (N, Co, L_out)
+     # Y[batch, co, out_pos] -> linear index: batch * Co * L_out + co * L_out + out_pos
+     mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < Co)
+     y_ptrs = Y_ptr + batch[:, None] * (Co * L_out) + offs_n[None, :] * L_out + out_pos[:, None]
+-    tl.store(y_ptrs, acc.to(tl.float32), mask=mask_out)
+-
++    tl.store(y_ptrs, acc, mask=mask_out)
+ 
+ def kernel_function(weight, x):
+     """

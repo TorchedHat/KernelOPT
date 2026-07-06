@@ -1,0 +1,62 @@
+--- baseline
++++ rebuilt
+@@ -5,26 +5,43 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 24576
+-    xnumel = 3025
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 96)
+-    y1 = yindex // 96
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), xmask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
+-    tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, xmask)
++    # XBLOCK=32 iterates over channels (C=96, stride=1 in NHWC input) -> COALESCED LOAD
++    # YBLOCK=32 iterates over spatial positions (HW=3025, stride=96 in NHWC input)
++    # After tl.trans(): XBLOCK over channels (stride=3025 in NCHW output), YBLOCK over spatial (stride=1) -> COALESCED STORE
++    C = 96
++    HW = 3025
++    spatial_tiles = 95  # triton.cdiv(3025, 32) = 95, hardcoded as Python int for pid decomposition
+ 
++    pid_c = tl.program_id(0)   # channel tile index
++    pid_ns = tl.program_id(1)  # encodes (batch_idx * spatial_tiles + spatial_tile_idx)
++    pid_n = pid_ns // spatial_tiles   # batch index
++    pid_s = pid_ns % spatial_tiles    # spatial tile index
+ 
++    c_off = pid_c * XBLOCK + tl.arange(0, XBLOCK)   # [XBLOCK] channel offsets
++    s_off = pid_s * YBLOCK + tl.arange(0, YBLOCK)   # [YBLOCK] spatial offsets
++    c_mask = c_off < C    # [XBLOCK]
++    s_mask = s_off < HW   # [YBLOCK]
++
++    # Phase 1: COALESCED LOAD — inner dim=channels (stride=1 in NHWC input)
++    # in_ptr0 NHWC strides: N=290400, HW_flat=96 (spatial stride), C=1
++    # load_idx shape [YBLOCK, XBLOCK]: rows=spatial, cols=channels
++    load_idx = pid_n * 290400 + s_off[:, None] * 96 + c_off[None, :]
++    load_mask = s_mask[:, None] & c_mask[None, :]
++    tile = tl.load(in_ptr0 + load_idx, load_mask, other=0.0)  # [YBLOCK, XBLOCK]
++
++    # Add bias: in_ptr1[c], shape [XBLOCK]
++    bias = tl.load(in_ptr1 + c_off, c_mask, other=0.0)  # [XBLOCK]
++    tile = tile + bias[None, :]  # broadcast: [YBLOCK, XBLOCK]
++
++    # Phase 2: COALESCED STORE — inner dim=spatial (stride=1 in NCHW output)
++    # out_ptr0 NCHW strides: N=290400, C=3025, HW=1
++    # store_idx shape [XBLOCK, YBLOCK]: rows=channels, cols=spatial
++    store_idx = pid_n * 290400 + c_off[:, None] * 3025 + s_off[None, :]
++    store_mask = c_mask[:, None] & s_mask[None, :]
++    tl.store(out_ptr0 + store_idx, tl.trans(tile), store_mask)  # tl.trans: [YBLOCK,XBLOCK]->[XBLOCK,YBLOCK]
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

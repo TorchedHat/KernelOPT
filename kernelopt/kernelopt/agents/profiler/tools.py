@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
@@ -39,7 +39,7 @@ def read_kernel_source(
 def submit_ncu_config(
     kernel_name: str,
     launch_skip: int,
-    launch_count: int,
+    launch_count: Optional[int],
     kernel_args: list[str],
     replay_mode: str,
 ) -> str:
@@ -49,7 +49,8 @@ def submit_ncu_config(
         kernel_name: Exact function name or 'regex:(name1|name2|...)' pattern
                      matching only the kernels to profile. Must be non-empty.
         launch_skip: Number of warmup launches to discard before capturing (>= 0).
-        launch_count: Number of steady-state launches to capture (>= 1).
+        launch_count: Number of steady-state launches to capture (>= 1),
+                      or null to profile all launches.
         kernel_args: CLI flags to pass to the kernel script, e.g.
                      ['--batch', '32', '--profile-only']. May be empty list.
         replay_mode: 'kernel' (default, lower overhead) or 'application'

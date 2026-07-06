@@ -1,0 +1,151 @@
+[
+  {
+    "item_id": "1ad26670",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_swap_tile_axes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_swap_tile_axes \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'memory_coalescing_swap_tile_axes' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel converts NCHW to channels-last layout. The store address is `y0 + 3*x2 + 150528*y1`, where x2 is the XBLOCK (spatial, 0-50175) and y0 is the channel index (0-2). With XBLOCK=128 threads in the x-dimension, consecutive threads write to addresses separated by stride 3 (i.e., `3*x2`), causing severe uncoalesced stores \u2014 only 20/32 bytes per sector are used. The load side (`x2 + 50176*y3`) is already stride-1 and coalesced. The fix is to swap the tile axes: make the channel dimension (y0, size 3) the XBLOCK axis and the spatial dimension (x2, size 50176) the YBLOCK axis. Then consecutive threads in x iterate over contiguous channel slots in the output (`y0` is stride-1 in the store), achieving coalesced writes.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_yblock1_coalescing_occupancy_001",
+    "iteration": 1,
+    "speedup": 1.5926,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_yblock1_to_fix_strided_store_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.56,
+        "Occupancy.Achieved Occupancy": 54.89,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.99,
+        "Scheduler Statistics.No Eligible": 70.62,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.89,
+        "Memory Workload Analysis.L2 Hit Rate": 60.71,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 26.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.78,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 25.36,
+        "Occupancy.Achieved Occupancy": 65.95,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.85,
+        "Scheduler Statistics.No Eligible": 48.41,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.24,
+        "Memory Workload Analysis.L2 Hit Rate": 75.93,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 18.0
+      }
+    },
+    "strategy_title": "Autotune YBLOCK=1 to Fix Strided Store Uncoalescing",
+    "strategy_description": "When a 2D Triton kernel performs stores with a stride in the Y dimension (e.g., layout permutation like NCHW\u2192NHWC where the store index contains `y0 + stride*x`), using YBLOCK>1 causes threads within a block to write to non-contiguous addresses, triggering UncoalescedGlobalAccess. Adding a `@triton.autotune` decorator with configurations that include YBLOCK=1 allows the autotuner to select a tile shape where each CTA handles a single Y-row, making X-dimension stores contiguous and eliminating intra-block store stride interleaving. This also reduces register pressure (26\u219218 registers/thread) and increases waves/SM (0.74\u21921.48), raising achieved occupancy from 54.9% to 66% and cutting warp stall cycles per instruction from 29.9 to 18.2.",
+    "slow_pseudocode": "# Fixed tile: XBLOCK=128, YBLOCK=8 \u2014 Y-threads write stride-3 apart\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]  # YBLOCK=8\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]  # XBLOCK=128\n    y0 = yindex % 3\n    y1 = yindex // 3\n    tmp = tl.load(in_ptr + (xindex + xnumel*yindex), ...)\n    tl.store(out_ptr + (y0 + 3*xindex + 150528*y1), tmp, ...)  # stride-3 uncoalesced\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # 1568 CTAs, 0.74 waves/SM\nkernel[grid](in_ptr, out_ptr, 30, 50176, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned: best config selects YBLOCK=1, larger XBLOCK \u2014 each CTA one Y-row\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 1}, num_warps=8),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 1}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 1}, num_warps=4),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 2}, num_warps=8),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 2}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4),  # baseline\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    y0 = yindex % 3\n    y1 = yindex // 3\n    tmp = tl.load(in_ptr + (xindex + xnumel*yindex), ...)\n    tl.store(out_ptr + (y0 + 3*xindex + 150528*y1), tmp, ...)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, 30, 50176)  # autotune injects XBLOCK/YBLOCK",
+    "applicable_when": "Triton 2D kernel with UncoalescedGlobalAccess rule triggered on stores; store index has a stride in the Y dimension (e.g., `y0 + stride*x` pattern from layout permutation); waves/SM < 1.0 indicating undersized grid; CPIStall on L1TEX > 40%; eligible warps per scheduler < 1.5; YBLOCK fixed at > 1 in baseline.",
+    "do_not_apply_when": "Store pattern is already coalesced (no stride in Y dimension); kernel is compute-bound rather than memory-latency-bound; ynumel is large (e.g., > 1024) making YBLOCK=1 create too many CTAs and excessive grid overhead; kernel already uses autotune.",
+    "framework_notes": "Triton-specific: use `@triton.autotune` decorator with `key=['ynumel', 'xnumel']` and replace fixed grid tuple with `lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))`. Remove explicit XBLOCK/YBLOCK kwargs from the call site \u2014 autotune injects them. In CUDA, the equivalent is trying different block dimensions in a launch configuration sweep."
+  },
+  {
+    "item_id": "triton_fix_hardcoded_grid_lambda_iter4_001",
+    "iteration": 4,
+    "speedup": 1.6359,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_hardcoded_grid_activate_autotune_tile_selection",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + UncoalescedGlobalAccess + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.78,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.84,
+        "Occupancy.Achieved Occupancy": 67.29,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.47,
+        "Scheduler Statistics.No Eligible": 39.62,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.71,
+        "Memory Workload Analysis.L2 Hit Rate": 77.13,
+        "Launch Statistics.Grid Size": 1568.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 18.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.68,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.48,
+        "Occupancy.Achieved Occupancy": 66.98,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.51,
+        "Scheduler Statistics.No Eligible": 39.48,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.57,
+        "Memory Workload Analysis.L2 Hit Rate": 77.18,
+        "Launch Statistics.Grid Size": 1568.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 18.0
+      }
+    },
+    "strategy_title": "Fix Hardcoded Grid to Activate Autotune Tile Selection",
+    "strategy_description": "When a Triton kernel has a `@triton.autotune` decorator but the launch site uses a hardcoded grid tuple (e.g., `grid = (cdiv(xnumel, 128), cdiv(ynumel, 8))`), the autotuner benchmarks all configs but the winning tile dimensions are never applied at launch. Replacing the fixed grid with `lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))` activates the autotuner's tile selection. In this iteration, the profiling metrics barely changed (duration 3.78\u21923.68 \u00b5s, grid size unchanged at 1568, same waves/SM), suggesting the autotuner selected a config very close to the hardcoded baseline, yielding only a modest ~2.7% wall-clock improvement in NCU but a 1.64x speedup in end-to-end timing \u2014 likely due to reduced autotuner overhead or warm-path selection.",
+    "slow_pseudocode": "# Autotune present but grid is hardcoded \u2014 tile dims never applied\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 512, 'YBLOCK': 1}, ...), ...],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\n# BUG: hardcoded grid ignores autotuned XBLOCK/YBLOCK\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "fast_pseudocode": "# FIX: lambda grid activates autotuner tile selection\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 512, 'YBLOCK': 1}, ...), ...],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no XBLOCK/YBLOCK kwargs",
+    "applicable_when": "Triton kernel has @triton.autotune decorator but launch site uses a hardcoded grid tuple; LaunchConfiguration rule triggered (partial wave tail effect); UncoalescedGlobalAccess present on stores; AchievedOccupancy below theoretical; kernel is memory-latency-bound (SM throughput < 30%).",
+    "do_not_apply_when": "Grid is already a lambda META (autotune already functional); kernel is compute-bound (SM throughput > 60%); shared memory arrays are sized by XBLOCK/YBLOCK constexprs where changing tile size would break correctness or cause OOM; ynumel is very large making YBLOCK=1 create excessive CTAs.",
+    "framework_notes": "Triton-specific: the hardcoded grid bug is subtle \u2014 @triton.autotune appears present and functional but the winning config's XBLOCK/YBLOCK are never used at launch. Always use `lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))` as the grid when autotune controls tile dims. Do NOT pass XBLOCK or YBLOCK as explicit kwargs at the call site \u2014 autotune injects them via the lambda META mechanism."
+  },
+  {
+    "item_id": "triton_autotune_lambda_grid_num_stages2_004",
+    "iteration": 4,
+    "speedup": 1.4368,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_increase_xblock_waves",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + UncoalescedGlobalAccess + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.78,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.84,
+        "Occupancy.Achieved Occupancy": 67.29,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.47,
+        "Scheduler Statistics.No Eligible": 39.62,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.71,
+        "Memory Workload Analysis.L2 Hit Rate": 77.13,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.05,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 29.05
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.19,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 28.99,
+        "Occupancy.Achieved Occupancy": 69.3,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.04,
+        "Scheduler Statistics.No Eligible": 38.93,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.59,
+        "Memory Workload Analysis.L2 Hit Rate": 77.41,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.1,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 46.49
+      }
+    },
+    "strategy_title": "Lambda Grid + Larger XBLOCK Configs Activate Autotune",
+    "strategy_description": "When a Triton kernel uses @triton.autotune but the launch grid is a hardcoded tuple (e.g., `(cdiv(xnumel, 128), cdiv(ynumel, 8))`), the autotuner benchmarks all configs but the winning tile is never applied \u2014 the kernel always runs with the hardcoded tile. Replacing the grid with a lambda `lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))` and removing explicit XBLOCK/YBLOCK kwargs from the call site activates the autotuner's tile selection. Adding larger XBLOCK configs (e.g., 1024) and num_stages=2 variants further expands the search space, allowing the autotuner to select tiles that increase L1/TEX cache throughput (29% \u2192 46%) and eligible warps per scheduler (3.47 \u2192 4.04), yielding a 1.44x speedup.",
+    "slow_pseudocode": "# Autotune benchmarks configs but grid is hardcoded \u2014 winning tile never applied\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 512, 'YBLOCK': 1}, ...), ...],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\n# BUG: hardcoded grid ignores autotune winner\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, XBLOCK=128, YBLOCK=8)",
+    "fast_pseudocode": "# Lambda grid activates autotune; larger XBLOCK + num_stages=2 expand search space\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 1}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 2}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=8, num_stages=1),\n        # ... more configs\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\n# FIX: lambda grid reads META from winning autotune config\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\n# FIX: no XBLOCK/YBLOCK kwargs \u2014 autotune injects them\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "Triton kernel uses @triton.autotune but launch grid is a hardcoded tuple (not a lambda), causing the autotuner's winning tile to be silently ignored. LaunchConfiguration rule triggered with partial-wave tail. Eligible warps per scheduler below 4.0 indicating latency-hiding headroom. L2 hit rate ~75-80% suggesting moderate reuse that benefits from larger tiles.",
+    "do_not_apply_when": "Grid is already a lambda (autotune already active). Kernel uses shared memory sized by XBLOCK/YBLOCK where changing tile size would cause OOM. Kernel is already achieving > 2 waves/SM and occupancy > 80%. Very short kernels where autotune overhead dominates.",
+    "framework_notes": "Triton-specific: the lambda grid pattern `lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))` is required for autotune to actually apply its winning config. Do NOT pass XBLOCK/YBLOCK as explicit kwargs at the call site \u2014 autotune injects them automatically and explicit kwargs override autotune. num_stages=2 in triton.Config enables software pipelining (equivalent to prefetching in CUDA). The dynamic_smem_per_block doubles with num_stages=2 (2KB \u2192 4KB) but remains well within device limits."
+  }
+]

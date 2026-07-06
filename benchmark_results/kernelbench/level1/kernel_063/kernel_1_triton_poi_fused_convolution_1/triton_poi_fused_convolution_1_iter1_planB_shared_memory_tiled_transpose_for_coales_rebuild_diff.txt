@@ -1,0 +1,117 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,89 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 16, 'YBLOCK': 16}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 64, 'YBLOCK': 64}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 64, 'YBLOCK': 64}, num_warps=16, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
+-
+-
++    # 2D square-tiled transpose for coalesced memory access
++    # pid_x tiles along x (xnumel=31500), pid_y tiles along y (ynumel=4096)
++    pid_x = tl.program_id(0)
++    pid_y = tl.program_id(1)
++    x_start = pid_x * XBLOCK
++    y_start = pid_y * YBLOCK
++    # tx is the fast (innermost) axis for threads - varies over XBLOCK
++    tx = tl.arange(0, XBLOCK)   # [XBLOCK]
++    ty = tl.arange(0, YBLOCK)   # [YBLOCK]
++    # x_idx: shape [1, XBLOCK], y_idx: shape [YBLOCK, 1]
++    x_idx = x_start + tx[None, :]
++    y_idx = y_start + ty[:, None]
++    y0 = y_idx % 128   # channel index - stride-1 in input (fast axis for loads)
++    y1 = y_idx // 128  # batch index
++    x2 = x_idx         # spatial index - stride-1 in output (fast axis for stores)
++    xmask = x_idx < xnumel
++    ymask = y_idx < ynumel
++    mask = xmask & ymask
++    # COALESCED LOAD: consecutive threads along tx read consecutive y0 values (stride-1 in input)
++    # Wait - tx is x dimension. For coalesced loads we need y0 to vary with the fast thread axis.
++    # With shape [YBLOCK, XBLOCK]: the fast (rightmost) axis is XBLOCK (tx).
++    # y0 = y_idx % 128 varies with ty (slow axis), x2 varies with tx (fast axis).
++    # Load: in_ptr0 + y0 + 128*x2 + 4032000*y1
++    #   fast axis contribution: 128*x2 -> stride 128 (non-coalesced for loads)
++    #   slow axis contribution: y0 -> stride 1 (coalesced for loads)
++    # To make loads coalesced, we need y0 as the fast axis.
++    # Swap: use ty as fast axis for loads by transposing the tile layout:
++    # tx_load = ty (fast for load), ty_load = tx (slow for load)
++    # Then for stores: x2 should be fast axis.
++    # Solution: load with [YBLOCK, XBLOCK] where YBLOCK is fast (y0 varies fast)
++    # but thread layout has XBLOCK as fast. We need to swap roles.
++    # Use XBLOCK threads total, iterate YBLOCK in outer loop - but that changes structure.
++    # Simplest correct approach: make y the fast axis by using ty as the innermost arange.
++    # Redefine: fast axis = y (ty), slow axis = x (tx)
++    # x_idx shape [XBLOCK, 1], y_idx shape [1, YBLOCK]
++    x_idx2 = x_start + tl.arange(0, XBLOCK)[:, None]   # [XBLOCK, 1]
++    y_idx2 = y_start + tl.arange(0, YBLOCK)[None, :]   # [1, YBLOCK]
++    y0_2 = y_idx2 % 128
++    y1_2 = y_idx2 // 128
++    x2_2 = x_idx2
++    xmask2 = x_idx2 < xnumel
++    ymask2 = y_idx2 < ynumel
++    mask2 = xmask2 & ymask2
++    # COALESCED LOAD: fast axis is YBLOCK (y0_2 varies), stride-1 in input
++    vals = tl.load(in_ptr0 + (y0_2 + 128 * x2_2 + 4032000 * y1_2), mask=mask2, other=0.0, eviction_policy='evict_last')
++    # COALESCED STORE: fast axis is YBLOCK (y_idx2 varies), but output stride on y is 31500 (not 1)
++    # Output: out_ptr0 + x2_2 + 31500 * y_idx2
++    # fast axis: y_idx2 -> stride 31500 in output (non-coalesced for stores)
++    # We need x2 as fast axis for stores. So we need XBLOCK as fast for stores.
++    # This is the fundamental transpose problem - can't have both coalesced without shared memory.
++    # Without shared memory in Triton (no explicit __shared__), use the original layout
++    # but swap which dimension is fast: make y the fast axis for loads (accepting strided stores)
++    # OR use the original x-fast layout (strided loads, coalesced stores).
++    # The plan says: loads coalesced (y0 fast) AND stores coalesced (x2 fast).
++    # In Triton without explicit shared memory, we rely on L1 cache acting as scratch.
++    # The plan's approach: [YBLOCK, XBLOCK] with y as slow, x as fast for thread layout,
++    # but y0 varies with ty (slow) and x2 varies with tx (fast).
++    # For loads: address = y0(ty) + 128*x2(tx) + 4032000*y1(ty)
++    #   consecutive threads (tx) -> x2 changes -> stride 128 in input (BAD)
++    # For stores: address = x2(tx) + 31500*y_idx(ty)
++    #   consecutive threads (tx) -> x2 changes -> stride 1 in output (GOOD)
++    # The plan's NEW approach swaps so y0 is fast for loads:
++    # Use [XBLOCK, YBLOCK] with YBLOCK as fast axis:
++    # x_idx [XBLOCK, 1], y_idx [1, YBLOCK]
++    # Load: y0(y_idx) fast -> stride 1 (GOOD), x2(x_idx) slow (OK)
++    # Store: x2(x_idx) slow, y_idx fast -> stride 31500 (BAD for stores)
++    # Neither layout gives coalesced for BOTH without shared memory.
++    # The plan accepts this and relies on L1 cache to handle the non-coalesced dimension.
++    # Going with the plan's exact specification: y0 fast for loads (accept strided stores)
++    tl.store(out_ptr0 + (x2_2 + 31500 * y_idx2), vals, mask=mask2)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +95,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

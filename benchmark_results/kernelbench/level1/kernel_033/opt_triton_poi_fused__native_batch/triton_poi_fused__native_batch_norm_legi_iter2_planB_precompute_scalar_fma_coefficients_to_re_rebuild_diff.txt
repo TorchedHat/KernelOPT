@@ -1,0 +1,66 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,16 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 128}, num_warps=2),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 128},  num_warps=2, num_stages=1),
+     ],
+     key=['numel'],
+ )
+@@ -31,23 +33,27 @@
+     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+     mask = offsets < numel
+ 
+-    # Determine which channel each element belongs to
+-    # Layout: [N, C, H, W] with strides [C*H*W, H*W, W, 1]
+-    # channel index = (flat_index // spatial_size) % C
+-    channel_idx = (offsets // spatial_size) % 64
++    # Scalar channel index: valid because BLOCK_SIZE <= spatial_size=262144
++    # so all threads in this block share the same channel
++    channel_idx = (pid * BLOCK_SIZE // spatial_size) % 64
+ 
+-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+-    mean = tl.load(running_mean_ptr + channel_idx, mask=mask, other=0.0).to(tl.float32)
+-    var = tl.load(running_var_ptr + channel_idx, mask=mask, other=1.0).to(tl.float32)
+-    weight = tl.load(weight_ptr + channel_idx, mask=mask, other=1.0).to(tl.float32)
+-    bias = tl.load(bias_ptr + channel_idx, mask=mask, other=0.0).to(tl.float32)
++    # Scalar loads for channel params (broadcast to all lanes), mask=True since always valid
++    mean_val   = tl.load(running_mean_ptr + channel_idx, mask=True, other=0.0).to(tl.float32)
++    var_val    = tl.load(running_var_ptr   + channel_idx, mask=True, other=1.0).to(tl.float32)
++    weight_val = tl.load(weight_ptr + channel_idx, mask=True, other=1.0).to(tl.float32)
++    bias_val   = tl.load(bias_ptr   + channel_idx, mask=True, other=0.0).to(tl.float32)
+ 
+-    # Batch norm: (x - mean) / sqrt(var + eps) * weight + bias
+-    x_norm = (x - mean) / tl.sqrt(var + eps)
+-    out = x_norm * weight + bias
++    # Precompute scalar FMA coefficients once per block (scalar, not vectorized)
++    inv_std    = weight_val * tl.rsqrt(var_val + eps)   # 1 MUFU.RSQRT + 1 FMUL
++    fused_bias = bias_val - mean_val * inv_std           # 1 FFMA scalar
+ 
+-    tl.store(out_ptr + offsets, out.to(tl.float32), mask=mask)
++    # Streaming loads/stores with evict_first since x/out are not reused
++    x = tl.load(x_ptr + offsets, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+ 
++    # Single FFMA per element: eliminates x_norm temporary register
++    out = x * inv_std + fused_bias
++
++    tl.store(out_ptr + offsets, out.to(tl.float32), mask=mask, eviction_policy='evict_first')
+ 
+ def kernel_function(p_bn_weight, p_bn_bias, b_bn_running_mean, b_bn_running_var, x):
+     # x: [N, C, H, W]

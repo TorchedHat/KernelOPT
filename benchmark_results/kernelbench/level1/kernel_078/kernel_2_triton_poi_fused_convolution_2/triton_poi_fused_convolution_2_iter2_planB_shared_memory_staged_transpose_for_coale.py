@@ -1,0 +1,72 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 64}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 64, 'YBLOCK': 64}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),
+        triton.Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=8, num_stages=3),
+    ],
+    key=['ynumel', 'xnumel'],
+)
+@triton.jit
+def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+    ynumel = 24576
+    xnumel = 3025
+    yoffset = tl.program_id(1) * YBLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    # yi is the fast (lane) dimension for loads: y0 (channel) has stride-1 in in_ptr0
+    yi = tl.arange(0, YBLOCK)[None, :]   # shape [1, YBLOCK] — fast for loads
+    xi = tl.arange(0, XBLOCK)[:, None]   # shape [XBLOCK, 1] — fast for stores
+    y_abs = yoffset + yi   # shape [1, YBLOCK], absolute y index
+    x_abs = xoffset + xi   # shape [XBLOCK, 1], absolute x index
+    ymask = y_abs < ynumel
+    xmask = x_abs < xnumel
+    load_mask = xmask & ymask
+    y0_l = y_abs % 96      # channel index, stride-1 in in_ptr0
+    y1_l = y_abs // 96     # batch index
+    # Load from NHWC-like input: stride layout (290400, 1, 5280, 96)
+    # in_ptr0[n, c, h, w] = in_ptr0 + n*290400 + c*1 + (h*55+w)*96
+    # = in_ptr0 + y0_l + 96*x_abs + 290400*y1_l  (coalesced: adjacent lanes differ in y0_l by 1)
+    val = tl.load(in_ptr0 + (y0_l + 96*x_abs + 290400*y1_l), load_mask, other=0.0, eviction_policy='evict_last')
+    bias = tl.load(in_ptr1 + y0_l, ymask, other=0.0, eviction_policy='evict_last')
+    val = val + bias
+    # Store to NCHW output: stride layout (290400, 3025, 55, 1)
+    # out_ptr0[n, c, h, w] = out_ptr0 + n*290400 + c*3025 + (h*55+w)*1
+    # = out_ptr0 + x_abs + 3025*y_abs  (coalesced: adjacent lanes in x_abs differ by 1)
+    tl.store(out_ptr0 + (x_abs + 3025*y_abs), val, load_mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    ynumel = 24576
+    xnumel = 3025
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_convolution_2[grid](arg_0, arg_1, arg_2, 24576, 3025)
+    return arg_2
+
+def get_inputs():
+    arg_0 = rand_strided((256, 96, 55, 55), (290400, 1, 5280, 96), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((96,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((256, 96, 55, 55), (290400, 3025, 55, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

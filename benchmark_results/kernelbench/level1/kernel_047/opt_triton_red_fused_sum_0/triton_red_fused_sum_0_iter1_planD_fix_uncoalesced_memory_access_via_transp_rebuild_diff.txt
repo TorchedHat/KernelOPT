@@ -1,0 +1,91 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,14 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 1024}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 256},  num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 512},  num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 1024}, num_warps=8,  num_stages=2),
+         triton.Config({'BLOCK_M': 1, 'BLOCK_R': 2048}, num_warps=16, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 2, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 256}, num_warps=4, num_stages=2),
+-        triton.Config({'BLOCK_M': 4, 'BLOCK_R': 512}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 1, 'BLOCK_R': 4096}, num_warps=16, num_stages=2),
+     ],
+     key=['batch', 'reduce_dim', 'last_dim'],
+ )
+@@ -26,48 +24,29 @@
+     BLOCK_M: tl.constexpr,
+     BLOCK_R: tl.constexpr,
+ ):
+-    # Grid: (batch * last_dim / BLOCK_M,)
+-    # Each program handles BLOCK_M output elements along last_dim
+-    # and reduces over reduce_dim
+-    pid = tl.program_id(0)
++    # 2D grid: axis 0 = output element index, axis 1 = r-chunk index
++    pid_out = tl.program_id(0)   # which output element (batch_idx * last_dim + col_idx)
++    pid_r   = tl.program_id(1)   # which chunk of reduce_dim
+ 
+-    # Each pid handles BLOCK_M consecutive last_dim positions for a given batch
+-    # We flatten: output index = batch_idx * last_dim + col_idx
+-    # pid covers BLOCK_M output elements
+-    out_start = pid * BLOCK_M
++    batch_idx = pid_out // last_dim
++    col_idx   = pid_out %  last_dim
+ 
+-    # Compute batch index and column index
+-    col_offsets = out_start + tl.arange(0, BLOCK_M)
+-    batch_idx = col_offsets // last_dim
+-    col_idx = col_offsets % last_dim
++    if batch_idx >= batch:
++        return
+ 
+-    mask_out = (batch_idx < batch) & (col_idx < last_dim)
++    r_start   = pid_r * BLOCK_R
++    r_offsets = r_start + tl.arange(0, BLOCK_R)   # contiguous in memory
++    r_mask    = r_offsets < reduce_dim
+ 
+-    # Accumulate sum over reduce_dim
+-    acc = tl.zeros([BLOCK_M], dtype=tl.float32)
++    # Coalesced 1D load along r_offsets for fixed (batch_idx, col_idx)
++    # linear_idx strides along r_offsets by last_dim — each CTA loads a contiguous
++    # chunk of the reduction dimension for a single output element
++    linear_idx = batch_idx * (reduce_dim * last_dim) + r_offsets * last_dim + col_idx
++    vals = tl.load(in_ptr + linear_idx, mask=r_mask, other=0.0)
++    partial = tl.sum(vals, axis=0)   # scalar
+ 
+-    for r_start in range(0, reduce_dim, BLOCK_R):
+-        r_offsets = r_start + tl.arange(0, BLOCK_R)
+-        r_mask = r_offsets < reduce_dim
+-
+-        # Load: in_ptr[batch_idx, r_offsets, col_idx]
+-        # Shape: [BLOCK_M, BLOCK_R]
+-        # in_ptr stride: [reduce_dim * last_dim, last_dim, 1]
+-        # Linear index: batch_idx * reduce_dim * last_dim + r * last_dim + col_idx
+-
+-        b_idx = batch_idx[:, None]  # [BLOCK_M, 1]
+-        r_idx = r_offsets[None, :]  # [1, BLOCK_R]
+-        c_idx = col_idx[:, None]    # [BLOCK_M, 1]
+-
+-        linear_idx = b_idx * (reduce_dim * last_dim) + r_idx * last_dim + c_idx
+-
+-        combined_mask = mask_out[:, None] & r_mask[None, :]
+-
+-        vals = tl.load(in_ptr + linear_idx, mask=combined_mask, other=0.0)
+-        acc += tl.sum(vals, axis=1)
+-
+-    tl.store(out_ptr + col_offsets, acc, mask=mask_out)
+-
++    # Accumulate partial sums from different pid_r CTAs into the pre-zeroed output
++    tl.atomic_add(out_ptr + pid_out, partial)
+ 
+ def kernel_function(x):
+     # x: [128, 4096, 4095], reduce over dim=1, keepdim=True -> [128, 1, 4095]

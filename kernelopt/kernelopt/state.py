@@ -13,6 +13,28 @@ from typing import Optional, TypedDict
 
 
 @dataclass
+class ActiveKernel:
+    """One active optimization chain in the multi-chain forest search.
+
+    The pipeline maintains a beam of B active kernels. Each iteration,
+    plans are generated for each active kernel, candidates are profiled,
+    and the top-B candidates form the next beam. This implements a
+    ThoughtForest-style multi-chain search where B concurrent optimization
+    paths are explored in parallel.
+    """
+    chain_id: str = "chain_0"        # stable ID across iterations
+    kernel_source: str = ""          # current kernel source code
+    latency_ns: float = float("inf") # NCU latency
+    wall_ms: float = float("inf")    # wall-clock latency
+    speedup: float = 1.0             # vs baseline
+    profiling_context: dict = field(default_factory=dict)  # most recent NCU context
+    ncu_summary: str = ""            # compact metrics for logging
+    history: list[str] = field(default_factory=list)  # directions applied in order
+    depth: int = 0                   # transformations from baseline
+    alive: bool = True               # False if chain produced 0 correct candidates
+
+
+@dataclass
 class PlanCandidate:
     """One optimization plan and its execution/profiling results."""
 
@@ -29,7 +51,10 @@ class PlanCandidate:
     csv_path: str = ""
     ncu_rep_path: str = ""
     latency_ns: float = float("inf")
+    wall_ms: float = float("inf")           # wall-clock end-to-end timing
     speedup: float = 1.0
+    wall_speedup: float = 1.0               # primary speedup metric (wall-clock)
+    chain_id: str = ""                      # which ActiveKernel this was derived from
 
 
 @dataclass
@@ -67,6 +92,9 @@ class PipelineConfig:
     api_key: str | None = None
     project_id: str = ""
     region: str = "us-east5"
+    llm_provider: str = "vertex"
+    openai_base_url: str | None = None
+    hf_inference_provider: str = "auto"
 
     # Per-agent model overrides
     planner_model: str | None = None
@@ -89,6 +117,35 @@ class PipelineConfig:
     # Profiler agent
     profile_hints: str = ""
 
+    # Search policy: "greedy" (single chain) or "beam" (multi-chain forest)
+    search_policy: str = "greedy"
+    beam_width: int = 1              # number of concurrent optimization chains
+
+    # E2E correctness retries: after re-stitching an optimized sub-kernel,
+    # verify full-model correctness against the original PyTorch model. If
+    # it fails, feed the error back and retry optimization with a targeted
+    # 1-iteration run. Catches bugs where per-kernel optimization breaks
+    # full-model correctness (e.g., accumulation errors at full scale).
+    e2e_retries: int = 2
+
+    # E2E performance gate: after re-stitching, measure wall-clock timing
+    # of the re-stitched model vs baseline. If the model is slower by more
+    # than e2e_perf_margin (per-kernel speedup didn't translate to
+    # model-level), reject and retry with layout/stride feedback.
+    # Uses e2e_retries for max attempts.
+    e2e_perf_gate: bool = True
+    e2e_perf_margin: float = 1.03  # 3% tolerance — reject if opt > baseline * margin
+
+    # E2E correctness timeout: seconds for the correctness subprocess to
+    # complete. Includes torch.compile capture backend for weight extraction,
+    # model compilation, and 3-seed verification. Increase for large models
+    # or complex compilation paths.
+    e2e_correctness_timeout: int = 180
+
+    # Synthesis options (PyTorch → Triton)
+    entry_point: str | None = None
+    input_shapes: list[tuple[int, ...]] | None = None
+
 
 @dataclass
 class PipelineState:
@@ -106,6 +163,7 @@ class PipelineState:
     # Current best
     best_kernel: str = ""
     best_latency_ns: float = float("inf")
+    best_wall_ms: float = float("inf")       # wall-clock end-to-end (primary speedup metric)
     best_ncu_rep: str = ""
 
     # Baseline profiling
@@ -132,6 +190,9 @@ class PipelineState:
     # Pre-run metrics from validate_gpu_for_profiling (for HUD; same source as CLI System Status)
     pre_run_system_snapshot: dict = field(default_factory=dict)
 
+    # Multi-kernel: benchmark source for rebuild_standalone_from_body
+    benchmark_kernel_source: str | None = None
+
 
 class GraphState(TypedDict, total=False):
     """LangGraph-compatible state for the optimization pipeline."""
@@ -151,19 +212,26 @@ class GraphState(TypedDict, total=False):
     baseline_csv: str
     baseline_ncu_rep: str
     baseline_latency_ns: float
+    baseline_wall_ms: float              # wall-clock end-to-end timing
     # NCU config from baseline profiling — reused for all candidates
     ncu_config: Optional[dict]
 
-    # Current best
+    # Current best (legacy scalar — kept for backward compatibility)
     best_kernel: str
     best_latency_ns: float
+    best_wall_ms: float                  # wall-clock end-to-end (primary speedup metric)
     best_ncu_rep: str
     current_profiling_context: dict
+
+    # Multi-chain forest search (ThoughtForest-style)
+    active_kernels: list[dict]           # list of ActiveKernel as dicts (beam)
+    global_best_kernel: str              # best kernel ever found across all chains
+    global_best_latency_ns: float        # corresponding latency
 
     # Per-iteration
     iteration: int
     no_improvement_streak: int
-    plans: list[tuple[str, dict]]
+    plans: list[tuple[str, dict]] | list[tuple[str, dict, str]]  # (letter, plan) or (letter, plan, chain_id)
     candidates: list[PlanCandidate]
     correctness_failure_items: list   # implementation_flaw items from correctness failures
 
@@ -173,9 +241,16 @@ class GraphState(TypedDict, total=False):
     # History
     iteration_results: list[IterationResult]
 
+    # Strategy analysis (two-phase planning)
+    optimization_strategy: Optional[dict]
+
     # Synthesis (Feature 4): original PyTorch source when input was auto-converted
     _original_pytorch_path: Optional[str]
     _original_pytorch_source: Optional[str]
+    _benchmark_kernel_source: Optional[str]
+    _all_benchmark_files: Optional[list]
+    _baseline_standalone_path: Optional[str]
+    _target_triton_kernel_name: Optional[str]
 
     # Internal: LangGraph entry routing (fresh | after_baseline | after_iteration)
     _entry: str

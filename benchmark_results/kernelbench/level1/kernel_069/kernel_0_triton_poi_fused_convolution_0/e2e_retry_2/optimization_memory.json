@@ -1,0 +1,71 @@
+[
+  {
+    "item_id": "d69377b1",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_tile_reshape",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_tile_reshape \u2014 correctness failure",
+    "strategy_description": "Plan 'vectorized_loads_with_tile_reshape' was applied but failed correctness. Error: Correctness subprocess failed (exit 1):  + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK)[None, :], 16), XBLOCK)\n                               ^\nShape of input to multiple",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout-transpose: it reads from a contiguous NCHW tensor (stride-1 in x) and writes to a strided output (y0 + 3*x2 + 150528*y1) where the innermost store stride is 3 floats (12 bytes), causing severely uncoalesced stores. Only 20/32 bytes per sector are used. The L1TEX stall (46.5% of cycles) is driven by these uncoalesced accesses. With XBLOCK=128 and YBLOCK=8, the load pointer in_ptr0 + (x2 + 50176*y3) has a large stride between y-rows preventing the compiler from emitting 128-bit vectorized loads. Applying tl.max_contiguous and tl.multiple_of on the x-dimension load indices tells the compiler the access is contiguous and aligned, enabling 128-bit (float4) vectorized loads. Increasing XBLOCK to 1024 and reducing YBLOCK to 1 maximizes the contiguous x-dimension tile per CTA and increases grid size from 1568 to ~4900 blocks (3.1 waves/SM vs 0.74), dramatically improving occupancy and hiding L1TEX latency.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1):  + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_smem_pressure_regression_001",
+    "iteration": 1,
+    "speedup": 0.3352,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_fix_uncoalesced_stores_and_low_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall (MIO queue full)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 6.08,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9027.0,
+        "Occupancy.Achieved Occupancy (%)": 55.28,
+        "Occupancy.Theoretical Occupancy (%)": 100.0,
+        "Occupancy.Block Limit Shared Mem": 26.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 4.1,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 991.07,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 38.68,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 60.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.8,
+        "Instruction Statistics.Executed Instructions": 771456.0,
+        "Source Counters.UncoalescedGlobalAccess excess sectors (%)": 23.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 18.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 27092.0,
+        "Occupancy.Achieved Occupancy (%)": 58.54,
+        "Occupancy.Theoretical Occupancy (%)": 81.25,
+        "Occupancy.Block Limit Shared Mem": 13.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 16.38,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 332.4,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 60.45,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 76.11,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 40.78,
+        "Instruction Statistics.Executed Instructions": 1759296.0,
+        "Source Counters.UncoalescedGlobalAccess excess sectors (%)": 52.0
+      }
+    },
+    "strategy_title": "Autotune with large YBLOCK worsens shared memory pressure and uncoalescing",
+    "strategy_description": "Adding @triton.autotune with large tile configs (YBLOCK=32, XBLOCK up to 1024) caused a 3x regression. The larger tiles increased dynamic shared memory per block from 4.1 KB to 16.4 KB, cutting Block Limit Shared Mem from 26 to 13 and reducing theoretical occupancy from 100% to 81.25%. Critically, the instruction count more than doubled (771K\u21921.76M) and the dominant stall shifted from L1TEX latency to MIO queue saturation (34.5% of cycles), indicating the autotune overhead and larger tile footprint introduced more shared memory traffic rather than eliminating it. The uncoalesced excess sector ratio actually worsened from 23% to 52%, meaning the tile change did not fix the store coalescing problem as predicted.",
+    "slow_pseudocode": "# BEFORE: fixed small tiles, no autotune\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # YBLOCK=8, XBLOCK=128\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:,None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None,:]\n    y0 = yindex % 3\n    y1 = yindex // 3\n    tmp0 = tl.load(in_ptr0 + (xindex + 50176*yindex), ...)\n    tl.store(out_ptr0 + (y0 + 3*xindex + 150528*y1), tmp0, ...)\ngrid = (cdiv(50176,128), cdiv(30,8))  # = (393, 4) = 1572 CTAs",
+    "fast_pseudocode": "# AFTER (regressed): autotune with large tiles\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK':128,'YBLOCK':32}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK':1024,'YBLOCK':32}, num_warps=8, num_stages=2),\n    # ... 6 more configs with YBLOCK in {16,32}, XBLOCK in {128..1024}\n], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Same index arithmetic, but larger tiles increase smem usage\n    # Dynamic smem: 4.1 KB -> 16.4 KB per block\n    # Block Limit Shared Mem: 26 -> 13 (halved)\n    # Theoretical occupancy: 100% -> 81.25%\n    ...\ngrid = lambda META: (cdiv(50176,META['XBLOCK']), cdiv(30,META['YBLOCK']))",
+    "applicable_when": "Never: this specific combination of autotune + large YBLOCK for a small-ynumel (30) layout permutation kernel caused regression. The pattern is a cautionary anti-pattern.",
+    "do_not_apply_when": "Do NOT apply large YBLOCK autotune configs when: (1) ynumel is very small (e.g. 30) so YBLOCK > ynumel causes wasted threads and mask overhead; (2) the kernel already has low dynamic shared memory usage and increasing tile size would push Block Limit Shared Mem below the current block limit, reducing theoretical occupancy; (3) the store pattern has a fixed stride in the y-dimension (y0 = yindex % C) \u2014 larger YBLOCK does not fix inter-thread store stride within a warp, it only changes which y-values are co-located in a CTA; (4) the autotune overhead itself (extra smem for autotuning bookkeeping) is significant relative to kernel duration (here 6 us baseline).",
+    "framework_notes": "In Triton, @triton.autotune allocates additional dynamic shared memory per block for its internal bookkeeping. For very short kernels (<10 us), this overhead can dominate. The Block Limit Shared Mem constraint is critical: going from 26 to 13 blocks/SM halves the maximum achievable occupancy ceiling. The MIO queue stall (CPIStall on MIO) is a Triton/CUDA-specific signal indicating shared memory pipeline saturation \u2014 distinct from L1TEX stalls which indicate global memory latency."
+  }
+]
