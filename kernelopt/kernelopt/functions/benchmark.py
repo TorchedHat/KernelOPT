@@ -17,6 +17,61 @@ import sys
 from pathlib import Path
 
 
+def _patch_device_properties_compat():
+    """Patch DeviceProperties to accept unknown kwargs for forward compatibility.
+
+    Inductor AOT code serializes DeviceProperties via repr(), hardcoding all
+    fields known at generation time.  When the generated code is loaded by a
+    different PyTorch version whose DeviceProperties NamedTuple has fewer
+    fields, the constructor raises TypeError on the unknown kwargs.
+
+    This patch makes DeviceProperties.__new__ silently drop unknown kwargs,
+    so generated code is portable across PyTorch versions.
+
+    See upstream: https://github.com/pytorch/pytorch/issues/141744
+    """
+    try:
+        from torch._inductor.runtime.hints import DeviceProperties
+        _orig_new = DeviceProperties.__new__.__wrapped__ if hasattr(
+            DeviceProperties.__new__, "__wrapped__"
+        ) else DeviceProperties.__new__
+
+        if getattr(_orig_new, "_kpt_compat_patched", False):
+            return  # already patched
+
+        _known_fields = set(DeviceProperties._fields)
+
+        def _compat_new(cls, *args, **kwargs):
+            if kwargs:
+                kwargs = {k: v for k, v in kwargs.items() if k in _known_fields}
+            return _orig_new(cls, *args, **kwargs)
+
+        _compat_new._kpt_compat_patched = True
+        DeviceProperties.__new__ = _compat_new
+    except (ImportError, AttributeError):
+        pass  # torch not installed or API changed — skip silently
+
+
+# Preamble injected into subprocess scripts so generated Inductor AOT code
+# can be loaded regardless of which PyTorch version produced it.
+# NOTE: braces are doubled ({{ }}) because this is embedded in .format() templates.
+_DEVICEPROPS_COMPAT_PREAMBLE = """\
+try:
+    from torch._inductor.runtime.hints import DeviceProperties as _DP
+    _orig = _DP.__new__
+    if not getattr(_orig, '_kpt_patched', False):
+        _known = set(_DP._fields)
+        def _compat(cls, *a, **kw):
+            if kw:
+                kw = {{k: v for k, v in kw.items() if k in _known}}
+            return _orig(cls, *a, **kw)
+        _compat._kpt_patched = True
+        _DP.__new__ = _compat
+except (ImportError, AttributeError):
+    pass
+"""
+
+
 def _find_callable_and_inputs(module):
     """Find the benchmark-able function and input generator in a kernel module."""
     fn = (
@@ -43,6 +98,8 @@ def benchmark_kernel(
         from triton.testing import do_bench
     except ImportError:
         return {"median_ms": -1, "error": "torch or triton not available"}
+
+    _patch_device_properties_compat()
 
     try:
         mod_name = f"_bench_{Path(kernel_path).stem}_{id(kernel_path)}"
@@ -73,6 +130,7 @@ def benchmark_kernel(
 _TIMING_SCRIPT_TEMPLATE = """\
 import json, torch, importlib.util, sys
 torch.cuda.set_device(0)
+""" + _DEVICEPROPS_COMPAT_PREAMBLE + """\
 from triton.testing import do_bench
 
 spec = importlib.util.spec_from_file_location("_m", "{file_path}")
@@ -132,7 +190,7 @@ def _time_in_subprocess(
 _CORRECTNESS_SCRIPT = """\
 import json, torch, importlib.util, sys
 torch.cuda.set_device(0)
-
+""" + _DEVICEPROPS_COMPAT_PREAMBLE + """\
 # Load original model
 spec1 = importlib.util.spec_from_file_location("_orig", "{original_path}")
 orig_mod = importlib.util.module_from_spec(spec1)

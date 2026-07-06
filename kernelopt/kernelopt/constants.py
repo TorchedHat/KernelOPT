@@ -12,6 +12,7 @@ MAX_SOURCE_CHARS = 3_000
 # merged into a single fused kernel; larger graphs use the type-aware strategy.
 MAX_GROUPS_FOR_SINGLE_FUSE = 6
 
-# Hard timeout (seconds) for Vertex AI LLM API calls.
-# Prevents infinite hangs on Vertex; 15 min covers the slowest Sonnet calls.
-VERTEX_API_TIMEOUT_S = 900.0
+# Hard timeout (seconds) for LLM API calls.
+# Prevents infinite hangs; 15 min covers the slowest model calls.
+LLM_API_TIMEOUT_S = 900.0
+VERTEX_API_TIMEOUT_S = LLM_API_TIMEOUT_S  # backward compat alias
