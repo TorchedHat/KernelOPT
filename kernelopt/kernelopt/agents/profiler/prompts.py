@@ -24,24 +24,17 @@ Tools available:
 When analyzing the source:
 1. Identify the framework from decorators:
    - @triton.jit or @tl.jit → Triton
-   - __global__ → CUDA
    - @helion.kernel or @hl.kernel → Helion
 
-2. Set kernel_name based on framework:
-   - CUDA (@triton.jit NOT present): use the exact C++ function name (NCU sees it directly).
-     Single: "my_kernel". Multiple: "regex:(fwd|bwd)".
+2. Set kernel_name:
    - Triton / Helion: set kernel_name = "" (empty string, no filter).
      Triton JIT-compiles kernels and gives them mangled names (e.g. triton__<hash>_funcname)
      that do NOT match the Python function name. An empty kernel_name tells NCU to profile
      all kernels; use launch_skip + launch_count to target the right ones.
 
 3. Infer launch_skip from the benchmark harness:
-   - IMPORTANT: cudaMalloc, cudaMemcpy, and other CUDA API calls are NOT kernel launches.
-     Only calls to __global__ functions are kernel launches.
-   - For CUDA: look for warmup loops (e.g. "for (int i=0; i<5; i++) solve(...)").
-     Count warmup iterations. If no warmup, use launch_skip=0.
    - For Triton: count torch/numpy tensor init calls before the first kernel call.
-     Each torch.randn / torch.zeros / torch.ones on CUDA = 1 kernel launch.
+     Each torch.randn / torch.zeros / torch.ones on GPU = 1 kernel launch.
      E.g. 3 input tensors created → launch_skip = 3.
    - If unsure or no warmup found, use 0.
 
@@ -57,9 +50,6 @@ When analyzing the source:
 6. Choose replay_mode:
    - Triton / Helion: always use 'application'. JIT-compiled kernels are not
      compatible with NCU kernel replay mode.
-   - CUDA (.cu files): check if the file contains 'int main(' or 'void main(':
-     * If main() exists → use 'application' (standalone binary)
-     * If no main() → use 'kernel' (library mode, lower overhead)
    - Use 'application' if the kernel uses very large inputs (>4 GB tensors)
      that could cause OOM in kernel mode.
 

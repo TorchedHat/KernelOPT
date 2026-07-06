@@ -15,7 +15,7 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
     """Parse the kernel source to detect framework and list all GPU kernel function names.
 
     Returns (framework, kernel_names).
-    framework: "triton" | "helion" | "cuda" | "pytorch" | "unknown"
+    framework: "triton" | "helion" | "pytorch" | "unknown"
     kernel_names: suitable for --kernel-name flag (exact or regex pattern)
     """
     path = Path(kernel_path)
@@ -35,13 +35,6 @@ def extract_kernel_info(kernel_path: str) -> tuple[str, list[str]]:
         if _is_pytorch_source(source, tree):
             return "pytorch", []
         return "unknown", []
-
-    elif ext == ".cu":
-        try:
-            source = path.read_text()
-        except OSError:
-            return "unknown", []
-        return _extract_cuda_kernels(source)
 
     return "unknown", []
 
@@ -65,13 +58,6 @@ def _extract_python_kernels(tree: ast.AST) -> tuple[str, list[str]]:
         return "triton", triton_kernels
     if helion_kernels:
         return "helion", helion_kernels
-    return "unknown", []
-
-
-def _extract_cuda_kernels(source: str) -> tuple[str, list[str]]:
-    names = re.findall(r'__global__\s+[\w\s*]+?\s+(\w+)\s*[(<]', source)
-    if names:
-        return "cuda", names
     return "unknown", []
 
 
@@ -101,11 +87,11 @@ def _detect_framework_from_name(kernel_name: str) -> str:
     if any(p in kernel_name for p in ["helion_", "helion::"]):
         return "helion"
     if any(p in kernel_name for p in ["at::", "pycuda_"]):
-        return "cuda"
+        return "unknown"
     if kernel_name.startswith("jit_"):
-        return "cuda"
+        return "unknown"
     if "__global__" in kernel_name or re.search(r"void\s+\w+<", kernel_name):
-        return "cuda"
+        return "unknown"
     return "unknown"
 
 
@@ -127,26 +113,16 @@ def build_ncu_command(
     replay_mode: str = "kernel",
     ncu_extra_args: list[str] | None = None,
     kernel_args: list[str] | None = None,
-    binary_path: str | None = None,
     ncu_set: str = "full",
     clock_control: str | None = None,
 ) -> list[str]:
     """Build the ncu command line for profiling.
 
     Args:
-        binary_path: For .cu kernels, path to the compiled binary. If None, derived from kernel_path.
         ncu_set: NCU metric set — "full" for optimization, "basic" for duration-only.
         clock_control: NCU clock control — None for default (locked), "none" for boost clocks.
     """
-    ext = Path(kernel_path).suffix
-    if ext == ".py":
-        runner = [sys.executable, kernel_path]
-    else:
-        # Use provided binary_path or derive from kernel_path
-        if binary_path:
-            runner = [binary_path]
-        else:
-            runner = [kernel_path.replace(ext, "")]
+    runner = [sys.executable, kernel_path]
 
     # kernel_name semantics:
     #   None: auto-detect from source (for backward compat)
@@ -231,12 +207,8 @@ def run_ncu(
     kernel_args: list[str] | None = None,
     kernel_id: int = 0,
     save_profiling_context: bool = True,
-    binary_path: str | None = None,
 ) -> tuple[str, str, str]:
     """Execute NCU profiling: profile → .ncu-rep → export CSV → optionally build context JSON.
-
-    Args:
-        binary_path: For .cu kernels, path to the compiled binary. If None, derived from kernel_path.
 
     Returns (csv_path, ncu_rep_path, profiling_context_path).
     """
@@ -267,7 +239,6 @@ def run_ncu(
         replay_mode=replay_mode,
         ncu_extra_args=ncu_extra_args,
         kernel_args=kernel_args,
-        binary_path=binary_path,
     )
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=1200, env=prof_env

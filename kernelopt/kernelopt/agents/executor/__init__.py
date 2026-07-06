@@ -40,7 +40,7 @@ def run_executor_agent(
         K:                  Maximum submit_kernel attempts allowed.
         llm_config:         Dict with keys model, api_key, project_id, region.
         llm_override:       Optional pre-built LLM (used in tests to avoid API calls).
-        compile_error:      nvcc error from a previous compile attempt, or None.
+        compile_error:      Compile/dry-run error from a previous attempt, or None.
         correctness_error:  Correctness failure message from a previous attempt, or None.
                             When set, the initial message includes the error so the
                             LLM can fix the numerical bug.

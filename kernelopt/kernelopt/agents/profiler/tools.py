@@ -27,7 +27,7 @@ def read_kernel_source(
     """Return the full kernel source code.
 
     Read this before calling submit_ncu_config. Inspect:
-    - GPU kernel function names and decorators (@triton.jit, __global__, @helion.kernel)
+    - GPU kernel function names and decorators (@triton.jit, @helion.kernel)
     - Benchmark harness structure (warmup loops, launch counts)
     - CLI argument parser (argparse/typer) to determine required kernel_args
     """
