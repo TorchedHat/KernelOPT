@@ -23,14 +23,12 @@ class ExecutorState(TypedDict, total=False):
     attempt: int                 # number of submit_kernel calls made so far
 
 
-_KERNEL_MARKERS = ["@triton.jit", "__global__", "@helion.kernel", "@hl.kernel"]
+_KERNEL_MARKERS = ["@triton.jit", "@helion.kernel", "@hl.kernel"]
 
 
 def _infer_framework(kernel_source: str) -> str:
     if "@triton.jit" in kernel_source:
         return "triton"
-    if "__global__" in kernel_source:
-        return "cuda"
     if "@helion.kernel" in kernel_source or "@hl.kernel" in kernel_source:
         return "helion"
     return "unknown"

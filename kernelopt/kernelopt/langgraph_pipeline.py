@@ -35,7 +35,6 @@ from rich.table import Table
 
 from kernelopt.agents.executor import run_executor_agent
 from kernelopt.agents.summarizer import run_summarizer
-from kernelopt.functions.compiler import compile_cuda
 from kernelopt.functions.correctness import check_correctness
 from kernelopt.functions.gpu_monitoring import (
     monitor_gpu_activity,
@@ -130,14 +129,6 @@ def _checkpoint_stage(state: GraphState, updates: dict, stage: str) -> None:
         pipe_print(f"[yellow]Warning:[/] checkpoint [{stage}] failed: {e}")
 
 
-def _compile_cuda(cu_path: str, output_dir: str | None = None) -> str:
-    """Compile a .cu file with nvcc and return the binary path. Raises on failure."""
-    binary_path, err = compile_cuda(cu_path, output_dir=output_dir)
-    if err:
-        raise RuntimeError(f"nvcc failed:\n{err}")
-    return binary_path
-
-
 # ---------------------------------------------------------------------------
 # Node 1: Profile baseline kernel
 # ---------------------------------------------------------------------------
@@ -163,17 +154,7 @@ def profile_baseline(state: GraphState) -> dict:
     if ui:
         ui.set_phase("Baseline profiling", Path(kernel_path).name)
 
-    # For .cu kernels: compile the baseline binary once so NCU can run it.
     ext = Path(kernel_path).suffix
-    compiled_binary = None
-    if ext == ".cu":
-        compiled_binary, err = compile_cuda(kernel_path, output_dir=str(output_dir))
-        if err:
-            raise RuntimeError(
-                f"Baseline .cu compilation failed:\n{err}\n\n"
-                f"Fix the kernel source and rerun."
-            )
-        pipe_print(f"  [dim]Compiled baseline binary: {compiled_binary}[/]")
 
     llm_config = {"model": cfg.profiler_model or cfg.model, **pipeline_llm_base_kwargs(cfg)}
 
@@ -196,7 +177,6 @@ def profile_baseline(state: GraphState) -> dict:
                 pipeline_config=cfg,
                 kernel_id=kernel_id,
                 llm_config=llm_config,
-                binary_path=compiled_binary,
             )
         except RuntimeError as e:
             raise RuntimeError(f"Baseline profiling failed: {e}") from e
@@ -1247,7 +1227,6 @@ def execute_plans(state: GraphState) -> dict:
         last_compile_err: str | None = None
         optimized_source: str | None = None
         execution_result: dict = {}
-        compiled_binary: str | None = None
         correctness_retried = False
         # executor_K = cfg.K gives the executor K attempts WITHIN a single
         # conversation so the LLM sees its previous failed code + the
@@ -1326,64 +1305,33 @@ def execute_plans(state: GraphState) -> dict:
                 ))
                 Path(diff_file).write_text(_diff)
 
-            if ext == ".cu":
-                binary_path, err = compile_cuda(kernel_file, output_dir=str(output_dir))
-                if err:
-                    last_compile_err = err
-                    pipe_print(
-                        f"    [yellow]Plan {plan_letter} attempt {attempt_idx + 1}/"
-                        f"{outer_attempts}: compile failed[/]\n"
-                        f"    {err.splitlines()[0] if err else ''}"
-                    )
-                    if attempt_idx == outer_attempts - 1:
-                        # All K attempts exhausted — record for planner memory
-                        correctness_failure_items.append(_make_failure_item(
-                            iteration=iteration + 1,
-                            framework=framework,
-                            direction=direction,
-                            plan=plan,
-                            title=f"{direction} — compile failed after {outer_attempts} attempts",
-                            description=(
-                                f"Plan '{direction}' produced a .cu file that nvcc rejected "
-                                f"after {outer_attempts} attempt(s). "
-                                f"Last error: {(last_compile_err or '')[:300]}"
-                            ),
-                            do_not_apply_when=f"Compilation failed: {(last_compile_err or '')[:200]}",
-                            chain_id=chain_id,
-                        ))
-                        optimized_source = None
-                    continue  # retry with error feedback
-
-                compiled_binary = binary_path
-
-            else:
-                # Python kernels (Triton/Helion): dry-run validation
-                from kernelopt.functions.correctness import validate_kernel_runs
-                ok, run_err = validate_kernel_runs(kernel_file)
-                if not ok:
-                    last_compile_err = run_err
-                    pipe_print(
-                        f"    [yellow]Plan {plan_letter} attempt {attempt_idx + 1}/"
-                        f"{outer_attempts}: dry-run failed[/]\n"
-                        f"    {run_err.strip() if run_err else 'unknown error'}"
-                    )
-                    if attempt_idx == outer_attempts - 1:
-                        correctness_failure_items.append(_make_failure_item(
-                            iteration=iteration + 1,
-                            framework=framework,
-                            direction=direction,
-                            plan=plan,
-                            title=f"{direction} — dry-run crashed after {outer_attempts} attempts",
-                            description=(
-                                f"Plan '{direction}' produced a kernel that crashed on execution "
-                                f"after {outer_attempts} attempt(s). "
-                                f"Last error: {(run_err or '')[:300]}"
-                            ),
-                            do_not_apply_when=f"Dry-run failed: {(run_err or '')[:200]}",
-                            chain_id=chain_id,
-                        ))
-                        optimized_source = None
-                    continue
+            # Dry-run validation
+            from kernelopt.functions.correctness import validate_kernel_runs
+            ok, run_err = validate_kernel_runs(kernel_file)
+            if not ok:
+                last_compile_err = run_err
+                pipe_print(
+                    f"    [yellow]Plan {plan_letter} attempt {attempt_idx + 1}/"
+                    f"{outer_attempts}: dry-run failed[/]\n"
+                    f"    {run_err.strip() if run_err else 'unknown error'}"
+                )
+                if attempt_idx == outer_attempts - 1:
+                    correctness_failure_items.append(_make_failure_item(
+                        iteration=iteration + 1,
+                        framework=framework,
+                        direction=direction,
+                        plan=plan,
+                        title=f"{direction} — dry-run crashed after {outer_attempts} attempts",
+                        description=(
+                            f"Plan '{direction}' produced a kernel that crashed on execution "
+                            f"after {outer_attempts} attempt(s). "
+                            f"Last error: {(run_err or '')[:300]}"
+                        ),
+                        do_not_apply_when=f"Dry-run failed: {(run_err or '')[:200]}",
+                        chain_id=chain_id,
+                    ))
+                    optimized_source = None
+                continue
 
             break  # compiled/validated successfully
 
@@ -1405,7 +1353,6 @@ def execute_plans(state: GraphState) -> dict:
             openai_base_url=cfg.openai_base_url,
             hf_inference_provider=cfg.hf_inference_provider,
             kernel_args=cfg.kernel_args,
-            binary_path=compiled_binary,
             original_pytorch_path=state.get("_baseline_standalone_path") or (kernel_path if state.get("_original_pytorch_path") else None),
             debug=cfg.debug,
         )
@@ -1560,7 +1507,7 @@ def execute_plans(state: GraphState) -> dict:
             execution_result=execution_result,
             correctness_passed=passed,
             correctness_message=msg,
-            compiled_binary_path=compiled_binary or "",
+            compiled_binary_path="",
             chain_id=chain_id,
         )
         candidates.append(candidate)
@@ -1611,16 +1558,6 @@ def profile_candidates(state: GraphState) -> dict:
         kernel_file = f"{output_base}{ext}"
         Path(kernel_file).write_text(c.optimized_kernel)
 
-        candidate_binary = None
-        if ext == ".cu":
-            try:
-                candidate_binary = _compile_cuda(kernel_file, output_dir=str(output_dir))
-            except RuntimeError as e:
-                pipe_print(f"    [red]Compile failed (plan {c.plan_letter}): {e}[/]")
-                c.latency_ns = float("inf")
-                c.speedup = 0.0
-                continue
-
         try:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
             # Candidates may have different launch patterns than baseline:
@@ -1637,7 +1574,8 @@ def profile_candidates(state: GraphState) -> dict:
                 ncu_config=candidate_ncu_config,
                 pipeline_config=cfg,
                 kernel_id=0,
-                binary_path=candidate_binary,
+
+
                 llm_config=llm_config,
             )
             ctx, _ = _maybe_spin("profiling", _prof_label,
