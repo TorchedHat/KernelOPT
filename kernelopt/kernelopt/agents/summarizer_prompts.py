@@ -35,7 +35,7 @@ Extract the key structural change as framework-neutral pseudocode. Strip boilerp
 Keep loop structure, tile parameters, memory allocation sizes, and access patterns.
 Label the framework if the syntax is framework-specific.
 
-For framework-specific changes (e.g. Triton num_stages, CUDA __launch_bounds__),
+For framework-specific changes (e.g. Triton num_stages),
 include the framework label and note what the equivalent concept is in other frameworks.
 
 ### Step 5 — Deduplication check
@@ -56,7 +56,7 @@ FIRST — the experience_item:
   "iteration": <int>,
   "speedup": <float>,
   "rewrite_type": "positive" | "negative",
-  "framework": "<cuda|triton|helion|unknown|multi>",
+  "framework": "<triton|helion|unknown|multi>",
   "direction": "<snake_case strategy name>",
   "profiling_signal": {
     "ncu_rule_triggered": "<Rule Name or null>",

@@ -131,10 +131,10 @@ def _write_compile_fallback(final_path: Path, original_path: Path) -> None:
 def run(
     ctx: typer.Context,
     kernel_path: Path = typer.Argument(
-        ..., help="Kernel file (.cu, .py, .hl)"
+        ..., help="Kernel file (.py, .hl)"
     ),
     framework: str = typer.Option(
-        "auto", help="cuda|triton|helion|auto"
+        "auto", help="triton|helion|auto"
     ),
     iterations: Optional[int] = typer.Option(
         None, "-T", "--iterations",
