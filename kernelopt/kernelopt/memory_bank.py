@@ -133,9 +133,6 @@ def classify_kernel_structure(kernel_source: str, profiling_context: dict) -> di
             kernel_type = "reduction"
         else:
             kernel_type = "pointwise"
-    elif "__global__" in kernel_source:
-        kernel_type = "cuda"
-
     has_library = any(p in kernel_source for p in ["torch.mm", "extern_kernels", "torch.addmm"])
     has_triton = "@triton.jit" in kernel_source
 

@@ -212,7 +212,7 @@ def submit_plan(plan: dict) -> str:
     The plan dict must include:
       plan_id             — short unique identifier (e.g. "plan_001")
       direction           — snake_case name (e.g. "reduce_register_pressure")
-      framework           — "cuda" | "triton" | "helion" | "unknown"
+      framework           — "triton" | "helion" | "unknown"
       evidence            — {ncu_rule, ncu_rule_speedup_pct, supporting_metrics, reasoning}
       step                — {action, target, change, predicted_effect,
                              implementation_hints, success_criteria}

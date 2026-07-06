@@ -296,48 +296,6 @@ Online softmax (for attention kernels):
         row_max = new_max
     out = acc / row_sum[:, None]
 
-CUDA KERNELS (.cu files):
-When optimizing CUDA kernels, follow this priority order:
-
-Priority 1 — Algorithmic (>50% impact):
-- Kernel fusion: combine multiple kernel launches into one
-- Shared memory tiling: load data tiles into __shared__ for reuse
-- Memory coalescing: adjacent threads (threadIdx.x) access adjacent addresses
-
-Priority 2 — Hardware utilization (20-50% impact):
-- Vectorized loads: use float4/int4 for 4x memory throughput
-- Warp-level primitives: __shfl_sync for reduction without shared memory
-- Occupancy tuning: balance block size (128/256/512) and register usage
-- Grid-stride loops: for(int i=tid; i<n; i+=stride) for scalable kernels
-
-Priority 3 — Fine-tuning (<20% impact):
-- Loop unrolling: #pragma unroll for inner loops
-- Bank conflict avoidance: pad shared memory rows to non-power-of-2 stride
-- Fast math: __expf, __sinf, __rsqrtf for approximate single-precision
-
-Thread block sizes: 128 (baseline), 256 (common), 512 (high occupancy). Must be power of 2.
-
-Common patterns:
-  Grid-stride loop:
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    for (int i = tid; i < size; i += stride) out[i] = compute(in[i]);
-
-  Warp reduction (no shared memory):
-    float sum = value;
-    for (int offset = warpSize/2; offset > 0; offset /= 2)
-        sum += __shfl_sync(0xffffffff, sum, threadIdx.x ^ offset);
-
-  Shared memory tiling:
-    __shared__ float tile[TILE][TILE];
-    // load → __syncthreads → compute → __syncthreads → next tile
-
-CUDA rules:
-- __syncthreads() before reading shared memory that other threads wrote
-- Accumulate reductions in FP32 even if inputs are FP16
-- Grid = (N + blockDim - 1) / blockDim, never hardcode grid size
-- Do NOT use torch.* operators inside CUDA kernels
-
 If submit_kernel returns a validation error, diagnose what went wrong and resubmit.
 """ + _TRITON_API_REF
 
@@ -355,9 +313,7 @@ def build_initial_message(
 ) -> HumanMessage:
     """Build the opening human message for the executor sub-graph."""
     content = f"Implement the optimization plan. You have up to {K} attempts.\n"
-    if framework == "cuda":
-        content += "\n**Framework: CUDA (.cu)** — Apply CUDA-specific optimizations.\n"
-    elif framework == "helion":
+    if framework == "helion":
         content += "\n**Framework: Helion (@helion.kernel)** — Apply Helion-specific optimizations.\n"
     else:
         content += "\n**Framework: Triton (@triton.jit)** — Apply Triton-specific optimizations.\n"
