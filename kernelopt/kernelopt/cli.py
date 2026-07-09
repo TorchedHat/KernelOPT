@@ -212,6 +212,11 @@ def run(
         help="Timeout in seconds for e2e correctness subprocess. Includes torch.compile "
              "capture, model compilation, and 3-seed verification. Increase for large models.",
     ),
+    trace_timeout: int = typer.Option(
+        1800, "--trace-timeout",
+        help="Timeout in seconds for graph tracing subprocess (torch.export + torch.compile "
+             "with autotuning). Complex architectures need longer. Default 1800s (30 min).",
+    ),
     multi_kernel: bool = typer.Option(
         True, "--multi-kernel/--single-kernel",
         help="Optimize ALL Triton kernels in a PyTorch model sequentially, re-stitching each back",
@@ -426,6 +431,7 @@ def run(
                 e2e_perf_gate=e2e_perf_gate,
                 e2e_perf_margin=e2e_perf_margin,
                 e2e_correctness_timeout=e2e_correctness_timeout,
+                trace_timeout=trace_timeout,
             )
     else:
         resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
@@ -535,7 +541,7 @@ def run(
 
             # Phase 1: Trace computation graph + get Inductor fusion decisions
             console.print("  [dim]Tracing computation graph...[/]")
-            kernel_groups = trace_model(str(kernel_path))
+            kernel_groups = trace_model(str(kernel_path), timeout=cfg.trace_timeout)
             console.print(f"  [dim]Inductor generated {len(kernel_groups)} kernel(s)[/]")
 
             # Phase 2: Merge fusible kernel groups
