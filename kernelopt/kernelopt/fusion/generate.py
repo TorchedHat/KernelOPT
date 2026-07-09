@@ -202,6 +202,9 @@ def generate_fused_kernel(
             temperature=llm_config.get("temperature", 0.1),
             project_id=llm_config.get("project_id"),
             region=llm_config.get("region"),
+            provider=llm_config.get("provider"),
+            openai_base_url=llm_config.get("openai_base_url"),
+            hf_inference_provider=llm_config.get("hf_inference_provider", "auto"),
         )
     except Exception as exc:
         pipe_print(f"[fusion] Failed to build LLM: {exc}")
@@ -259,6 +262,9 @@ def generate_from_pattern_match(
             temperature=llm_config.get("temperature", 0.1),
             project_id=llm_config.get("project_id"),
             region=llm_config.get("region"),
+            provider=llm_config.get("provider"),
+            openai_base_url=llm_config.get("openai_base_url"),
+            hf_inference_provider=llm_config.get("hf_inference_provider", "auto"),
         )
     except Exception as exc:
         pipe_print(f"[fusion] Failed to build LLM: {exc}")
