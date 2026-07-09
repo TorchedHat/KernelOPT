@@ -16,8 +16,8 @@ def validate_against_eager(
     pytorch_path: str,
     generated_kernel_path: str,
     *,
-    atol: float = 1e-3,
-    rtol: float = 1e-3,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
     seeds: tuple[int, ...] = (0, 42),
     timeout: int = 300,
 ) -> tuple[bool, str]:

@@ -361,7 +361,7 @@ try:
                 diff = (r.float() - opt_f).abs().max().item()
                 if diff > seed_worst_diff:
                     seed_worst_diff = diff
-                correct_el = torch.allclose(r.float(), opt_f, rtol=1e-3, atol=1e-5)
+                correct_el = torch.allclose(r.float(), opt_f, rtol=1e-4, atol=1e-4)
 
                 if not correct_el:
                     # Tier 2: float64 reference — distinguishes "different FP32
