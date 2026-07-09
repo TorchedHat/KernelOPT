@@ -142,6 +142,12 @@ class PipelineConfig:
     # or complex compilation paths.
     e2e_correctness_timeout: int = 180
 
+    # Graph tracing timeout: seconds for the torch.compile tracing subprocess.
+    # Includes torch.export, Inductor compilation with autotuning, and kernel
+    # extraction. Complex architectures (Inception, DenseNet, ViT) with many
+    # modules require longer autotuning. Scale with model complexity.
+    trace_timeout: int = 1800
+
     # Synthesis options (PyTorch → Triton)
     entry_point: str | None = None
     input_shapes: list[tuple[int, ...]] | None = None

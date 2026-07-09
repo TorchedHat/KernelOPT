@@ -20,7 +20,7 @@ from kernelopt.constants import MAX_SOURCE_CHARS
 def trace_model(
     pytorch_path: str,
     *,
-    timeout: int = 300,
+    timeout: int = 1800,
 ) -> list[dict]:
     """Trace a PyTorch model and return kernel group descriptions.
 
