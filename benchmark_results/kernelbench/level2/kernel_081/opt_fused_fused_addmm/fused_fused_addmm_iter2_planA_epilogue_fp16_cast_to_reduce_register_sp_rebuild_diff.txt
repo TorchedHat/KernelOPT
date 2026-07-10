@@ -1,0 +1,73 @@
+--- baseline
++++ rebuilt
+@@ -2,6 +2,7 @@
+ import triton
+ import triton.language as tl
+ from triton.language.extra import libdevice
++
+ 
+ 
+ @triton.autotune(
+@@ -52,43 +53,49 @@
+ 
+         a = tl.load(a_ptrs,
+                     mask=(offs_m[:, None] < M) & (mask_k[None, :]),
+-                    other=0.0)
++                    other=0.0,
++                    eviction_policy='evict_first')
+         b = tl.load(b_ptrs,
+                     mask=(mask_k[:, None]) & (offs_n[None, :] < N),
+-                    other=0.0)
++                    other=0.0,
++                    eviction_policy='evict_first')
+ 
+         acc = tl.dot(a, b, acc, allow_tf32=False)
+ 
+         a_ptrs += BLOCK_K * stride_ak
+         b_ptrs += BLOCK_K * stride_bk
+ 
+-    # Load bias and add
++    # Load bias and add in FP32 (preserve precision for large bias values)
+     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+     acc = acc + bias[None, :]
+ 
+-    # Swish: x * sigmoid(x)
++    # Swish: x * sigmoid(x) — keep in FP32 for precision near 0
+     sigmoid_acc = tl.sigmoid(acc)
+     acc = acc * sigmoid_acc
+ 
+     # Divide by 2
+     acc = acc * 0.5
+ 
+-    # Clamp to [-1, 1]
++    # Clamp to [-1, 1] in FP32, then cast to FP16 (values now bounded, FP16 sufficient)
+     acc = tl.maximum(acc, -1.0)
+     acc = tl.minimum(acc, 1.0)
+ 
+-    # Tanh
+-    acc = libdevice.tanh(acc)
++    # Cast to FP16 — values are bounded to [-1, 1], FP16 precision is adequate
++    acc16 = acc.to(tl.float16)
+ 
+-    # Clamp to [-1, 1] again
+-    acc = tl.maximum(acc, -1.0)
+-    acc = tl.minimum(acc, 1.0)
++    # Tanh in FP32 (cast up for tanh, back to FP16)
++    acc_tanh = libdevice.tanh(acc16.to(tl.float32))
++    acc16 = acc_tanh.to(tl.float16)
+ 
+-    # Store result
++    # Clamp to [-1, 1] in FP16
++    acc16 = tl.maximum(acc16, -1.0)
++    acc16 = tl.minimum(acc16, 1.0)
++
++    # Store result — cast back to FP32 to match output tensor dtype
+     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+-    tl.store(c_ptrs, acc.to(tl.float32), mask=mask)
+-
++    tl.store(c_ptrs, acc16.to(tl.float32), mask=mask,
++             eviction_policy='evict_first')
+ 
+ def kernel_function(p_gemm_weight, p_gemm_bias, x):
+     # x: [M, K], weight: [N, K] (linear weight is transposed), bias: [N]

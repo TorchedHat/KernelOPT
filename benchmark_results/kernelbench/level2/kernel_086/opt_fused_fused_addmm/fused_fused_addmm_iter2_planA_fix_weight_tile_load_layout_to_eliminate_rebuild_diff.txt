@@ -1,0 +1,62 @@
+--- baseline
++++ rebuilt
+@@ -2,6 +2,7 @@
+ import triton
+ import triton.language as tl
+ from triton.language.extra import libdevice
++
+ 
+ 
+ @triton.autotune(
+@@ -14,6 +15,15 @@
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # New small-tile configs to reduce register pressure
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -60,17 +70,18 @@
+ 
+         # Load X tile: [BLOCK_M, BLOCK_K]
+         x_ptrs = X_ptr + rm[:, None] * stride_xm + offs_k[None, :] * stride_xk
+-        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
++        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0, eviction_policy='evict_last')
+ 
+-        # Load W tile: [BLOCK_K, BLOCK_N] (W is N x K, we want K x N for dot)
+-        # W_ptr[n, k] -> we need [k, n] layout for tl.dot
+-        w_ptrs = W_ptr + rn[None, :] * stride_wn + offs_k[:, None] * stride_wk
+-        w_tile = tl.load(w_ptrs, mask=mask_n[None, :] & mask_k[:, None], other=0.0)
++        # Load W tile: [BLOCK_N, BLOCK_K] -- COALESCED along K (fast axis for row-major W stored as [N, K])
++        # w_tile[n, k] = W[rn[n], offs_k[k]], then tl.trans gives [BLOCK_K, BLOCK_N] for tl.dot
++        w_ptrs = W_ptr + rn[:, None] * stride_wn + offs_k[None, :] * stride_wk
++        w_tile = tl.load(w_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0, eviction_policy='evict_last')
+ 
+-        acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=False)
++        # tl.trans() is a zero-cost metadata op: [BLOCK_N, BLOCK_K] -> [BLOCK_K, BLOCK_N] for tl.dot
++        acc = tl.dot(x_tile, tl.trans(w_tile), acc=acc, allow_tf32=False)
+ 
+     # Add bias
+-    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0)
++    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0, eviction_policy='evict_last')
+     acc = acc + bias[None, :]
+ 
+     # Divide by divisor
+@@ -85,8 +96,7 @@
+ 
+     # Store output
+     out_ptrs = OUT_ptr + rm[:, None] * N + rn[None, :]
+-    tl.store(out_ptrs, result.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :])
+-
++    tl.store(out_ptrs, result.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :], eviction_policy='evict_first')
+ 
+ def kernel_function(weight, bias, x):
+     # weight: (N, K) = (8192, 8192)

@@ -1,0 +1,121 @@
+# Kernel Optimization Log
+
+## Summary
+
+- **Kernel**: `triton_poi_fused_convolution_0` on **H200 SXM5** (CC 9.0)
+- **Baseline latency**: 6140 ns — **Best latency**: 4220 ns (**1.4550×** vs baseline)
+- **Iterations completed**: 1
+- **Outcome**: Best configuration **`autotune_tile_sizes_to_improve_occupancy_and_coalescing`** beats baseline latency.
+
+## Environment
+
+- **Device**: H200 SXM5, 132 SMs, 139.8 GB HBM
+- **Compute Capability**: 9.0
+- **Peak HBM Bandwidth**: 4800 GB/s
+- **CUDA**: 13.0 | **Torch**: 2.11.0+cu130 | **Triton**: 3.6.0
+
+## Baseline Kernel
+
+- **Name**: `triton_poi_fused_convolution_0`
+- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_089/kernel_0_triton_poi_fused_convolution_0/standalone.py`
+- **Framework**: triton
+- **Launch**: Block (128,1,1), Grid (1568,1,1), Waves/SM: 0.74
+- **Registers/thread**: 26
+- **Duration**: 6140 ns
+- **SM Throughput**: 16.77 % | **Memory**: 40.72 % | **DRAM**: 20.14 %
+- **Achieved Occupancy**: 56.18 %
+- **IPC Active**: 1.07 inst/cycle | **No Eligible**: 70.91 %
+
+## Iteration 1
+
+**Best so far**: 1.0× | **Memory items**: 3
+
+| Plan | Direction | Wall | NCU | Correctness | Kept? |
+|------|-----------|------|-----|-------------|-------|
+| B | autotune_tile_sizes_to_improve_occupancy_and_coalescing | 1.338× | 1.455× | ✓ | **✓ best** |
+| C | add_triton_autotune | 1.001× | 1.042× | ✓ |  |
+
+
+### Metric Comparison
+
+| Metric | Baseline | autotune_tile_siz... | Δ | add_triton_autotu... | Δ |
+|--------|----------|----------|-----|----------|-----|
+| Duration (ns) | 6140 ns | 4220 ns | -1920 ns (-31.3%) | 5890 ns | -250 ns (-4.1%) |
+| SM Throughput (%) | 16.77 % | 16.97 % | +0.20 pp | 17.13 % | +0.36 pp |
+| Memory Throughput (%) | 40.72 % | 27.31 % | -13.41 pp | 42.50 % | +1.78 pp |
+| DRAM Throughput (%) | 20.14 % | 14.66 % | -5.48 pp | 20.96 % | +0.82 pp |
+| Achieved Occupancy (%) | 56.18 % | 56.90 % | +0.72 pp | 55.20 % | -0.98 pp |
+| Registers/Thread | 26.00 register/thread | 21.00 register/thread | -5 | 26.00 register/thread | +0 |
+| Waves/SM | 0.74 | 0.74 | +0.00 | 0.74 | +0.00 |
+| No Eligible (%) | 70.91 % | 63.19 % | -7.72 pp | 70.78 % | -0.13 pp |
+| IPC Active | 1.07 inst/cycle | 1.38 inst/cycle | +0.31 | 1.13 inst/cycle | +0.06 |
+
+---
+
+## Cumulative Progress
+
+```
+Baseline:  6140 ns  (1.000×)
+Iter 1     4220 ns  (1.455×)  — autotune_tile_sizes_to_improve_occupancy_and_coalescing
+
+Final best: 4220 ns  (1.4550×)
+```
+
+
+## Best kernel vs baseline (diff)
+
+```diff
+--- baseline_kernel
+
++++ best_kernel
+
+@@ -5,6 +5,22 @@
+
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 8},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 256, 'YBLOCK': 4},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 512, 'YBLOCK': 2},  num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 16}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 16}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 256, 'YBLOCK': 8},  num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 32}, num_warps=8, num_stages=4),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_0(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+     ynumel = 30
+@@ -22,15 +38,13 @@
+
+     tmp0 = tl.load(in_ptr0 + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_last')
+     tl.store(out_ptr0 + (y0 + 3*x2 + 150528*y1), tmp0, xmask & ymask)
+ 
+-
+-
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+     arg_1 = inputs[1]
+     ynumel = 30
+     xnumel = 50176
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176)
+     return arg_1
+ 
+ def get_inputs():
+```
+
+## Config
+
+- T=1, N=2, K=2, TopK=4, ExpN=8
+- t_pos=1.04, t_neg=1.15
+- replay_mode=kernel
+- kernel_args: `—`

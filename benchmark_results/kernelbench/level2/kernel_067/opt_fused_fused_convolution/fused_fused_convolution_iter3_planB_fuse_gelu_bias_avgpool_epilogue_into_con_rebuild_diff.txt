@@ -1,0 +1,152 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,24 @@
+ from triton.language.extra import libdevice
+ 
+ # Conv kernel: implicit GEMM with NHWC layout
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        # Small tiles: low register pressure, high occupancy
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
++        # Medium tiles: balance between tile efficiency and occupancy
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
++        # Original large tiles retained for completeness
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+     ],
+     key=['BATCH', 'IN_C', 'IN_H', 'IN_W', 'OUT_C', 'OUT_H', 'OUT_W'],
+ )
+@@ -26,63 +36,92 @@
+     M_TOTAL,
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+ ):
++    # Parameter repurposing for fused epilogue:
++    #   Out_ptr      -> PartialSum_ptr [BATCH, OUT_C], zero-initialized float32
++    #   stride_on    -> Bias_ptr (integer address of bias tensor [OUT_C])
++    #   stride_oh    -> N_SPATIAL (= OUT_H * OUT_W, integer)
++    #   stride_ow, stride_oc are unused in fused mode
++
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+-    
++
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    
++
+     # Decode M -> (batch, out_h, out_w)
+     out_w = offs_m % OUT_W
+     tmp = offs_m // OUT_W
+     out_h = tmp % OUT_H
+     batch = tmp // OUT_H
+-    
++
++    TOTAL_K = IN_C * KERNEL_H * KERNEL_W
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    
+-    TOTAL_K = IN_C * KERNEL_H * KERNEL_W
+-    
++
+     for k_off in range(0, TOTAL_K, BLOCK_K):
+         offs_k = k_off + tl.arange(0, BLOCK_K)
+         # Decode K -> (in_c, kh, kw)
+         in_c = offs_k % IN_C
+         kw = (offs_k // IN_C) % KERNEL_W
+         kh = offs_k // (IN_C * KERNEL_W)
+-        
++
+         ih = out_h[:, None] + kh[None, :]  # no padding, stride=1
+         iw = out_w[:, None] + kw[None, :]
+-        
++
+         valid_m = offs_m < M_TOTAL
+         valid_k = offs_k < TOTAL_K
+         valid_x = valid_m[:, None] & valid_k[None, :] & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+-        
++
+         x_ptrs = X_ptr + batch[:, None] * stride_xn + ih * stride_xh + iw * stride_xw + in_c[None, :] * stride_xc
+         x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
+-        
++
+         valid_w = valid_k[:, None] & (offs_n[None, :] < OUT_C)
+         w_ptrs = W_ptr + offs_n[None, :] * stride_wco + in_c[:, None] * stride_wci + kh[:, None] * stride_wkh + kw[:, None] * stride_wkw
+         w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+-        
++
+         acc = tl.dot(x_tile, w_tile, acc=acc)
+-    
+-    # Store output in NCHW layout: [batch, out_c, out_h, out_w]
+-    valid_out = (offs_m[:, None] < M_TOTAL) & (offs_n[None, :] < OUT_C)
+-    out_ptrs = Out_ptr + batch[:, None] * stride_on + offs_n[None, :] * stride_oc + out_h[:, None] * stride_oh + out_w[:, None] * stride_ow
+-    tl.store(out_ptrs, acc.to(tl.float32), mask=valid_out)
+-
+-
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 64}, num_warps=2),
+-    ],
+-    key=['N_SPATIAL'],
+-)
++
++    # Fused epilogue: bias + GELU + partial sum accumulation for average pooling
++    # stride_on holds the integer address of the bias tensor
++    # stride_oh holds N_SPATIAL
++    Bias_ptr = stride_on.to(tl.pointer_type(tl.float32), bitcast=True)
++    N_SPATIAL = stride_oh
++
++    # Load bias for this tile's output channels
++    bias = tl.load(Bias_ptr + offs_n, mask=(offs_n < OUT_C), other=0.0)
++
++    # Add bias: acc [BLOCK_M, BLOCK_N], bias [BLOCK_N]
++    acc_biased = acc + bias[None, :]
++
++    # GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
++    gelu_vals = (acc_biased * 0.5) * (1.0 + libdevice.erf(acc_biased * 0.7071067811865476))
++
++    # Mask out invalid entries (out-of-bounds M or N)
++    valid_mask = (offs_m[:, None] < M_TOTAL) & (offs_n[None, :] < OUT_C)
++    gelu_vals = tl.where(valid_mask, gelu_vals, 0.0)
++
++    # Accumulate partial sums into Out_ptr [BATCH, OUT_C] via atomic_add
++    # Handle tiles that may span multiple batch indices
++    batch_first = batch[0]
++    batch_last = batch[BLOCK_M - 1]
++
++    if batch_first == batch_last:
++        # All rows belong to the same batch — simple reduction
++        partial = tl.sum(gelu_vals, axis=0)  # [BLOCK_N]
++        out_ptrs = Out_ptr + batch_first * OUT_C + offs_n
++        tl.atomic_add(out_ptrs, partial, mask=(offs_n < OUT_C))
++    else:
++        # Tile spans multiple batches — accumulate per batch
++        for b in tl.range(batch_first, batch_last + 1):
++            batch_mask = (batch == b)  # [BLOCK_M]
++            b_gelu = tl.where(batch_mask[:, None] & (offs_n[None, :] < OUT_C), gelu_vals, 0.0)
++            partial_b = tl.sum(b_gelu, axis=0)  # [BLOCK_N]
++            out_ptrs_b = Out_ptr + b * OUT_C + offs_n
++            tl.atomic_add(out_ptrs_b, partial_b, mask=(offs_n < OUT_C))
++
++
+ @triton.jit
++
+ def gelu_avgpool_kernel(
+     Conv_ptr, Bias_ptr, Out_ptr,
+     BATCH, OUT_C, N_SPATIAL,

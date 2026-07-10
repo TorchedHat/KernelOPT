@@ -1,0 +1,98 @@
+--- baseline
++++ rebuilt
+@@ -2,14 +2,17 @@
+ import triton
+ import triton.language as tl
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=4),
+-        triton.Config({'BLOCK_N': 512, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128}, num_warps=4, num_stages=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -22,53 +25,50 @@
+     BLOCK_N: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+ ):
+-    # Each program handles one row of X (one batch element)
+-    # Computes: sum_n(sigmoid(sum_k(X[m,k] * W[n,k]) + B[n]))
++    # ONE CTA per row, no BLOCK_M, no 2D accumulator, no tl.dot
+     row_m = tl.program_id(0)
+-    
+     if row_m >= M:
+         return
+-    
+-    # Accumulate the final sum over all output neurons
+-    total_sum = tl.zeros((), dtype=tl.float32)
+-    
+-    # We tile over the output dimension N
++
++    # Scalar accumulator for the sum over all output neurons
++    total_sum = tl.zeros([], dtype=tl.float32)
++
++    # Tile over the output dimension N
+     for n_start in tl.range(0, N, BLOCK_N):
+         n_offs = n_start + tl.arange(0, BLOCK_N)
+         n_mask = n_offs < N
+-        
+-        # Accumulate dot product for this block of output neurons
++
++        # 1D accumulator — no shared memory bank conflicts
+         acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+-        
++
+         for k_start in tl.range(0, K, BLOCK_K):
+             k_offs = k_start + tl.arange(0, BLOCK_K)
+             k_mask = k_offs < K
+-            
+-            # Load X[row_m, k_offs]: shape [BLOCK_K]
++
++            # Load single row of X: shape [BLOCK_K]
+             x_ptrs = X_ptr + row_m * stride_xm + k_offs * stride_xk
+             x_vals = tl.load(x_ptrs, mask=k_mask, other=0.0)  # [BLOCK_K]
+-            
++
+             # Load W[n_offs, k_offs]: shape [BLOCK_N, BLOCK_K]
+             w_ptrs = W_ptr + n_offs[:, None] * stride_wn + k_offs[None, :] * stride_wk
+             w_vals = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)  # [BLOCK_N, BLOCK_K]
+-            
+-            # acc[n] += sum_k(x[k] * w[n,k])
+-            acc += tl.sum(w_vals * x_vals[None, :], axis=1)
+-        
++
++            # Explicit element-wise dot product — no shared memory staging
++            acc += tl.sum(w_vals * x_vals[None, :], axis=1)  # [BLOCK_N]
++
+         # Add bias
+         b_vals = tl.load(B_ptr + n_offs, mask=n_mask, other=0.0)
+         acc += b_vals
+-        
++
+         # Apply sigmoid: 1 / (1 + exp(-x))
+         sig = 1.0 / (1.0 + tl.exp(-acc))
+-        
+-        # Mask and accumulate into total sum
++
++        # Mask out-of-bounds N and accumulate scalar sum
+         sig = tl.where(n_mask, sig, 0.0)
+         total_sum += tl.sum(sig, axis=0)
+-    
+-    # Store result
++
++    # Scalar store — one output element per CTA
+     tl.store(Out_ptr + row_m, total_sum)
+-
+ 
+ def kernel_function(weight, bias, x):
+     M, K = x.shape

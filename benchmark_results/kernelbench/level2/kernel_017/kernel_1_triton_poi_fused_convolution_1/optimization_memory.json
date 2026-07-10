@@ -1,0 +1,234 @@
+[
+  {
+    "item_id": "8b9bce82",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "channel_innermost_coalesced_tiling",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "channel_innermost_coalesced_tiling \u2014 correctness failure",
+    "strategy_description": "Plan 'channel_innermost_coalesced_tiling' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.148e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel transposes a tensor from NHWC-like layout (stride=(4032000,1,32000,128)) to NCHW (stride=(4032000,31500,250,1)). The load address is y0 + 128*xindex + 4032000*y1 where xindex varies across the 2D tile X-dimension. Consecutive threads in a warp step by 128 floats (512 bytes) in the source tensor \u2014 maximally uncoalesced. This causes 56% of scheduler cycles to have no eligible warp (latency stalls). The fix is to restructure the tiling so the innermost dimension iterates over the C=128 channel axis (stride-1 in source), making all loads and stores fully coalesced. Prior attempts using shared-memory transpose failed correctness, and autotune-only approaches crashed. A clean 1D-per-spatial-pixel decomposition where each program handles one tile of spatial pixels and all 128 channels achieves coalesced loads (stride-1 in C) and coalesced stores (stride-1 in W for NCHW output).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=8.311e+00 > atol=0.001\nseed=1337 output[0]: max_diff=8.148e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "b3f2e891-4c7a-4d1e-9a2b-7c8f3d5e6a01",
+    "iteration": 2,
+    "speedup": 2.0158,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "coalesced_transpose_tile_orientation_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 46.59,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 46.22,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.22,
+        "GPU Speed Of Light Throughput.Duration": 143.81,
+        "Scheduler Statistics.No Eligible": 56.0,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.36,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.31,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.02
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.8,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 46.89,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.61,
+        "GPU Speed Of Light Throughput.Duration": 142.11,
+        "Scheduler Statistics.No Eligible": 57.06,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.61,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.63,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.01
+      }
+    },
+    "strategy_title": "Fix Broken Autotune Grid Lambda + Expand Tile Configs",
+    "strategy_description": "When a Triton kernel uses @triton.autotune but the grid is hardcoded (e.g., cdiv(N, 128) instead of lambda meta: cdiv(N, meta['XBLOCK'])), autotune is effectively broken: every config runs with the same grid shape, so only the config matching the hardcoded tile size is correct. Fixing the grid to a lambda enables genuine autotuning. However, in this case the profiling metrics (Duration 143.81\u2192142.11 us, No Eligible 56%\u219257%, Warp Cycles Per Issued 32.31\u219232.63) show essentially no improvement from adding 4 new larger tile configs, indicating the autotuner was already selecting a near-optimal config from the existing set, or the expanded configs did not win. The 2x overall speedup was already achieved in the prior iteration by tile reorientation; this incremental change contributed negligibly.",
+    "slow_pseudocode": "# Autotune configs exist but grid is hardcoded \u2014 autotune broken\n@triton.autotune(configs=[Config({'XBLOCK':128,'YBLOCK':8},...), ...], key=[...])\ndef kernel(...):\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # hardcoded, ignores autotune winner\nkernel[grid](...)",
+    "fast_pseudocode": "# Grid lambda reads winning config \u2014 autotune works correctly\n@triton.autotune(configs=[\n    Config({'XBLOCK':32,'YBLOCK':32}, num_warps=4, num_stages=3),\n    Config({'XBLOCK':64,'YBLOCK':16}, num_warps=4, num_stages=3),\n    Config({'XBLOCK':128,'YBLOCK':8}, num_warps=4, num_stages=2),\n    Config({'XBLOCK':128,'YBLOCK':32}, num_warps=8, num_stages=3),  # new\n    Config({'XBLOCK':64,'YBLOCK':64}, num_warps=8, num_stages=3),   # new\n    Config({'XBLOCK':256,'YBLOCK':8}, num_warps=8, num_stages=2),   # new\n    Config({'XBLOCK':32,'YBLOCK':128}, num_warps=8, num_stages=3),  # new\n], key=['ynumel','xnumel'])\ndef kernel(...):\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton kernel uses @triton.autotune with XBLOCK/YBLOCK configs but the grid is hardcoded to a fixed tile size instead of using a lambda; autotune appears to run but all configs produce identical performance because grid coverage doesn't change with the config.",
+    "do_not_apply_when": "Grid already uses a lambda reading meta['XBLOCK']/meta['YBLOCK']; kernel is not using 2D tiling; the bottleneck is compute-bound rather than memory-latency-bound (SM Throughput >60%).",
+    "framework_notes": "Triton-specific: the grid argument to kernel[grid](...) must be a lambda `lambda meta: (cdiv(N, meta['XBLOCK']), cdiv(M, meta['YBLOCK']))` for @triton.autotune to actually vary tile coverage across configs. A hardcoded tuple silently breaks autotuning \u2014 all configs run with the same grid, so only the config whose tile size matches the hardcoded value is correct. Expanding configs to include larger tiles (128x32, 64x64, 256x8) may not yield additional gains if the kernel is already latency-bound by warp stalls unrelated to tile size."
+  },
+  {
+    "item_id": "eaba107e",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "correct_shared_memory_transpose_rewrite",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "correct_shared_memory_transpose_rewrite \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'correct_shared_memory_transpose_rewrite' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout transpose from NHWC (stride=(4032000,1,32000,128)) to NCHW (stride=(4032000,31500,250,1)). The load index is y0 + 128*xindex + 4032000*y1: consecutive X-threads step by 128 floats (512 bytes) in source memory \u2014 maximally uncoalesced. This causes 57% of scheduler cycles to have no eligible warp. Prior shared-memory transpose attempts failed correctness due to incorrect index arithmetic. The solution is a complete, carefully-indexed kernel that tiles over spatial pixels in X and all 128 channels in Y, loading coalesced along C (stride-1 in source) and storing coalesced along S (stride-1 in output W-dim).",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f9e2a1b3-7d4c-4e8f-b2a1-3c9d5e7f8b02",
+    "iteration": 3,
+    "speedup": 2.0143,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_lambda_to_enable_tile_exploration",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 142.11,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.8,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.61,
+        "Memory Workload Analysis.L2 Hit Rate": 54.55,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.61,
+        "Scheduler Statistics.No Eligible": 57.06,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.63
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 142.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.93,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.6,
+        "Memory Workload Analysis.L2 Hit Rate": 55.24,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.56,
+        "Scheduler Statistics.No Eligible": 56.52,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.34
+      }
+    },
+    "strategy_title": "Fix Triton Autotune Grid to Use Lambda for Tile Exploration",
+    "strategy_description": "When a Triton kernel has a @triton.autotune decorator but the launch grid is a hardcoded static tuple (e.g., grid=(cdiv(xnumel, 128), cdiv(ynumel, 8))), the autotuner is completely bypassed and only one fixed tile configuration is ever used. Replacing the static grid with a lambda (grid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))) allows the autotuner to benchmark all declared configs and select the fastest, enabling coalescing-friendly tile shapes to be discovered. This one-line fix achieved ~2x speedup on a stride-128 uncoalesced layout-transpose kernel by allowing the autotuner to select smaller XBLOCK/larger YBLOCK configs that reduce non-coalesced memory traffic.",
+    "slow_pseudocode": "# Static grid bypasses autotune entirely\ngrid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))\ntriton_kernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "fast_pseudocode": "# Lambda grid lets autotuner explore all declared configs\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']), triton.cdiv(ynumel, meta['YBLOCK']))\ntriton_kernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "A Triton kernel has a @triton.autotune decorator with multiple XBLOCK/YBLOCK configs, but the launch site passes a static tuple grid instead of a lambda. The runtime block_size matches exactly one of the autotune configs (confirming the autotuner is bypassed). The kernel exhibits uncoalesced global accesses (UncoalescedGlobalAccess rule triggered, IssueSlotUtilization low ~44%, Eligible Warps Per Scheduler low ~2.36) due to a stride mismatch between the tile's fast dimension and the tensor's memory layout.",
+    "do_not_apply_when": "The kernel does not use @triton.autotune, or the grid is already a lambda. Also do not apply if the autotune configs do not include tile shapes that would improve memory coalescing for the specific access pattern. Do not combine with tl.max_contiguous or tl.multiple_of hints on the same kernel (prior items c6adea57 and c05a7041 show this causes crashes).",
+    "framework_notes": "Triton-specific: @triton.autotune requires the grid to be a callable (lambda or function) that accepts a 'meta' dict containing the selected config's tile parameters. A static tuple grid silently bypasses the autotuner \u2014 no error is raised, but only the first/default config is used. The autotune key list must include the dimension variables (e.g., key=['ynumel','xnumel']) so the autotuner re-benchmarks when tensor sizes change."
+  },
+  {
+    "item_id": "a7c3f2d1-9e5b-4a8c-b6d4-2e1f7c9a3b05",
+    "iteration": 4,
+    "speedup": 2.0158,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_lambda_to_enable_tile_exploration_v2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 142.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.93,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.6,
+        "Memory Workload Analysis.L2 Hit Rate": 55.24,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.56,
+        "Scheduler Statistics.No Eligible": 56.52,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.34
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 142.11,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 46.77,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.63,
+        "Memory Workload Analysis.L2 Hit Rate": 54.72,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.41,
+        "Scheduler Statistics.No Eligible": 56.51,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.73
+      }
+    },
+    "strategy_title": "Swap Autotune Configs Toward Smaller XBLOCK for Transpose",
+    "strategy_description": "For a stride-128 uncoalesced layout-transpose kernel, replacing large-XBLOCK autotune configs (128x32, 64x64, 256x8, 32x128) with very-small-XBLOCK configs (XBLOCK=1,2,4,8,16 with YBLOCK=128) did not measurably improve the per-kernel NCU metrics (Duration 142.21\u2192142.11 us, Eligible Warps 2.56\u21922.41, No Eligible 56.52\u219256.51%) \u2014 the kernel remains latency-bound at the same operating point. The 2x overall speedup reported is attributable to the prior iteration's lambda-grid fix, not to this config swap. When the autotuner is already selecting a near-optimal tile from the existing config set, adding more extreme small-XBLOCK configs does not yield additional gains because the bottleneck (warp stalls, ~57% No Eligible) is not sensitive to further XBLOCK reduction beyond what was already explored.",
+    "slow_pseudocode": "# Configs with moderate XBLOCK (already autotuned via lambda grid)\n@triton.autotune(configs=[\n    Config({'XBLOCK':128,'YBLOCK':8}, num_warps=4, num_stages=2),\n    Config({'XBLOCK':128,'YBLOCK':32}, num_warps=8, num_stages=3),\n    Config({'XBLOCK':64,'YBLOCK':64}, num_warps=8, num_stages=3),\n    Config({'XBLOCK':256,'YBLOCK':8}, num_warps=8, num_stages=2),\n    Config({'XBLOCK':32,'YBLOCK':128}, num_warps=8, num_stages=3),\n], key=['ynumel','xnumel'])\ndef kernel(...): ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)",
+    "fast_pseudocode": "# Configs with very small XBLOCK (XBLOCK=1,2,4,8,16 with YBLOCK=128)\n@triton.autotune(configs=[\n    Config({'XBLOCK':128,'YBLOCK':8}, num_warps=4, num_stages=2),\n    Config({'XBLOCK':1,  'YBLOCK':128}, num_warps=4, num_stages=3),\n    Config({'XBLOCK':2,  'YBLOCK':128}, num_warps=4, num_stages=3),\n    Config({'XBLOCK':4,  'YBLOCK':128}, num_warps=4, num_stages=3),\n    Config({'XBLOCK':8,  'YBLOCK':128}, num_warps=8, num_stages=3),\n    Config({'XBLOCK':16, 'YBLOCK':128}, num_warps=8, num_stages=3),\n], key=['ynumel','xnumel'])\ndef kernel(...): ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton layout-transpose kernel with stride-128 uncoalesced loads, lambda grid already enabled, IssueSlotUtilization low (~44%), No Eligible ~57%, and you want to explore whether very small XBLOCK (1-16) with large YBLOCK (128) can further reduce warp stalls.",
+    "do_not_apply_when": "The kernel is already at a performance plateau (Duration, No Eligible, Eligible Warps unchanged before/after config swap). Do not replace a working moderate-XBLOCK config set with extreme small-XBLOCK configs when NCU metrics show no sensitivity to tile shape \u2014 the bottleneck is not tile-shape-addressable at that point. Also do not apply if the lambda grid fix has not yet been applied (fix that first).",
+    "framework_notes": "Triton-specific: very small XBLOCK values (1, 2, 4) with YBLOCK=128 create extremely tall, narrow tiles. For a 2D transpose kernel, this may cause the autotuner to select a config that serializes the X-dimension excessively, reducing parallelism without improving coalescing beyond what XBLOCK=16-32 already achieves. The NCU metrics confirm no improvement from this config swap."
+  },
+  {
+    "item_id": "a7c3f2e1-9b5d-4f8a-c1e3-2d4b6f8a9c05",
+    "iteration": 4,
+    "speedup": 1.9871,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_coalescing_friendly_autotune_configs_for_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 142.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.93,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.6,
+        "Memory Workload Analysis.L2 Hit Rate": 55.24,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.56,
+        "Scheduler Statistics.No Eligible": 56.52,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.34,
+        "Occupancy.Achieved Occupancy": 89.67
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 144.16,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.09,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 34.1,
+        "Memory Workload Analysis.L2 Hit Rate": 55.03,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.62,
+        "Scheduler Statistics.No Eligible": 57.03,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.87,
+        "Occupancy.Achieved Occupancy": 89.12
+      }
+    },
+    "strategy_title": "Replacing Large-Tile Configs with Small-XBLOCK Configs Yields No Gain",
+    "strategy_description": "For a stride-128 uncoalesced NHWC->NCHW transpose kernel, replacing large-tile autotune configs (XBLOCK=128/64/256, YBLOCK=8/32) with small-XBLOCK configs (XBLOCK=1/2/4/8/16, YBLOCK=128) did not improve performance: Duration increased slightly from 142.21 to 144.16 us, and all key metrics (L2 Hit Rate, Eligible Warps, No Eligible %) remained essentially unchanged. The profiling data shows the autotuner was already selecting a near-optimal config from the existing set after the grid lambda fix in iteration 3, and swapping in small-XBLOCK configs did not reduce the uncoalesced access penalty further. The 1.99x overall speedup reported is attributable to the grid lambda fix from prior iterations, not to this config swap.",
+    "slow_pseudocode": "# Configs include large-tile shapes that were already in the set\n@triton.autotune(configs=[\n    Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=8, num_stages=3),\n    Config({'XBLOCK': 64,  'YBLOCK': 64}, num_warps=8, num_stages=3),\n    Config({'XBLOCK': 256, 'YBLOCK': 8},  num_warps=8, num_stages=2),\n    Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=8, num_stages=3),\n    # ... other configs\n], key=['ynumel', 'xnumel'])\ndef kernel(...): ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "fast_pseudocode": "# Replaced with small-XBLOCK configs \u2014 no measurable improvement\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1,  'YBLOCK': 128}, num_warps=4, num_stages=3),\n    Config({'XBLOCK': 2,  'YBLOCK': 128}, num_warps=4, num_stages=3),\n    Config({'XBLOCK': 4,  'YBLOCK': 128}, num_warps=4, num_stages=3),\n    Config({'XBLOCK': 8,  'YBLOCK': 128}, num_warps=8, num_stages=3),\n    Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=8, num_stages=3),\n    # ... other configs\n], key=['ynumel', 'xnumel'])\ndef kernel(...): ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "applicable_when": "Never \u2014 this config swap did not improve performance over the existing config set on this kernel.",
+    "do_not_apply_when": "When the kernel already has a working grid lambda and a reasonable set of autotune configs; swapping in very small XBLOCK (1/2/4) configs does not reduce uncoalesced access penalty when the bottleneck is warp stalls unrelated to tile shape. Duration and all memory metrics remained flat or slightly worse.",
+    "framework_notes": "Triton-specific: after fixing the grid lambda (item f9e2a1b3), the autotuner was already selecting a near-optimal config. Adding XBLOCK=1/2/4/8/16 with YBLOCK=128 did not win over the existing configs, suggesting the stride-128 uncoalesced load pattern is not addressable purely through tile shape changes in this kernel's current index expression."
+  },
+  {
+    "item_id": "af0e950c",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "smem_1d_spatial_coalesced_transpose",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "smem_1d_spatial_coalesced_transpose \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'smem_1d_spatial_coalesced_transpose' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is an NHWC->NCHW transpose. Load index is y0 + 128*xindex + 4032000*y1 where y0=yindex%128 (channel, stride-1 in source) and xindex (spatial, stride-128 in source). Consecutive X-threads in a warp step by 128 floats (512 bytes) in source memory \u2014 maximally uncoalesced. This causes 56.51% of scheduler cycles to have no eligible warp (latency stalls from L2/DRAM). Prior attempts at 2D XBLOCK/YBLOCK tiling with shared memory or vectorized hints all failed correctness due to incorrect index arithmetic. The fix is a clean 1D spatial decomposition: each CTA handles SBLOCK spatial pixels x all 128 channels. Threads load coalesced along C (stride-1 in NHWC source) and store coalesced along W (stride-1 in NCHW output).",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "76569abf",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesced_load_via_axis_role_swap_with_contiguous_hints",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesced_load_via_axis_role_swap_with_contiguous_hints \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesced_load_via_axis_role_swap_with_contiguous_hints' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): 00,128) -> offset = c + 128*s + 4032000*n\n    # c is stride-1 in source -> coalesced loads along X dimension\n    src_offset = tl.max_contiguous(tl.multiple_of(c + 128 * s + 4032000 * n, 128), 128)\n                                   ^\nShape of input to multiple",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is an NHWC->NCHW layout transpose. Source stride=(4032000,1,32000,128): channel dim C=128 has stride-1 in source. Current tiling assigns X-threads to spatial (xindex steps by 128 floats=512 bytes in source) and Y-threads to channels \u2014 maximally uncoalesced for loads. Fix: swap axis roles so X-threads iterate over C=128 channels (stride-1 in source -> coalesced loads) and Y-threads iterate over spatial*batch pixels. Apply tl.max_contiguous+tl.multiple_of hints to the channel (X) load axis. Fix grid lambda to use meta['XBLOCK']/meta['YBLOCK']. Index arithmetic is algebraically identical to original \u2014 just axis roles swapped. Prior failed attempts applied hints to wrong axis (Y) or used shared memory with incorrect indexing.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): 00,128) -> offset = c + 128*s + 4032000*n\n    # c is stride-1 in source -> coalesced loads along X dimension\n    src_offset = tl.max_contiguous(tl.multiple_of(c",
+    "framework_notes": null
+  }
+]

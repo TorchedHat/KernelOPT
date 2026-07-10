@@ -1,0 +1,76 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,51 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 16, 'YBLOCK': 16}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 16, 'YBLOCK': 16}, num_warps=8, num_stages=2),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+-def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
++def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
+     ynumel = 4096
+     xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    pid_x = tl.program_id(0)
++    pid_y = tl.program_id(1)
++    x_base = pid_x * XBLOCK
++    y_base = pid_y * YBLOCK
+ 
++    tx = tl.arange(0, XBLOCK)
++    ty = tl.arange(0, YBLOCK)
+ 
++    # Shape: [YBLOCK, XBLOCK] — ty varies along rows (y), tx varies along cols (x)
++    x_idx = x_base + tx[None, :]   # shape [1, XBLOCK] broadcast -> [YBLOCK, XBLOCK]
++    y_idx = y_base + ty[:, None]   # shape [YBLOCK, 1] broadcast -> [YBLOCK, XBLOCK]
++
++    # Decompose y_idx for load address
++    y0 = y_idx % 128
++    y1 = y_idx // 128
++
++    # Load coalesced: consecutive threads in x_idx dimension read consecutive addresses
++    load_mask = (x_idx < xnumel) & (y_idx < ynumel)
++    src = tl.load(in_ptr0 + (y0 + 128 * x_idx + 4032000 * y1),
++                  mask=load_mask, other=0.0, eviction_policy='evict_last')
++
++    # Transpose in-register: shape [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK]
++    src_T = tl.trans(src)
++
++    # Build output indices after transpose (XBLOCK == YBLOCK for square tiles)
++    x_out = x_base + tx[:, None]   # shape [XBLOCK, 1] broadcast -> [XBLOCK, YBLOCK]
++    y_out = y_base + ty[None, :]   # shape [1, YBLOCK] broadcast -> [XBLOCK, YBLOCK]
++
++    # Store coalesced: consecutive threads in y_out dimension write consecutive addresses
++    store_mask = (x_out < xnumel) & (y_out < ynumel)
++    tl.store(out_ptr0 + (x_out + 31500 * y_out), src_T, mask=store_mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +57,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

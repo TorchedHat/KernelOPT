@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "28f6e8c3",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_contiguous_hints",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_contiguous_hints \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_contiguous_hints' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout-permutation (NCHW to NHWC-like) that reads contiguously from in_ptr0 (stride-1 in x) but writes with stride-3 in the C dimension (y0 + 3*x2), causing uncoalesced stores. NCU reports 23% excessive sectors and only 20/32 bytes utilized per store sector. The load path is contiguous in x (xindex stride-1) but the compiler cannot prove alignment/contiguity without explicit hints, preventing 128-bit vectorized loads. Adding tl.max_contiguous and tl.multiple_of hints on the load index allows the compiler to emit LDG.128 instructions, reducing L1TEX stall cycles (currently 14.9 cycles/warp, 49% of CPI). Additionally, increasing XBLOCK from 128 to 512 via autotune increases waves/SM from 0.74 toward 3.0+ and improves memory-level parallelism.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/run",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_autotune_block_size_wave_occupancy_001",
+    "iteration": 1,
+    "speedup": 1.4511,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_block_size_to_increase_waves_and_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Occupancy.Achieved Occupancy": 54.74,
+        "Scheduler Statistics.No Eligible": 71.5,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.92,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.29,
+        "GPU Speed Of Light Throughput.Duration": 6.08,
+        "Launch Statistics.Block Size": 128.0,
+        "Compute Workload Analysis.Issue Slots Busy": 29.31
+      },
+      "key_metric_after": {
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Occupancy.Achieved Occupancy": 68.26,
+        "Scheduler Statistics.No Eligible": 42.79,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.6,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.4,
+        "GPU Speed Of Light Throughput.Duration": 4.19,
+        "Launch Statistics.Block Size": 256.0,
+        "Compute Workload Analysis.Issue Slots Busy": 61.28
+      }
+    },
+    "strategy_title": "Autotune Block Size to Increase Wave Count and Occupancy",
+    "strategy_description": "When a Triton kernel shows fewer than 1.0 waves/SM (SOLBottleneck), low achieved occupancy (<60%), and high 'No Eligible' warp percentage (>60%), the block size is likely too small to saturate the GPU. Adding @triton.autotune with configs spanning a wide range of XBLOCK/YBLOCK values (e.g., 64\u20131024) and num_warps (4\u201316) allows the runtime to select the configuration that maximizes wave count and hides memory latency. In this case, doubling the block size from 128 to 256 (selected by autotuner) doubled waves/SM from 0.74 to 1.48, raised achieved occupancy from 54.7% to 68.3%, and cut warp cycles per issued instruction from 30.3 to 17.4, yielding a 1.45x speedup.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # fixed tile sizes, hardcoded at launch\n    ...\n\n# launch with fixed config\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 2}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 8}, num_warps=4, num_stages=3),\n        # ... more configs spanning XBLOCK in {64,128,256,512,1024} x YBLOCK in {1,2,4,8}\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # kernel body unchanged\n    ...\n\n# launch: autotuner injects XBLOCK/YBLOCK via meta\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel has waves/SM < 1.0 (SOLBottleneck rule triggered), achieved occupancy < 60%, 'No Eligible' warp % > 60%, and issue slots busy < 35%. The kernel uses 2D tiling (XBLOCK x YBLOCK) with fixed hardcoded launch parameters. Problem size is large enough that larger block sizes won't over-partition the grid.",
+    "do_not_apply_when": "Kernel already has waves/SM > 2.0 or achieved occupancy > 80%. Kernel body has register pressure that would be worsened by larger blocks. Grid is already large relative to SM count. Autotuning overhead is unacceptable (e.g., very short-lived kernels called once).",
+    "framework_notes": "Triton-specific: @triton.autotune must be placed immediately before @triton.jit. The grid lambda must use meta['XBLOCK'] and meta['YBLOCK'] instead of hardcoded values. XBLOCK/YBLOCK must NOT be passed explicitly at launch when autotuning \u2014 the autotuner injects them. num_stages in triton.Config controls software pipelining depth. Equivalent in CUDA: use __launch_bounds__ or grid-stride loops with different block sizes benchmarked via occupancy calculator."
+  }
+]

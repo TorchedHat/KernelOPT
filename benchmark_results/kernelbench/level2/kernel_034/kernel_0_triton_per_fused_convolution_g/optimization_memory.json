@@ -1,0 +1,200 @@
+[
+  {
+    "item_id": "exp_triton_reduce_register_pressure_xblock_autotune_001",
+    "iteration": 1,
+    "speedup": 25.4491,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_xblock_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 168.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 18.3,
+        "Occupancy.Block Limit Registers": 3.0,
+        "Scheduler Statistics.No Eligible": 35.32,
+        "GPU Speed Of Light Throughput.Duration": 717.41,
+        "Compute Workload Analysis.Issue Slots Busy": 64.89
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 23.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 87.28,
+        "Occupancy.Block Limit Registers": 21.0,
+        "Scheduler Statistics.No Eligible": 16.69,
+        "GPU Speed Of Light Throughput.Duration": 28.19,
+        "Compute Workload Analysis.Issue Slots Busy": 83.05
+      }
+    },
+    "strategy_title": "Autotune XBLOCK Down to Reduce Register Pressure",
+    "strategy_description": "When a Triton persistent-reduction kernel uses a 2D tile [XBLOCK, R_BLOCK] and XBLOCK is large (e.g. 128), the compiler must keep all R_BLOCK reduction-lane values live per XBLOCK row simultaneously, causing extreme register pressure (168 regs/thread here). This caps active blocks/SM at 3 (18.75% theoretical occupancy) and produces >35% scheduler 'No Eligible' stall rate. Adding @triton.autotune with small XBLOCK configs (1\u20138) collapses the tile to near-1D, cutting registers from 168 to 23/thread, raising theoretical occupancy from 18.75% to 100%, and reducing kernel duration by 25x.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    # XBLOCK=128 fixed at launch\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    r_index = tl.arange(0, R_BLOCK)[None, :]  # R_BLOCK=64\n    # 2D tile [128, 64] -> 168 regs/thread\n    data = tl.load(ptr + r_index + R_BLOCK * xindex, None)\n    reduced = tl.sum(tl.broadcast_to(data, [XBLOCK, R_BLOCK]), 1)[:, None]\n    tl.store(ptr + r_index + R_BLOCK * xindex, result, None)\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1}, num_warps=4),\n        triton.Config({'XBLOCK': 1}, num_warps=8),\n        triton.Config({'XBLOCK': 2}, num_warps=4),\n        triton.Config({'XBLOCK': 2}, num_warps=8),\n        triton.Config({'XBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 4}, num_warps=8),\n        triton.Config({'XBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 8}, num_warps=8),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel\n    r_index = tl.arange(0, R_BLOCK)[None, :]  # R_BLOCK unchanged=64\n    r_mask = r_index < r0_numel\n    # 2D tile [1-8, 64] -> 23 regs/thread\n    data = tl.load(ptr + r_index + R_BLOCK * xindex, xmask & r_mask)\n    reduced = tl.sum(tl.broadcast_to(data, [XBLOCK, R_BLOCK]), 1)[:, None]\n    tl.store(ptr + r_index + R_BLOCK * xindex, result, xmask & r_mask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # no XBLOCK kwarg; autotuner injects it",
+    "applicable_when": "Triton kernel with 2D [XBLOCK, R_BLOCK] tile pattern where XBLOCK >= 32 and registers_per_thread > 80; TheoreticalOccupancy NCU rule fires; Block Limit Registers << Block Limit Warps; theoretical occupancy < 25%; scheduler 'No Eligible' stall rate > 25%",
+    "do_not_apply_when": "XBLOCK is already small (1\u20138); register pressure is not the occupancy bottleneck (Block Limit Registers >= Block Limit Warps); kernel correctness requires a specific XBLOCK (e.g. tiled matmul where XBLOCK affects accumulator shape); R_BLOCK must be reduced instead of XBLOCK to fix the issue",
+    "framework_notes": "Triton-specific: @triton.autotune must be placed above @triton.jit. The grid must be a lambda using meta['XBLOCK'] so CTA count scales with the chosen config. R_BLOCK (the reduction dimension) must remain fixed to cover the full reduction in one pass for correctness (e.g. LayerNorm). Masks (xmask & r_mask) must be added to tl.load/tl.store when XBLOCK < original value to avoid out-of-bounds access."
+  },
+  {
+    "item_id": "exp_001_triton_xblock_register_pressure",
+    "iteration": 1,
+    "speedup": 25.2787,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_xblock_reduction",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 168.0,
+        "Occupancy.theoretical_occupancy_pct": 18.75,
+        "Occupancy.achieved_occupancy_pct": 18.3,
+        "Occupancy.block_limit_registers": 3.0,
+        "Scheduler.active_warps_per_scheduler": 2.91,
+        "GPU_SOL.duration_us": 717.41,
+        "GPU_SOL.compute_sm_throughput_pct": 64.43,
+        "Memory.l1_hit_rate_pct": 9.1,
+        "Launch.waves_per_sm": 82.75
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 23.0,
+        "Occupancy.theoretical_occupancy_pct": 100.0,
+        "Occupancy.achieved_occupancy_pct": 87.62,
+        "Occupancy.block_limit_registers": 21.0,
+        "Scheduler.active_warps_per_scheduler": 13.91,
+        "GPU_SOL.duration_us": 28.38,
+        "GPU_SOL.compute_sm_throughput_pct": 79.15,
+        "Memory.l1_hit_rate_pct": 86.53,
+        "Launch.waves_per_sm": 15.52
+      }
+    },
+    "strategy_title": "Shrink XBLOCK to Collapse 2D Register Tensors",
+    "strategy_description": "When a Triton kernel uses a large XBLOCK alongside a full R0_BLOCK reduction, intermediate 2D tensors of shape [XBLOCK, R0_BLOCK] all live simultaneously in registers, causing extreme register pressure (168 regs/thread) and catastrophically low occupancy (18.75%, Block Limit Registers=3). Reducing XBLOCK to 1 (or a small power of 2) collapses these 2D tensors to [1, R0_BLOCK] scalars, dropping register usage from 168 to 23 per thread and raising theoretical occupancy from 18.75% to 100%. This also dramatically improves L1 cache hit rate (9.1% \u2192 86.53%) because each program now reuses a small, cache-resident working set rather than scattering across a large register file.",
+    "slow_pseudocode": "# XBLOCK=128, R0_BLOCK=64 \u2192 2D intermediates [128, 64] live in registers\nXBLOCK = 128\ngrid = (xnumel // XBLOCK,)  # 32768 programs\nxindex = program_id * XBLOCK + arange(0, XBLOCK)[:, None]  # shape [128, 1]\nr0_index = arange(0, R0_BLOCK)[None, :]                    # shape [1, 64]\ntmp = load(ptr + r0_index + R0_BLOCK * xindex)             # shape [128, 64]\ntmp_bc = broadcast_to(tmp, [XBLOCK, R0_BLOCK])             # [128, 64] \u2014 register explosion\nrow_sum = sum(tmp_bc, axis=1)[:, None]                     # [128, 1]\n# ... many more [128, 64] intermediates ...\nstore(ptr + r0_index + R0_BLOCK * xindex, result)          # [128, 64]",
+    "fast_pseudocode": "# XBLOCK=1 (autotuned), R0_BLOCK=64 \u2192 2D intermediates collapse to [1, 64]\n@triton.autotune(configs=[Config({'XBLOCK': 1}), Config({'XBLOCK': 2}), Config({'XBLOCK': 4})], key=['xnumel'])\ngrid = (xnumel // XBLOCK,)  # up to 4194304 programs at XBLOCK=1\nxindex = program_id * XBLOCK + arange(0, XBLOCK)[:, None]  # shape [1, 1]\nr0_index = arange(0, R0_BLOCK)[None, :]                    # shape [1, 64]\nxmask = xindex < xnumel\ntmp = load(ptr + r0_index + R0_BLOCK * xindex, xmask)      # shape [1, 64]\ntmp_bc = broadcast_to(tmp, [XBLOCK, R0_BLOCK])             # [1, 64] \u2014 no explosion\nrow_sum = sum(tmp_bc, axis=1)[:, None]                     # [1, 1]\n# ... all intermediates remain [1, 64] ...\nstore(ptr + r0_index + R0_BLOCK * xindex, result, xmask)   # [1, 64]",
+    "applicable_when": "NCU reports TheoreticalOccupancy rule with Block Limit Registers << Block Limit Warps; registers_per_thread > 100; kernel has 2D intermediate tensors shaped [XBLOCK, R0_BLOCK] where R0_BLOCK covers the full reduction dimension; XBLOCK is large (\u226532) relative to the reduction size.",
+    "do_not_apply_when": "XBLOCK=1 causes excessive kernel launch overhead (grid >> 10M programs on small tensors); when register pressure is not the occupancy limiter (Block Limit Registers \u2248 Block Limit Warps); when the reduction dimension is much larger than XBLOCK making per-row granularity wasteful; when memory bandwidth (not occupancy) is the bottleneck.",
+    "framework_notes": "Triton-specific: XBLOCK is a tl.constexpr controlling how many x-dimension elements each program handles. Setting XBLOCK=1 makes each program handle exactly one row of the reduction. Use @triton.autotune with XBLOCK in {1, 2, 4} to find the sweet spot. Also add xmask = xindex < xnumel guards on all loads/stores when XBLOCK > 1 to handle boundary cases. In CUDA, the equivalent is reducing the number of elements processed per thread block in the non-reduction dimension (e.g., using __launch_bounds__ or splitting the grid)."
+  },
+  {
+    "item_id": "exp_triton_expand_xblock_autotune_configs_with_grid_lambda_002",
+    "iteration": 2,
+    "speedup": 7.6207,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_xblock_autotune_configs_with_grid_lambda",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 70.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 40.94,
+        "Occupancy.Block Limit Registers": 14.0,
+        "Scheduler Statistics.No Eligible": 21.61,
+        "GPU Speed Of Light Throughput.Duration": 94.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.51,
+        "Launch.Waves Per SM": 17.73,
+        "Launch.Block Size": 64.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 23.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 87.28,
+        "Occupancy.Block Limit Registers": 21.0,
+        "Scheduler Statistics.No Eligible": 16.69,
+        "GPU Speed Of Light Throughput.Duration": 28.19,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.6,
+        "Launch.Waves Per SM": 15.52,
+        "Launch.Block Size": 128.0
+      }
+    },
+    "strategy_title": "Expand Autotune XBLOCK Configs and Fix Grid Lambda",
+    "strategy_description": "When a Triton per-reduction kernel's @triton.autotune config set is limited to small XBLOCK values (16\u201364) and the grid is hardcoded to a fixed constant rather than a lambda over meta['XBLOCK'], the autotuner cannot explore larger tile sizes that may reduce register pressure further and improve occupancy. Replacing the hardcoded grid with `lambda meta: (cdiv(xnumel, meta['XBLOCK']),)` and expanding configs to include XBLOCK in {128, 256} with num_warps in {8, 16} allows the autotuner to find configurations that drop registers/thread from 70 to 23, raise theoretical occupancy from 43.75% to 100%, and reduce kernel duration by ~3.3x. The grid lambda fix is also a correctness requirement: a hardcoded grid constant causes under-processing of elements when the winning XBLOCK differs from the hardcoded value.",
+    "slow_pseudocode": "# Grid hardcoded to constant, XBLOCK configs limited to 16-64\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 16}, num_warps=2, num_stages=1),\n    triton.Config({'XBLOCK': 32}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 64}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 32}, num_warps=8, num_stages=1),\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel\n    r_index = tl.arange(0, R_BLOCK)[None, :]\n    r_mask = r_index < r_numel\n    data = tl.load(ptr + r_index + R_BLOCK * xindex, xmask & r_mask)\n    # ... reduction compute ...\n    tl.store(ptr + r_index + R_BLOCK * xindex, result, xmask & r_mask)\n\ngrid = (cdiv(xnumel, 128),)  # BUG: hardcoded, ignores winning XBLOCK\nkernel[grid](...)",
+    "fast_pseudocode": "# Grid is lambda, XBLOCK configs expanded to 16-256 with higher num_warps\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 16},  num_warps=2,  num_stages=1),\n    triton.Config({'XBLOCK': 32},  num_warps=4,  num_stages=1),\n    triton.Config({'XBLOCK': 64},  num_warps=4,  num_stages=1),\n    triton.Config({'XBLOCK': 32},  num_warps=8,  num_stages=1),\n    triton.Config({'XBLOCK': 64},  num_warps=8,  num_stages=1),\n    triton.Config({'XBLOCK': 128}, num_warps=8,  num_stages=1),\n    triton.Config({'XBLOCK': 128}, num_warps=16, num_stages=1),\n    triton.Config({'XBLOCK': 256}, num_warps=8,  num_stages=1),\n    triton.Config({'XBLOCK': 256}, num_warps=16, num_stages=1),\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    xmask = (xindex < xnumel)\n    r_index = tl.arange(0, R_BLOCK)[None, :]\n    r_mask = (r_index < r_numel)\n    data = tl.load(ptr + r_index + R_BLOCK * xindex, xmask & r_mask, other=0.0)\n    # ... same reduction compute ...\n    tl.store(ptr + r_index + R_BLOCK * xindex, result, xmask & r_mask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)  # FIXED: scales with winning config\nkernel[grid](...)",
+    "applicable_when": "Triton per-reduction kernel already has @triton.autotune with small XBLOCK configs (\u226464) but the grid is hardcoded to a constant; TheoreticalOccupancy NCU rule fires with high speedup estimate; registers_per_thread is still elevated (>40) after initial XBLOCK reduction; Block Limit Registers is still the binding occupancy constraint; scheduler 'No Eligible' stall rate >15%.",
+    "do_not_apply_when": "The grid is already a lambda over meta['XBLOCK'] and configs already include large XBLOCK values; register pressure is not the occupancy bottleneck; XBLOCK=1 already achieves near-100% theoretical occupancy; the kernel has correctness constraints requiring a specific XBLOCK value.",
+    "framework_notes": "Triton-specific: the grid MUST be a lambda `lambda meta: (cdiv(xnumel, meta['XBLOCK']),)` rather than a precomputed tuple when using @triton.autotune with variable XBLOCK \u2014 a hardcoded grid constant is a correctness bug when the winning XBLOCK differs from the constant. The restore_value=[...] parameter in @triton.autotune is required for in-place output tensors to prevent data corruption across autotuning warmup runs. In CUDA, the equivalent of expanding configs is adding more __launch_bounds__ variants or using a tuning harness."
+  },
+  {
+    "item_id": "exp_triton_expand_num_warps_num_stages_autotune_003",
+    "iteration": 3,
+    "speedup": 30.8829,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_num_warps_and_num_stages_for_latency_bound_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 23.26,
+        "Occupancy.Achieved Occupancy": 44.54,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Scheduler Statistics.No Eligible": 44.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.1,
+        "Scheduler Statistics.Active Warps Per Scheduler": 7.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.64,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 22.0,
+        "Instruction Statistics.Executed Instructions": 8650752.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 23.23,
+        "Occupancy.Achieved Occupancy": 44.13,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Scheduler Statistics.No Eligible": 44.34,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.09,
+        "Scheduler Statistics.Active Warps Per Scheduler": 7.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.67,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 22.0,
+        "Instruction Statistics.Executed Instructions": 8650752.0
+      }
+    },
+    "strategy_title": "Expanding num_warps/num_stages Autotune Configs Yields Marginal Gain",
+    "strategy_description": "When a Triton kernel is already latency-bound (MIO + L1TEX scoreboard stalls ~60% of cycles, No Eligible ~44%) with low register pressure (22 regs/thread) and the autotuner has already selected a small block size (64 threads = 2 warps), adding higher num_warps (16) and num_stages (2) configs to the autotune search space produces only a marginal improvement (~0.03us, <0.2% duration reduction). The profiling metrics are nearly identical before and after: No Eligible dropped only from 44.65% to 44.34%, achieved occupancy from 44.54% to 44.13%, and the winning config remained block_size=64. This suggests the autotuner already found the optimal warp count in the prior iteration, and the latency bottleneck (MIO stalls from MUFU special math like rsqrt/erf) cannot be hidden by more warps alone when the eligible warp pool is already saturated at the current block granularity.",
+    "slow_pseudocode": "# 9 configs: XBLOCK in {1,2,4} x num_warps in {2,4,8}, no num_stages\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1}, num_warps=2),\n        triton.Config({'XBLOCK': 1}, num_warps=4),\n        triton.Config({'XBLOCK': 1}, num_warps=8),\n        triton.Config({'XBLOCK': 2}, num_warps=2),\n        # ... etc\n    ],\n    key=['xnumel'],\n    restore_value=['in_out_ptr0'],\n)\n# grid hardcoded: (cdiv(xnumel, 128),)  <- correctness bug",
+    "fast_pseudocode": "# 15 configs: XBLOCK in {1,2,4} x num_warps in {2,4,8,16} + num_stages in {1,2}\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1}, num_warps=2,  num_stages=1),\n        triton.Config({'XBLOCK': 1}, num_warps=16, num_stages=1),\n        triton.Config({'XBLOCK': 1}, num_warps=2,  num_stages=2),\n        triton.Config({'XBLOCK': 1}, num_warps=16, num_stages=2),\n        # ... etc\n    ],\n    key=['xnumel'],\n    restore_value=['in_out_ptr0'],\n)\n# grid fixed: lambda meta: (cdiv(xnumel, meta['XBLOCK']),)",
+    "applicable_when": "Triton kernel is latency-bound (MIO + L1TEX scoreboard stalls >50% combined, No Eligible >40%) with low register pressure (<30 regs/thread); prior autotune already explored num_warps in {2,4,8} and selected a small block size; adding num_warps=16 and num_stages=2 extends the search space at minimal cost.",
+    "do_not_apply_when": "The autotuner has already explored num_warps up to 8 and selected num_warps=2 as the winner \u2014 this is a strong signal that the bottleneck is not warp-count-limited and adding num_warps=16 will not help; when MIO stalls are from MUFU (rsqrt/erf) which are fixed-latency and cannot be pipelined away by num_stages; when the speedup budget is limited and autotune search time is costly.",
+    "framework_notes": "Triton-specific: num_stages controls software pipelining depth for global memory loads; it is most effective when the bottleneck is L1TEX latency from sequential load\u2192compute chains, not MUFU special math (rsqrt, erf) which are MIO-bound. When the autotuner already prefers num_warps=2 over num_warps=8, it indicates cache locality (fewer warps = better L1 reuse) outweighs latency hiding \u2014 adding num_warps=16 is unlikely to win. The grid lambda fix (lambda meta: (cdiv(xnumel, meta['XBLOCK']),)) is a correctness improvement regardless of performance outcome."
+  },
+  {
+    "item_id": "exp_triton_num_stages_pipelining_with_static_r0_mask_003",
+    "iteration": 3,
+    "speedup": 30.7901,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "num_stages_pipelining_with_static_r0_mask",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 23.26,
+        "Occupancy.Achieved Occupancy": 44.54,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Scheduler Statistics.No Eligible": 44.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.64,
+        "Instruction Statistics.Executed Instructions": 8650752.0,
+        "Launch.Registers Per Thread": 22.0,
+        "Memory Workload Analysis.Memory Throughput": 360.8
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 23.3,
+        "Occupancy.Achieved Occupancy": 43.7,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Scheduler Statistics.No Eligible": 46.83,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.39,
+        "Instruction Statistics.Executed Instructions": 8323072.0,
+        "Launch.Registers Per Thread": 22.0,
+        "Memory Workload Analysis.Memory Throughput": 360.3
+      }
+    },
+    "strategy_title": "Adding num_stages and Static r0_mask Yields Marginal Change",
+    "strategy_description": "When a Triton per-reduction kernel already has low register pressure (22 regs/thread) and near-100% theoretical occupancy, adding num_stages=2 to autotune configs and replacing a dynamic r0_mask with a static one produces negligible kernel-level change: duration moved from 23.26us to 23.30us, executed instructions dropped slightly (8.65M to 8.32M), but scheduler 'No Eligible' stall rate worsened (44.65% to 46.83%) and eligible warps per scheduler fell (1.1 to 0.96). The 30x reported speedup is attributable to the cumulative effect of prior iterations (XBLOCK reduction), not this specific change. When the kernel is already register-pressure-free and occupancy-limited by latency stalls (MIO + L1TEX scoreboard stalls ~60% of cycles), adding num_stages and static masks does not address the root bottleneck.",
+    "slow_pseudocode": "# Before: dynamic r0_mask, autotune configs without num_stages\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1}, num_warps=2),\n    triton.Config({'XBLOCK': 2}, num_warps=4),\n    triton.Config({'XBLOCK': 4}, num_warps=8),\n], key=['xnumel'], restore_value=['in_out_ptr0'])\n@triton.jit\ndef kernel(...):\n    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]  # static already\n    tmp0 = tl.load(ptr + r0_3 + 64*x4, xmask, eviction_policy='evict_first')\n    tl.store(ptr + r0_3 + 64*x4, result, xmask)",
+    "fast_pseudocode": "# After: dynamic r0_mask added back, num_stages in {1,2} added to configs\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1},  num_warps=2, num_stages=1),\n    triton.Config({'XBLOCK': 2},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 4},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 8},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 16}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 32}, num_warps=8, num_stages=2),\n    triton.Config({'XBLOCK': 64}, num_warps=8, num_stages=2),\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])\n@triton.jit\ndef kernel(...):\n    r0_mask = (r0_index < r0_numel)  # dynamic mask re-introduced\n    tmp0 = tl.load(ptr + r0_3 + 64*x4, xmask & r0_mask, other=0.0)\n    tl.store(ptr + r0_3 + 64*x4, result, xmask & r0_mask)",
+    "applicable_when": "Kernel already has low register pressure (< 30 regs/thread) and near-100% theoretical occupancy; bottleneck is MIO/L1TEX scoreboard stalls (CPIStall rules firing at >30% each); num_stages=2 has not yet been explored in the autotune config set.",
+    "do_not_apply_when": "Register pressure is still the occupancy bottleneck (Block Limit Registers << Block Limit Warps); the kernel is already latency-bound by MIO stalls that num_stages cannot hide (shared memory bank conflicts or special math instructions); the r0_mask was already static (tl.full True) in the slow version \u2014 re-introducing a dynamic mask is a regression.",
+    "framework_notes": "Triton-specific: num_stages controls software pipelining depth in the Triton compiler. Adding num_stages=2 is most effective when HBM latency is the dominant stall and the kernel has sufficient arithmetic to overlap with memory. When MIO stalls dominate (shared memory or special math), num_stages does not help. Note: in this case the 'before' kernel already had a static r0_mask (tl.full True), and the 'after' kernel re-introduced a dynamic r0_mask \u2014 this is a regression in mask computation, not an improvement."
+  }
+]

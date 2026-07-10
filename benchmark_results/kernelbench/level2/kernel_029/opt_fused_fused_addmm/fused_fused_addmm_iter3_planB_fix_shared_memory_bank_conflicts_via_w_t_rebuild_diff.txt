@@ -1,0 +1,98 @@
+--- baseline
++++ rebuilt
+@@ -4,16 +4,25 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        # GROUP_M=8 configs (original best performers)
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        # GROUP_M=4 variants
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=4, num_warps=4),
++        # GROUP_M=16 variants
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=4, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -45,8 +54,9 @@
+ 
+     # Pointers
+     X_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+-    # W is stored as (N, K) i.e. weight matrix, we access W[n, k]
+-    W_ptrs = W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
++    # W is stored as (N, K): load as (BLOCK_N, BLOCK_K) so K is contiguous (conflict-free),
++    # then use tl.trans() before tl.dot to get correct (BLOCK_K, BLOCK_N) layout
++    W_ptrs = W_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+ 
+     # Accumulate
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+@@ -58,21 +68,30 @@
+         x_tile = tl.load(
+             X_ptrs,
+             mask=(offs_m[:, None] < M) & (mask_k[None, :]),
+-            other=0.0
++            other=0.0,
++            eviction_policy='evict_first'  # streaming: each X tile used once per CTA
+         )
++        # Load W as (BLOCK_N, BLOCK_K) — K is inner/contiguous, no bank conflicts
+         w_tile = tl.load(
+             W_ptrs,
+-            mask=(mask_k[:, None]) & (offs_n[None, :] < N),
+-            other=0.0
++            mask=(offs_n[:, None] < N) & (mask_k[None, :]),
++            other=0.0,
++            eviction_policy='evict_first'  # streaming: each W tile used once per CTA
+         )
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++        # tl.trans(w_tile) converts (BLOCK_N, BLOCK_K) -> (BLOCK_K, BLOCK_N) for dot
++        acc = tl.dot(x_tile, tl.trans(w_tile), acc, allow_tf32=False)
+ 
+         X_ptrs += BLOCK_K * stride_xk
+         W_ptrs += BLOCK_K * stride_wk
+ 
+     # Add bias
+-    bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
++    bias = tl.load(
++        B_ptr + offs_n,
++        mask=offs_n < N,
++        other=0.0,
++        eviction_policy='evict_last'  # bias reused across all M-dim CTAs sharing same N column
++    )
+     acc = acc + bias[None, :]
+ 
+     # Apply mish: x * tanh(softplus(x))
+@@ -98,8 +117,12 @@
+     # Store result
+     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     Y_ptrs = Y_ptr + offs_m[:, None] * N + offs_n[None, :]
+-    tl.store(Y_ptrs, mish2.to(tl.float32), mask=out_mask)
+-
++    tl.store(
++        Y_ptrs,
++        mish2.to(tl.float32),
++        mask=out_mask,
++        eviction_policy='evict_first'  # output written once, no reuse
++    )
+ 
+ def kernel_function(p_linear_weight, p_linear_bias, x):
+     M, K = x.shape

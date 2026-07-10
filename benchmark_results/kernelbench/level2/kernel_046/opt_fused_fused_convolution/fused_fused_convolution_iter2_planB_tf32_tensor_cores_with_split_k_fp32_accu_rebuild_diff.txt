@@ -1,0 +1,62 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,17 @@
+ import triton.language as tl
+ from triton.language.extra import libdevice
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 16}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 128}, num_stages=3, num_warps=4),
+     ],
+     key=['BATCH', 'IN_C', 'OUT_C', 'OUT_H', 'OUT_W'],
+ )
+@@ -50,10 +53,10 @@
+         k_off = k_idx * BLOCK_K
+         offs_k = k_off + tl.arange(0, BLOCK_K)
+         
+-        # Decode K -> (in_c, kh, kw)
+-        in_c = offs_k % IN_C
+-        kh = (offs_k // IN_C) % KH
+-        kw = offs_k // (IN_C * KH)
++        # Decode K -> (kw, kh, in_c): kw fastest-changing to match weight layout (OUT_C, IN_C, KH, KW)
++        kw = offs_k % KW
++        kh = (offs_k // KW) % KH
++        in_c = offs_k // (KH * KW)
+         
+         # Input coordinates
+         ih = out_h[:, None] + kh[None, :]  # no padding, stride=1
+@@ -70,7 +73,11 @@
+         w_ptrs = W_ptr + offs_n[None, :] * stride_wco + in_c[:, None] * stride_wci + kh[:, None] * stride_wkh + kw[:, None] * stride_wkw
+         w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+         
+-        acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=False)
++        # KEY CHANGE: fresh zero internal acc per sub-tile, add FP32 partial externally.
++        # tl.dot without acc= argument initializes accumulator to zero internally.
++        # TF32 error is bounded to BLOCK_K elements per sub-group, not total K=576.
++        partial = tl.dot(x_tile, w_tile, allow_tf32=True)  # returns FP32, TF32 error bounded to BLOCK_K elements
++        acc = acc + partial  # FP32 addition outside dot keeps running sum in full FP32
+     
+     # Add bias
+     bias = tl.load(B_ptr + offs_n, mask=offs_n < OUT_C, other=0.0)
+@@ -97,6 +104,7 @@
+     key=['N_TOTAL'],
+ )
+ @triton.jit
++
+ def avgpool2d_kernel(
+     IN_ptr, OUT_ptr,
+     BATCH: tl.constexpr, C: tl.constexpr,

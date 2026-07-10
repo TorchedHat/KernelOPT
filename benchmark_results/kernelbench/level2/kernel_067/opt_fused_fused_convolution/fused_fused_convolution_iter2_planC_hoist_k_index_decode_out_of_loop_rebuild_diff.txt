@@ -1,0 +1,94 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,24 @@
+ from triton.language.extra import libdevice
+ 
+ # Conv kernel: implicit GEMM with NHWC layout
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        # Small tiles: low register pressure, high occupancy
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
++        # Medium tiles: balance between tile efficiency and occupancy
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
++        # Original large tiles retained for completeness
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+     ],
+     key=['BATCH', 'IN_C', 'IN_H', 'IN_W', 'OUT_C', 'OUT_H', 'OUT_W'],
+ )
+@@ -28,43 +38,43 @@
+ ):
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+-    
++
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    
++
+     # Decode M -> (batch, out_h, out_w)
+     out_w = offs_m % OUT_W
+     tmp = offs_m // OUT_W
+     out_h = tmp % OUT_H
+     batch = tmp // OUT_H
+-    
++
++    TOTAL_K = IN_C * KERNEL_H * KERNEL_W
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    
+-    TOTAL_K = IN_C * KERNEL_H * KERNEL_W
+-    
++
+     for k_off in range(0, TOTAL_K, BLOCK_K):
+         offs_k = k_off + tl.arange(0, BLOCK_K)
+         # Decode K -> (in_c, kh, kw)
+         in_c = offs_k % IN_C
+         kw = (offs_k // IN_C) % KERNEL_W
+         kh = offs_k // (IN_C * KERNEL_W)
+-        
++
+         ih = out_h[:, None] + kh[None, :]  # no padding, stride=1
+         iw = out_w[:, None] + kw[None, :]
+-        
++
+         valid_m = offs_m < M_TOTAL
+         valid_k = offs_k < TOTAL_K
+         valid_x = valid_m[:, None] & valid_k[None, :] & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+-        
++
+         x_ptrs = X_ptr + batch[:, None] * stride_xn + ih * stride_xh + iw * stride_xw + in_c[None, :] * stride_xc
+         x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
+-        
++
+         valid_w = valid_k[:, None] & (offs_n[None, :] < OUT_C)
+         w_ptrs = W_ptr + offs_n[None, :] * stride_wco + in_c[:, None] * stride_wci + kh[:, None] * stride_wkh + kw[:, None] * stride_wkw
+         w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+-        
++
+         acc = tl.dot(x_tile, w_tile, acc=acc)
+-    
++
+     # Store output in NCHW layout: [batch, out_c, out_h, out_w]
+     valid_out = (offs_m[:, None] < M_TOTAL) & (offs_n[None, :] < OUT_C)
+     out_ptrs = Out_ptr + batch[:, None] * stride_on + offs_n[None, :] * stride_oc + out_h[:, None] * stride_oh + out_w[:, None] * stride_ow
+@@ -83,6 +93,7 @@
+     key=['N_SPATIAL'],
+ )
+ @triton.jit
++
+ def gelu_avgpool_kernel(
+     Conv_ptr, Bias_ptr, Out_ptr,
+     BATCH, OUT_C, N_SPATIAL,

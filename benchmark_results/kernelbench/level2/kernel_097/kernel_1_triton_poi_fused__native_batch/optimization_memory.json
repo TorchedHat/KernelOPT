@@ -1,0 +1,191 @@
+[
+  {
+    "item_id": "6d2343c3",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_xblock_for_vectorized_loads_and_better_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_xblock_for_vectorized_loads_and_better_occupancy \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_xblock_for_vectorized_loads_and_better_occupancy' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in comp",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a pure pointwise fused op (batch-norm + add + sigmoid + SiLU) over 8,388,608 FP32 elements. With XBLOCK=128, each CTA processes only 128 elements, generating 65,536 CTAs. This causes: (1) L1TEX scoreboard stalls (38.7% of cycles) because each warp has too few in-flight loads to hide latency; (2) achieved occupancy of only 67.7% due to warp scheduling overhead at this granularity; (3) near-but-not-fully vectorized accesses (30.9/32 bytes/sector). Increasing XBLOCK to 1024 gives Triton's compiler the opportunity to emit 128-bit (float4) vectorized loads for the large in_out_ptr0 tensor, reduces grid size 8x (65536 to 8192 CTAs), and allows each warp to issue more independent loads to hide L1TEX latency. The 5 broadcast vectors (in_ptr1 to in_ptr5, each 8192 elements) will be reused across the 1024-element tile, improving L1 cache hit rate. Register pressure stays low (22 regs/thread currently, well within the 21-block limit).",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_xblock_register_spill_regression_001",
+    "iteration": 1,
+    "speedup": 0.0654,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune_for_better_occupancy_and_cache_reuse",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 22.0,
+        "Launch.block_size": 128.0,
+        "Launch.waves_per_sm": 31.03,
+        "Occupancy.Achieved_Occupancy_pct": 67.69,
+        "Occupancy.Theoretical_Occupancy_pct": 100.0,
+        "GPU_Speed_Of_Light.Duration_us": 43.23,
+        "GPU_Speed_Of_Light.Compute_SM_Throughput_pct": 71.8,
+        "Memory_Workload.Memory_Throughput_GBs": 944.54,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 14.32,
+        "Instruction_Statistics.Executed_Instructions": 24379392.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 64.0,
+        "Launch.block_size": 512.0,
+        "Launch.waves_per_sm": 248.24,
+        "Occupancy.Achieved_Occupancy_pct": 45.44,
+        "Occupancy.Theoretical_Occupancy_pct": 50.0,
+        "GPU_Speed_Of_Light.Duration_us": 661.06,
+        "GPU_Speed_Of_Light.Compute_SM_Throughput_pct": 89.42,
+        "Memory_Workload.Memory_Throughput_GBs": 61.45,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 8.06,
+        "Instruction_Statistics.Executed_Instructions": 467730432.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK increase causes register spill and 15x regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs caused the compiler to select a 512-thread block configuration that tripled register usage per thread (22 \u2192 64), cutting theoretical occupancy from 100% to 50% and achieved occupancy from 67.7% to 45.4%. The instruction count exploded 19x (24M \u2192 468M executed instructions) while memory throughput collapsed from 945 GB/s to 61 GB/s, indicating the autotune selected a configuration that caused massive register pressure and likely instruction bloat from predicated/masked loads introduced by the xmask change. The kernel duration increased 15x (43 \u00b5s \u2192 661 \u00b5s). The root cause is that introducing xmask (replacing tl.full([XBLOCK], True) with xindex < xnumel) combined with autotune's larger block sizes caused the compiler to generate far more instructions and spill registers, overwhelming any cache-reuse benefit.",
+    "slow_pseudocode": "# AFTER (regressed) - autotune with xmask\n@triton.autotune(configs=[Config({'XBLOCK': 4096}, num_warps=16), ..., Config({'XBLOCK': 128}, num_warps=4)], key=['xnumel'])\n@triton.jit\ndef kernel(..., xnumel, XBLOCK: tl.constexpr):\n    xmask = xindex < xnumel  # introduced mask\n    tmp0 = tl.load(ptr + x0, xmask, eviction_policy='evict_last')  # masked loads\n    ...\n    tl.store(out + x2, result, xmask)  # masked store\n\ngrid = (triton.cdiv(xnumel, 128),)  # grid not updated to use META['XBLOCK']\nkernel[grid](..., xnumel)  # autotune picks 512-thread block",
+    "fast_pseudocode": "# BEFORE (baseline) - fixed XBLOCK=128, no mask\n@triton.jit\ndef kernel(..., xnumel, XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no mask needed, xnumel divisible\n    tmp0 = tl.load(ptr + x0, None, eviction_policy='evict_last')  # unmasked loads\n    ...\n    tl.store(out + x2, result, None)  # unmasked store\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., xnumel, XBLOCK=128)",
+    "applicable_when": "Never - this is a negative result. Do not apply autotune with larger XBLOCK when the kernel already has low register usage (\u226422 regs/thread) and the xnumel is exactly divisible by the current XBLOCK (making masks unnecessary).",
+    "do_not_apply_when": "Do not add @triton.autotune with larger XBLOCK configs when: (1) current register count is low (\u226424 regs/thread) and larger blocks would cause register pressure; (2) xnumel is exactly divisible by current XBLOCK making xmask unnecessary \u2014 adding xmask introduces predication overhead; (3) the grid is not updated to a lambda using META['XBLOCK'] (fixed grid with autotune causes incorrect element coverage). Also avoid when the kernel is already compute-bound (Compute SM Throughput >70%) rather than memory-latency-bound.",
+    "framework_notes": "In Triton, adding @triton.autotune does not automatically update the launch grid \u2014 the grid must be changed to a lambda: `lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)`. In this case the grid remained fixed at cdiv(xnumel, 128), so autotune selected a 512-thread block but the grid was still sized for 128-thread blocks, causing 4x more work per block and 19x instruction explosion. Additionally, replacing `tl.full([XBLOCK], True, tl.int1)` with `xindex < xnumel` adds predication that increases register pressure significantly when XBLOCK is large."
+  },
+  {
+    "item_id": "270c12ea",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_register_pressure_fix",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_with_register_pressure_fix \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_tile_scheduling_with_register_pressure_fix' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel is in a severely regressed state caused by a prior autotune attempt that: (1) selected XBLOCK=512 with 512-thread blocks, tripling register usage from 22 to 64 regs/thread; (2) introduced xmask=xindex<xnumel predication even though xnumel=8388608 is exactly divisible by 128 (no mask needed); (3) failed to update the grid to use META['XBLOCK'], so the fixed grid of cdiv(8388608,128)=65536 blocks combined with 512-thread blocks causes each block to process 4x more elements than intended, exploding instruction count 19x (24M to 468M). The register pressure from 64 regs/thread limits Block Limit Registers to 2 blocks/SM, capping theoretical occupancy at 50%. The fix is to revert to XBLOCK=128 with 4 warps (128 threads), remove the xmask predication, and fix the grid. Additionally implement persistent tile scheduling by having each CTA process NUM_TILES_PER_CTA=4 consecutive tiles in a loop, reducing grid from 65536 to 16384 CTAs while keeping register pressure low.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "65412797",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_via_cta_tile_loop",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_via_cta_tile_loop \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_tile_scheduling_via_cta_tile_loop' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches 65,536 CTAs each processing only 128 elements. This creates enormous CTA scheduling overhead: with 132 SMs and 31 waves, the GPU spends significant time on CTA launch/teardown rather than useful work. Eligible warps per scheduler is only 2.17 \u2014 too few to hide the 5.6-cycle L1TEX scoreboard stall from 5 broadcast loads (evict_last). By having each CTA process NUM_TILES_PER_CTA=4 consecutive tiles in a loop, the grid shrinks from 65,536 to 16,384 CTAs, each CTA does 4x more work, the broadcast loads (in_ptr1..in_ptr5 over 8192-element vectors) are reused across tiles within the same CTA improving L1 cache hit rate, and the scheduler has more in-flight instructions per CTA to hide latency. XBLOCK stays at 128 (no register pressure change), no xmask is introduced (xnumel=8388608 is divisible by 512), and no autotune is added \u2014 avoiding all prior failure modes.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "26a5986e",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_corrected_index_computation",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_corrected_index_computation \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'persistent_tile_scheduling_corrected_index_computation' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nthon3.11/site-packages/triton/runtime/autotuner.py\", line 229, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches 65,536 CTAs each processing only 128 elements (31 waves over 132 SMs). This creates enormous CTA scheduling overhead and leaves only 1.3 eligible warps per scheduler \u2014 far too few to hide the 6.3-cycle L1TEX scoreboard stall from 5 broadcast loads (evict_last from 8192-element vectors). By having each CTA process NUM_TILES_PER_CTA=4 consecutive tiles in a loop, the grid shrinks from 65,536 to 16,384 CTAs (~8 waves), each CTA does 4x more work, the 5 broadcast vectors (in_ptr1..in_ptr5, each 8192 elements) are reused across tiles within the same CTA improving L1 cache hit rate, and the scheduler has more in-flight instructions per CTA to hide latency. XBLOCK stays at 128 (no register pressure change). xnumel=8388608 is exactly divisible by 128x4=512, so no xmask is needed. Prior attempts (items 270c12ea, 65412797) failed correctness due to incorrect index computation in the tile loop \u2014 this plan fixes that with a precise before/after implementation.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nthon3.11/site-packages/triton/runtime/autotuner.py\", line 229, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n           ",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a7e9863c",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_sm_tile_loop_with_correct_index_arithmetic",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_sm_tile_loop_with_correct_index_arithmetic \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_sm_tile_loop_with_correct_index_arithmetic' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches 65,536 CTAs of 128 threads each on 132 SMs (31 waves). Each CTA processes only 128 elements but issues 5 broadcast loads from 8192-element vectors (in_ptr1..in_ptr5 with evict_last). The L1TEX scoreboard stall (52.8% of cycles, 6.4 cycles/warp) is caused by these broadcast loads \u2014 each CTA re-fetches the same 8192-element vectors from L1/L2 rather than reusing them across tiles. With only 1.31 eligible warps per scheduler, there is insufficient ILP to hide the latency. The fix is a persistent SM loop: instead of one CTA per tile, each CTA processes NUM_TILES_PER_CTA=8 consecutive tiles in a loop. This (a) reduces grid from 65,536 to 8,192 CTAs, (b) reuses the broadcast vectors across tiles within the same CTA's L1 cache, (c) gives the scheduler more in-flight instructions to hide L1TEX latency. Prior persistent kernel attempts failed due to incorrect index arithmetic and incorrect grid sizing. This plan uses a carefully correct implementation.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c97d6577",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_via_grid_stride_loop_no_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_via_grid_stride_loop_no_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_tile_scheduling_via_grid_stride_loop_no_autotune' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches 65,536 CTAs each processing only 128 elements across 132 SMs (31 waves). This creates massive CTA scheduling overhead and leaves only 1.29 eligible warps per scheduler \u2014 far too few to hide the 6.4-cycle L1TEX scoreboard stall from 5 broadcast loads (evict_last from 8192-element vectors). Prior persistent-kernel attempts (items 270c12ea, 65412797, 26a5986e) all failed because they used @triton.autotune which crashed the autotuner benchmarking loop. This plan removes @triton.autotune entirely and uses tl.static_range for compile-time loop unrolling, reducing grid from 65,536 to 8,192 CTAs.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "d7fa7d34",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_fixed_no_autotune",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_fixed_no_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_tile_scheduling_fixed_no_autotune' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches 65,536 CTAs each processing only 128 elements across 31 waves over 132 SMs. This creates massive CTA scheduling overhead and leaves only 1.28 eligible warps per scheduler \u2014 far too few to hide the 6.4-cycle L1TEX scoreboard stall from 5 broadcast loads (evict_last from 8192-element vectors: in_ptr1..in_ptr5). By having each CTA process NUM_TILES_PER_CTA=8 consecutive tiles in a loop, the grid shrinks from 65,536 to 8,192 CTAs (~4 waves), each CTA does 8x more work, the 5 broadcast vectors are reused across tiles within the same CTA improving L1 cache hit rate, and the scheduler has more in-flight instructions per CTA to hide latency. Prior attempts (items 270c12ea, 65412797, 26a5986e) all failed because they kept @triton.autotune which caused the autotuner to crash when combined with the tile loop. This plan removes @triton.autotune entirely and uses a fixed XBLOCK=128 with 4 warps, avoiding the autotuner crash. xnumel=8388608 is exactly divisible by 128*8=1024, so no xmask is needed inside the tile loop.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  }
+]

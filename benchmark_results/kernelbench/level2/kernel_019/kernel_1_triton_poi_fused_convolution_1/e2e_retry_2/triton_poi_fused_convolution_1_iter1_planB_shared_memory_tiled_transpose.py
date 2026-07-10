@@ -1,0 +1,69 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'YBLOCK': 32, 'XBLOCK': 32}, num_warps=4, num_stages=3),
+        triton.Config({'YBLOCK': 32, 'XBLOCK': 32}, num_warps=8, num_stages=3),
+        triton.Config({'YBLOCK': 16, 'XBLOCK': 16}, num_warps=4, num_stages=3),
+        triton.Config({'YBLOCK': 16, 'XBLOCK': 16}, num_warps=8, num_stages=3),
+    ],
+    key=['xnumel', 'ynumel'],
+)
+@triton.jit
+def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
+    # Register-tiled transpose: YBLOCK == XBLOCK == TILE
+    # pid_x tiles along x (output columns), pid_y tiles along y (output rows)
+    pid_x = tl.program_id(0)
+    pid_y = tl.program_id(1)
+    x_start = pid_x * XBLOCK
+    y_start = pid_y * YBLOCK
+    x_range = x_start + tl.arange(0, XBLOCK)  # [XBLOCK]
+    y_range = y_start + tl.arange(0, YBLOCK)  # [YBLOCK]
+    # LOAD: inner dim = y (stride=1 in source), outer dim = x (stride=128)
+    # x_load is [XBLOCK, 1] (slow), y_load is [1, YBLOCK] (fast => coalesced in src)
+    x_load = x_range[:, None]   # [XBLOCK, 1]
+    y_load = y_range[None, :]   # [1, YBLOCK]
+    mask_load = (x_load < xnumel) & (y_load < ynumel)
+    y0_load = y_load % 128
+    y1_load = y_load // 128
+    # src shape: [XBLOCK, YBLOCK]
+    src = tl.load(in_ptr0 + (y0_load + 128 * x_load + 4032000 * y1_load), mask_load, other=0.0)
+    # TRANSPOSE in registers: src[x, y] -> dst[y, x] => [YBLOCK, XBLOCK]
+    dst = tl.trans(src)
+    # STORE: inner dim = x (stride=1 in dest) => coalesced
+    # y_store is [YBLOCK, 1] (slow), x_store is [1, XBLOCK] (fast => coalesced in dst)
+    x_store = x_range[None, :]   # [1, XBLOCK]
+    y_store = y_range[:, None]   # [YBLOCK, 1]
+    mask_store = (x_store < xnumel) & (y_store < ynumel)
+    tl.store(out_ptr0 + (x_store + 31500 * y_store), dst, mask_store)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 4096
+    xnumel = 31500
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((32, 128, 126, 250), (4032000, 1, 32000, 128), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((32, 128, 126, 250), (4032000, 31500, 250, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

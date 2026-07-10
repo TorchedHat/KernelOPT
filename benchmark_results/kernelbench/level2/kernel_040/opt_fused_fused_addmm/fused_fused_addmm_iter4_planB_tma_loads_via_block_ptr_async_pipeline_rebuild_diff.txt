@@ -1,0 +1,106 @@
+--- baseline
++++ rebuilt
+@@ -8,16 +8,17 @@
+ # Which simplifies to: out = linear_out * (1 + scale)
+ # where scale = 0.5, so out = linear_out * 1.5
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -47,45 +48,41 @@
+     # Row/col offsets
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    rk = tl.arange(0, BLOCK_K)
+ 
+-    # Masks
++    # Masks (kept for bias load and output store)
+     mask_m = rm < M
+     mask_n = rn < N
+ 
+     # Accumulator
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    # Pointers to X and W
+-    X_ptrs = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
++    # Block pointers for TMA-style async loads
++    x_block_ptr = tl.make_block_ptr(
++        base=X_ptr, shape=(M, K), strides=(stride_xm, stride_xk),
++        offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))
+     # W is stored as (N, K) -- weight matrix of linear layer
+-    W_ptrs = W_ptr + rn[None, :] * stride_wn + rk[:, None] * stride_wk
++    # Load W as [BLOCK_N, BLOCK_K] (coalesced: rn rows with stride_wn, rk cols with stride_wk=1)
++    w_block_ptr = tl.make_block_ptr(
++        base=W_ptr, shape=(N, K), strides=(stride_wn, stride_wk),
++        offsets=(pid_n * BLOCK_N, 0), block_shape=(BLOCK_N, BLOCK_K), order=(1, 0))
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_offset = k * BLOCK_K
+-        mask_k = (rk + k_offset) < K
++        # Load X tile [BLOCK_M, BLOCK_K] via TMA block pointer
++        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option='zero')
+ 
+-        # Load X tile [BLOCK_M, BLOCK_K]
+-        x_tile = tl.load(
+-            X_ptrs,
+-            mask=mask_m[:, None] & mask_k[None, :],
+-            other=0.0
+-        )
++        # Load W tile [BLOCK_N, BLOCK_K] via TMA block pointer
++        w_tile = tl.load(w_block_ptr, boundary_check=(0, 1), padding_option='zero')
+ 
+-        # Load W tile [BLOCK_K, BLOCK_N] -- W is (N, K), so W[n, k]
+-        w_tile = tl.load(
+-            W_ptrs,
+-            mask=mask_k[:, None] & mask_n[None, :],
+-            other=0.0
+-        )
++        # tl.trans(w_tile) gives [BLOCK_K, BLOCK_N] for the dot product: [M,K] x [K,N]
++        # input_precision='tf32x3': Ozaki decomposition using 3 TF32 HMMA ops for FP32-equivalent accuracy
++        acc = tl.dot(x_tile, tl.trans(w_tile), acc, input_precision='tf32x3')
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
+-
+-        X_ptrs += BLOCK_K * stride_xk
+-        W_ptrs += BLOCK_K * stride_wk
++        x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_K))
++        w_block_ptr = tl.advance(w_block_ptr, (0, BLOCK_K))
+ 
+     # Add bias
+-    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0)
++    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0,
++                   cache_modifier='.cg')  # cache at L2 only: tiny vector, read once per output tile
+     acc = acc + bias[None, :]
+ 
+     # Fuse: out = acc * scaling_factor + acc = acc * (1 + scaling_factor)
+@@ -97,9 +94,9 @@
+     tl.store(
+         out_ptrs,
+         acc.to(tl.float32),
+-        mask=mask_m[:, None] & mask_n[None, :]
++        mask=mask_m[:, None] & mask_n[None, :],
++        cache_modifier='.cs'  # evict_first: write-once streaming output, avoid polluting L2
+     )
+-
+ 
+ def kernel_function(p_matmul_weight, p_matmul_bias, x, scaling_factor=0.5):
+     M, K = x.shape

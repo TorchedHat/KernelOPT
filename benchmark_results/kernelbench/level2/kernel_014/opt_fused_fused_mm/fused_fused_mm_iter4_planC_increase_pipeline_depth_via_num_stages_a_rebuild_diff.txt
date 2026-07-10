@@ -1,0 +1,78 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,34 @@
+ import triton.language as tl
+ 
+ # GEMM kernel: computes out = x @ weight.T, shape [M, N]
++
+ @triton.autotune(
+     configs=[
++        # Original configs
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
++        # NEW: num_stages=5/6 for large tiles to hide L2->L1 latency (~30 cycles)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=6, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=6, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=5, num_warps=4),
++        # NEW: smaller tiles -> grid=2048 blocks (16*128) vs current 512, eliminates partial wave
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=6, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=6, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=5, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -25,10 +43,16 @@
+     stride_cm, stride_cn,
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+ ):
++    GROUP_M: tl.constexpr = 8
+     pid = tl.program_id(0)
++    grid_m = tl.cdiv(M, BLOCK_M)
+     grid_n = tl.cdiv(N, BLOCK_N)
+-    pid_m = pid // grid_n
+-    pid_n = pid % grid_n
++    num_pid_in_group = GROUP_M * grid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_M
++    group_size_m = min(grid_m - first_pid_m, GROUP_M)
++    pid_m = first_pid_m + (pid % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
+ 
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+@@ -52,7 +76,6 @@
+     tl.store(c_ptrs, acc, mask=mask)
+ 
+ 
+-# Fused reduction kernel: div by 2, sum over dim=1, mul by scaling_factor
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_N': 256}, num_stages=2, num_warps=4),
+@@ -65,6 +88,7 @@
+     key=['M', 'N'],
+ )
+ @triton.jit
++
+ def fused_div_sum_mul_kernel(
+     inp_ptr, out_ptr,
+     M, N,

@@ -1,0 +1,71 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=8, num_stages=2),
+        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=4, num_stages=3),
+        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=4, num_stages=3),
+        triton.Config({'XBLOCK': 128, 'YBLOCK': 128}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 128, 'YBLOCK': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['xnumel'],
+)
+@triton.jit
+def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
+    # YBLOCK=128 = full channel dimension (C=128), XBLOCK varies over spatial dim
+    xnumel = 31500
+    pid_x = tl.program_id(0)   # tiles over spatial dim (0..cdiv(31500,XBLOCK)-1)
+    pid_b = tl.program_id(1)   # batch index (0..31)
+
+    x_off = pid_x * XBLOCK
+    x_idx = x_off + tl.arange(0, XBLOCK)   # [XBLOCK], spatial indices
+    x_mask = x_idx < xnumel                 # [XBLOCK], True for valid spatial positions
+
+    c_idx = tl.arange(0, YBLOCK)            # [YBLOCK=128], channel indices 0..127
+
+    # Load [YBLOCK, XBLOCK]: coalesced along c_idx (stride-1 in input)
+    # Input flat index: c + 128*x + 4032000*batch
+    # (input strides: batch=4032000, c=1, h=32000, w=128; x=h*250+w => 128*x = 128*h*250+128*w = 32000*h+128*w)
+    load_idx = c_idx[:, None] + 128 * x_idx[None, :] + 4032000 * pid_b
+    load_mask = x_mask[None, :]             # broadcast to [YBLOCK, XBLOCK]
+    data = tl.load(in_ptr0 + load_idx, mask=load_mask, other=0.0)  # [YBLOCK, XBLOCK]
+
+    # Store [YBLOCK, XBLOCK]: coalesced along x_idx (stride-1 in output)
+    # Output flat index: x + 31500*c + 4032000*batch
+    # (output strides: batch=4032000, c=31500, h=250, w=1; x=h*250+w => x is stride-1)
+    store_idx = x_idx[None, :] + 31500 * c_idx[:, None] + 4032000 * pid_b
+    tl.store(out_ptr0 + store_idx, data, mask=load_mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 4096
+    xnumel = 31500
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((32, 128, 126, 250), (4032000, 1, 32000, 128), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((32, 128, 126, 250), (4032000, 31500, 250, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

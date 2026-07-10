@@ -1,0 +1,68 @@
+--- baseline
++++ rebuilt
+@@ -8,16 +8,19 @@
+ # Which simplifies to: out = linear_out * (1 + scale)
+ # where scale = 0.5, so out = linear_out * 1.5
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=8,  maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=5, num_warps=8,  maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=4,  maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=5, num_warps=4,  maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=4,  maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=5, num_warps=4,  maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=8,  maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=5, num_warps=4,  maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=5, num_warps=8,  maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4,  maxnreg=128),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -59,7 +62,10 @@
+     # Pointers to X and W
+     X_ptrs = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
+     # W is stored as (N, K) -- weight matrix of linear layer
+-    W_ptrs = W_ptr + rn[None, :] * stride_wn + rk[:, None] * stride_wk
++    # Load W as [BLOCK_N, BLOCK_K] so K is the fast-varying axis (contiguous),
++    # eliminating shared memory bank conflicts. Use tl.trans() in tl.dot to
++    # preserve the x @ W.T matmul semantics.
++    W_ptrs = W_ptr + rn[:, None] * stride_wn + rk[None, :] * stride_wk
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+         k_offset = k * BLOCK_K
+@@ -72,14 +78,14 @@
+             other=0.0
+         )
+ 
+-        # Load W tile [BLOCK_K, BLOCK_N] -- W is (N, K), so W[n, k]
++        # Load W tile [BLOCK_N, BLOCK_K] -- K is fast axis, matching physical (N,K) layout
+         w_tile = tl.load(
+             W_ptrs,
+-            mask=mask_k[:, None] & mask_n[None, :],
++            mask=mask_n[:, None] & mask_k[None, :],
+             other=0.0
+         )
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++        acc = tl.dot(x_tile, tl.trans(w_tile), acc, allow_tf32=True)
+ 
+         X_ptrs += BLOCK_K * stride_xk
+         W_ptrs += BLOCK_K * stride_wk
+@@ -99,7 +105,6 @@
+         acc.to(tl.float32),
+         mask=mask_m[:, None] & mask_n[None, :]
+     )
+-
+ 
+ def kernel_function(p_matmul_weight, p_matmul_bias, x, scaling_factor=0.5):
+     M, K = x.shape

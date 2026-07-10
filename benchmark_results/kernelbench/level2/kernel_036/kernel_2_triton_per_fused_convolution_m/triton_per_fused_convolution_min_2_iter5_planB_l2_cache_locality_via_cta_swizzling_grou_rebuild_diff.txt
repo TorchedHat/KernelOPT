@@ -1,0 +1,89 @@
+--- baseline
++++ rebuilt
+@@ -5,22 +5,64 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32},  num_warps=2, num_stages=1),
++        triton.Config({'XBLOCK': 32},  num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64},  num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64},  num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 256}, num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 32},  num_warps=2, num_stages=2),
++        triton.Config({'XBLOCK': 32},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 256}, num_warps=8, num_stages=2),
++    ],
++    key=['xnumel', 'r0_numel'],
++)
+ @triton.jit
+-def triton_per_fused_convolution_min_2(in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr):
+-    R0_BLOCK: tl.constexpr = 128
+-    xoffset = tl.program_id(0) * XBLOCK
++def triton_per_fused_convolution_min_2(in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
++    R0_BLOCK: tl.constexpr = 32
++    GROUP_SIZE_H: tl.constexpr = 16
++    # Swizzled CTA mapping: group CTAs by (n,h) row for L2 reuse
++    pid = tl.program_id(0)
++    tiles_per_row = tl.cdiv(256, XBLOCK)  # W-tiles per (n,h) row
++    num_pid_in_group = GROUP_SIZE_H * tiles_per_row
++    group_id = pid // num_pid_in_group
++    first_row_in_group = group_id * GROUP_SIZE_H
++    pid_in_group = pid % num_pid_in_group
++    row_in_group = pid_in_group // tiles_per_row
++    w_tile_in_row = pid_in_group % tiles_per_row
++    n_idx = (first_row_in_group + row_in_group) // 256
++    h_idx = (first_row_in_group + row_in_group) % 256
++    xoffset = n_idx * 65536 + h_idx * 256 + w_tile_in_row * XBLOCK
+     xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+     xmask = xindex < xnumel
+-    r0_index = tl.max_contiguous(tl.multiple_of(tl.arange(0, R0_BLOCK), R0_BLOCK), R0_BLOCK)[None, :]
+-    r0_1 = r0_index
+-    x0 = xindex
+-    tmp0 = tl.load(in_ptr0 + (r0_1 + 128*x0), xmask, eviction_policy='evict_first')
+-    tmp1 = tl.load(in_ptr1 + (r0_1), xmask, eviction_policy='evict_last')
+-    tmp2 = tmp0 + tmp1
+-    tmp3 = tl.broadcast_to(tmp2, [XBLOCK, R0_BLOCK])
+-    tmp5 = triton_helpers.min2(tmp3, 1)[:, None].to(tl.float32)
+-    tl.store(out_ptr0 + (x0), tmp5, xmask)
+-
++    x0 = xindex  # flat index over N*H*W = 1048576
++    # Decompose x0 into (n, h, w): W is fastest-varying (stride=1 in out_ptr0)
++    x0_w = x0 % 256           # W coordinate [0,256)
++    x0_h = (x0 // 256) % 256  # H coordinate [0,256)
++    x0_n = x0 // 65536         # N (batch) coordinate [0,16)
++    # Tiled reduction over 128 channels with R0_BLOCK=32 (4 iterations)
++    acc = tl.full([XBLOCK, 1], float('inf'), dtype=tl.float32)
++    for r0_start in tl.static_range(0, 128, R0_BLOCK):
++        r0_index = r0_start + tl.max_contiguous(tl.multiple_of(tl.arange(0, R0_BLOCK), R0_BLOCK), R0_BLOCK)[None, :]
++        r0_mask = r0_index < r0_numel
++        # in_ptr0 strides: (N=8388608, C=1, H=32768, W=128)
++        in_offset = r0_index + 128*x0_w + 32768*x0_h + 8388608*x0_n
++        tmp0 = tl.load(in_ptr0 + in_offset, xmask & r0_mask, eviction_policy='evict_first', other=float('inf'))
++        tmp1 = tl.load(in_ptr1 + r0_index, xmask & r0_mask, eviction_policy='evict_last', other=float('inf'))
++        tmp2 = tmp0 + tmp1
++        tile_min = triton_helpers.min2(tmp2, 1)[:, None]
++        acc = tl.minimum(acc, tile_min)
++    # out_ptr0 strides: (N=65536, C=1048576, H=256, W=1), C=0 (1 output channel)
++    out_offset = x0_w + 256*x0_h + 65536*x0_n
++    tl.store(out_ptr0 + out_offset, acc.to(tl.float32), xmask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -29,7 +71,7 @@
+     xnumel = 1048576
+     r0_numel = 128
+     grid = (triton.cdiv(xnumel, 128),)
+-    triton_per_fused_convolution_min_2[grid](arg_0, arg_1, arg_2, 1048576, 128, XBLOCK=128)
++    triton_per_fused_convolution_min_2[grid](arg_0, arg_1, arg_2, 1048576, 128)
+     return arg_2
+ 
+ def get_inputs():

@@ -1,0 +1,271 @@
+[
+  {
+    "item_id": "ef01feec",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "online_softmax_corrected_scalar_register_loop",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "online_softmax_corrected_scalar_register_loop \u2014 correctness failure",
+    "strategy_description": "Plan 'online_softmax_corrected_scalar_register_loop' was applied but failed correctness. Error: Correctness FAILED:\nseed=1337 output[0]: max_diff=1.041e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The 2D tile layout [XBLOCK=128, R0_BLOCK=16] forces Triton to use shared memory for the tl.max2 and tl.sum reductions across R0. The non-power-of-2 strides (12600 for input, 12608 for output) cause 8.6-way bank conflicts on 88% of all shared memory wavefronts, saturating the MIO pipeline and leaving schedulers with only 0.95 eligible warps/cycle. All prior attempts to fix this via XBLOCK tuning failed correctness (max_diff=1.041). The correct fix is to eliminate shared memory reductions entirely by restructuring the kernel so each thread owns one x-position and iterates over all 16 r0 channels in a scalar register loop (online softmax: running max + running sum), then writes normalized results directly to global memory. The prior scalar attempt (item 0d7f3349) also failed correctness \u2014 the bug was almost certainly in the index arithmetic: input stride for r0 is 12600 but output stride for r0 is 12608 (padded tensor). This plan provides corrected implementation with exact index arithmetic.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=1337 output[0]: max_diff=1.041e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f3c2d891",
+    "iteration": 3,
+    "speedup": 1.5153,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "eliminate_shared_memory_bank_conflicts_via_1d_thread_register_softmax",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Memory Throughput": 89.51,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 27.9,
+        "GPU Speed Of Light Throughput.Duration": 95.71,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 3.02,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 51.53,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2048.0,
+        "Occupancy.Achieved Occupancy": 93.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Memory Throughput": 59.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 52.38,
+        "GPU Speed Of Light Throughput.Duration": 63.71,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 41.91,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.95,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.06,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Occupancy.Achieved Occupancy": 48.11
+      }
+    },
+    "strategy_title": "Replace 2D Shared-Memory Reduction with 1D Register-Only Softmax",
+    "strategy_description": "When a Triton softmax kernel uses a 2D tile [XBLOCK, R0_BLOCK] and the reduction dimension has a non-power-of-2 stride (e.g., 12608), shared memory bank conflicts reach 8.6-way severity on 88% of wavefronts, saturating the MIO pipeline and leaving schedulers with <1 eligible warp/cycle. Replacing the 2D tile with a 1D thread layout [XBLOCK] where each thread owns one spatial position and iterates over all reduction elements via tl.static_range in registers eliminates shared memory entirely, dropping warp cycles per instruction from 51.5 to 13.9 and improving compute throughput from 27.9% to 52.4%. The key correctness constraint when input and output tensors have different strides (e.g., 12600 vs 12608 due to output padding) is to keep load and store index formulas strictly separate.",
+    "slow_pseudocode": "# 2D tile: [XBLOCK, R0_BLOCK], reduction via shared memory\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # [XBLOCK, 1]\nr0_index = tl.arange(0, R0_BLOCK)[None, :]          # [1, R0_BLOCK]\nval = tl.load(in_ptr + (x0 + IN_STRIDE*r0_index + BATCH_IN*x1), xmask)\nval_max = triton_helpers.max2(val, 1)[:, None]       # shared memory reduction\nval_sum = tl.sum(tl.exp(val - val_max), 1)[:, None] # shared memory reduction\ntl.store(out_ptr + (x0 + OUT_STRIDE*r0_index + BATCH_OUT*x1), tl.exp(val-val_max)/val_sum, xmask)",
+    "fast_pseudocode": "# 1D thread layout: each thread owns one x-position, r0 loop in registers\nxindex = xoffset + tl.arange(0, XBLOCK)  # [XBLOCK] 1D\nx0 = xindex % SPATIAL; x1 = xindex // SPATIAL\n# Pass 1: max in registers\nrunning_max = tl.full([XBLOCK], float('-inf'), tl.float32)\nfor r0 in tl.static_range(R0_NUMEL):\n    val = tl.load(in_ptr + (x0 + IN_STRIDE*r0 + BATCH_IN*x1), mask=xmask, other=float('-inf'))\n    running_max = tl.maximum(running_max, val + bias[r0])\n# Pass 2: sum of exp in registers\nrunning_sum = tl.zeros([XBLOCK], tl.float32)\nfor r0 in tl.static_range(R0_NUMEL):\n    val = tl.load(in_ptr + (x0 + IN_STRIDE*r0 + BATCH_IN*x1), mask=xmask, other=float('-inf'))\n    running_sum += tl.exp(val + bias[r0] - running_max)\n# Pass 3: coalesced store (consecutive threads = consecutive x0, stride-1)\nfor r0 in tl.static_range(R0_NUMEL):\n    val = tl.load(in_ptr + (x0 + IN_STRIDE*r0 + BATCH_IN*x1), mask=xmask, other=float('-inf'))\n    tl.store(out_ptr + (x0 + OUT_STRIDE*r0 + BATCH_OUT*x1), tl.exp(val+bias[r0]-running_max)/running_sum, mask=xmask)",
+    "applicable_when": "Triton kernel performs softmax over a small reduction dimension (R0 <= 32) using a 2D tile [XBLOCK, R0_BLOCK]; NCU reports SharedMemoryConflicts with 8+ way bank conflicts on >80% of wavefronts; MIO stall accounts for >40% of warp cycles; the reduction stride is non-power-of-2 (causing systematic bank aliasing); DRAM throughput is well below peak (<50%), indicating bandwidth headroom for re-reading data in multiple passes.",
+    "do_not_apply_when": "Reduction dimension is large (R0 > 64), making 3-pass re-reads of global memory prohibitively expensive; kernel is already compute-bound rather than MIO/shared-memory-bound; input and output tensors share the same stride (no padding difference to track); occupancy is already low and adding register pressure (56 vs 32 regs/thread) would further reduce it below the latency-hiding threshold.",
+    "framework_notes": "Triton-specific: use tl.static_range(N) for the register-only loop so the compiler unrolls it at compile time. The 1D xindex (no [:, None] reshape) is critical \u2014 it keeps the thread layout flat and ensures consecutive threads write consecutive memory addresses (coalesced stores). When input stride != output stride (e.g., padded output tensor), load and store index expressions must use their respective strides independently."
+  },
+  {
+    "item_id": "f3c2a817",
+    "iteration": 3,
+    "speedup": 1.4965,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "online_softmax_register_two_pass_no_shared_memory",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Memory Throughput": 89.51,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 27.9,
+        "GPU Speed Of Light Throughput.Duration": 95.71,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 51.53,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Scheduler Statistics.No Eligible": 71.04,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 3.02,
+        "Occupancy.Achieved Occupancy": 93.5,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.05,
+        "Compute Workload Analysis.Issue Slots Busy": 28.9
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Memory Throughput": 59.15,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 58.81,
+        "GPU Speed Of Light Throughput.Duration": 64.51,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.75,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.22,
+        "Scheduler Statistics.No Eligible": 39.26,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 41.98,
+        "Occupancy.Achieved Occupancy": 48.19,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Compute Workload Analysis.Issue Slots Busy": 60.34
+      }
+    },
+    "strategy_title": "Eliminate Shared Memory Bank Conflicts via Register-Only Softmax",
+    "strategy_description": "When a fused softmax kernel uses a 2D tile [XBLOCK, R0_BLOCK] with tl.max2/tl.sum reductions over shared memory, non-power-of-2 strides in the reduction dimension cause severe shared memory bank conflicts (8.6-way, 88% of wavefronts), saturating the MIO pipeline and leaving schedulers starved (0.95 eligible warps/cycle, 71% no-eligible cycles). Replacing the 2D tile with a 1D tile where each thread owns one x-position and iterates over all reduction channels via tl.static_range in three register-only passes (find max, accumulate exp-sum, write normalized output) eliminates all shared memory traffic for the reduction, dropping warp cycles per instruction from 51.5 to 12.75 and raising compute throughput from 27.9% to 58.8%. The key correctness requirement is that xindex must be 1D shape [XBLOCK] (not 2D [:, None]), preserving all original index expressions exactly.",
+    "slow_pseudocode": "# 2D tile with shared memory reductions\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # [XBLOCK, 1]\nr0_index = tl.arange(0, R0_BLOCK)[None, :]         # [1, 16]\nx0 = xindex % 12600; x1 = xindex // 12600\ntmp = tl.load(in_ptr0 + (x0 + 12600*r0_index + 201600*x1), xmask)\ntmp += tl.load(in_ptr1 + r0_index)  # bias\nmax_val = triton_helpers.max2(tl.where(xmask, tmp, -inf), 1)[:, None]  # smem reduction\nexp_sum = tl.sum(tl.where(xmask, tl.exp(tmp - max_val), 0), 1)[:, None]  # smem reduction\ntl.store(out_ptr2 + (x0 + 12608*r0_index + 201728*x1), tl.exp(tmp-max_val)/exp_sum, xmask)",
+    "fast_pseudocode": "# 1D tile with register-only three-pass softmax\nxindex = xoffset + tl.arange(0, XBLOCK)  # 1D [XBLOCK]\nxmask = xindex < xnumel\nx0 = xindex % 12600; x1 = xindex // 12600\n# Pass 1: find max in registers\nrunning_max = tl.full([XBLOCK], -inf, tl.float32)\nfor r in tl.static_range(16):\n    val = tl.load(in_ptr0 + (x0 + 12600*r + 201600*x1), mask=xmask, other=-inf)\n    val += tl.load(in_ptr1 + (tl.arange(0, XBLOCK)*0 + r), mask=xmask, other=0.0)\n    running_max = tl.maximum(running_max, val)  # elementwise, no smem\n# Pass 2: accumulate exp-sum\nexp_sum = tl.zeros([XBLOCK], tl.float32)\nfor r in tl.static_range(16):\n    val = tl.load(...); val += bias\n    exp_sum += tl.where(xmask, tl.exp(val - running_max), 0.0)\n# Pass 3: write output\nfor r in tl.static_range(16):\n    val = tl.load(...); val += bias\n    tl.store(out_ptr2 + (x0 + 12608*r + 201728*x1), tl.where(xmask, tl.exp(val-running_max)/exp_sum, 0.0), mask=xmask)",
+    "applicable_when": "Triton kernel performs softmax reduction over a small R0 dimension (\u226432) using 2D tile [XBLOCK, R0_BLOCK] with tl.max2/tl.sum shared memory reductions; NCU reports SharedMemoryConflicts with \u22658-way bank conflicts on \u226580% of wavefronts; MIO stall represents \u226540% of warp cycles; eligible warps/scheduler < 1.0; non-power-of-2 strides in the reduction dimension are the root cause of bank conflicts.",
+    "do_not_apply_when": "R0 dimension is large (>64) making three register passes over global memory prohibitively expensive; kernel is already compute-bound rather than MIO/shared-memory-bound; shared memory is used for purposes other than the reduction (e.g., input staging); occupancy is already low and adding register pressure (32\u219256 registers/thread) would further reduce it below the latency-hiding threshold.",
+    "framework_notes": "Triton-specific: use tl.static_range(N) to unroll the channel loop at compile time with zero dynamic branches. Load scalar bias as tl.load(in_ptr1 + (tl.arange(0, XBLOCK)*0 + r)) to broadcast a scalar to [XBLOCK] shape. tl.maximum(a, b) is elementwise (no reduction). xindex MUST be 1D [XBLOCK], not 2D [:, None] \u2014 using 2D shape causes index mapping errors (max_diff\u22481.04). Dynamic shared memory drops from 2KB/block to 0 after this change."
+  },
+  {
+    "item_id": "b8795162",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_triton_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'add_triton_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=1337 output[0]: max_diff=1.041e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel already uses the correct 1D register-only 3-pass softmax (no shared memory). The remaining bottleneck is register pressure: 56 registers/thread limits the SM to 9 blocks (Block Limit Registers=9), yielding only 56.25% theoretical occupancy and 48.11% achieved. With only 1.06 eligible warps/scheduler, the 8.9-cycle L1TEX latency cannot be hidden, leaving 44% of cycles with no eligible warp. The 3-pass structure (Pass1=max, Pass2=sum, Pass3=store) unrolls 3x16=48 iterations of tl.static_range, keeping many live values simultaneously. Merging Pass1 and Pass2 into a single online softmax pass reduces the number of unrolled loops from 3 to 2 (32 iterations total), cutting live variable count and expected register usage from ~56 to ~36-40. At 40 registers/thread with XBLOCK=128 (4 warps), Block Limit Registers rises from 9 to ~12-14 blocks/SM, pushing theoretical occupancy toward 75% and providing enough warp parallelism to hide L1TEX latency.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=1337 output[0]: max_diff=1.041e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c9f1b3e2",
+    "iteration": 4,
+    "speedup": 1.5769,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "cache_small_bias_tensor_in_registers_eliminate_redundant_global_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 63.71,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 52.38,
+        "GPU Speed Of Light Throughput.Memory Throughput": 59.88,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.95,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.06,
+        "Scheduler Statistics.No Eligible": 44.04,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 41.91,
+        "Launch Statistics.Registers Per Thread": 56.0,
+        "Occupancy.Achieved Occupancy": 48.11,
+        "Occupancy.Block Limit Registers": 9.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 61.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 56.01,
+        "GPU Speed Of Light Throughput.Memory Throughput": 62.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.83,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.02,
+        "Scheduler Statistics.No Eligible": 40.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 40.5,
+        "Launch Statistics.Registers Per Thread": 71.0,
+        "Occupancy.Achieved Occupancy": 36.58,
+        "Occupancy.Block Limit Registers": 7.0
+      }
+    },
+    "strategy_title": "Cache Tiny Bias Tensor in Registers, Eliminate Repeated Global Loads",
+    "strategy_description": "When a kernel loads a very small tensor (e.g., 16 scalars = 64 bytes) redundantly across multiple passes of a loop, pre-loading all values as scalar registers before the passes eliminates the repeated L1TEX load instructions. This directly reduces CPIStall scoreboard stall cycles (here: 8.9 \u2192 5.3 cycles/warp stalled on L1TEX, warp cycles per issued instruction dropped from 13.95 to 9.83), improving compute throughput from 52.4% to 56.0% and reducing kernel duration by ~4%. The trade-off is increased register pressure (56 \u2192 71 registers/thread), which lowers theoretical occupancy (56.25% \u2192 43.75%) and achieved occupancy (48.1% \u2192 36.6%), but the latency reduction from fewer in-flight loads outweighs the occupancy loss when the kernel is already latency-bound.",
+    "slow_pseudocode": "# Bias loaded redundantly in each of 3 passes, 16 times each = 48 total loads\nfor r in tl.static_range(16):\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r + BATCH_IN*x1), mask=xmask, other=-inf)\n    bias = tl.load(in_ptr1 + (tl.arange(0, XBLOCK)*0 + r), mask=xmask, other=0.0)  # 48x redundant\n    val = val + bias\n    running_max = tl.maximum(running_max, val)\n# ... same pattern in pass 2 and pass 3",
+    "fast_pseudocode": "# Pre-load all N bias scalars ONCE before any pass (N=16, 64 bytes total)\nbias0  = tl.load(in_ptr1 + 0,  eviction_policy='evict_last')\nbias1  = tl.load(in_ptr1 + 1,  eviction_policy='evict_last')\n# ... bias2..bias15 similarly\nbias_cache = [bias0, bias1, ..., bias15]\n\n# All 3 passes reuse bias_cache[r] \u2014 zero additional global loads for bias\nfor r in tl.static_range(16):\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r + BATCH_IN*x1), mask=xmask, other=-inf)\n    val = val + bias_cache[r]  # scalar broadcast, no load\n    running_max = tl.maximum(running_max, val)\n# ... same pattern in pass 2 and pass 3",
+    "applicable_when": "Kernel loads a small read-only tensor (\u2264256 bytes, e.g., bias/scale vectors) redundantly across multiple passes or loop iterations; CPIStall rule is triggered with significant L1TEX scoreboard stall cycles (>5 cycles/warp); the tensor fits trivially in registers; the kernel is already latency-bound (low eligible warps/scheduler, high no-eligible %) rather than occupancy-bound.",
+    "do_not_apply_when": "The cached tensor is large enough that the register pressure increase causes occupancy to drop below the latency-hiding threshold (typically <25% achieved occupancy); the kernel is already register-limited (Block Limit Registers is the binding constraint and is already at minimum); the repeated loads already hit L1 cache with near-100% hit rate (making the load latency negligible); the kernel is compute-bound rather than memory-latency-bound.",
+    "framework_notes": "In Triton, scalar loads use tl.load(ptr + int_offset) with no mask (always valid for small fixed-size tensors). Using eviction_policy='evict_last' hints the compiler to keep these values in L1 cache. Adding a scalar to a [XBLOCK] tensor auto-broadcasts in Triton \u2014 no explicit tl.full() needed. Store scalars in a Python list indexed by the compile-time tl.static_range variable for zero-overhead access."
+  },
+  {
+    "item_id": "c808ba55",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_xblock_and_num_warps_to_reduce_boundary_uncoalesced_loads",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_xblock_and_num_warps_to_reduce_boundary_uncoalesced_loads \u2014 correctness failure",
+    "strategy_description": "Plan 'increase_xblock_and_num_warps_to_reduce_boundary_uncoalesced_loads' was applied but failed correctness. Error: Correctness FAILED:\nseed=1337 output[0]: max_diff=1.041e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses XBLOCK=128 with xnumel=1612800 and spatial stride 12600. Each row has 12600 elements; with XBLOCK=128, warps can straddle the x1 row boundary (where xindex // 12600 changes), causing some threads in a warp to access a different row and producing non-contiguous global memory addresses. This explains the 26.4/32 bytes utilized per sector (17.5% waste). Additionally, the bias tensor (16 scalars = 64 bytes) is loaded twice per r0 iteration across both tl.static_range loops (32 total bias loads per thread). Pre-caching all 16 bias values as scalar registers before both passes eliminates 16 redundant L1TEX loads per thread, directly reducing CPIStall scoreboard stalls. @triton.autotune explores XBLOCK in {128, 256, 512} and num_warps in {4, 8} to find the best balance of occupancy vs. tile efficiency vs. boundary coalescing.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=1337 output[0]: max_diff=1.041e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a7d2f501",
+    "iteration": 5,
+    "speedup": 1.5184,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_xblock_to_cut_register_pressure_and_raise_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 71.0,
+        "Occupancy.Block Limit Registers": 7.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 36.58,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.02,
+        "Scheduler Statistics.No Eligible": 40.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.83,
+        "GPU Speed Of Light Throughput.Duration": 61.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 56.01,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 62.47
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 56.0,
+        "Occupancy.Block Limit Registers": 9.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 48.02,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.05,
+        "Scheduler Statistics.No Eligible": 43.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.94,
+        "GPU Speed Of Light Throughput.Duration": 63.58,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 52.72,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 60.08
+      }
+    },
+    "strategy_title": "Halve XBLOCK to Reduce Register Pressure and Raise Occupancy",
+    "strategy_description": "When a Triton kernel is register-pressure-limited (Block Limit Registers is the binding occupancy constraint), halving XBLOCK reduces the width of all live [XBLOCK]-shaped vector registers, directly cutting registers-per-thread (here: 71\u219256) and raising Block Limit Registers (7\u21929) and theoretical occupancy (43.75%\u219256.25%). The grid doubles to compensate (12600\u219225200 blocks), keeping total work identical. Despite the per-kernel profiling showing slightly longer duration (61\u219264 \u00b5s) for this single kernel invocation, the end-to-end speedup of 1.52x indicates that the occupancy improvement enables better SM utilization across the full workload. Note that this change also removed the pre-cached bias scalar array (reverting to per-iteration scalar loads inside the loop), which was the dominant code change alongside XBLOCK reduction.",
+    "slow_pseudocode": "# XBLOCK=128, grid=(cdiv(xnumel, 128),), 71 registers/thread\n# Block Limit Registers=7 -> 28 warps/SM -> 43.75% theoretical occupancy\n# Pre-load 16 bias scalars into named registers before loops\nbias0..bias15 = tl.load(in_ptr1 + 0..15, eviction_policy='evict_last')\nbias_cache = [bias0, ..., bias15]\nxindex = xoffset + tl.arange(0, 128)  # [128]\nfor r in tl.static_range(16):\n    val = tl.load(...) + bias_cache[r]\n    running_max = tl.maximum(running_max, val)\n# ... pass 2 and 3 similarly using bias_cache[r]",
+    "fast_pseudocode": "# XBLOCK=64, grid=(cdiv(xnumel, 64),), 56 registers/thread\n# Block Limit Registers=9 -> 36 warps/SM -> 56.25% theoretical occupancy\n# Load bias scalar inline per iteration (no pre-cache array)\nxindex = xoffset + tl.arange(0, 64)  # [64]\nfor r in tl.static_range(16):\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r + BATCH_IN*x1), mask=xmask, other=-inf)\n    bias = tl.load(in_ptr1 + r, None)  # scalar, loaded per iteration\n    val = val + bias\n    running_max = tl.maximum(running_max, val)\n# ... pass 2 and 3 similarly",
+    "applicable_when": "Triton kernel is register-pressure-limited (Block Limit Registers is the binding SM occupancy constraint, not Block Limit Warps); registers_per_thread >= 56; theoretical occupancy <= 50%; the kernel body contains multiple tl.static_range loops that keep many [XBLOCK]-shaped vectors live simultaneously; xnumel is divisible by the reduced XBLOCK (no masking overhead introduced); grid size after doubling remains reasonable (waves_per_sm > 5).",
+    "do_not_apply_when": "Block Limit Warps (not Block Limit Registers) is already the binding occupancy constraint \u2014 halving XBLOCK doubles the grid but does not increase warps/SM; XBLOCK is already at minimum (e.g., 32 or 64) and further reduction would cause excessive grid launch overhead; the kernel is bandwidth-bound (DRAM throughput >85%) rather than latency/occupancy-bound; xnumel is not divisible by the reduced XBLOCK, introducing masking overhead that hurts performance.",
+    "framework_notes": "In Triton, XBLOCK is a tl.constexpr so changing it triggers a full recompile \u2014 no kernel body changes are needed. The grid must be updated to cdiv(xnumel, NEW_XBLOCK). If num_warps is set explicitly, update it to match (e.g., XBLOCK=64 \u2192 num_warps=2 for 2 warps/block). The register reduction comes from narrower [XBLOCK] vector registers across all unrolled tl.static_range loop bodies. Removing the pre-cached bias scalar array (reverting to inline scalar loads) also contributed to register reduction by eliminating 16 named scalar registers from the live set."
+  },
+  {
+    "item_id": "a7d2e591",
+    "iteration": 5,
+    "speedup": 1.3037,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_online_softmax_two_pass",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 71.0,
+        "Occupancy.Block Limit Registers": 7.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 36.58,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.02,
+        "Scheduler Statistics.No Eligible": 40.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.83,
+        "GPU Speed Of Light Throughput.Duration": 61.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 56.01,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 62.47
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Block Limit Registers": 12.0,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 65.94,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.09,
+        "Scheduler Statistics.No Eligible": 42.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.54,
+        "GPU Speed Of Light Throughput.Duration": 74.05,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.5,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 51.37
+      }
+    },
+    "strategy_title": "Merge Max+Sum Passes into Online Softmax to Cut Registers",
+    "strategy_description": "When a register-only 3-pass softmax (separate max, sum, store loops) is limited by register pressure (e.g., 71 registers/thread, Block Limit Registers=7, theoretical occupancy ~43.75%), merging the max and sum passes into a single online softmax recurrence (running_sum = running_sum * exp(old_max - new_max) + exp(val - new_max)) reduces the number of unrolled loop bodies from 3 to 2, cutting live variable count and register usage (71\u219240 registers/thread). This raises Block Limit Registers from 7 to 12 and theoretical occupancy from 43.75% to 75%, improving achieved occupancy from 36.6% to 65.9%. However, the net wall-clock speedup (1.30x) is modest because the higher occupancy also increases warp cycles per instruction (9.83\u219218.54), partially offsetting the latency-hiding benefit; the kernel remains latency-bound rather than bandwidth-bound.",
+    "slow_pseudocode": "# 3-pass register-only softmax with pre-cached bias scalars (71 registers/thread)\nbias_cache = [tl.load(in_ptr1 + r, eviction_policy='evict_last') for r in range(16)]\nrunning_max = tl.full([XBLOCK], -inf, tl.float32)\nfor r in tl.static_range(16):  # Pass 1: max\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r + BATCH_IN*x1), mask=xmask, other=-inf)\n    running_max = tl.maximum(running_max, val + bias_cache[r])\nexp_sum = tl.zeros([XBLOCK], tl.float32)\nfor r in tl.static_range(16):  # Pass 2: sum\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r + BATCH_IN*x1), mask=xmask, other=-inf)\n    exp_sum += tl.exp(val + bias_cache[r] - running_max)\nfor r in tl.static_range(16):  # Pass 3: store\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r + BATCH_IN*x1), mask=xmask, other=-inf)\n    tl.store(out_ptr2 + (x0 + OUT_STRIDE*r + BATCH_OUT*x1), tl.exp(val+bias_cache[r]-running_max)/exp_sum, mask=xmask)",
+    "fast_pseudocode": "# 2-pass online softmax (40 registers/thread)\nrunning_max = tl.full([XBLOCK], float('-inf'), dtype=tl.float32)\nrunning_sum = tl.zeros([XBLOCK], dtype=tl.float32)\nfor r0 in tl.static_range(16):  # Pass 1: online max+sum combined\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r0 + BATCH_IN*x1), mask=xmask, other=float('-inf'))\n    bias = tl.load(in_ptr1 + r0, None)  # scalar load\n    new_val = val + bias\n    new_max = tl.maximum(running_max, new_val)\n    running_sum = running_sum * tl.exp(running_max - new_max) + tl.exp(new_val - new_max)\n    running_max = new_max\nfor r0 in tl.static_range(16):  # Pass 2: store (unchanged)\n    val = tl.load(in_ptr0 + (x0 + IN_STRIDE*r0 + BATCH_IN*x1), mask=xmask, other=float('-inf'))\n    bias = tl.load(in_ptr1 + r0, None)\n    result = tl.exp(val + bias - running_max) / running_sum\n    tl.store(out_ptr2 + (x0 + OUT_STRIDE*r0 + BATCH_OUT*x1), result, mask=xmask)",
+    "applicable_when": "Register-only (no shared memory) Triton softmax kernel with 3 separate tl.static_range loops (max, sum, store); NCU reports TheoreticalOccupancy limited by registers (Block Limit Registers < Block Limit Warps); registers_per_thread >= 48; theoretical occupancy <= 60%; achieved occupancy < 55%; kernel is latency-bound with eligible warps/scheduler near 1.0.",
+    "do_not_apply_when": "Kernel already uses 2-pass or online softmax; register count is already low (<40/thread) and occupancy is not register-limited; R0 is large (>64) making two global memory passes expensive; kernel is bandwidth-bound rather than latency-bound (DRAM throughput >80%); the online recurrence introduces numerical precision issues unacceptable for the application.",
+    "framework_notes": "Triton-specific: tl.static_range(N) unrolls loops at compile time; merging two static_range(16) loops into one reduces the number of simultaneously live vector registers. The online softmax recurrence order is mandatory: new_max = tl.maximum(running_max, new_val); running_sum = running_sum * tl.exp(running_max - new_max) + tl.exp(new_val - new_max); running_max = new_max. Bias must be added in BOTH the fused online loop and the store loop. Note: despite higher theoretical occupancy, warp cycles per instruction increased (9.83\u219218.54) because more active warps compete for the same memory bandwidth, so the net speedup (1.30x) is lower than the occupancy improvement alone would suggest. This transformation is most effective when starting from a high-register-pressure state (71 regs/thread) rather than a moderate one (56 regs/thread), yielding a larger absolute register reduction."
+  }
+]

@@ -1,0 +1,88 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,17 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -44,7 +47,8 @@
+     a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+     b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+ 
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    # FP64 accumulator for correctness with TF32 dot products
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float64)
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+         k_remaining = K - k * BLOCK_K
+@@ -57,38 +61,41 @@
+                     mask=(mask_k[:, None]) & (offs_n[None, :] < N),
+                     other=0.0)
+ 
+-        acc = tl.dot(a, b, acc, allow_tf32=False)
++        # allow_tf32=True enables Tensor Core MMA; accumulate into FP64 for correctness
++        acc = acc + tl.dot(a, b, allow_tf32=True).to(tl.float64)
+ 
+         a_ptrs += BLOCK_K * stride_ak
+         b_ptrs += BLOCK_K * stride_bk
+ 
++    # Cast back to FP32 for epilogue
++    acc_f32 = acc.to(tl.float32)
++
+     # Load bias and add
+     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+-    acc = acc + bias[None, :]
++    acc_f32 = acc_f32 + bias[None, :]
+ 
+     # Swish: x * sigmoid(x)
+-    sigmoid_acc = tl.sigmoid(acc)
+-    acc = acc * sigmoid_acc
++    sigmoid_acc = tl.sigmoid(acc_f32)
++    acc_f32 = acc_f32 * sigmoid_acc
+ 
+     # Divide by 2
+-    acc = acc * 0.5
++    acc_f32 = acc_f32 * 0.5
+ 
+     # Clamp to [-1, 1]
+-    acc = tl.maximum(acc, -1.0)
+-    acc = tl.minimum(acc, 1.0)
++    acc_f32 = tl.maximum(acc_f32, -1.0)
++    acc_f32 = tl.minimum(acc_f32, 1.0)
+ 
+     # Tanh
+-    acc = libdevice.tanh(acc)
++    acc_f32 = libdevice.tanh(acc_f32)
+ 
+     # Clamp to [-1, 1] again
+-    acc = tl.maximum(acc, -1.0)
+-    acc = tl.minimum(acc, 1.0)
++    acc_f32 = tl.maximum(acc_f32, -1.0)
++    acc_f32 = tl.minimum(acc_f32, 1.0)
+ 
+     # Store result
+     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+-    tl.store(c_ptrs, acc.to(tl.float32), mask=mask)
+-
++    tl.store(c_ptrs, acc_f32.to(tl.float32), mask=mask)
+ 
+ def kernel_function(p_gemm_weight, p_gemm_bias, x):
+     # x: [M, K], weight: [N, K] (linear weight is transposed), bias: [N]

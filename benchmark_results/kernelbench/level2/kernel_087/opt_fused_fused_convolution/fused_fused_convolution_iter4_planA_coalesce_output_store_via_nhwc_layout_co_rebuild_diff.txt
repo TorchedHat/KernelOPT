@@ -1,0 +1,118 @@
+--- baseline
++++ rebuilt
+@@ -4,13 +4,23 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        # Small-tile configs — low register pressure, high occupancy
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
++        # ORIGINAL configs retained
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128,'BLOCK_K': 16}, num_stages=2, num_warps=4),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+     ],
+     key=['BATCH', 'OUT_C', 'OUT_H', 'OUT_W', 'IN_C'],
+@@ -38,7 +48,6 @@
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+ 
+     M_TOTAL = BATCH * OUT_H * OUT_W
+-    TOTAL_K = KH * KW * IN_C
+ 
+     # Decode M index -> (batch, out_h, out_w)
+     out_w = offs_m % OUT_W
+@@ -51,34 +60,34 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    for k_start in range(0, TOTAL_K, BLOCK_K):
+-        offs_k = k_start + tl.arange(0, BLOCK_K)
+-        valid_k = offs_k < TOTAL_K
+-
+-        # Decode K index -> (kh, kw, in_c)
+-        in_c = offs_k % IN_C
+-        tmp_k = offs_k // IN_C
+-        kw = tmp_k % KW
+-        kh = tmp_k // KW
+-
+-        # Input spatial coordinates
+-        ih = out_h[:, None] * STRIDE_H + kh[None, :] - PAD_H
+-        iw = out_w[:, None] * STRIDE_W + kw[None, :] - PAD_W
+-
+-        valid_spatial = (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+-        mask_x = valid_m[:, None] & valid_k[None, :] & valid_spatial
+-
+-        x_ptrs = X_ptr + batch[:, None] * s_xn + ih * s_xh + iw * s_xw + in_c[None, :] * s_xc
+-        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)
+-
+-        # Weight: (OUT_C, KH, KW, IN_C)
+-        # offs_n: [BLOCK_N], offs_k: [BLOCK_K]
+-        # w_ptrs shape: [BLOCK_K, BLOCK_N]
+-        mask_w = valid_k[:, None] & valid_n[None, :]
+-        w_ptrs = W_ptr + offs_n[None, :] * s_wn + kh[:, None] * s_wh + kw[:, None] * s_ww + in_c[:, None] * s_wc
+-        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)
+-
+-        acc = tl.dot(x_tile, w_tile, acc=acc)
++    # Triple nested loop: kh_i and kw_i are scalar constants (compile-time after unrolling),
++    # in_c is a simple sequential range — no vector div/mod needed.
++    for kh_i in tl.static_range(KH):          # KH=3 constexpr, fully unrolled
++        for kw_i in tl.static_range(KW):      # KW=3 constexpr, fully unrolled
++            # ih/iw computed once per (kh_i, kw_i) pair as 1D vectors [BLOCK_M]
++            ih = out_h * STRIDE_H + kh_i - PAD_H   # [BLOCK_M], scalar offset
++            iw = out_w * STRIDE_W + kw_i - PAD_W   # [BLOCK_M], scalar offset
++            # valid_spatial only depends on kh_i/kw_i — hoisted outside ic_start loop
++            valid_spatial = (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)  # [BLOCK_M]
++            for ic_start in range(0, IN_C, BLOCK_K):
++                in_c = ic_start + tl.arange(0, BLOCK_K)  # sequential, no modulo
++                valid_k = in_c < IN_C
++                mask_x = valid_m[:, None] & valid_spatial[:, None] & valid_k[None, :]  # [BLOCK_M, BLOCK_K]
++                x_ptrs = (X_ptr
++                           + batch[:, None] * s_xn
++                           + ih[:, None]    * s_xh
++                           + iw[:, None]    * s_xw
++                           + in_c[None, :]  * s_xc)   # in_c is sequential
++                mask_w = valid_k[:, None] & valid_n[None, :]  # [BLOCK_K, BLOCK_N]
++                # kh_i*s_wh + kw_i*s_ww are compile-time constants after unrolling
++                w_ptrs = (W_ptr
++                           + offs_n[None, :] * s_wn
++                           + kh_i            * s_wh   # compile-time constant
++                           + kw_i            * s_ww   # compile-time constant
++                           + in_c[:, None]   * s_wc)  # [BLOCK_K, BLOCK_N]
++                x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)
++                w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)
++                acc = tl.dot(x_tile, w_tile, acc=acc)
+ 
+     # Load bias and apply epilogue: bias + sub(0.5) + sub(0.2) + mish
+     bias = tl.load(B_ptr + offs_n, mask=valid_n, other=0.0)
+@@ -90,12 +99,14 @@
+     softplus = tl.where(acc > 20.0, acc, libdevice.log(1.0 + libdevice.exp(acc)))
+     result = acc * libdevice.tanh(softplus)
+ 
+-    # Store output in NCHW layout: (BATCH, OUT_C, OUT_H, OUT_W)
+-    # Linear index: batch * OUT_C * OUT_H * OUT_W + c * OUT_H * OUT_W + h * OUT_W + w
+-    out_idx = batch[:, None] * (OUT_C * OUT_H * OUT_W) + offs_n[None, :] * (OUT_H * OUT_W) + out_h[:, None] * OUT_W + out_w[:, None]
++    # Store output in NHWC layout: (BATCH, OUT_H, OUT_W, OUT_C)
++    # Adjacent N-threads (varying offs_n) differ by 1 in address -> single cache line
++    out_idx = (batch[:, None] * (OUT_H * OUT_W * OUT_C)
++               + out_h[:, None] * (OUT_W * OUT_C)
++               + out_w[:, None] * OUT_C
++               + offs_n[None, :])
+     mask_out = valid_m[:, None] & valid_n[None, :]
+     tl.store(Y_ptr + out_idx, result.to(tl.float32), mask=mask_out)
+-
+ 
+ def kernel_function(p_conv_weight, p_conv_bias, x):
+     # x: (128, 8, 256, 256) NCHW

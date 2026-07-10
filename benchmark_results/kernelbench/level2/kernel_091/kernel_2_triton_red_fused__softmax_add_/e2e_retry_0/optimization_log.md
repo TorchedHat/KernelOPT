@@ -1,0 +1,179 @@
+# Kernel Optimization Log
+
+## Summary
+
+- **Kernel**: `triton_red_fused__softmax_add_convolution_exp_mul_prepare_softmax_online_sigmoid_sub_2` on **H200 SXM5** (CC 9.0)
+- **Baseline latency**: 57510000 ns — **Best latency**: 1370000 ns (**41.9781×** vs baseline)
+- **Iterations completed**: 1
+- **Outcome**: Best configuration **`online_softmax_attention_single_pass`** beats baseline latency.
+
+## Environment
+
+- **Device**: H200 SXM5, 132 SMs, 139.8 GB HBM
+- **Compute Capability**: 9.0
+- **Peak HBM Bandwidth**: 4800 GB/s
+- **CUDA**: 13.0 | **Torch**: 2.11.0+cu130 | **Triton**: 3.6.0
+
+## Baseline Kernel
+
+- **Name**: `triton_red_fused__softmax_add_convolution_exp_mul_prepare_softmax_online_sigmoid_sub_2`
+- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_091/kernel_2_triton_red_fused__softmax_add_/standalone.py`
+- **Framework**: triton
+- **Launch**: Block (128,1,1), Grid (16641,1,1), Waves/SM: 42.02
+- **Registers/thread**: 32
+- **Duration**: 57510000 ns
+- **SM Throughput**: 11.89 % | **Memory**: 45.32 % | **DRAM**: 45.32 %
+- **Achieved Occupancy**: 18.65 %
+- **IPC Active**: 0.35 inst/cycle | **No Eligible**: 91.32 %
+
+## Iteration 1
+
+**Best so far**: 1.0× | **Memory items**: 2
+
+| Plan | Direction | Wall | NCU | Correctness | Kept? |
+|------|-----------|------|-----|-------------|-------|
+| B | online_softmax_attention_single_pass | 52.203× | 41.978× | ✓ | **✓ best** |
+
+
+### Metric Comparison
+
+| Metric | Baseline | online_softmax_at... | Δ |
+|--------|----------|----------|-----|
+| Duration (ns) | 57510000 ns | 1370000 ns | -56140000 ns (-97.6%) |
+| SM Throughput (%) | 11.89 % | 44.40 % | +32.51 pp |
+| Memory Throughput (%) | 45.32 % | 36.48 % | -8.84 pp |
+| DRAM Throughput (%) | 45.32 % | 16.79 % | -28.53 pp |
+| Achieved Occupancy (%) | 18.65 % | 12.39 % | -6.26 pp |
+| Registers/Thread | 32.00 register/thread | 255.00 register/thread | +223 |
+| Waves/SM | 42.02 | 63.03 | +21.01 |
+| No Eligible (%) | 91.32 % | 55.38 % | -35.94 pp |
+| IPC Active | 0.35 inst/cycle | 1.79 inst/cycle | +1.44 |
+
+---
+
+## Cumulative Progress
+
+```
+Baseline:  57510000 ns  (1.000×)
+Iter 1     1370000 ns  (41.978×)  — online_softmax_attention_single_pass
+
+Final best: 1370000 ns  (41.9781×)
+```
+
+
+## Best kernel vs baseline (diff)
+
+```diff
+--- baseline_kernel
+
++++ best_kernel
+
+@@ -5,64 +5,57 @@
+
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),
++    ],
++    key=['xnumel', 'r0_numel'],
++)
+ @triton.jit
+ def triton_red_fused__softmax_add_convolution_exp_mul_prepare_softmax_online_sigmoid_sub_2(in_ptr0, in_ptr1, in_ptr2, out_ptr2, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+     xnumel = 2130048
+     r0_numel = 128
+-    rnumel = r0_numel
+     RBLOCK: tl.constexpr = R0_BLOCK
+     xoffset = tl.program_id(0) * XBLOCK
+     xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+     xmask = xindex < xnumel
+     r0_base = tl.arange(0, R0_BLOCK)[None, :]
+-    rbase = r0_base
+     x3 = xindex
++    x0 = (xindex % 16641)
++    x1 = xindex // 16641
+     _tmp4_max = tl.full([XBLOCK, R0_BLOCK], float('-inf'), tl.float32)
+     _tmp4_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+-    x0 = (xindex % 16641)
+-    x1 = xindex // 16641
++    # SINGLE PASS: load all inputs once, accumulate softmax state, then compute output inline
+     for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+         r0_index = r0_offset + r0_base
+         r0_mask = r0_index < r0_numel
+-        roffset = r0_offset
+-        rindex = r0_index
+         r0_2 = r0_index
+-        tmp0 = tl.load(in_ptr0 + (r0_2 + 128*x3), r0_mask & xmask, eviction_policy='evict_last', other=0.0)
+-        tmp1 = tl.load(in_ptr1 + (r0_2), r0_mask, eviction_policy='evict_last', other=0.0)
++        tmp0 = tl.load(in_ptr0 + (r0_2 + 128*x3), mask=r0_mask & xmask, eviction_policy='evict_last', other=0.0)
++        tmp1 = tl.load(in_ptr1 + (r0_2), mask=r0_mask, eviction_policy='evict_last', other=0.0)
++        tmp12 = tl.load(in_ptr2 + (r0_2), mask=r0_mask, eviction_policy='evict_last', other=0.0)
+         tmp2 = tmp0 + tmp1
+         tmp3 = tl.broadcast_to(tmp2, [XBLOCK, R0_BLOCK])
+-
+         _tmp4_max_next, _tmp4_sum_next = triton_helpers.online_softmax_combine(
+             _tmp4_max, _tmp4_sum, tmp3, False
+         )
+-
+         _tmp4_max = tl.where(r0_mask & xmask, _tmp4_max_next, _tmp4_max)
+         _tmp4_sum = tl.where(r0_mask & xmask, _tmp4_sum_next, _tmp4_sum)
+-
+-    tmp4, tmp5 = triton_helpers.online_softmax_reduce(
+-        _tmp4_max, _tmp4_sum, 1, False)
+-    tmp4 = tmp4[:, None]
+-    tmp5 = tmp5[:, None]
+-    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+-        r0_index = r0_offset + r0_base
+-        r0_mask = r0_index < r0_numel
+-        roffset = r0_offset
+-        rindex = r0_index
+-        r0_2 = r0_index
+-        tmp6 = tl.load(in_ptr0 + (r0_2 + 128*x3), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+-        tmp7 = tl.load(in_ptr1 + (r0_2), r0_mask, eviction_policy='evict_last', other=0.0)
+-        tmp12 = tl.load(in_ptr2 + (r0_2), r0_mask, eviction_policy='evict_last', other=0.0)
+-        tmp8 = tmp6 + tmp7
+-        tmp9 = tmp8 - tmp4
++        # Compute output inline using still-live register values
++        # (safe because R0_BLOCK=128 == r0_numel=128, loop runs exactly once)
++        tmp4_g, tmp5_g = triton_helpers.online_softmax_reduce(_tmp4_max, _tmp4_sum, 1, False)
++        tmp4_g = tmp4_g[:, None]
++        tmp5_g = tmp5_g[:, None]
++        tmp9 = tmp2 - tmp4_g
+         tmp10 = tl.exp(tmp9)
+-        tmp11 = (tmp10 / tmp5)
++        tmp11 = tmp10 / tmp5_g
+         tmp13 = tmp11 + tmp12
+-        tmp14 = tl.full([1, 1], 2.0, tl.float32)
+-        tmp15 = tmp13 * tmp14
++        tmp15 = tmp13 * tl.full([1, 1], 2.0, tl.float32)
+         tmp16 = tl.sigmoid(tmp15)
+-        tl.store(out_ptr2 + (x0 + 16641*r0_2 + 2130048*x1), tmp16, r0_mask & xmask)
+-
+-
++        tl.store(out_ptr2 + (x0 + 16641*r0_2 + 2130048*x1), tmp16, mask=r0_mask & xmask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -72,7 +65,7 @@
+
+     xnumel = 2130048
+     r0_numel = 128
+     grid = (triton.cdiv(xnumel, 128),)
+-    triton_red_fused__softmax_add_convolution_exp_mul_prepare_softmax_online_sigmoid_sub_2[grid](arg_0, arg_1, arg_2, arg_3, 2130048, 128, XBLOCK=128, R0_BLOCK=512)
++    triton_red_fused__softmax_add_convolution_exp_mul_prepare_softmax_online_sigmoid_sub_2[grid](arg_0, arg_1, arg_2, arg_3, 2130048, 128)
+     return arg_3
+ 
+ def get_inputs():
+```
+
+## Config
+
+- T=1, N=2, K=2, TopK=4, ExpN=8
+- t_pos=1.04, t_neg=1.15
+- replay_mode=kernel
+- kernel_args: `—`

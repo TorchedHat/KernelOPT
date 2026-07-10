@@ -1,0 +1,84 @@
+[
+  {
+    "item_id": "triton_autotune_tile_layout_permutation_001",
+    "iteration": 1,
+    "speedup": 1.9187,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_layout_permutation_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.14,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.25,
+        "GPU Speed Of Light Throughput.Memory Throughput": 40.04,
+        "Occupancy.Achieved Occupancy": 55.38,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Block Size": 128.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.93,
+        "Memory Workload Analysis.L2 Hit Rate": 60.69,
+        "Source Counters.UncoalescedGlobalAccess excessive sectors": 112896.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 5.11,
+        "GPU Speed Of Light Throughput.Memory Throughput": 11.34,
+        "Occupancy.Achieved Occupancy": 27.24,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Launch Statistics.Block Size": 64.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.49,
+        "Memory Workload Analysis.L2 Hit Rate": 77.91,
+        "Source Counters.UncoalescedGlobalAccess excessive sectors": 25088.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes for Strided Layout Permutation Kernels",
+    "strategy_description": "When a Triton kernel performs a layout permutation (e.g. NCHW\u2192NHWC) with a fixed XBLOCK/YBLOCK that produces high L1TEX stall cycles (CPIStall ~49%), uncoalesced global accesses (~23% excessive sectors), and low wave count (<1.0), adding @triton.autotune over a range of XBLOCK/YBLOCK/num_warps configurations allows the runtime to select the tile shape that minimizes wall time. The winning configuration reduces register pressure (26\u219216 registers/thread), improves L2 hit rate (60.7%\u219277.9%), and cuts elapsed cycles by ~49% despite lower achieved occupancy, because the smaller working set fits better in cache. The key mechanism is that autotuning finds a block size where the strided store pattern causes fewer cache-line conflicts and the compiler can better pipeline loads.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # fixed tile: XBLOCK=128, YBLOCK=8\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    tmp = tl.load(in_ptr + (xindex + stride_x*yindex), mask)\n    tl.store(out_ptr + (y0 + stride_out*xindex + stride_batch*y1), tmp, mask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 1},  num_warps=2, num_stages=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 1},  num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 1},  num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 1},  num_warps=8, num_stages=4),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 2},  num_warps=2, num_stages=4),\n        # ... more configs spanning YBLOCK in {1,2,4,8,16,32} x XBLOCK in {32,64,128,256,512}\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # same body, tile shape injected by autotuner\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    tmp = tl.load(in_ptr + (xindex + stride_x*yindex), mask)\n    tl.store(out_ptr + (y0 + stride_out*xindex + stride_batch*y1), tmp, mask)\n\n# No explicit XBLOCK/YBLOCK in call; autotuner selects best config\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "Triton pointwise kernel with fixed XBLOCK/YBLOCK tile sizes; CPIStall rule triggered with L1TEX stall >40% of warp cycles; UncoalescedGlobalAccess rule triggered with >15% excessive sectors; waves_per_sm < 1.0; kernel performs strided memory access (e.g. layout permutation) where store stride does not match thread indexing stride",
+    "do_not_apply_when": "Kernel is already autotuned; grid size is already large enough to saturate all SMs (waves_per_sm > 2.0); kernel has data-dependent control flow that makes tile-size changes unsafe; YBLOCK or XBLOCK must be a specific value for correctness (e.g. reduction kernels where tile size determines reduction scope)",
+    "framework_notes": "Triton-specific: @triton.autotune injects XBLOCK/YBLOCK as tl.constexpr into the kernel; the launch grid must be a lambda META: (...) that reads META['XBLOCK'] and META['YBLOCK']. num_stages=4 enables software pipelining (async copy overlap). YBLOCK values that are not powers-of-2 (e.g. 30) must be rounded up to the next power-of-2 (32) with a ymask guard for correctness. In CUDA the equivalent is template<int BLOCK_X, int BLOCK_Y> with cudaOccupancyMaxPotentialBlockSize or manual tuning."
+  },
+  {
+    "item_id": "triton_vectorized_loads_autotune_contiguous_hint_001",
+    "iteration": 1,
+    "speedup": 1.0478,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_autotune_contiguous_hint",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9166.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.93,
+        "Scheduler Statistics.No Eligible": 70.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 259546.0,
+        "Compute Workload Analysis.Issue Slots Busy": 28.59,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Occupancy.Achieved Occupancy": 55.38
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.86,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8713.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.89,
+        "Scheduler Statistics.No Eligible": 53.74,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.95,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 150767.0,
+        "Compute Workload Analysis.Issue Slots Busy": 45.95,
+        "Launch Statistics.Waves Per SM": 0.99,
+        "Launch Statistics.Registers Per Thread": 38.0,
+        "Occupancy.Achieved Occupancy": 51.3
+      }
+    },
+    "strategy_title": "Add tl.max_contiguous/tl.multiple_of + autotune for memory-bound transpose kernels",
+    "strategy_description": "When a Triton kernel has stride-1 loads along the x-dimension but NCU reports high L1TEX stall cycles (CPIStall ~49%) and uncoalesced global accesses (~23% excess sectors), wrapping the xindex computation with `tl.max_contiguous(tl.multiple_of(..., XBLOCK), XBLOCK)` signals 128-byte alignment and contiguity to the compiler, enabling 128-bit vectorized LDG instructions. Adding `@triton.autotune` over XBLOCK/YBLOCK/num_warps configs allows the runtime to select the tile shape that best balances load width and SM wave coverage. This reduced warp cycles per issued instruction from 29.9 to 17.9 and halved L2 sector traffic, yielding a 4.8% wall-time speedup despite a register increase that slightly reduced theoretical occupancy.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # no contiguity hint\n    tmp0 = tl.load(in_ptr + (x2 + stride * y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Fixed launch config\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, 30, 50176, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=2),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 8}, num_warps=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    # Signal stride-1 contiguity and XBLOCK alignment for 128-bit vectorized loads\n    xindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\n    tmp0 = tl.load(in_ptr + (x2 + stride * y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Autotune-driven launch\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, 30, 50176)",
+    "applicable_when": "Triton kernel with stride-1 (contiguous) loads along the x-dimension; NCU reports CPIStall with L1TEX stall as dominant reason (>40% of warp cycles); UncoalescedGlobalAccess rule fires with >15% excess sectors; achieved occupancy is below 60% and no-eligible-warp fraction is above 60%; kernel is a memory-bound layout transpose or copy pattern.",
+    "do_not_apply_when": "Loads are not stride-1 along x (e.g., strided or indirect accesses) \u2014 tl.multiple_of hint would be incorrect and could cause wrong codegen; kernel is already compute-bound (Compute SM Throughput >70%); register pressure is already near the per-SM limit and adding autotune configs with larger XBLOCK would further reduce occupancy below the threshold needed for latency hiding.",
+    "framework_notes": "tl.max_contiguous(ptr, N) and tl.multiple_of(ptr, N) are Triton-specific compiler hints that tell the backend the pointer is N-element aligned and contiguous, enabling 128-bit (float4) LDG.128 vectorized loads. Equivalent in CUDA: use __ldg with 128-bit aligned float4 loads or annotate with __builtin_assume_aligned. The autotune decorator is Triton-specific; in CUDA this would be achieved via template parameters or runtime kernel selection."
+  }
+]

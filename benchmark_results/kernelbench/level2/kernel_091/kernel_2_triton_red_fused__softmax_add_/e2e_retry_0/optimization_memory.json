@@ -1,0 +1,69 @@
+[
+  {
+    "item_id": "46e8d691",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_r0_block_oversize_and_reduce_register_spill",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (local stores + local loads)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_r0_block_oversize_and_reduce_register_spill \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_r0_block_oversize_and_reduce_register_spill' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.509e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.470e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.721e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "R0_BLOCK=512 is 4x larger than the actual reduction dimension (r0_numel=128). Triton allocates accumulator arrays of shape [XBLOCK, R0_BLOCK] = [128, 512] = 65536 elements per block. This far exceeds available registers (128 threads x 32 regs = 4096 register slots), forcing massive register spilling to local memory. The spilled accesses are strided (one element per thread across 32-byte sectors), explaining the catastrophic 1/32 byte utilization. This causes 91% of scheduler cycles to stall on L1TEX scoreboard waits. The fix is to set R0_BLOCK=128 (matching r0_numel exactly), eliminating the spill entirely. Additionally, adding @triton.autotune explores XBLOCK and num_warps to recover occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.509e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.470e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.721e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_online_softmax_single_pass_fusion",
+    "iteration": 1,
+    "speedup": 41.9781,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "online_softmax_two_pass_to_single_pass_fusion",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + HighPipeUtilization + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 57.51,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 11.89,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 45.32,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 34.37,
+        "Scheduler Statistics.No Eligible_%": 91.32,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.09,
+        "Memory Workload Analysis.L1/TEX Hit Rate_%": 3.39,
+        "Memory Workload Analysis.L2 Hit Rate_%": 62.48,
+        "Occupancy.Theoretical Occupancy_%": 18.75,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 65.54,
+        "Launch Statistics.Registers Per Thread": 32.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 1.37,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 44.4,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 16.79,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.43,
+        "Scheduler Statistics.No Eligible_%": 55.38,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.62,
+        "Memory Workload Analysis.L1/TEX Hit Rate_%": 24.39,
+        "Memory Workload Analysis.L2 Hit Rate_%": 69.18,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 32.77,
+        "Launch Statistics.Registers Per Thread": 255.0
+      }
+    },
+    "strategy_title": "Fuse Two-Pass Softmax Into Single Register-Resident Pass",
+    "strategy_description": "When a reduction kernel performs two sequential passes over the same global memory data (pass-1 accumulates online softmax max/sum; pass-2 re-reads the same data to compute exp/normalize/output), and the reduction dimension fits entirely within one tile (R0_BLOCK == r0_numel), the second pass can be eliminated by computing the output inline at the end of the first pass using still-live register values. This directly eliminates the dominant stall source: L1TEX scoreboard waits caused by re-fetching data evicted between passes (L1 hit rate 3.39% \u2192 24.39%, warp cycles per instruction 34.37 \u2192 4.43). The fix also reduces shared memory usage per block (65 KB \u2192 33 KB), which relaxes the shared-memory block limit and allows more waves per SM (42 \u2192 63), while compute throughput rises from 11.89% to 44.4% of peak.",
+    "slow_pseudocode": "# Pass 1: accumulate online softmax state\nfor r0_offset in range(0, r0_numel, R0_BLOCK):  # R0_BLOCK=512 >> r0_numel=128\n    tmp0 = load(in_ptr0[r0, x])   # global load\n    tmp1 = load(in_ptr1[r0])      # global load\n    tmp2 = tmp0 + tmp1\n    _max, _sum = online_softmax_combine(_max, _sum, tmp2)\n\ntmp4, tmp5 = online_softmax_reduce(_max, _sum)  # cross-warp reduce\n\n# Pass 2: re-read same data, compute output\nfor r0_offset in range(0, r0_numel, R0_BLOCK):\n    tmp6 = load(in_ptr0[r0, x])   # REDUNDANT global load\n    tmp7 = load(in_ptr1[r0])      # REDUNDANT global load\n    tmp12 = load(in_ptr2[r0])\n    out = sigmoid((softmax(tmp6+tmp7, tmp4, tmp5) + tmp12) * 2.0)\n    store(out_ptr[...])",
+    "fast_pseudocode": "# SINGLE PASS: load all inputs once, accumulate state, compute output inline\n# Requires R0_BLOCK == r0_numel so loop body executes exactly once\nfor r0_offset in range(0, r0_numel, R0_BLOCK):  # R0_BLOCK=128 == r0_numel\n    tmp0 = load(in_ptr0[r0, x])   # loaded once\n    tmp1 = load(in_ptr1[r0])      # loaded once\n    tmp12 = load(in_ptr2[r0])     # loaded once\n    tmp2 = tmp0 + tmp1\n    _max, _sum = online_softmax_combine(_max, _sum, tmp2)\n    # Values still live in registers \u2014 compute output immediately\n    tmp4_g, tmp5_g = online_softmax_reduce(_max, _sum)\n    out = sigmoid((softmax(tmp2, tmp4_g, tmp5_g) + tmp12) * 2.0)\n    store(out_ptr[...])\n\n# Also: set R0_BLOCK=r0_numel (128) instead of oversized 512\n# Use @triton.autotune for XBLOCK and num_warps",
+    "applicable_when": "Triton reduction kernel with two sequential tl.range loops over the same global memory (two-pass softmax pattern); L1TEX hit rate < 10% indicating data evicted between passes; CPIStall rule triggered with L1TEX scoreboard stalls > 50% of stall budget; reduction dimension (r0_numel) is small enough to fit in one tile (R0_BLOCK can equal r0_numel); R0_BLOCK is set larger than r0_numel (wasted iterations).",
+    "do_not_apply_when": "r0_numel is too large to fit in a single tile (loop must execute multiple times, so values are not all live in registers simultaneously); the two passes have data dependencies that prevent fusion (e.g., pass-2 requires a fully-reduced global value that cannot be computed per-tile); occupancy is already register-limited and adding more register pressure (255 registers/thread) would cause spilling or further reduce occupancy below a useful threshold.",
+    "framework_notes": "Triton-specific: set R0_BLOCK as a tl.constexpr equal to r0_numel so the compiler can fully unroll the loop. Use @triton.autotune to explore XBLOCK and num_warps configs since the optimal block shape changes after fusion. The inline reduce (online_softmax_reduce inside the loop) is valid only when R0_BLOCK == r0_numel so the partial state equals the full state after one iteration. In CUDA, the equivalent is fusing two kernel passes into one kernel with shared-memory reduction, keeping loaded values in registers across the reduction."
+  }
+]

@@ -1,0 +1,208 @@
+[
+  {
+    "item_id": "exp_triton_autotune_xblock_r0block_regression_001",
+    "iteration": 1,
+    "speedup": 0.1497,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_r0block_to_reduce_register_pressure_and_improve_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 640.7,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 69.68,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 77.27,
+        "Occupancy.Theoretical Occupancy_%": 25.0,
+        "Occupancy.Achieved Occupancy_%": 21.93,
+        "Launch Statistics.Registers Per Thread": 127.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Instruction Statistics.Executed Instructions": 348631040.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 4280.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 80.27,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 17.59,
+        "Occupancy.Theoretical Occupancy_%": 18.75,
+        "Occupancy.Achieved Occupancy_%": 17.12,
+        "Launch Statistics.Registers Per Thread": 155.0,
+        "Occupancy.Block Limit Registers": 3.0,
+        "Instruction Statistics.Executed Instructions": 2721877632.0
+      }
+    },
+    "strategy_title": "Autotuning XBLOCK/R0_BLOCK Increases Register Pressure, Causes Regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK values (8\u201332) and smaller R0_BLOCK values (256\u20131024) to a reduction kernel caused a severe 6.7x slowdown. Despite the intent to reduce register pressure, the autotuner selected a configuration that increased registers/thread from 127 to 155, further reducing theoretical occupancy from 25% to 18.75% and Block Limit Registers from 4 to 3. Critically, executed instructions exploded from 348M to 2.72B (7.8x), indicating the autotuner selected a configuration with far more loop iterations or inefficient tiling that massively increased total work. The grid was not updated to use the autotuned XBLOCK (it remained fixed at triton.cdiv(xnumel, 1)=1024), so the autotuner's XBLOCK changes only affected the inner tile size without reducing grid size, causing each block to do redundant work.",
+    "slow_pseudocode": "# BEFORE: fixed XBLOCK=1, R0_BLOCK=2048, grid=1024\ngrid = (triton.cdiv(xnumel, 1),)  # = 1024\nkernel[grid](..., XBLOCK=1, R0_BLOCK=2048)",
+    "fast_pseudocode": "# ATTEMPTED (caused regression): autotune XBLOCK/R0_BLOCK but grid not updated\n@triton.autotune(configs=[Config({'XBLOCK':8,'R0_BLOCK':256}), ...], key=[...])\n@triton.jit\ndef kernel(...):\n    ...\n# BUG: grid still fixed at 1024, not lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\ngrid = (triton.cdiv(xnumel, 1),)  # should be lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # XBLOCK/R0_BLOCK injected by autotuner but grid is wrong",
+    "applicable_when": "Never apply this exact pattern. The grid must be updated to a lambda using meta['XBLOCK'] when autotuning XBLOCK in a Triton reduction kernel.",
+    "do_not_apply_when": "Do not add @triton.autotune for XBLOCK without simultaneously changing the grid to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. Failing to do so causes the autotuner to select large XBLOCK values that increase register pressure while the grid remains oversized, exploding total instruction count and causing severe regressions (7.8x more instructions, 6.7x slower).",
+    "framework_notes": "Triton-specific: when using @triton.autotune with XBLOCK as a tunable parameter, the grid MUST be a lambda that reads meta['XBLOCK'], e.g. `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. A static grid ignores the autotuned XBLOCK, causing each block to process only its fixed slice while the autotuner may pick large XBLOCK values that increase register pressure without reducing grid size."
+  },
+  {
+    "item_id": "exp_triton_autotune_config_replace_regression_002",
+    "iteration": 2,
+    "speedup": 0.13,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "add_autotune_with_larger_xblock_and_vectorized_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 127.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 21.91,
+        "GPU Speed Of Light Throughput.Duration (us)": 641.76,
+        "Instruction Statistics.Executed Instructions": 348631040.0,
+        "Launch.Waves Per SM": 1.94,
+        "Memory Workload Analysis.Mem Busy": 77.4,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 69.81
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 244.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 11.92,
+        "GPU Speed Of Light Throughput.Duration (us)": 4930.0,
+        "Instruction Statistics.Executed Instructions": 2798905600.0,
+        "Launch.Waves Per SM": 3.88,
+        "Memory Workload Analysis.Mem Busy": 15.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 71.6
+      }
+    },
+    "strategy_title": "Autotune XBLOCK increase caused register explosion and 8x slowdown",
+    "strategy_description": "Replacing autotune configs with larger XBLOCK values (8\u201316) and num_stages=2 on a Welford reduction kernel caused registers per thread to jump from 127 to 244, cutting theoretical occupancy from 25% to 12.5% and executed instructions to balloon from 348M to 2799M (8x more work). The root cause is that the launch grid remained fixed at (cdiv(xnumel, 1),) = 1024 blocks rather than being updated to a lambda using META['XBLOCK'], so the autotuner selected larger XBLOCK values but the grid did not shrink proportionally \u2014 each CTA processed far more elements than intended. When adding or modifying autotune configs with variable XBLOCK in a Triton reduction kernel, the launch grid must be a lambda: `lambda META: (cdiv(xnumel, META['XBLOCK']),)`; failing to do so causes each block to redundantly process XBLOCK times more data, exploding both register pressure and total instruction count.",
+    "slow_pseudocode": "# Before: fixed grid, fixed XBLOCK=1, R0_BLOCK=2048\ngrid = (cdiv(xnumel, 1),)  # = 1024\nkernel[grid](..., XBLOCK=1, R0_BLOCK=2048)",
+    "fast_pseudocode": "# Correct: grid must scale with XBLOCK\n@triton.autotune(configs=[Config({'XBLOCK': 8, 'R0_BLOCK': 512}, ...)], key=[...])\n@triton.jit\ndef kernel(...):\n    ...\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](...)  # no explicit XBLOCK/R0_BLOCK",
+    "applicable_when": "Triton reduction kernel with XBLOCK=1 and high register pressure limiting occupancy; autotune configs are being added or modified to explore larger XBLOCK values.",
+    "do_not_apply_when": "The launch grid is not simultaneously updated to a lambda using META['XBLOCK'] \u2014 this causes each CTA to process XBLOCK times more elements than intended, exploding instruction count and register pressure. Also avoid when the kernel body uses hardcoded tile-size assumptions that don't scale with XBLOCK.",
+    "framework_notes": "In Triton, when using @triton.autotune with XBLOCK as a tunable parameter, the grid MUST be a lambda: `grid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)`. A static grid computed before the kernel call (e.g., `grid = (cdiv(xnumel, 1),)`) ignores the autotuner's XBLOCK selection and causes each block to process XBLOCK times more data than expected, regardless of whether configs are added or replaced."
+  },
+  {
+    "item_id": "exp_triton_autotune_xblock_grid_lambda_regression_003",
+    "iteration": 4,
+    "speedup": 0.4107,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_grid_lambda_to_enable_xblock_autotune_and_increase_r0block_for_fewer_iterations",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 639.87,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 69.58,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 77.97,
+        "Occupancy.Theoretical Occupancy_%": 25.0,
+        "Occupancy.Achieved Occupancy_%": 21.92,
+        "Launch Statistics.Registers Per Thread": 127.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Instruction Statistics.Executed Instructions": 348631040.0,
+        "Launch Statistics.Block Size": 128.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 1560.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 30.32,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 29.7,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Occupancy.Achieved Occupancy_%": 12.01,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Instruction Statistics.Executed Instructions": 371529728.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Scheduler Statistics.No Eligible_%": 69.1,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38
+      }
+    },
+    "strategy_title": "Halving Block Size to 64 Threads Doubles Register Pressure, Causes Regression",
+    "strategy_description": "Adding num_warps=2 (64-thread block) configs to a Triton reduction kernel autotune caused the autotuner to select a 64-thread configuration that pushed registers per thread from 127 to 255 (the hardware maximum), halving theoretical occupancy from 25% to 12.5% and tripling kernel duration from 640us to 1560us. Despite the intent to allow more blocks per SM by reducing per-block register budget, the compiler instead allocated more registers per thread when given fewer threads per block, resulting in the same Block Limit Registers=4 constraint but with half the warps per block \u2014 net occupancy dropped. The 'No Eligible' scheduler stall rate jumped from 27.7% to 69.1%, indicating severe latency-hiding loss due to the occupancy collapse.",
+    "slow_pseudocode": "# BEFORE: block_size=128, registers=127, occupancy=21.9%\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4),  # 128 threads\n    Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=8),\n], key=['xnumel', 'r0_numel'])",
+    "fast_pseudocode": "# ATTEMPTED (caused regression): added num_warps=2 (64-thread) configs\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=2),  # 64 threads -- BAD\n    Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=2),  # 64 threads -- BAD\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=2),  # 64 threads -- BAD\n    Config({'XBLOCK': 2, 'R0_BLOCK': 1024}, num_warps=4),  # XBLOCK>1 without grid lambda -- BAD\n    Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=8),  # XBLOCK>1 without grid lambda -- BAD\n    ...\n], key=['xnumel', 'r0_numel'])\n# Result: autotuner selected 64-thread config, registers jumped to 255, occupancy halved",
+    "applicable_when": "Never: reducing num_warps below 4 in a high-register-pressure Triton reduction kernel does not improve occupancy when the compiler compensates by allocating more registers per thread.",
+    "do_not_apply_when": "Do not add num_warps=2 (64-thread block) configs to autotune when the kernel already uses 127+ registers per thread at num_warps=4. The compiler will allocate up to 255 registers per thread with fewer threads, keeping Block Limit Registers the same but halving warps per block, collapsing occupancy and causing severe latency-hiding loss (No Eligible stalls jump from ~28% to ~69%). Also, XBLOCK>1 configs without a corrected grid lambda remain broken (same root cause as exp_001 and exp_002).",
+    "framework_notes": "In Triton, num_warps controls threads per block (num_warps * 32). Reducing num_warps from 4 to 2 halves block size from 128 to 64 threads. When a kernel is already register-bound (127+ registers/thread), the compiler may allocate even more registers per thread with smaller blocks, negating any occupancy benefit. The Block Limit Registers constraint (4 blocks/SM here) did not improve despite halving block size because registers/thread doubled to 255."
+  },
+  {
+    "item_id": "exp_triton_reduce_r0block_num_warps_regression_003",
+    "iteration": 4,
+    "speedup": 0.7264,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_r0block_and_num_warps_to_cut_register_pressure_and_improve_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 639.87,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 69.58,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 77.97,
+        "Occupancy.Theoretical Occupancy_%": 25.0,
+        "Occupancy.Achieved Occupancy_%": 21.92,
+        "Launch Statistics.Registers Per Thread": 127.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.85,
+        "Instruction Statistics.Executed Instructions": 348631040.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 882.08,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 47.29,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 52.27,
+        "Occupancy.Theoretical Occupancy_%": 75.0,
+        "Occupancy.Achieved Occupancy_%": 23.56,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Occupancy.Block Limit Registers": 24.0,
+        "Launch Statistics.Waves Per SM": 0.32,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.82,
+        "Instruction Statistics.Executed Instructions": 328964096.0
+      }
+    },
+    "strategy_title": "Smaller R0_BLOCK/num_warps Collapses Waves, Causes Regression",
+    "strategy_description": "Reducing R0_BLOCK from 2048 to 256/512 and num_warps from 4/8 to 2 successfully cut registers/thread from 127 to 34 and raised theoretical occupancy from 25% to 75%, but caused a 38% slowdown. The critical failure was that waves_per_sm collapsed from 1.94 to 0.32 \u2014 with only 1024 grid blocks and 132 SMs, the smaller block size (64 threads vs 128) meant the GPU was severely underutilized, with most SMs idle. Despite higher theoretical occupancy, achieved occupancy barely improved (21.92% \u2192 23.56%), and warp cycles per issued instruction nearly doubled (4.85 \u2192 7.82 cycles), indicating increased L1TEX stall latency (CPIStall rule triggered at 62.4% of stall cycles). When a reduction kernel's grid is fixed and small relative to SM count, reducing block size to improve occupancy backfires: fewer total threads means fewer waves, leaving the GPU starved of work and amplifying memory latency stalls.",
+    "slow_pseudocode": "# BEFORE: block_size=128, R0_BLOCK=2048, waves_per_sm=1.94\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=8, num_stages=1),\n], key=['xnumel', 'r0_numel'])\n# grid = 1024 blocks, 128 threads/block => 1.94 waves/SM",
+    "fast_pseudocode": "# AFTER (caused regression): block_size=64, R0_BLOCK=256, waves_per_sm=0.32\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 256}, num_warps=2, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512}, num_warps=2, num_stages=1),\n    # ... smaller configs selected by autotuner\n], key=['xnumel', 'r0_numel'])\n# grid = 1024 blocks, 64 threads/block => 0.32 waves/SM\n# Result: GPU severely underutilized, warp stalls doubled",
+    "applicable_when": "Never apply this pattern when the grid is fixed and small (waves_per_sm < 2) relative to SM count. Reducing block size in this regime collapses waves further and starves the GPU.",
+    "do_not_apply_when": "Do not reduce num_warps or block_size to improve theoretical occupancy when waves_per_sm is already near or below 2.0 with a fixed grid. The resulting collapse in total thread count leaves SMs idle and amplifies memory latency stalls (warp cycles per issued instruction increases). The correct fix for register-pressure-limited occupancy in this regime is to reduce register usage within the kernel body (e.g., spill accumulators to shared memory, restructure the reduction loop) rather than shrinking block size.",
+    "framework_notes": "In Triton, when the grid is fixed (not a lambda) and small relative to SM count, reducing num_warps (block_size) to improve theoretical occupancy is counterproductive: waves_per_sm drops proportionally, leaving most SMs idle. The autotuner selected R0_BLOCK=256/num_warps=2 (block_size=64), which dropped waves_per_sm from 1.94 to 0.32 \u2014 a 6x reduction in GPU utilization that overwhelmed the occupancy benefit."
+  },
+  {
+    "item_id": "exp_triton_increase_num_warps_8_16_xblock1_regression_005",
+    "iteration": 5,
+    "speedup": 0.6523,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_num_warps_to_hide_l1tex_latency_with_fixed_xblock1_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 643.42,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 69.46,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 77.14,
+        "Occupancy.Theoretical Occupancy_%": 25.0,
+        "Occupancy.Achieved Occupancy_%": 21.9,
+        "Launch Statistics.Registers Per Thread": 127.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.86,
+        "Instruction Statistics.Executed Instructions": 348631040.0,
+        "Scheduler Statistics.No Eligible_%": 27.8,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.51
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 982.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 63.75,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 47.68,
+        "Occupancy.Theoretical Occupancy_%": 100.0,
+        "Occupancy.Achieved Occupancy_%": 74.2,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.18,
+        "Instruction Statistics.Executed Instructions": 497664000.0,
+        "Scheduler Statistics.No Eligible_%": 30.95,
+        "Scheduler Statistics.Active Warps Per Scheduler": 11.87
+      }
+    },
+    "strategy_title": "Doubling num_warps Collapses Waves, Triples CPI Stall",
+    "strategy_description": "Replacing autotune configs with num_warps=8/16 (block_size=256/512) on a XBLOCK=1 reduction kernel with a fixed 1024-block grid caused a 35% slowdown despite dramatically improving theoretical occupancy (25%\u2192100%) and achieved occupancy (21.9%\u219274.2%). The critical failure was that waves_per_sm collapsed from 1.94 to 0.97 \u2014 with only 1024 grid blocks and 132 SMs, doubling block size halved the number of waves, leaving the GPU underutilized in terms of total work. Warp cycles per issued instruction tripled from 4.86 to 17.18, and a new CPIStall rule triggered at 51.6% of stall cycles attributed to L1TEX scoreboard waits, indicating that despite more warps per SM, the memory access pattern remained uncoalesced and the larger blocks amplified total instruction count (348M\u2192498M) without proportional throughput gain.",
+    "slow_pseudocode": "# BEFORE: block_size=128, num_warps=4, waves_per_sm=1.94, CPI=4.86\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4, num_stages=1),\n    Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n    # ... mixed XBLOCK configs\n], key=['xnumel', 'r0_numel'])\n# grid = (cdiv(xnumel, 1),) = 1024 blocks fixed",
+    "fast_pseudocode": "# AFTER (caused regression): block_size=256, num_warps=8, waves_per_sm=0.97, CPI=17.18\n@triton.autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=8,  num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=8,  num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8,  num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8,  num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=16, num_stages=1),\n    # ...\n], key=['xnumel', 'r0_numel'])\n# grid = (cdiv(xnumel, 1),) = 1024 blocks fixed\n# Result: waves_per_sm=0.97, CPI tripled, 35% slower",
+    "applicable_when": "Never apply when the grid is fixed and small (waves_per_sm near or below 2.0) relative to SM count. Increasing num_warps in this regime halves waves_per_sm further and amplifies per-warp memory latency stalls.",
+    "do_not_apply_when": "Do not increase num_warps (block_size) to hide L1TEX latency when the grid is fixed at ~1024 blocks across 132 SMs and waves_per_sm is already near 2.0. Doubling block size halves waves_per_sm to ~1.0, leaving half the SMs underutilized during the partial wave. The resulting CPI stall increase (4.86\u219217.18 cycles) overwhelms any latency-hiding benefit from more warps per SM. The uncoalesced access pattern (33M excessive sectors) is the root bottleneck that more warps cannot fix.",
+    "framework_notes": "In Triton, with a fixed grid of 1024 blocks on a 132-SM GPU, waves_per_sm = 1024 / (132 * blocks_per_sm). Increasing num_warps from 4 to 8 (block_size 128\u2192256) reduces blocks_per_sm due to register/warp limits, collapsing waves_per_sm from 1.94 to 0.97. Even though theoretical occupancy jumped to 100% and achieved occupancy to 74.2%, the halved wave count meant the GPU processed less total work per unit time. The CPIStall L1TEX rule (51.6% of stall cycles) indicates the uncoalesced memory access pattern is the true bottleneck that must be fixed structurally, not masked with more warps."
+  }
+]

@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "2084d9e4",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_xblock_for_persistent_tile_efficiency",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_xblock_for_persistent_tile_efficiency \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'autotune_xblock_for_persistent_tile_efficiency' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches 861,056 CTAs of only 128 threads each over 110M elements. With 132 SMs this is 407.7 waves \u2014 enormous launch overhead. The scheduler has only 0.91 eligible warps/cycle (45.7% idle cycles) because each tiny CTA cannot supply enough in-flight memory operations to hide the 9.2-cycle L1TEX scoreboard stall. Increasing XBLOCK from 128 to 1024\u20134096 reduces the grid to 107K\u201327K CTAs, gives each SM more work per wave, and allows the warp scheduler to hide memory latency by overlapping more in-flight loads.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.5733,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_tile_size_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 531.68,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.06,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.73,
+        "Occupancy.Achieved Occupancy": 53.21,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.91,
+        "Scheduler Statistics.No Eligible": 45.69,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Instruction Statistics.Executed Instructions": 227318784.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 927.46,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.59,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 18.77,
+        "Occupancy.Achieved Occupancy": 88.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 9.73,
+        "Scheduler Statistics.No Eligible": 7.3,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Instruction Statistics.Executed Instructions": 675497106.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK Increase Causes Instruction Explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (512/1024/2048) alongside a mask change (xmask = xindex < xnumel instead of tl.full([XBLOCK], True)) caused executed instructions to nearly triple (227M \u2192 675M) and duration to increase 1.74x despite improving occupancy (53% \u2192 88%) and scheduler utilization (54% \u2192 93%). The register count per thread rose from 16 to 28, halving the Block Limit Registers from 32 to 16, which constrained occupancy gains. The instruction explosion \u2014 likely from predicated/masked loads on a tensor whose size is already a multiple of the original XBLOCK \u2014 dominated any latency-hiding benefit from larger tiles. When the original kernel uses tl.full([XBLOCK], True) (no masking needed), introducing xmask = xindex < xnumel adds unnecessary predication overhead that scales with the larger tile sizes chosen by autotune.",
+    "slow_pseudocode": "# BEFORE: fixed XBLOCK=128, no mask needed\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)\n    tmp0 = tl.load(ptr + xindex, None)  # no mask\n    ...\n    tl.store(ptr + xindex, result, None)  # no mask\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# AFTER (regressed): autotune + mask added\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 2048}, num_warps=16, num_stages=1),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xmask = xindex < xnumel  # <-- added mask\n    tmp0 = tl.load(ptr + xindex, xmask)  # masked load\n    ...\n    tl.store(ptr + xindex, result, xmask)  # masked store\n\ngrid = (triton.cdiv(xnumel, 128),)  # grid NOT updated to use meta['XBLOCK']\nkernel[grid](...)",
+    "applicable_when": "Never \u2014 this specific combination is always harmful. The general direction of increasing XBLOCK may still be valid but requires correct grid lambda and no spurious mask introduction.",
+    "do_not_apply_when": "When the original kernel already uses tl.full([XBLOCK], True) indicating xnumel is a multiple of XBLOCK (no boundary masking needed). Do not introduce xmask = xindex < xnumel in that case as it adds predication overhead. Also, the grid was not updated to use lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),) \u2014 the fixed grid of cdiv(xnumel, 128) blocks was kept, meaning autotune selected larger XBLOCK but the grid remained sized for XBLOCK=128, causing each block to process far more elements than intended and massively inflating instruction count.",
+    "framework_notes": "Critical implementation flaw: the grid was NOT changed to lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),). The grid remained (triton.cdiv(xnumel, 128),) = 861056 blocks. When autotune selected XBLOCK=1024 or 2048, each block processed 8-16x more elements than the grid was designed for, causing ~3x instruction inflation. Additionally, registers/thread rose from 16 to 28 (likely from the mask computation), cutting Block Limit Registers from 32 to 16 blocks/SM."
+  }
+]

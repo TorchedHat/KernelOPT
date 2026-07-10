@@ -1,0 +1,65 @@
+--- baseline
++++ rebuilt
+@@ -5,26 +5,46 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_poi_fused_convolution_2(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 24576
+-    xnumel = 3025
++    # Axes reassigned:
++    #   x-axis (XBLOCK=96) -> channel dim C=96, stride=1 in in_ptr0 -> COALESCED
++    #   y-axis (YBLOCK)    -> flattened (batch * spatial) = 256*3025 = 774400
++    C = 96
++    NHW = 774400  # 256 * 3025
++
++    xoffset = tl.program_id(0) * XBLOCK
++    # Apply vectorization hints on 1D arange before reshape
++    xarange = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)
++    xindex = xarange[None, :]   # shape [1, XBLOCK] — channel index
++
+     yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 96)
+-    y1 = yindex // 96
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 96*x2 + 290400*y1), xmask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
++    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # shape [YBLOCK, 1] — batch*spatial index
++    ymask = yindex < NHW        # guard (batch*spatial) index < 774400
++
++    # xmask guards channel_idx < 96 AND batch*spatial < 774400
++    xmask = (xindex < C) & ymask
++
++    # Decompose yindex into spatial (x2) and batch (y1)
++    x2 = yindex % 3025   # spatial index
++    y1 = yindex // 3025  # batch index
++
++    # chan_idx = xindex (channel, stride=1 in in_ptr0 -> COALESCED)
++    chan_idx = xindex
++
++    # Load: address = chan_idx + 96*x2 + 290400*y1
++    # Identical to original y0 + 96*x2 + 290400*y1
++    # chan_idx varies by 1 per thread -> COALESCED 128-bit loads
++    tmp0 = tl.load(in_ptr0 + (chan_idx + 96*x2 + 290400*y1),
++                   mask=xmask, eviction_policy='evict_last')
++    # Bias: per-channel, broadcast over YBLOCK rows; mask by channel guard
++    tmp1 = tl.load(in_ptr1 + chan_idx, mask=xmask, eviction_policy='evict_last')
+     tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 3025*y3), tmp2, xmask)
+-
+-
++    # Store: address = x2 + 3025*(chan_idx + 96*y1)
++    # Identical to original x2 + 3025*y3 where y3 = chan_idx + 96*y1
++    tl.store(out_ptr0 + (x2 + 3025*(chan_idx + 96*y1)),
++             tmp2, mask=xmask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

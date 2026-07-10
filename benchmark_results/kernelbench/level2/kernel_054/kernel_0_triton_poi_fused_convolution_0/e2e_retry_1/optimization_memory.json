@@ -1,0 +1,46 @@
+[
+  {
+    "item_id": "triton_autotune_tile_coalesced_stores_001",
+    "iteration": 1,
+    "speedup": 1.3826,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 5.89,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8790.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.39,
+        "Memory Workload Analysis.L2 Hit Rate": 60.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.26,
+        "Scheduler Statistics.No Eligible": 70.41,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.1,
+        "UncoalescedGlobalAccess.excess_sectors": 112896.0,
+        "CPIStall.L1TEX_scoreboard_stall_pct": 48.4
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.26,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6330.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 27.6,
+        "Memory Workload Analysis.L2 Hit Rate": 63.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 28.9,
+        "Scheduler Statistics.No Eligible": 64.71,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.29,
+        "Launch Statistics.Registers Per Thread": 21.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.05,
+        "UncoalescedGlobalAccess.excess_sectors": 50176.0,
+        "CPIStall.L1TEX_scoreboard_stall_pct": 32.06
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Reduce Strided Store Uncoalescing",
+    "strategy_description": "When a kernel writes to a strided output layout (e.g., NHWC with stride-3 channel dimension), the fixed tile shape may cause every store transaction to be uncoalesced, wasting 30-50% of memory bandwidth. Adding @triton.autotune with configs spanning multiple YBLOCK and XBLOCK values allows the runtime to select a tile shape that aligns the y-tile boundary to the stride period, reducing excess sectors and L1TEX scoreboard stalls. This also reduces register pressure (26\u219221 registers/thread) and shared memory usage, improving scheduler eligibility (eligible warps/scheduler: 0.95\u21921.29) and cutting kernel duration by ~28%.",
+    "slow_pseudocode": "# Fixed tile shape causes stride-3 scatter in stores\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    y0 = yindex % 3  # stride-3 channel index\n    y1 = yindex // 3\n    tmp = tl.load(in_ptr + (xindex + XSTRIDE * yindex), mask)\n    tl.store(out_ptr + (y0 + 3*xindex + YSTRIDE*y1), tmp, mask)\n\n# Fixed launch\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune selects tile shape that aligns y-tile to stride period\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4},  num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 4},  num_warps=8, num_stages=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=8, num_stages=4),\n        # ... more configs spanning XBLOCK in {64,128,256,512}, YBLOCK in {4,8,16}\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # body unchanged\n    ...\n\n# Lambda grid uses autotuned meta\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel has UncoalescedGlobalAccess rule triggered with >15% excess sectors; store address contains a modulo/stride term (e.g., yindex % K) that creates non-unit stride scatter; CPIStall on L1TEX scoreboard is >30% of warp cycles; kernel uses fixed hardcoded tile sizes (XBLOCK, YBLOCK) without autotuning; IssueSlotUtilization shows >50% no-eligible cycles.",
+    "do_not_apply_when": "Kernel is already autotuned or tile sizes are already optimal; the store pattern is naturally coalesced (unit stride); the grid is already large enough to saturate the device (waves_per_sm >> 1); autotuning overhead is unacceptable (e.g., very short-lived kernels called once); YBLOCK must remain a power of 2 and the stride period is not a power of 2 (alignment may not improve).",
+    "framework_notes": "Triton-specific: @triton.autotune requires key= parameter listing tensor-size arguments that determine the best config. YBLOCK must be a power of 2 for tl.arange; use ymask = yindex < ynumel to guard boundary lanes. The grid must be a lambda using meta['XBLOCK'] and meta['YBLOCK'] when autotuning both dimensions. In CUDA, the equivalent is launching multiple configurations and selecting the fastest, or using __launch_bounds__ to reduce register pressure."
+  }
+]

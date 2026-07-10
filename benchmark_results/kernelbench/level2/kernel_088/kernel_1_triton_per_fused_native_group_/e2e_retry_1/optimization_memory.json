@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "54bd1610",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_autotune \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_autotune' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n constexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, opti",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is memory-bound (DRAM 64% vs Compute 27.9%). The dominant stall is L1TEX scoreboard (72.4% of stall cycles, 27.5 cycles avg), meaning warps are blocked waiting for scalar loads to return from L2/DRAM. The load address is `in_ptr0 + (r0_1 + 16*x0)`: each thread in the XBLOCK dimension loads a contiguous 16-element row (64 bytes = one cache line), but Triton cannot emit 128-bit (float4) vectorized loads without explicit `tl.max_contiguous` / `tl.multiple_of` hints on the pointer offset. Adding these hints tells the compiler the inner dimension is contiguous and aligned, enabling 128-bit LDG.E.128 instructions that halve the number of memory transactions and reduce L1TEX stall cycles. Additionally, the current fixed XBLOCK=128 produces 4096 blocks on 132 SMs (1 full wave + 1984-block partial wave = 50% tail overhead per the LaunchConfiguration rule). Autotuning XBLOCK across {64, 128, 256, 512} and num_warps across {2, 4, 8} will find the configuration that eliminates or minimizes the partial wave while maximizing vectorization width.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n constexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_register_reduction_group_norm",
+    "iteration": 1,
+    "speedup": 1.5537,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_reduce_registers_and_smem",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.14,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 64.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 27.92,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 37.99,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 512.0,
+        "Scheduler Statistics.No Eligible": 64.51,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.85,
+        "Instruction Statistics.Executed Instructions": 2424832.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 7.17,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 47.87,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 28.42,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.04,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 256.0,
+        "Scheduler Statistics.No Eligible": 59.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.0,
+        "Instruction Statistics.Executed Instructions": 1531904.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Cut Registers, SMEM, and Instructions",
+    "strategy_description": "Adding @triton.autotune with a range of XBLOCK configs allowed the compiler to select a configuration that reduced registers per thread from 32 to 20 and dynamic shared memory per block from 512 to 256 bytes, cutting total executed instructions by ~37%. This directly reduced L1TEX scoreboard stall cycles (Warp Cycles Per Issued Instruction dropped from 38.0 to 31.0) and improved scheduler eligible warps from 0.85 to 1.0 per cycle. The index rewrite from `r0_1 + 16*x0` to `xindex * R0_BLOCK + r0_index` is mathematically equivalent but makes the contiguous (r0) axis explicit, enabling better memory access patterns at the selected XBLOCK.",
+    "slow_pseudocode": "# Fixed XBLOCK=128, no autotune\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK: tl.constexpr):\n    R0_BLOCK: tl.constexpr = 16\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]\n    # stride-16 non-coalesced load\n    tmp0 = tl.load(in_ptr0 + (r0_index + 16 * xindex), xmask)\n    ...\ngrid = (triton.cdiv(xnumel, 128),)  # fixed 4096 blocks\nkernel[grid](in_ptr0, out_ptr0, out_ptr1, xnumel, 16, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune over XBLOCK configs\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64},   num_warps=4,  num_stages=2),\n        triton.Config({'XBLOCK': 128},  num_warps=4,  num_stages=2),\n        triton.Config({'XBLOCK': 256},  num_warps=8,  num_stages=2),\n        triton.Config({'XBLOCK': 512},  num_warps=8,  num_stages=3),\n        triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=3),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK: tl.constexpr):\n    R0_BLOCK: tl.constexpr = 16\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]\n    # explicit contiguous r0 axis\n    tmp0 = tl.load(in_ptr0 + (xindex * R0_BLOCK + r0_index), xmask)\n    ...\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](in_ptr0, out_ptr0, out_ptr1, xnumel, 16)  # XBLOCK from autotune",
+    "applicable_when": "Triton kernel has a fixed XBLOCK with high register pressure (>24 registers/thread), high dynamic shared memory per block, high L1TEX scoreboard stall cycles (Warp Cycles Per Issued Instruction >30), low eligible warps per scheduler (<1.0), and the kernel performs a small inner reduction (R0_BLOCK <= 32) over a large outer dimension. CPIStall and SOLBottleneck NCU rules are triggered.",
+    "do_not_apply_when": "The kernel is already autotuned or register count is already low (<20 registers/thread). Do not apply when the inner reduction dimension is large (R0_BLOCK > 64) and shared memory is genuinely needed for the reduction. Also avoid when the grid size is already well-matched to SM count with no partial wave overhead.",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter. The key=['xnumel'] ensures autotuning is re-run when problem size changes. The grid lambda `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` is required when XBLOCK is determined at autotune time rather than fixed at launch. In CUDA, the equivalent would be using __launch_bounds__ with different block sizes and selecting via runtime heuristics."
+  }
+]

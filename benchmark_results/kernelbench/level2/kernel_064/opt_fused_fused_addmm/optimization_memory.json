@@ -1,0 +1,323 @@
+[
+  {
+    "item_id": "e404a8a7",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fuse_gemm_epilogue_with_logsumexp_reduction",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions + MemoryL2Compression + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fuse_gemm_epilogue_with_logsumexp_reduction \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fuse_gemm_epilogue_with_logsumexp_reduction' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 229, in <d",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is already compute-bound at 91.79% SM throughput with TF32 Tensor Cores active. The remaining bottlenecks are: (1) FPInstructions rule flags 262,144 non-fused FP32 scalar instructions in the epilogue (bias add + store path) creating fixed-latency dependency chains (CPIStall = 47.4% of stalls) between the wgmma accumulator and scalar bias/store ops; (2) L2 Compression = 0% on 33.6 MB of GEMM output written to global memory, then immediately re-read by logsumexp_leakyrelu_gelu_kernel in two full passes \u2014 this is 3x unnecessary global memory traffic (1 write + 2 reads) for 33.6 MB. Fusing the GEMM epilogue (bias add) directly into the logsumexp reduction kernel eliminates the 33.6 MB intermediate buffer entirely: the GEMM tile output stays in registers/SRAM and feeds the row-max reduction inline, removing 2 global memory round-trips and the L2 compression miss penalty. This is a classic GEMM epilogue fusion pattern (strategy #10) combined with cross-reduction fusion (strategy #9).",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  Fi",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_003_bias_hoist_and_num_stages6_triton_gemm",
+    "iteration": 3,
+    "speedup": 18.1639,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_bias_epilogue_and_deepen_pipeline_num_stages",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 428.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.84,
+        "Memory Workload Analysis.L2 Hit Rate": 77.63,
+        "Scheduler Statistics.No Eligible": 67.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Launch Statistics.Registers Per Thread": 200.0,
+        "Instruction Statistics.Executed Instructions": 91410432.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 425.57,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.07,
+        "Memory Workload Analysis.L2 Hit Rate": 78.79,
+        "Scheduler Statistics.No Eligible": 67.56,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Instruction Statistics.Executed Instructions": 91416576.0
+      }
+    },
+    "strategy_title": "Hoist Epilogue Load and Remove Redundant FP32 Cast",
+    "strategy_description": "When a GEMM epilogue loads a bias vector after the K-loop and applies it as a separate FADD, NCU's FPInstructions rule flags these as non-fused FP32 instructions (0 fused, 262,144 non-fused). Hoisting the bias load before the K-loop makes it register-resident, giving the compiler the opportunity to fuse the bias-add with preceding operations. Removing the redundant `.to(tl.float32)` cast on the store (when the accumulator is already float32) eliminates a no-op type conversion. However, when the kernel is already at >91% compute throughput and the FPInstructions count is small relative to total instructions (~0.3% speedup_pct per NCU), these changes produce only marginal improvement (~0.6% duration reduction, 428\u00b5s \u2192 426\u00b5s), confirming the kernel is near its compute-bound ceiling.",
+    "slow_pseudocode": "# Bias loaded AFTER K-loop, non-fused FADD, redundant cast\nacc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A, mask=...)\n    b = tl.load(B, mask=...)\n    acc = tl.dot(a, b, acc, allow_tf32=True)\n    A += BLOCK_K * stride_ak\n    B += BLOCK_K * stride_bk\nbias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0)  # loaded after K-loop\nacc = acc + bias[None, :]  # 262,144 non-fused FADD\ntl.store(C, acc.to(tl.float32), mask=mask)  # redundant cast",
+    "fast_pseudocode": "# Bias hoisted BEFORE K-loop, register-resident, cast removed\nacc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\nbias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0)  # hoisted before K-loop\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A, mask=..., eviction_policy='evict_last')\n    b = tl.load(B, mask=..., eviction_policy='evict_last')\n    acc = tl.dot(a, b, acc, allow_tf32=True)\n    A += BLOCK_K * stride_ak\n    B += BLOCK_K * stride_bk\nacc = acc + bias[None, :]  # fused FMA eligible\ntl.store(C, acc, mask=mask)  # acc already float32, no cast needed",
+    "applicable_when": "NCU FPInstructions rule reports non-fused FP32 instructions > 0 with 0 fused; epilogue bias-add is performed after the main compute loop; accumulator dtype is already float32 but store uses explicit .to(float32) cast; compute throughput is below 85% (leaving headroom for epilogue fusion to matter).",
+    "do_not_apply_when": "Kernel is already at >90% compute throughput \u2014 the FPInstructions non-fused count is a small fraction of total instructions and the marginal gain is <1%. Also inapplicable if the bias load aliases any write target (A, B, C pointers) or if the accumulator dtype differs from float32 (cast may be semantically necessary). Adding num_stages=6 autotune configs is only beneficial if the autotuner actually selects them and smem budget allows; if the kernel is already at peak compute, deeper pipelines add config search overhead without runtime benefit.",
+    "framework_notes": "Triton-specific: hoisting `tl.load` before a loop is safe when the pointer is read-only and does not alias loop-modified pointers. The `eviction_policy='evict_last'` hint on A/B loads encourages L1 retention for reuse across K-loop iterations. In CUDA, the equivalent is loading bias into registers before the K-loop and using `__fmaf_rn` for fused multiply-add. The num_stages=6 autotune configs require verifying smem budget: (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N)*dtype_bytes*num_stages \u2264 per-SM smem limit (228KB on H200)."
+  },
+  {
+    "item_id": "exp_003_reduce_register_pressure_via_block_size_increase_triton_gemm",
+    "iteration": 3,
+    "speedup": 15.7421,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "increase_occupancy_via_register_pressure_reduction_through_block_size",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.84,
+        "GPU Speed Of Light Throughput.Duration": 428.22,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 200.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.18,
+        "Occupancy.Theoretical Active Warps per SM": 8.0,
+        "Scheduler Statistics.No Eligible": 67.68,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.95,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Memory Workload Analysis.L2 Hit Rate": 77.63
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 78.16,
+        "GPU Speed Of Light Throughput.Duration": 491.04,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 110.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 24.36,
+        "Occupancy.Theoretical Active Warps per SM": 16.0,
+        "Scheduler Statistics.No Eligible": 62.25,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.89,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.6,
+        "Memory Workload Analysis.L2 Hit Rate": 87.15
+      }
+    },
+    "strategy_title": "Double Block Size to Halve Registers and Double Occupancy",
+    "strategy_description": "When a Triton GEMM kernel is register-limited to 1-2 blocks/SM (e.g., 200 registers/thread with 128-thread blocks), switching to autotune configs with larger num_warps (e.g., 8 warps = 256 threads/block) can reduce registers/thread (200 \u2192 110) by spreading register file usage across more threads, doubling theoretical occupancy from 12.5% to 25% and active warps/scheduler from 1.95 to 3.89. However, this trade-off is not always a net win: in this case, the increased occupancy improved L2 hit rate (77.6% \u2192 87.2%) and reduced no-eligible scheduler cycles (67.7% \u2192 62.3%), but the smaller effective tile work per warp and increased barrier stalls (CPIStall shifted from fixed-latency to barrier-wait, 52.9% of stall cycles) caused Compute (SM) Throughput to drop from 91.8% to 78.2%, resulting in a net duration increase from 428 \u00b5s to 491 \u00b5s. The strategy is beneficial only when the register-limited occupancy is the primary bottleneck and the new configs do not introduce significant barrier synchronization overhead.",
+    "slow_pseudocode": "# Before: 128-thread blocks, 200 regs/thread, 12.5% occupancy, 8 warps/SM\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),\n    # ... configs with num_warps=4 or 8, producing 128-thread blocks\n], key=['M', 'N', 'K'])\ndef gemm_kernel(...):\n    # 200 regs/thread, Block Limit Registers=2, Theoretical Occupancy=12.5%\n    acc = tl.dot(a, b, acc, allow_tf32=True)",
+    "fast_pseudocode": "# After: 256-thread blocks, 110 regs/thread, 25% occupancy, 16 warps/SM\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=8),\n    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=8),\n    # ... smem-efficient configs targeting <= 114KB/block for 2 blocks/SM\n], key=['M', 'N', 'K'])\ndef gemm_kernel(...):\n    # 110 regs/thread, Block Limit Warps=8, Theoretical Occupancy=25%\n    # BUT: barrier stalls now dominate (52.9% of stall cycles)\n    acc = tl.dot(a, b, acc, allow_tf32=True)",
+    "applicable_when": "Kernel is register-limited to \u226412.5% theoretical occupancy (Block Limit Registers = 1 or 2); registers/thread > 150; no-eligible scheduler cycles > 60%; the kernel does NOT already have high barrier synchronization overhead; smem per block is well below the per-SM limit so doubling blocks/SM is feasible.",
+    "do_not_apply_when": "Kernel is already at high compute throughput (>85% SM Busy) with low occupancy \u2014 the Tensor Core pipeline is saturated and more warps add barrier overhead without improving throughput. Also avoid when the winning autotune config already uses num_warps=8+ and the register reduction from larger blocks would be insufficient to meaningfully increase blocks/SM. Do not apply when shared memory per block is already near the per-SM limit.",
+    "framework_notes": "Triton-specific: num_warps in triton.Config controls threads/block (num_warps * 32). Increasing num_warps from 4 to 8 doubles block size from 128 to 256 threads. Triton's register allocator tends to reduce registers/thread as block size increases because the compiler can reuse registers across the larger warp group. The smem formula (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N)*4*num_stages must stay \u2264 (SM_smem / target_blocks_per_SM) to achieve the desired occupancy. In CUDA, equivalent control is via __launch_bounds__(max_threads, min_blocks) which hints the compiler to reduce register usage."
+  },
+  {
+    "item_id": "exp_004_num_warps16_wgmma_interleaving_triton_gemm",
+    "iteration": 4,
+    "speedup": 18.062,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "hide_mma_fixed_latency_via_num_warps16_warp_group_interleaving",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 425.57,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.07,
+        "Memory Workload Analysis.L2 Hit Rate": 78.79,
+        "Scheduler Statistics.No Eligible": 67.56,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 427.97,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.95,
+        "Memory Workload Analysis.L2 Hit Rate": 87.75,
+        "Scheduler Statistics.No Eligible": 67.44,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.22
+      }
+    },
+    "strategy_title": "Add num_warps=16 Configs to Hide wgmma Fixed-Latency Stalls",
+    "strategy_description": "Adding num_warps=16 autotune configs (4 warp groups on Hopper) to a Triton GEMM kernel with CPIStall fixed-latency stalls at 42.9% of stall cycles and only 0.38 eligible warps/scheduler produced no measurable improvement: duration increased slightly from 425.57 \u00b5s to 427.97 \u00b5s, and all key scheduler metrics (no-eligible %, eligible warps/scheduler, active warps/scheduler, warp cycles/instruction) remained essentially unchanged. The autotuner selected a num_warps=16 config (L2 hit rate improved from 78.79% to 87.75%, suggesting a different tile shape was chosen), but the larger warp group did not reduce fixed-latency stalls \u2014 the kernel remained at 12.5% theoretical occupancy with 201 registers/thread, indicating the register and smem limits prevented any additional blocks/SM from launching. When a kernel is already at >91% compute throughput and register/smem-limited to 2 blocks/SM, adding more warps per block does not increase SM-level parallelism and cannot hide wgmma latency.",
+    "slow_pseudocode": "# Before: num_warps=4 configs only, 128 threads/block\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=6, num_warps=4),\n    # ... other num_warps=4 configs\n], key=['M', 'N', 'K'])\ndef gemm_kernel(...):\n    # 201 regs/thread, 2 blocks/SM, 8 warps/SM, 1.96 active warps/scheduler\n    acc = tl.dot(a, b, acc, allow_tf32=True)",
+    "fast_pseudocode": "# After: added num_warps=16 configs (4 warp groups), 512 threads/block\n@triton.autotune(configs=[\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=6, num_warps=4),\n    # ... existing num_warps=4 configs ...\n    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=16),\n    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=16),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=16),\n    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=16),\n    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=16),\n    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=16),\n], key=['M', 'N', 'K'])\ndef gemm_kernel(...):\n    # Still 201 regs/thread, still 2 blocks/SM, still 8 warps/SM total\n    # num_warps=16 config selected but occupancy unchanged \u2014 no latency hiding benefit\n    acc = tl.dot(a, b, acc, allow_tf32=True)",
+    "applicable_when": "Never demonstrated to help in this context. Theoretically applicable when: kernel is NOT register/smem-limited (blocks/SM > 2 headroom exists); fixed-latency CPIStall > 40% of stall cycles; active warps/scheduler < 4; increasing num_warps does not push register usage to the per-SM limit.",
+    "do_not_apply_when": "Kernel is already register-limited to 2 blocks/SM (Block Limit Registers = 2, Block Limit Shared Mem = 2) with >200 registers/thread \u2014 adding more warps per block cannot increase SM-level warp count and provides no additional latency-hiding parallelism. Also avoid when compute throughput is already >90% SM Busy; the Tensor Core pipeline is saturated and the fixed-latency stalls are an irreducible artifact of the wgmma instruction latency at this occupancy level. Do not apply when a prior attempt with num_warps=8 (exp_003) already showed regression from barrier stalls.",
+    "framework_notes": "Triton-specific: on Hopper, wgmma requires warp groups of 4 warps (128 threads). num_warps=16 = 4 warp groups per block. However, if the block is already register/smem-limited to 2 blocks/SM, the total warps/SM stays at 2*16=32 warps regardless \u2014 no improvement over 2*4=8 warps if the autotuner selects a smaller-tile num_warps=16 config that still hits the same register ceiling. The L2 hit rate improvement (78.79% \u2192 87.75%) suggests the autotuner chose a different tile shape, but this did not translate to throughput gains."
+  },
+  {
+    "item_id": "exp_005_online_logsumexp_single_pass_triton_v2",
+    "iteration": 5,
+    "speedup": 18.263,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "single_pass_online_logsumexp_to_halve_dram_reads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryL2Compression",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 427.97,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.95,
+        "Memory Workload Analysis.Memory Throughput": 860.22,
+        "Memory Workload Analysis.L2 Hit Rate": 87.75,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 17.51,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Instruction Statistics.Executed Instructions": 91416576.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 423.26,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.98,
+        "Memory Workload Analysis.Memory Throughput": 860.33,
+        "Memory Workload Analysis.L2 Hit Rate": 79.87,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 17.51,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Instruction Statistics.Executed Instructions": 91416576.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.01
+      }
+    },
+    "strategy_title": "Online Logsumexp Single-Pass: Autotune Config Change Only",
+    "strategy_description": "This iteration again attempted to convert a two-pass logsumexp kernel to a single-pass online algorithm (Welford-style running max/sum) to eliminate one full read of the input buffer. However, the diff shows only autotune config list modifications (removing num_warps=16 GEMM configs and adding BLOCK_N=8192/4096 logsumexp configs) \u2014 the actual two-pass loop body was NOT replaced with the online update rule. All key metrics remained essentially unchanged: Duration moved from 427.97\u00b5s to 423.26\u00b5s (~1% improvement), Executed Instructions identical at 91,416,576, DRAM Throughput unchanged at 17.51%, confirming the kernel body was not modified. The marginal duration improvement is attributable to autotune config pruning (removing the num_warps=16 GEMM configs that were previously selected and caused slight regression), not to any logsumexp algorithm change.",
+    "slow_pseudocode": "# Two-pass logsumexp (unchanged in this iteration)\n# Pass 1: find max\nrow_max = -inf\nfor off in range(0, N, BLOCK_N):\n    x = tl.load(row_ptr + cols, mask=mask, other=-inf)\n    row_max = tl.maximum(row_max, tl.max(x, axis=0))\n# Pass 2: sum of exp\nrow_sum = 0.0\nfor off in range(0, N, BLOCK_N):\n    x = tl.load(row_ptr + cols, mask=mask, other=-inf)  # second full read\n    row_sum += tl.sum(tl.where(mask, exp(x - row_max), 0.0), axis=0)\nlse = log(row_sum) + row_max",
+    "fast_pseudocode": "# Only autotune config list was changed (NOT the kernel body)\n# Removed: num_warps=16 GEMM configs\n# Added: BLOCK_N=8192 (num_stages=3), BLOCK_N=4096 (num_stages=3) logsumexp configs\n# Kernel body loop structure: UNCHANGED (still two-pass)\ntriton.Config({'BLOCK_N': 8192}, num_stages=3, num_warps=16),\ntriton.Config({'BLOCK_N': 4096}, num_stages=3, num_warps=8),",
+    "applicable_when": "A logsumexp/softmax kernel performs two sequential passes over the same input buffer; the input buffer is large enough to cause DRAM re-reads (buffer > L2 cache size); L2 compression success rate is 0% (FP32 data); the gemm_kernel feeding the buffer is compute-bound (>90% SM throughput). The online algorithm IS the correct strategy \u2014 but requires the loop body to be rewritten.",
+    "do_not_apply_when": "The diff only modifies the autotune config list without changing the kernel body loop structure \u2014 this produces no speedup from the logsumexp optimization. After two failed attempts (iterations 4 and 5), the two-pass loop body has never been successfully replaced with the online update rule. Do not attempt again without verifying the actual kernel body contains the single-pass running_max/running_sum update pattern. Also avoid when the input buffer fits entirely in L2 cache (second pass hits L2, not DRAM).",
+    "framework_notes": "The online logsumexp update rule is: m_new = max(running_max, local_max); running_sum = running_sum * exp(running_max - m_new) + sum(exp(x - m_new)); running_max = m_new. In Triton, use tl.maximum() for scalar max and libdevice.exp() for element-wise exp. The critical implementation check: the AFTER code must have ONE for-loop (not two) over the N dimension, with running_max and running_sum updated inside that single loop. If two for-loops remain in the kernel body, the optimization was not applied."
+  },
+  {
+    "item_id": "exp_005_online_logsumexp_single_pass_triton",
+    "iteration": 5,
+    "speedup": 17.9747,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "implement_online_single_pass_logsumexp_to_eliminate_second_dram_read",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryL2Compression",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 427.97,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.95,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 17.51,
+        "Memory Workload Analysis.L2 Hit Rate": 87.75,
+        "Memory Workload Analysis.Memory Throughput": 860.22,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.22,
+        "Scheduler Statistics.No Eligible": 67.44,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 430.05,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 92.14,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 17.37,
+        "Memory Workload Analysis.L2 Hit Rate": 79.96,
+        "Memory Workload Analysis.Memory Throughput": 853.61,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.18,
+        "Scheduler Statistics.No Eligible": 67.48,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.02
+      }
+    },
+    "strategy_title": "Online Single-Pass Logsumexp Fails When GEMM Dominates Runtime",
+    "strategy_description": "Converting a two-pass logsumexp kernel (separate max-finding and sum-of-exp passes) to a single-pass online Welford-style algorithm produced no measurable improvement: duration increased slightly from 427.97 \u00b5s to 430.05 \u00b5s, and all key metrics (compute throughput, DRAM throughput, scheduler statistics, warp cycles/instruction) remained essentially unchanged. The profiling data shows the gemm_kernel dominates total runtime at >91% compute throughput, and the logsumexp reduction kernel's contribution is negligible relative to the GEMM. The diff reveals that only autotune configs were modified (num_warps=16 configs removed from gemm_kernel, one logsumexp config added) \u2014 the actual online Welford loop body change was not reflected in the profiling delta, confirming the gemm_kernel profile is what NCU captured. When the GEMM kernel is the bottleneck and the reduction kernel is a small fraction of total time, eliminating passes in the reduction kernel yields no observable end-to-end speedup.",
+    "slow_pseudocode": "# Two-pass logsumexp (before)\nrow_max = -inf\nfor off in range(0, N, BLOCK_N):  # Pass 1: find max\n    x = tl.load(row_ptr + cols, mask=mask, other=-inf)\n    row_max = tl.maximum(row_max, tl.max(x, axis=0))\nrow_sum = 0.0\nfor off in range(0, N, BLOCK_N):  # Pass 2: sum exp\n    x = tl.load(row_ptr + cols, mask=mask, other=-inf)\n    row_sum += tl.sum(tl.where(mask, exp(x - row_max), 0.0), axis=0)\nlse = log(row_sum) + row_max",
+    "fast_pseudocode": "# Single-pass online Welford logsumexp (after)\nrunning_max = -inf\nrunning_sum = 0.0\nfor off in range(0, N, BLOCK_N):  # Single pass\n    x = tl.load(row_ptr + cols, mask=mask, other=-inf)\n    local_max = tl.max(tl.where(mask, x, -inf), axis=0)\n    m_new = tl.maximum(running_max, local_max)\n    running_sum = running_sum * exp(running_max - m_new) + tl.sum(tl.where(mask, exp(x - m_new), 0.0), axis=0)\n    running_max = m_new\nlse = log(running_sum) + running_max",
+    "applicable_when": "The logsumexp/softmax reduction kernel is a measurable fraction of total end-to-end runtime (>10%); the GEMM or upstream compute kernel is NOT the dominant bottleneck; DRAM throughput of the reduction kernel is high (>50%) indicating memory-bound behavior; the intermediate buffer is large enough (>10 MB) that two passes create significant DRAM traffic.",
+    "do_not_apply_when": "The upstream GEMM kernel dominates total runtime at >90% compute throughput \u2014 the reduction kernel's contribution is negligible and eliminating its second pass produces no observable end-to-end speedup. Also avoid when the profiling tool (NCU) captures only the GEMM kernel profile and not the reduction kernel, making it impossible to verify the reduction kernel's actual improvement. Do not apply when the code change only modifies autotune configs without actually replacing the two-pass loop body in the kernel.",
+    "framework_notes": "Triton-specific: the online Welford logsumexp update is mathematically equivalent to two-pass (used in FlashAttention). The key correctness constraint is masking out-of-bounds columns to -inf for tl.max and 0.0 for tl.sum contributions. With BLOCK_N >= N, the loop executes exactly once, eliminating all loop overhead. However, if NCU only profiles the dominant kernel (gemm_kernel), improvements to the logsumexp kernel will not appear in the captured metrics."
+  },
+  {
+    "item_id": "exp_005_smem_bank_conflict_b_tile_order_triton_gemm",
+    "iteration": 5,
+    "speedup": 12.2186,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "eliminate_smem_bank_conflicts_via_b_tile_order_correction",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 427.97,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.95,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.22,
+        "Scheduler Statistics.No Eligible": 67.44,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Memory Workload Analysis.L2 Hit Rate": 87.75,
+        "Memory Workload Analysis.Memory Throughput": 860.22
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 632.64,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 58.96,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 110.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 23.93,
+        "Scheduler Statistics.No Eligible": 65.87,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.61,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.83,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.22,
+        "Memory Workload Analysis.L2 Hit Rate": 85.45,
+        "Memory Workload Analysis.Memory Throughput": 608.38
+      }
+    },
+    "strategy_title": "Fix B Tile smem Order to Eliminate Shared Memory Bank Conflicts",
+    "strategy_description": "Changing the `order` parameter of `tl.make_block_ptr` for the B tile from (0,1) to (1,0) \u2014 intended to match Hopper wgmma's N-major B read pattern and eliminate 5.1-way shared memory bank conflicts \u2014 did not improve performance. The profiling after shows the autotuner selected a different winning config (block_size 128\u2192256, registers/thread 201\u2192110) that doubled occupancy (12.5%\u219225%) but introduced severe barrier stalls (CPIStall shifted to barrier-wait at 48.1% of stall cycles, warp cycles/instruction 6.03\u219211.22) and dropped Compute (SM) Throughput from 91.95% to 58.96%, increasing duration from 428 \u00b5s to 633 \u00b5s. The SharedMemoryConflicts rule (5.1-way, 10.94% conflict wavefronts) was present in the AFTER profile as well, indicating the order change did not eliminate the conflicts, and the autotune config shift masked any potential benefit while introducing a large regression from barrier synchronization overhead.",
+    "slow_pseudocode": "# Before: pointer arithmetic, 128-thread blocks, 201 regs/thread\nA = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)\nB = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A, mask=..., eviction_policy='evict_last')\n    b = tl.load(B, mask=..., eviction_policy='evict_last')\n    acc = tl.dot(a, b, acc, allow_tf32=True)\n    A += BLOCK_K * stride_ak\n    B += BLOCK_K * stride_bk\n# Duration: 428 \u00b5s, Compute SOL: 91.95%, Warp cycles/inst: 6.03",
+    "fast_pseudocode": "# After: tl.make_block_ptr with order=(1,0) for B, 256-thread blocks, 110 regs/thread\nA_block_ptr = tl.make_block_ptr(base=A_ptr, shape=(M,K), strides=(stride_am,stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M,BLOCK_K), order=(1,0))\nB_block_ptr = tl.make_block_ptr(base=B_ptr, shape=(K,N), strides=(stride_bk,stride_bn),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K,BLOCK_N), order=(1,0))  # N-fast\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(B_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc = tl.dot(a, b, acc, allow_tf32=True)\n    A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))\n    B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))\n# Duration: 633 \u00b5s, Compute SOL: 58.96%, Warp cycles/inst: 11.22 \u2014 REGRESSION",
+    "applicable_when": "Never demonstrated to help. Theoretically: SharedMemoryConflicts rule reports >5-way bank conflicts on B tile shared loads; kernel is NOT already at >90% compute throughput; the autotune config space is constrained so the winning config does not shift to a larger block size that introduces barrier stalls.",
+    "do_not_apply_when": "Kernel is already at >90% Compute (SM) Throughput with register/smem-limited occupancy (2 blocks/SM). Switching from pointer arithmetic to tl.make_block_ptr changes the autotune landscape: the new configs with num_warps=8 (256-thread blocks) may be selected instead of num_warps=4 (128-thread blocks), introducing severe barrier synchronization stalls (CPIStall barrier-wait >45% of stall cycles, warp cycles/instruction doubling from ~6 to ~11) that far outweigh any bank conflict reduction. Do not apply when the autotune config list simultaneously changes block size or num_warps alongside the order parameter change, as the config shift confounds attribution.",
+    "framework_notes": "Triton-specific: `tl.make_block_ptr` order=(1,0) for a [BLOCK_K, BLOCK_N] tile makes dim-1 (N) the fast dimension in shared memory. On Hopper, wgmma reads B operand with N as the inner dimension, so N-fast smem layout is theoretically correct. However, the actual speedup depends critically on which autotune config wins \u2014 if the config list changes simultaneously with the order parameter, the autotuner may select a different block size that dominates the performance outcome. The SharedMemoryConflicts rule's 5.775% speedup estimate was not realized because the autotune config shift caused a much larger regression."
+  },
+  {
+    "item_id": "exp_005_block_ptr_swizzled_smem_layout_triton_gemm",
+    "iteration": 5,
+    "speedup": 12.0944,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "eliminate_smem_bank_conflicts_via_block_ptr_swizzled_layout",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 427.97,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 91.95,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 201.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.22,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.38,
+        "Scheduler Statistics.No Eligible": 67.44,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.03,
+        "Memory Workload Analysis.L2 Hit Rate": 87.75,
+        "Memory Workload Analysis.Memory Throughput": 860.22
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 639.14,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 59.87,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 110.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 23.94,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.84,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.61,
+        "Scheduler Statistics.No Eligible": 65.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.22,
+        "Memory Workload Analysis.L2 Hit Rate": 83.95,
+        "Memory Workload Analysis.Memory Throughput": 607.35
+      }
+    },
+    "strategy_title": "tl.make_block_ptr Swizzle to Eliminate SMEM Bank Conflicts",
+    "strategy_description": "Replacing manual pointer arithmetic with tl.make_block_ptr (order=(1,0) for A, order=(0,1) for B) was intended to trigger Triton's automatic swizzled shared memory layout and eliminate 5.1-way average bank conflicts. However, the autotuner selected a 256-thread (num_warps=8) config instead of the prior 128-thread (num_warps=4) config, causing registers/thread to drop from 201 to 110 and theoretical occupancy to double from 12.5% to 25%. The increased occupancy introduced severe CTA barrier stalls (CPIStall shifted from fixed-latency 42.9% to barrier-wait 47.8%, warp cycles/instruction nearly doubled from 6.03 to 11.22), causing Compute (SM) Throughput to collapse from 91.95% to 59.87% and duration to increase from 428 \u00b5s to 639 \u00b5s. The bank-conflict elimination benefit was completely overwhelmed by the barrier stall regression introduced by the config change.",
+    "slow_pseudocode": "# Manual pointer arithmetic, 128-thread blocks, 201 regs/thread, 12.5% occupancy\nrk = tl.arange(0, BLOCK_K)\nA = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)\nB = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A, mask=(rm[:, None] < M) & (rk[None, :] < k_remaining), other=0.0)\n    b = tl.load(B, mask=(rk[:, None] < k_remaining) & (rn[None, :] < N), other=0.0)\n    acc = tl.dot(a, b, acc, allow_tf32=True)\n    A += BLOCK_K * stride_ak\n    B += BLOCK_K * stride_bk",
+    "fast_pseudocode": "# tl.make_block_ptr, 256-thread blocks (autotuner chose num_warps=8), 110 regs/thread, 25% occupancy\nA_block_ptr = tl.make_block_ptr(base=A_ptr, shape=(M, K), strides=(stride_am, stride_ak),\n    offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))\nB_block_ptr = tl.make_block_ptr(base=B_ptr, shape=(K, N), strides=(stride_bk, stride_bn),\n    offsets=(0, pid_n * BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(0, 1))\nfor k in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A_block_ptr, boundary_check=(0, 1), padding_option='zero')\n    b = tl.load(B_block_ptr, boundary_check=(0, 1), padding_option='zero')\n    acc = tl.dot(a, b, acc, allow_tf32=True)\n    A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))\n    B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))",
+    "applicable_when": "SharedMemoryConflicts rule reports >3-way average bank conflicts AND the kernel is NOT already at >85% compute throughput AND the autotuner config space is constrained to prevent num_warps from increasing (to avoid barrier stall regression).",
+    "do_not_apply_when": "Kernel is already at >90% Compute (SM) Throughput with register/smem-limited occupancy (2 blocks/SM); the tl.make_block_ptr change expands the autotune config space to include larger num_warps values, which the autotuner may select, causing the block size to double and introducing severe CTA barrier stalls (warp cycles/instruction doubling from ~6 to ~11). Do not apply when the autotune config list includes both num_warps=4 and num_warps=8 configs simultaneously, as the autotuner will likely select the larger block size regardless of the smem layout change.",
+    "framework_notes": "Triton-specific: tl.make_block_ptr with order=(1,0) for row-major A and order=(0,1) for col-major B is intended to trigger Triton's automatic swizzled smem layout (ldmatrix-compatible). However, the interaction with the autotune config list is critical: if the config list includes num_warps=8 configs alongside num_warps=4 configs, the autotuner may select the larger block size, which changes occupancy and stall characteristics independently of the smem layout change. To isolate the bank-conflict fix, constrain the autotune config list to only num_warps=4 configs when applying tl.make_block_ptr."
+  }
+]

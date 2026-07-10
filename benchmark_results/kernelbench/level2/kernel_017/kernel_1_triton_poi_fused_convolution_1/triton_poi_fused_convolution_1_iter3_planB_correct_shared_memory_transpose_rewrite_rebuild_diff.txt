@@ -1,0 +1,71 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,42 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'YBLOCK': 1,  'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 2,  'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 4,  'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 8,  'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 16, 'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 32, 'XBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'YBLOCK': 64, 'XBLOCK': 128}, num_warps=8, num_stages=2),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+-def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
+-
+-
++def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
++    # Repurposed: ynumel=spatial_numel=31500, xnumel=batch_numel=32
++    # YBLOCK=BLOCK_S (spatial tile), XBLOCK=BLOCK_C=128 (channel tile, covers all C)
++    # W=250, H=126, C=128, stride_src=(4032000,1,32000,128), stride_dst=(4032000,31500,250,1)
++    W = 250
++    pid_s = tl.program_id(0)   # spatial tile index
++    pid_n = tl.program_id(1)   # batch index
++    s_off = pid_s * YBLOCK + tl.arange(0, YBLOCK)   # [YBLOCK] spatial offsets
++    c_off = tl.arange(0, XBLOCK)                     # [XBLOCK=128] channel offsets 0..127
++    s_mask = s_off < ynumel
++    # Clamp s_off to avoid out-of-bounds pointer arithmetic on masked lanes
++    s_off_safe = tl.where(s_mask, s_off, 0)
++    h_idx = s_off_safe // W    # [YBLOCK]
++    w_idx = s_off_safe % W     # [YBLOCK]
++    # Source: stride (4032000,1,32000,128) -> flat = n*4032000 + c + h*32000 + w*128
++    src_base = pid_n * 4032000 + h_idx * 32000 + w_idx * 128   # [YBLOCK]
++    src_idx = src_base[:, None] + c_off[None, :]                # [YBLOCK, XBLOCK]
++    tile = tl.load(in_ptr0 + src_idx, mask=s_mask[:, None], other=0.0)
++    # Dest: stride (4032000,31500,250,1) -> flat = n*4032000 + c*31500 + s
++    dst_base = pid_n * 4032000 + s_off_safe                     # [YBLOCK]
++    dst_idx = dst_base[:, None] + c_off[None, :] * 31500        # [YBLOCK, XBLOCK]
++    tl.store(out_ptr0 + dst_idx, tile, mask=s_mask[:, None])
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +48,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

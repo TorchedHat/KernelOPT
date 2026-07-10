@@ -1,0 +1,112 @@
+[
+  {
+    "item_id": "exp_triton_autotune_xblock_regression_001",
+    "iteration": 1,
+    "speedup": 0.1121,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_for_fused_fp32_and_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 44.32,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 77.59,
+        "GPU Speed Of Light Throughput.Memory Throughput (%)": 19.89,
+        "Occupancy.Achieved Occupancy (%)": 77.73,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 31.03,
+        "Instruction Statistics.Executed Instructions": 26738666.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 395.23,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 91.31,
+        "GPU Speed Of Light Throughput.Memory Throughput (%)": 6.5,
+        "Occupancy.Achieved Occupancy (%)": 95.14,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Waves Per SM": 62.06,
+        "Instruction Statistics.Executed Instructions": 285278120.0
+      }
+    },
+    "strategy_title": "Triton Autotune XBLOCK Increase Causes Massive Instruction Explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20132048) to a Triton pointwise kernel caused a ~9x regression (44 \u00b5s \u2192 395 \u00b5s). The autotuner selected XBLOCK=256 with 32 registers/thread (doubled from 16), and executed instructions exploded from 26.7M to 285.3M \u2014 a 10.7x increase \u2014 indicating the larger block size triggered excessive loop unrolling or redundant computation rather than FMA fusion. The grid was not updated to use META['XBLOCK'], so the grid remained fixed at cdiv(xnumel, 128) while the kernel processed XBLOCK=256 elements per CTA, causing each element to be processed multiple times (2x overlap), which explains the instruction count explosion.",
+    "slow_pseudocode": "# BEFORE: fixed grid matches XBLOCK\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](args, XBLOCK=128)",
+    "fast_pseudocode": "# CORRECT autotune pattern: grid must use META['XBLOCK']\n@triton.autotune(configs=[...], key=['xnumel'])\n@triton.jit\ndef kernel(...):\n    ...\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](args)  # no XBLOCK kwarg \u2014 autotuner injects it",
+    "applicable_when": "Never apply this specific pattern (fixed grid + autotune without META grid lambda). The correct autotune pattern with a META grid lambda may be applicable when a Triton pointwise kernel is compute-bound with low register pressure (<20 registers/thread) and high non-fused FP32 instruction ratio.",
+    "do_not_apply_when": "Do NOT add @triton.autotune without simultaneously updating the grid to use `lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)`. If the grid remains hardcoded to the original XBLOCK while the autotuner selects a larger XBLOCK, each element will be processed multiple times, causing instruction count explosion and severe regression. Also avoid when register count is already near the SM limit, as larger XBLOCK may double register usage and reduce occupancy.",
+    "framework_notes": "Triton-specific: when using @triton.autotune, the launch grid MUST be a lambda that reads META['XBLOCK'] (or whichever constexpr is being tuned). A fixed grid = (triton.cdiv(xnumel, FIXED_VALUE),) is incompatible with autotuning XBLOCK \u2014 it causes redundant work proportional to XBLOCK/FIXED_VALUE when the autotuner picks a larger value."
+  },
+  {
+    "item_id": "exp_001_triton_autotune_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.2182,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 44.32,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 77.59,
+        "GPU Speed Of Light Throughput.Memory Throughput": 19.89,
+        "Occupancy.Achieved Occupancy": 77.73,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Instruction Statistics.Executed Instructions": 26738666.0,
+        "Memory Workload Analysis.Memory Throughput": 914.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 203.1,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 89.86,
+        "GPU Speed Of Light Throughput.Memory Throughput": 7.49,
+        "Occupancy.Achieved Occupancy": 94.37,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 144244736.0,
+        "Memory Workload Analysis.Memory Throughput": 200.55
+      }
+    },
+    "strategy_title": "Avoid autotune XBLOCK increase when grid is fixed",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs caused a 4.6x slowdown (44 \u00b5s \u2192 203 \u00b5s) despite occupancy improving from 77.7% to 94.4%. The root cause is that the launch grid was left fixed at cdiv(xnumel, 128) instead of being updated to a lambda using meta['XBLOCK'], so the autotuner selected a larger XBLOCK but the grid remained sized for XBLOCK=128 \u2014 causing each block to process far more elements than intended and inflating executed instructions from 26.7M to 144.2M (~5.4x). Additionally, registers per thread doubled from 16 to 32, halving the theoretical blocks-per-SM. When using autotune with variable XBLOCK, the launch grid must be a lambda that reads meta['XBLOCK'], not a static expression computed from the original tile size.",
+    "slow_pseudocode": "# Fixed grid computed from old XBLOCK=128\ngrid = (triton.cdiv(xnumel, 128),)  # = 65536 blocks\nkernel[grid](args, xnumel)  # autotuner picks XBLOCK=4096 but grid stays 65536",
+    "fast_pseudocode": "# Grid must scale with XBLOCK chosen by autotuner\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](args, xnumel)  # grid shrinks as XBLOCK grows",
+    "applicable_when": "Never apply this pattern (fixed grid + autotune XBLOCK). The lambda grid form is always required when autotuning XBLOCK.",
+    "do_not_apply_when": "Do not use a static grid expression when adding @triton.autotune over XBLOCK. The static grid will be computed from the original XBLOCK value and will not adapt to the autotuner's chosen config, causing each block to process XBLOCK_new/XBLOCK_old times more work than intended.",
+    "framework_notes": "Triton-specific: @triton.autotune requires the launch grid to be a Python callable (lambda meta: ...) that reads meta['XBLOCK'] when XBLOCK is an autotuned parameter. A static tuple grid computed before the kernel call will not reflect the autotuner's chosen XBLOCK. Also note: changing from tl.full([XBLOCK], True, tl.int1) mask to xindex < xnumel mask is correct but unnecessary when xnumel is exactly divisible by all XBLOCK candidates."
+  },
+  {
+    "item_id": "exp_triton_xblock_autotune_regression_001",
+    "iteration": 1,
+    "speedup": 0.4165,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_for_vectorized_loads_and_reduced_launch_overhead",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 44.32,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 77.59,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 19.89,
+        "Occupancy.Achieved Occupancy_%": 77.73,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Instruction Statistics.Executed Instructions": 26738666.0,
+        "Launch Statistics.Grid Size": 65536.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 106.4,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 89.72,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 9.57,
+        "Occupancy.Achieved Occupancy_%": 91.75,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Instruction Statistics.Executed Instructions": 75104245.0,
+        "Launch Statistics.Grid Size": 65536.0
+      }
+    },
+    "strategy_title": "Increasing XBLOCK via autotune causes instruction explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK values (512\u20134096) to a compute-bound pointwise kernel caused a 2.4x slowdown despite improving achieved occupancy from 77.7% to 91.8%. The total executed instruction count ballooned from 26.7M to 75.1M (2.8x increase), and registers per thread jumped from 16 to 28, indicating the compiler unrolled more work per thread and increased register pressure without a compensating reduction in grid size (grid remained 65536 because the autotune wrapper did not update the grid lambda). The memory throughput actually dropped from 19.9% to 9.6%, confirming the kernel became more compute-bound with redundant work rather than more efficient. The implementation flaw was that the static grid=(cdiv(xnumel, 128),) was not updated to use meta['XBLOCK'], so the grid stayed at 65536 blocks regardless of which XBLOCK config was selected, causing each block to process far fewer elements than XBLOCK while still paying the full unrolled instruction cost.",
+    "slow_pseudocode": "# BEFORE: fixed XBLOCK=128, static grid\ngrid = (triton.cdiv(xnumel, 128),)  # = 65536 blocks\nkernel[grid](..., XBLOCK=128)\n\n# Inside kernel:\nxoffset = tl.program_id(0) * XBLOCK  # 128 elements per block\nxindex = xoffset + tl.arange(0, XBLOCK)[:]",
+    "fast_pseudocode": "# CORRECT autotune pattern: grid must use meta['XBLOCK']\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 512}, num_warps=4), ...],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr): ...\n\n# Grid MUST be a lambda consuming meta:\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)\n# NOT: grid = (triton.cdiv(xnumel, 128),)  <-- BUG: ignores autotuned XBLOCK",
+    "applicable_when": "Never apply this specific pattern (static grid with autotune). The general XBLOCK increase strategy is applicable when: memory throughput is the bottleneck (Memory SOL >> Compute SOL), grid size is very large (>32K blocks), and registers per thread are low (<20), leaving headroom for larger tiles.",
+    "do_not_apply_when": "Do not use @triton.autotune with a static grid that hardcodes the original XBLOCK in cdiv \u2014 the grid will not shrink with larger XBLOCK values, causing each CTA to process fewer elements than XBLOCK while the compiler still unrolls for the full XBLOCK, exploding instruction count. Also avoid increasing XBLOCK when the kernel is already compute-bound (Compute SOL > 75%) rather than memory-bound.",
+    "framework_notes": "Triton-specific: when using @triton.autotune with XBLOCK as a tunable parameter, the grid lambda MUST reference meta['XBLOCK'] via `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. A static grid tuple computed before the autotune decorator is evaluated will always use the original fixed value, making the autotune ineffective and potentially harmful due to compiler unrolling mismatch."
+  }
+]

@@ -1,0 +1,60 @@
+--- baseline
++++ rebuilt
+@@ -4,16 +4,18 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # Large-tile, high-warp configs to avoid bank conflicts and stay in high-performance regime
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8},  num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8},  num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8},  num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8},  num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8},  num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8},  num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8},  num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8},  num_stages=5, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -50,11 +52,18 @@
+         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+ 
+         # W has shape [N, K], stride_wn=K, stride_wk=1
+-        w_ptrs = W_ptr + offs_n[None, :] * stride_wn + k_offs[:, None] * stride_wk
+-        w_mask = (offs_n[None, :] < N) & (k_offs[:, None] < K)
+-        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
++        # Load as [BLOCK_N, BLOCK_K] for coalesced access (k_offs inner dim, stride 1)
++        w_block_ptr = tl.make_block_ptr(
++            base=W_ptr,
++            shape=(N, K),
++            strides=(stride_wn, stride_wk),
++            offsets=(pid_n * BLOCK_N, k * BLOCK_K),
++            block_shape=(BLOCK_N, BLOCK_K),
++            order=(0, 1),   # row-major: aligns SMEM layout with tl.dot access pattern
++        )
++        w_tile = tl.load(w_block_ptr, boundary_check=(0, 1), padding_option='zero')  # shape [BLOCK_N, BLOCK_K]
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++        acc = tl.dot(x_tile, w_tile.T, acc, allow_tf32=False)  # w_tile.T -> [BLOCK_K, BLOCK_N]
+ 
+     # Add bias
+     bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
+@@ -75,6 +84,7 @@
+     key=['group_size'],
+ )
+ @triton.jit
++
+ def groupnorm_leakyrelu_add_kernel(
+     X_ptr, GN_W_ptr, GN_B_ptr, Out_ptr,
+     num_rows, N, num_groups, group_size,

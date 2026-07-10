@@ -1,0 +1,328 @@
+[
+  {
+    "item_id": "exp_triton_maxnreg_occupancy_002",
+    "iteration": 2,
+    "speedup": 4.0281,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "cap_registers_with_maxnreg_to_raise_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 55.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.87,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Launch.Block Size": 64.0,
+        "GPU Speed Of Light Throughput.Duration": 52.99,
+        "Compute Workload Analysis.Issue Slots Busy": 76.31,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.32,
+        "Instruction Statistics.Executed Instructions": 29540352.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 55.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.77,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Launch.Block Size": 64.0,
+        "GPU Speed Of Light Throughput.Duration": 51.94,
+        "Compute Workload Analysis.Issue Slots Busy": 78.23,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.29,
+        "Instruction Statistics.Executed Instructions": 29540352.0
+      }
+    },
+    "strategy_title": "Add maxnreg to Triton JIT to Cap Register Usage",
+    "strategy_description": "Adding maxnreg to the @triton.jit decorator emits a PTX .maxnreg directive that caps per-thread register allocation, which can raise SM occupancy when the kernel is register-limited. However, in this case the profiling data shows that the before and after NCU metrics are nearly identical (registers/thread stayed at 55, Block Limit Registers stayed at 18, theoretical occupancy stayed at 56.25%, duration dropped only marginally from 52.99 us to 51.94 us), suggesting the 4x speedup reported is not attributable to the maxnreg change itself but rather to the already-applied XBLOCK autotune from the prior iteration. The marginal improvement (~2%) in Issue Slots Busy (76.31% \u2192 78.23%) and duration is consistent with minor compiler scheduling differences rather than a structural occupancy gain.",
+    "slow_pseudocode": "# No maxnreg cap\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    ...",
+    "fast_pseudocode": "# With maxnreg cap\n@triton.jit(maxnreg=64)\ndef kernel(..., XBLOCK: tl.constexpr):\n    ...",
+    "applicable_when": "Triton kernel where registers/thread is high (>= 70) and Block Limit Registers is the binding occupancy constraint; TheoreticalOccupancy NCU rule fires; the compiler is allocating more registers than strictly necessary due to aggressive unrolling.",
+    "do_not_apply_when": "Registers/thread is already at or below the target cap (e.g., already 55 when maxnreg=64 is applied); Block Limit Registers is not the binding constraint; the kernel genuinely requires the registers and capping will cause spilling to local memory, which degrades performance. Do not apply when the occupancy bottleneck has already been resolved by a prior XBLOCK reduction.",
+    "framework_notes": "Triton-specific: maxnreg is passed as a kwarg to @triton.jit (e.g., @triton.jit(maxnreg=64)). This emits .maxnreg in PTX. If the compiler cannot satisfy the cap without spilling, performance may regress. The call site and grid calculation are unchanged \u2014 maxnreg is a compiler hint only."
+  },
+  {
+    "item_id": "exp_triton_evict_first_streaming_load_001",
+    "iteration": 2,
+    "speedup": 3.9889,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_on_streaming_load_to_preserve_l2_for_broadcast",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 52.99,
+        "Memory Workload Analysis.L2 Hit Rate": 5.4,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 53.59,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.78,
+        "Compute Workload Analysis.Issue Slots Busy": 76.31,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.32,
+        "Scheduler Statistics.No Eligible": 22.84
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 52.45,
+        "Memory Workload Analysis.L2 Hit Rate": 5.67,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 53.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.61,
+        "Compute Workload Analysis.Issue Slots Busy": 78.92,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.44,
+        "Scheduler Statistics.No Eligible": 20.48
+      }
+    },
+    "strategy_title": "Use evict_first on Large Streaming Loads to Protect L2 Broadcast Data",
+    "strategy_description": "When a kernel mixes a large streaming tensor (unique data per CTA, no inter-CTA reuse) with small broadcast tensors (reused across many CTAs), the streaming tensor thrashes the L2 cache and evicts the broadcast data, causing a very low L2 hit rate (~5%). Adding eviction_policy='evict_first' (maps to ld.global.cs on NVIDIA GPUs) to the streaming load deprioritizes it in L2, preserving L2 capacity for the broadcast tensors. In this case the improvement was modest (52.99us \u2192 52.45us, ~1% duration reduction) because the kernel was already compute-bound (Compute SOL 73-75%) and the L2 hit rate barely moved (5.4% \u2192 5.67%), suggesting the broadcast tensors' working set still exceeded L2 capacity or the compute bottleneck dominated. The strategy is sound in principle but yields large gains only when the broadcast tensor working set fits comfortably in L2 and the kernel is memory-bound.",
+    "slow_pseudocode": "# Streaming load with default eviction (evict_normal)\ntmp_broadcast = tl.load(ptr_small + (r + RBLOCK*x_local), mask, eviction_policy='evict_last')\ntmp_stream   = tl.load(ptr_large + (r + RBLOCK*x_global), mask, other=0.0)  # no eviction hint\ntmp_broadcast2 = tl.load(ptr_small2 + (r + RBLOCK*x_local), mask, eviction_policy='evict_last')",
+    "fast_pseudocode": "# Streaming load with evict_first to protect L2 for broadcast tensors\ntmp_broadcast = tl.load(ptr_small + (r + RBLOCK*x_local), mask, eviction_policy='evict_last')\ntmp_stream   = tl.load(ptr_large + (r + RBLOCK*x_global), mask, eviction_policy='evict_first', other=0.0)\ntmp_broadcast2 = tl.load(ptr_small2 + (r + RBLOCK*x_local), mask, eviction_policy='evict_last')",
+    "applicable_when": "Kernel mixes a large streaming tensor (indexed by global CTA id, no inter-CTA reuse, size >> L2 cache) with small broadcast tensors (indexed by local offset, reused across many CTAs, size fits in L2). L2 hit rate is very low (<10%) despite small broadcast tensors being present. Kernel is memory-bound or L1TEX-stall-bound (CPIStall rule fires with L1TEX stall >30% of cycles). DRAM throughput is high (>40%).",
+    "do_not_apply_when": "Kernel is already compute-bound with high Compute SOL (>70%) and low memory headroom \u2014 the gain will be negligible as seen here (~1%). Do not apply when the broadcast tensor working set is larger than L2 (evict_first won't help if broadcast data can't fit anyway). Do not apply evict_first to tensors that ARE reused across CTAs. Do not change evict_last hints on confirmed broadcast/reuse tensors.",
+    "framework_notes": "Triton-specific: eviction_policy='evict_first' maps to NVIDIA PTX ld.global.cs (cache streaming), which deprioritizes the loaded cache line for L2 retention. eviction_policy='evict_last' maps to ld.global.ca (cache all), which maximizes L2 retention. These are pure cache hints and do not affect numerical correctness. In CUDA C++, the equivalent is __ldcs() for evict_first and __ldcg()/__ldca() for evict_last."
+  },
+  {
+    "item_id": "exp_triton_welford_single_pass_variance_regression_001",
+    "iteration": 2,
+    "speedup": 0.1001,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_welford_single_pass_variance",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 55.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.87,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Launch.Block Size": 64.0,
+        "GPU Speed Of Light Throughput.Duration": 52.99,
+        "Compute Workload Analysis.Issue Slots Busy": 76.31,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.32,
+        "Instruction Statistics.Executed Instructions": 29540352.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 64.67,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.78
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 32.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 94.07,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Launch.Block Size": 128.0,
+        "GPU Speed Of Light Throughput.Duration": 2090.0,
+        "Compute Workload Analysis.Issue Slots Busy": 5.51,
+        "Scheduler Statistics.Active Warps Per Scheduler": 15.06,
+        "Instruction Statistics.Executed Instructions": 90243072.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 93.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 273.22
+      }
+    },
+    "strategy_title": "Welford Single-Pass Variance Causes Severe Uncoalesced Access",
+    "strategy_description": "Replacing a vectorized two-pass reduction (loading full [XBLOCK, R0_BLOCK] tiles) with a scalar Welford loop using tl.static_range caused a catastrophic 10x regression. The Welford loop issues 64 separate scalar loads per thread (one per iteration of tl.static_range), each accessing a single element with stride patterns that are uncoalesced \u2014 NCU reported 352M excessive sectors out of 403M total (87% uncoalesced). Warp cycles per issued instruction exploded from 10.78 to 273.22 as the L1 instruction queue for LG operations became saturated (CPIStall: 88.1% of cycles stalled on LG queue full), and total executed instructions tripled (29M \u2192 90M) despite the algorithm doing less arithmetic work.",
+    "slow_pseudocode": "# Welford scalar loop \u2014 64 separate scalar loads per thread, uncoalesced\nwelford_mean = tl.zeros([XBLOCK, 1], dtype=tl.float32)\nwelford_m2   = tl.zeros([XBLOCK, 1], dtype=tl.float32)\nfor r in tl.static_range(R0_BLOCK):  # 64 iterations, each issues scalar loads\n    r_idx = tl.full([XBLOCK, 1], r, dtype=tl.int32)\n    val0 = tl.load(in_ptr0 + (r_idx + 64 * x0), None, eviction_policy='evict_last')\n    val1 = tl.load(in_ptr1 + (r_idx + 64 * x3), None)\n    val2 = tl.load(in_ptr2 + (r_idx + 64 * x0), None, eviction_policy='evict_last')\n    # ... Welford update ...",
+    "fast_pseudocode": "# Vectorized two-pass \u2014 loads full [XBLOCK, R0_BLOCK] tile in one transaction\nr0_index = tl.arange(0, R0_BLOCK)[None, :]  # [1, 64]\ntmp0 = tl.load(in_ptr0 + (r0_index + 64*x0), xmask, eviction_policy='evict_last', other=0.0)  # [XBLOCK, 64]\ntmp1 = tl.load(in_ptr1 + (r0_index + 64*x3), xmask, other=0.0)  # [XBLOCK, 64]\ntmp5 = tl.load(in_ptr2 + (r0_index + 64*x0), xmask, eviction_policy='evict_last', other=0.0)  # [XBLOCK, 64]\n# ... compute activation ...\ntmp11 = tl.sum(tmp9, 1)[:, None]   # pass 1: mean\ntmp19 = tl.sum(tmp17, 1)[:, None]  # pass 2: variance",
+    "applicable_when": "Never \u2014 this strategy caused a 10x regression due to uncoalesced scalar loads in the static_range loop.",
+    "do_not_apply_when": "Always avoid replacing vectorized [XBLOCK, R0_BLOCK] tile loads with scalar per-element loads inside tl.static_range loops when R0_BLOCK is large (\u2265 32). The scalar loop pattern issues one load instruction per element per thread, saturating the L1 LG instruction queue and causing massive uncoalesced access penalties. The two-pass vectorized approach is superior even if it keeps a larger tensor live in registers, because coalesced wide loads amortize memory latency far better than 64 sequential scalar loads.",
+    "framework_notes": "Triton-specific: tl.static_range fully unrolls the loop at compile time, but each unrolled iteration still issues separate load instructions with [XBLOCK, 1] shape. These scalar loads are stride-1 within a warp but the per-iteration r_idx offset means each warp issues 64 separate LDG instructions instead of one wide LDG.128 per row. The L1 LG queue saturation stall (CPIStall rule, 88.1% of cycles) is the direct cause of the 40x duration increase (52.99 \u00b5s \u2192 2090 \u00b5s)."
+  },
+  {
+    "item_id": "exp_triton_fix_autotune_callsite_lambda_grid_003",
+    "iteration": 3,
+    "speedup": 4.0065,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_autotune_callsite_lambda_grid_and_expand_xblock_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 51.74,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.77,
+        "Launch.Registers Per Thread": 55.0,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Compute Workload Analysis.Issue Slots Busy": 78.06,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.51,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.3,
+        "Memory Workload Analysis.L2 Hit Rate": 5.72
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 52.22,
+        "Instruction Statistics.Executed Instructions": 29540352.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.76,
+        "Launch.Registers Per Thread": 55.0,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Compute Workload Analysis.Issue Slots Busy": 77.79,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.65,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.27,
+        "Memory Workload Analysis.L2 Hit Rate": 5.4
+      }
+    },
+    "strategy_title": "Fix Hardcoded Autotune Grid and Expand XBLOCK Configs",
+    "strategy_description": "When a Triton kernel uses @triton.autotune but the call site passes a hardcoded integer grid tuple (e.g., grid=(triton.cdiv(xnumel, 128),)) instead of a lambda using META['XBLOCK'], the autotuner is bypassed entirely and the kernel always runs with the last config's XBLOCK value. Fixing the call site to use a lambda grid (lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)) enables the autotuner to actually select the best config. In this case, however, the profiling data shows nearly identical NCU metrics before and after (duration 51.74 us vs 52.22 us, executed instructions 30.2M vs 29.5M, occupancy unchanged at 56.25%), indicating the 4x speedup reported is attributable to the prior iteration's XBLOCK autotune change rather than this iteration's call-site fix or expanded configs (XBLOCK 256/512). The kernel body simplification (removing redundant broadcast_to calls and intermediate variables) reduced instruction count marginally (~2%) but did not change the structural performance profile.",
+    "slow_pseudocode": "# Broken autotune call site \u2014 always runs with last config's XBLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32}, num_warps=2, num_stages=1),\n        ...\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=1),  # last config\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr): ...\n\ndef kernel_function(*inputs):\n    grid = (triton.cdiv(xnumel, 128),)  # BUG: hardcoded, bypasses autotune\n    kernel[grid](..., XBLOCK=128)        # BUG: explicit XBLOCK kwarg",
+    "fast_pseudocode": "# Fixed call site \u2014 autotune actually selects best config\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32},  num_warps=2,  num_stages=1),\n        ...\n        triton.Config({'XBLOCK': 128}, num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 256}, num_warps=8,  num_stages=1),  # NEW\n        triton.Config({'XBLOCK': 256}, num_warps=16, num_stages=1),  # NEW\n        triton.Config({'XBLOCK': 512}, num_warps=8,  num_stages=1),  # NEW\n        triton.Config({'XBLOCK': 512}, num_warps=16, num_stages=1),  # NEW\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr): ...\n\ndef kernel_function(*inputs):\n    grid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)  # FIXED\n    kernel[grid](...)  # no explicit XBLOCK kwarg",
+    "applicable_when": "Triton kernel uses @triton.autotune but the call site has a hardcoded integer grid tuple rather than a lambda using META['XBLOCK']; the kernel always runs with the same XBLOCK regardless of the autotune config list; FPInstructions or TheoreticalOccupancy NCU rules fire suggesting suboptimal tile sizing.",
+    "do_not_apply_when": "The call site already uses a lambda grid with META['XBLOCK']; the kernel is not using @triton.autotune; expanding XBLOCK to 256/512 causes register spilling; grid size would drop below 4 waves/SM. Also: if the kernel is already near-optimal after a prior XBLOCK autotune step, this fix yields <1% additional gain on its own.",
+    "framework_notes": "Triton-specific: @triton.autotune injects the winning config's parameters into the kernel via META at the call site. The grid must be a callable (lambda META: ...) not a static tuple when XBLOCK is autotuned. Passing XBLOCK as an explicit kwarg at the call site when autotune is active causes a conflict \u2014 autotune injects it automatically. The kernel body should not reference XBLOCK as a hardcoded constant anywhere outside tl.constexpr parameters."
+  },
+  {
+    "item_id": "exp_triton_fma_fusion_silu_reciprocal_mean_004",
+    "iteration": 4,
+    "speedup": 4.0335,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_silu_with_libdevice_fma_and_reciprocal_mean",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 51.74,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.52,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.77,
+        "Launch.Registers Per Thread": 55.0,
+        "Compute Workload Analysis.Issue Slots Busy": 78.77,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.41,
+        "Memory Workload Analysis.L2 Hit Rate": 5.62
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 51.87,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.62,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 46.36,
+        "Launch.Registers Per Thread": 64.0,
+        "Compute Workload Analysis.Issue Slots Busy": 77.69,
+        "Scheduler Statistics.Active Warps Per Scheduler": 7.33,
+        "Memory Workload Analysis.L2 Hit Rate": 5.51
+      }
+    },
+    "strategy_title": "libdevice.fma for SiLU and Reciprocal Mean Division",
+    "strategy_description": "Replacing `sigmoid(x) * x + bias` with `libdevice.fma(sigmoid(x), x, bias)` and replacing mean division `/ N` with multiplication by `1.0 / N` (a compile-time constant) targets the FPInstructions NCU rule (high non-fused FP32 ratio). However, the profiling data shows that despite the FPInstructions rule firing (80% non-fused ratio before), the executed instruction count remained identical (30.2M), duration barely changed (51.74 us \u2192 51.87 us), and registers/thread actually increased from 55 to 64, reducing theoretical occupancy from 56.25% to 50%. The warp cycles per issued instruction improved slightly (10.52 \u2192 9.62), but this is insufficient to offset the occupancy regression. The 4.03x speedup reported is attributable to the prior iterations' XBLOCK autotune and evict_first changes, not to the FMA fusion itself.",
+    "slow_pseudocode": "# SiLU with separate FMUL + FADD (non-fused)\nact = tl.sigmoid(tmp0 + tmp1) * (tmp0 + tmp1) + tmp5\nmean = tl.sum(act, 1)[:, None] / R0_BLOCK  # FDIV",
+    "fast_pseudocode": "# SiLU with libdevice.fma (single FMAD) + reciprocal multiply\nact_pre = tmp0 + tmp1\nsig = tl.sigmoid(act_pre)\nact = libdevice.fma(sig, act_pre, tmp5)  # FMAD: sig*act_pre + tmp5\nmean = tl.sum(act, 1)[:, None] * (1.0 / R0_BLOCK)  # FMUL with compile-time constant",
+    "applicable_when": "FPInstructions NCU rule fires with >70% non-fused FP32 ratio; kernel contains explicit sigmoid(x)*x+bias patterns (SiLU activation); mean computation uses integer division by a tl.constexpr block size; the kernel is not already register-limited (registers/thread < 50).",
+    "do_not_apply_when": "Kernel is already register-limited (registers/thread >= 55); applying libdevice.fma increases register count (55\u219264 observed), reducing theoretical occupancy (56.25%\u219250%) and active warps per scheduler (8.41\u21927.33). The FPInstructions rule firing does not guarantee FMA fusion will help if the compiler already schedules instructions efficiently or if register pressure is the binding constraint.",
+    "framework_notes": "Triton-specific: libdevice.fma(a, b, c) computes a*b+c as a single FMAD PTX instruction, imported via `from triton.language.extra import libdevice`. Replacing `/N` with `*(1.0/N)` where N is a tl.constexpr folds to a compile-time FMUL constant. However, on Hopper (H200), the compiler may already fuse FMUL+FADD pairs automatically, making explicit libdevice.fma redundant while adding register pressure from the extra intermediate variable (act_pre, sig held live simultaneously)."
+  },
+  {
+    "item_id": "exp_triton_remove_redundant_broadcast_to_enable_fma_004",
+    "iteration": 4,
+    "speedup": 4.0188,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "remove_redundant_broadcast_to_identity_ops_for_fma_fusion",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 51.74,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Instruction Statistics.Issued Instructions": 30208314.0,
+        "Compute Workload Analysis.Issue Slots Busy": 78.77,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.52,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.77,
+        "Launch.Registers Per Thread": 55.0,
+        "Memory Workload Analysis.L2 Hit Rate": 5.62,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 54.11
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 52.06,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Instruction Statistics.Issued Instructions": 30208912.0,
+        "Compute Workload Analysis.Issue Slots Busy": 78.22,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.55,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.69,
+        "Launch.Registers Per Thread": 55.0,
+        "Memory Workload Analysis.L2 Hit Rate": 5.66,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 53.75
+      }
+    },
+    "strategy_title": "Remove Redundant broadcast_to Identity Ops to Enable FMA Fusion",
+    "strategy_description": "When a Triton kernel contains tl.broadcast_to() calls where the input tensor already has the target shape (identity broadcasts), these no-op SSA nodes can block the LLVM backend's FMA fusion pass by pinning intermediate values. The FPInstructions NCU rule firing with a high ratio of non-fused to fused FP32 instructions (e.g., 11.5M non-fused vs 2.9M fused, ~4:1) is the diagnostic signal. However, in this specific case the profiling data shows that removing the two redundant broadcast_to calls and replacing the int32 division chain with a float literal division did NOT reduce executed instructions (30.195M before vs 30.195M after \u2014 identical) nor duration (51.74 us before vs 52.06 us after \u2014 slight regression), indicating the Triton/LLVM backend did not actually fuse additional FMA instructions from this change alone. The 4.0x speedup reported is attributable to the prior iterations' XBLOCK autotune and eviction policy changes, not to this broadcast_to removal.",
+    "slow_pseudocode": "# Identity broadcast_to calls that may block FMA fusion\ntmp7 = tl.broadcast_to(tmp6, [XBLOCK, R0_BLOCK])       # tmp6 already [XBLOCK, R0_BLOCK]\ntmp9 = tl.broadcast_to(tmp7, [XBLOCK, R0_BLOCK])       # IDENTITY: tmp7 already correct shape\ntmp11 = tl.sum(tmp9, 1)[:, None].to(tl.float32)\ntmp12 = tl.full([1, 1], 64, tl.int32)\ntmp13 = tmp12.to(tl.float32)\ntmp14 = (tmp11 / tmp13)                                 # int32 constant division chain\ntmp15 = tmp7 - tmp14\ntmp16 = tmp15 * tmp15\ntmp17 = tl.broadcast_to(tmp16, [XBLOCK, R0_BLOCK])     # IDENTITY: tmp16 already correct shape\ntmp19 = tl.sum(tmp17, 1)[:, None].to(tl.float32)",
+    "fast_pseudocode": "# Redundant broadcast_to removed, constant division inlined\ntmp7 = tl.broadcast_to(tmp6, [XBLOCK, R0_BLOCK])       # first broadcast kept (needed)\ntmp11 = tl.sum(tmp7, 1)[:, None].to(tl.float32)        # sum directly from tmp7\ntmp14 = tmp11 / 64.0                                    # inline float literal (power-of-2)\ntmp15 = tmp7 - tmp14\ntmp16 = tmp15 * tmp15\ntmp19 = tl.sum(tmp16, 1)[:, None].to(tl.float32)       # sum directly from tmp16",
+    "applicable_when": "FPInstructions NCU rule fires with non-fused FP32 instructions >> fused (ratio >= 3:1); kernel contains tl.broadcast_to() calls where the input tensor already matches the target shape (identity ops); kernel is compute-bound (Compute SOL > Memory SOL). The code cleanup is always safe but may not yield measurable speedup if the LLVM backend already handles these patterns or if the kernel is bottlenecked elsewhere.",
+    "do_not_apply_when": "The broadcast_to calls are genuinely changing tensor shapes (not identity ops); the kernel is memory-bandwidth-bound rather than compute-bound; the FPInstructions rule is not triggered; prior optimizations (XBLOCK autotune, eviction policy) have already resolved the primary bottleneck and the kernel is near its roofline. In this case the change produced a marginal regression (-0.6% duration) rather than improvement, suggesting the LLVM backend already handles these patterns or the bottleneck lies elsewhere.",
+    "framework_notes": "Triton-specific: tl.broadcast_to() on an already-correctly-shaped tensor is a no-op semantically but may or may not create an SSA barrier for the LLVM FMA fusion pass depending on the Triton version and LLVM backend. Replacing tl.full([1,1], N, tl.int32).to(tl.float32) division with direct float literal division (/ N.0) allows the compiler to emit FMUL by reciprocal instead of FDIV when N is a power of 2. The autotune config list was also expanded in this iteration (adding XBLOCK=512 configs and num_stages=2) which may contribute to the reported speedup via better config selection."
+  },
+  {
+    "item_id": "exp_triton_num_stages_software_pipelining_autotune_004",
+    "iteration": 4,
+    "speedup": 3.967,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "add_num_stages_variants_to_autotune_configs_for_software_pipelining",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 51.74,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 77447.0,
+        "Compute Workload Analysis.Issue Slots Busy": 78.77,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.52,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Memory Workload Analysis.L2 Hit Rate": 5.62,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.77,
+        "Launch.Registers Per Thread": 55.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 52.74,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 78944.0,
+        "Compute Workload Analysis.Issue Slots Busy": 79.76,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.49,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Memory Workload Analysis.L2 Hit Rate": 5.68,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.69,
+        "Launch.Registers Per Thread": 55.0
+      }
+    },
+    "strategy_title": "Add num_stages=3 Autotune Configs for Software Pipelining",
+    "strategy_description": "Adding num_stages=3 variants to the @triton.autotune config list was intended to enable Triton's software pipelining to overlap memory loads with compute, targeting the FPInstructions bottleneck (16.27% potential speedup) and CPIStall L1TEX stall (38% of cycles). However, the profiling data shows nearly identical NCU metrics before and after: duration increased slightly (51.74 us \u2192 52.74 us), executed instructions were unchanged (30.2M), occupancy was unchanged (56.25% theoretical, ~51.7% achieved), and registers/thread stayed at 55. The autotuner selected the same XBLOCK=64 config as before, meaning the num_stages=3 variants were not chosen as winners \u2014 likely because the increased register pressure from pipelining offset any latency-hiding benefit at this occupancy level. The 3.967x speedup reported reflects the cumulative gain from prior iterations, not this change.",
+    "slow_pseudocode": "# Autotune configs with only num_stages=1\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64}, num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 64}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 256}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 256}, num_warps=16, num_stages=1),\n        triton.Config({'XBLOCK': 512}, num_warps=16, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)",
+    "fast_pseudocode": "# Autotune configs with num_stages=3 variants added\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 64}, num_warps=4, num_stages=3),   # NEW\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=3),  # NEW\n        triton.Config({'XBLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 256}, num_warps=16, num_stages=3), # NEW\n        triton.Config({'XBLOCK': 512}, num_warps=16, num_stages=2),\n        triton.Config({'XBLOCK': 512}, num_warps=16, num_stages=3), # NEW\n    ],\n    key=['xnumel', 'r0_numel'],\n)",
+    "applicable_when": "FPInstructions NCU rule fires with a high fraction of non-fused FP32 instructions (>70% non-fused); CPIStall L1TEX stall >30% of cycles; kernel has a large outer x-dimension with streaming loads that could benefit from prefetching; registers/thread is low enough (<60) that adding pipeline stages won't cause register spilling.",
+    "do_not_apply_when": "The kernel is already at or near register limits (registers/thread >= 60, Block Limit Registers <= 12) \u2014 adding num_stages increases register pressure and the autotuner will not select the higher-stage configs; the kernel is a reduction-dominated kernel where the reduction dimension (RBLOCK) is fixed and the x-dimension tiles are small (XBLOCK <= 32); the kernel is already compute-bound with high Compute SOL (>80%) and the FPInstructions bottleneck is not the primary limiter. Do not expect this change to yield gains when the autotuner's winning config remains at num_stages=1 (check if block_size and registers/thread are unchanged after the change).",
+    "framework_notes": "Triton-specific: num_stages in triton.Config controls the software pipeline depth. On Hopper/Ampere, num_stages=3 enables async copy pipelining (cp.async) for global\u2192shared memory loads, overlapping 3 tiles of prefetch with compute. Higher num_stages increases register usage because more live values must be kept in flight simultaneously. If the autotuner selects num_stages=1 despite higher-stage configs being available, it means the register overhead of pipelining outweighs the latency-hiding benefit for that problem shape. In CUDA, the equivalent concept is manual double/triple buffering with __pipeline_memcpy_async."
+  },
+  {
+    "item_id": "exp_triton_fma_fusion_via_libdevice_004",
+    "iteration": 4,
+    "speedup": 3.9648,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fma_fusion_via_libdevice_for_silu_bias_add",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 52.22,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.52,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 51.77,
+        "Launch.Registers Per Thread": 55.0,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Compute Workload Analysis.Issue Slots Busy": 78.77,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.41,
+        "Memory Workload Analysis.L2 Hit Rate": 5.62
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 52.77,
+        "Instruction Statistics.Executed Instructions": 30195712.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.36,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 46.39,
+        "Launch.Registers Per Thread": 64.0,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Compute Workload Analysis.Issue Slots Busy": 76.12,
+        "Scheduler Statistics.Active Warps Per Scheduler": 7.32,
+        "Memory Workload Analysis.L2 Hit Rate": 5.58
+      }
+    },
+    "strategy_title": "libdevice.fma for SiLU+Bias Does Not Reduce Non-Fused FP32 Instructions",
+    "strategy_description": "Replacing a two-step SiLU+bias computation (sigmoid(x)*x + bias) with libdevice.fma(sigmoid(x), x, bias) was expected to convert non-fused FMUL+FADD pairs into single FMAD instructions, but the profiling data shows the executed instruction count remained identical (30,195,712) and the FPInstructions rule still fired with the same non-fused count. The change instead increased register pressure (55 \u2192 64 registers/thread), reducing theoretical occupancy from 56.25% to 50% and achieved occupancy from 51.77% to 46.39%, while warp cycles per issued instruction actually improved slightly (10.52 \u2192 9.36) \u2014 likely a scheduling artifact rather than a structural gain. The net effect was a marginal duration increase (52.22 \u2192 52.77 \u00b5s), confirming the strategy did not achieve its goal and introduced a register pressure regression.",
+    "slow_pseudocode": "# Two-step SiLU + bias (original)\nact_pre = tmp0 + tmp1\nsig = tl.sigmoid(act_pre)\nact = sig * act_pre + tmp5  # FMUL + FADD, not fused",
+    "fast_pseudocode": "# Attempted FMA fusion via libdevice (did NOT reduce non-fused instructions)\nact_pre = tmp0 + tmp1\nsig = tl.sigmoid(act_pre)\nact = libdevice.fma(sig, act_pre, tmp5)  # intended PTX fma.rn.f32, but compiler did not fuse",
+    "applicable_when": "Never demonstrated to work: libdevice.fma on sigmoid(x)*x+bias did not reduce non-fused FP32 instruction count in Triton on Hopper (H200). The FPInstructions rule firing does not guarantee that libdevice.fma will cause the PTX compiler to emit FMAD for this pattern.",
+    "do_not_apply_when": "When the FPInstructions NCU rule fires for a SiLU+bias pattern (sigmoid(x)*x+bias): libdevice.fma does not reliably fuse this into FMAD in Triton's PTX lowering. Additionally, libdevice.fma increases register pressure (55\u219264 registers/thread in this case), which reduces occupancy and can negate any potential compute gains. Avoid when registers/thread is already near the Block Limit Registers threshold.",
+    "framework_notes": "Triton-specific: libdevice.fma(a, b, c) is intended to map to PTX fma.rn.f32, but the Triton compiler's PTX lowering does not guarantee FMAD emission when the inputs involve transcendental operations (e.g., tl.sigmoid). The intermediate sigmoid result breaks the fusion chain at the PTX level. In CUDA C++, __fmaf_rn() has the same limitation when one operand is the result of __expf() or similar. The FPInstructions NCU rule may fire even when libdevice.fma is used if the compiler cannot prove the fusion is safe or profitable."
+  }
+]

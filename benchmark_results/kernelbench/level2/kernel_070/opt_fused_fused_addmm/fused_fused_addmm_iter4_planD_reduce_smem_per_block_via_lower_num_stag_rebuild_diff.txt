@@ -1,0 +1,121 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,21 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        # 128x128x32: 32768 bytes/stage -> max safe stages=3 (98 KB)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),   # 98 KB OK
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),   # 65 KB OK
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),   # 65 KB OK
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),   # 98 KB OK
++        # 128x128x64: 65536 bytes/stage -> max safe stages=1 (65 KB)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=4),   # 65 KB OK
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=1, num_warps=8),   # 65 KB OK
++        # 256x128x32: 65536 bytes/stage -> max safe stages=1 (65 KB)
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=1, num_warps=8),   # 65 KB OK
++        # 128x256x32: 65536 bytes/stage -> max safe stages=1 (65 KB)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=1, num_warps=8),   # 65 KB OK
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -38,40 +43,40 @@
+     pid_m = group_id * GROUP_M + (pid % group_size)
+     pid_n = (pid % width) // group_size
+ 
+-    # Row/col offsets
+-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    # Row/col offsets (still needed for bias load)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    offs_k = tl.arange(0, BLOCK_K)
+ 
+-    # Pointers
+-    X_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+-    # W is stored as (N, K) i.e. weight matrix of linear layer shape [out, in]
+-    W_ptrs = W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
++    # TMA block_ptr for X: shape [M, K], row-major (K contiguous)
++    X_block_ptr = tl.make_block_ptr(
++        base=X_ptr,
++        shape=(M, K),
++        strides=(stride_xm, stride_xk),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    # TMA block_ptr for W: stored as [N, K], accessed as transposed [K, N]
++    # shape=(K, N), strides=(stride_wk, stride_wn)
++    W_block_ptr = tl.make_block_ptr(
++        base=W_ptr,
++        shape=(K, N),
++        strides=(stride_wk, stride_wn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1),
++    )
+ 
+     # Accumulate
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        mask_k = offs_k < k_remaining
++        x_tile = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        w_tile = tl.load(W_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        acc = tl.dot(x_tile, w_tile, acc, input_precision='tf32x3')
++        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_K))
++        W_block_ptr = tl.advance(W_block_ptr, (BLOCK_K, 0))
+ 
+-        x_tile = tl.load(
+-            X_ptrs,
+-            mask=(offs_m[:, None] < M) & (mask_k[None, :]),
+-            other=0.0
+-        )
+-        w_tile = tl.load(
+-            W_ptrs,
+-            mask=(mask_k[:, None]) & (offs_n[None, :] < N),
+-            other=0.0
+-        )
+-
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
+-
+-        X_ptrs += BLOCK_K * stride_xk
+-        W_ptrs += BLOCK_K * stride_wk
+-
+-    # Load bias
++    # Load bias (keep scalar 1D load — bias is a vector, not a 2D tile)
+     bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
+ 
+     # Add bias -> this is original_x
+@@ -86,11 +91,16 @@
+     # Residual add
+     result = scaled + original_x
+ 
+-    # Store
+-    out_ptrs = Out_ptr + offs_m[:, None] * N + offs_n[None, :]
+-    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+-    tl.store(out_ptrs, result.to(tl.float32), mask=mask_out)
+-
++    # Store via block_ptr (Out is [M, N] row-major, stride N, 1)
++    Out_block_ptr = tl.make_block_ptr(
++        base=Out_ptr,
++        shape=(M, N),
++        strides=(N, 1),
++        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
++        block_shape=(BLOCK_M, BLOCK_N),
++        order=(1, 0),
++    )
++    tl.store(Out_block_ptr, result.to(tl.float32), boundary_check=(0, 1))
+ 
+ def kernel_function(p_gemm_weight, p_gemm_bias, x):
+     # p_gemm_weight: [N, K] = [8192, 8192]

@@ -1,0 +1,76 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,53 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 512},  num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 256},  num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 512},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 16,  'YBLOCK': 256},  num_warps=4, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_0(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+     ynumel = 30
+     xnumel = 50176
++
++    # FAST axis (warp-lane dim): channel index, program_id(0)
++    xoffset = tl.program_id(0) * XBLOCK
++    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # shape [1, XBLOCK]
++    xmask = xindex < ynumel  # channel mask: guard against ynumel=30 boundary
++
++    # SLOW axis: spatial index, program_id(1)
+     yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = yindex < ynumel
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y3 = yindex
+-    y0 = (yindex % 3)
+-    y1 = yindex // 3
+-    tmp0 = tl.load(in_ptr0 + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (y0 + 3*x2 + 150528*y1), tmp0, xmask & ymask)
++    y_arange = tl.arange(0, YBLOCK)
++    y_arange = tl.max_contiguous(tl.multiple_of(y_arange, YBLOCK), YBLOCK)
++    yindex = yoffset + y_arange[:, None]  # shape [YBLOCK, 1]
++    ymask = yindex < xnumel  # spatial mask: guard against xnumel=50176 boundary
+ 
++    # Combined mask for all memory operations
++    mask = ymask & xmask
+ 
++    # Logical variable names (matching original semantics)
++    ch = xindex   # full channel index 0..29  (was y3 in original)
++    sp = yindex   # spatial index 0..50175    (was x2 in original)
++    c  = ch % 3   # RGB channel 0,1,2         (was y0 in original)
++    n  = ch // 3  # batch index 0..9          (was y1 in original)
++
++    # Load: NCHW layout, in_ptr0 strides (150528, 50176, 224, 1)
++    # Address: sp + 50176*ch  ==  x2 + 50176*y3  (algebraically identical to original)
++    tmp0 = tl.load(in_ptr0 + (sp + 50176 * ch), mask=xmask, eviction_policy='evict_last')
++
++    # Store: NHWC layout, out_ptr0 strides (150528, 1, 672, 3)
++    # Address: c + 3*sp + 150528*n  ==  y0 + 3*x2 + 150528*y1  (algebraically identical)
++    # NOW: consecutive threads vary along ch (XBLOCK), so c=ch%3 cycles 0,1,2
++    # => stride-1 floats between consecutive threads => COALESCED stores!
++    tl.store(out_ptr0 + (c + 3 * sp + 150528 * n), tmp0, mask=xmask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +59,7 @@
+     ynumel = 30
+     xnumel = 50176
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176)
+     return arg_1
+ 
+ def get_inputs():

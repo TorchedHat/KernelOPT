@@ -1,0 +1,84 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,39 @@
+ import math
+ 
+ # GEMM kernel: computes x @ W^T + bias, output shape [M, N]
++
+ @triton.autotune(
+     configs=[
++        # === 2 blocks/SM configs: smem <= 114KB ===
++        # BLOCK_M=128, BLOCK_N=128, BLOCK_K=32: smem=(128*32+32*128)*4*stages
++        # stages=3: 98304 bytes OK   stages=4: 131072 bytes borderline
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=4, num_warps=8),
++        # BLOCK_M=128, BLOCK_N=128, BLOCK_K=16: smem=(128*16+16*128)*4*stages
++        # stages=4: 65536 bytes OK   stages=5: 81920 bytes OK
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16, 'GROUP_M': 4}, num_stages=5, num_warps=8),
++        # BLOCK_M=128, BLOCK_N=128, BLOCK_K=64: smem=(128*64+64*128)*4*stages
++        # stages=2: 131072 bytes borderline 2 blocks/SM
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=16),
++        # BLOCK_M=64, BLOCK_N=128, BLOCK_K=32: smem=(64*32+32*128)*4*stages
++        # stages=4: 98304 bytes OK   stages=5: 122880 bytes OK
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # BLOCK_M=64, BLOCK_N=64, BLOCK_K=32: smem=(64*32+32*64)*4*stages
++        # stages=5: 61440 bytes OK -- very small smem, highest occupancy
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        # === Keep existing small-warp configs for comparison ===
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -36,9 +61,16 @@
+     pid_m = group_id * GROUP_M + (pid % group_size)
+     pid_n = (pid % width) // group_size
+ 
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    rk = tl.arange(0, BLOCK_K)
++    # Annotate index vectors so Triton backend emits conflict-free swizzled smem layout
++    rm = tl.max_contiguous(
++             tl.multiple_of(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), BLOCK_M),
++             BLOCK_M)
++    rn = tl.max_contiguous(
++             tl.multiple_of(pid_n * BLOCK_N + tl.arange(0, BLOCK_N), BLOCK_N),
++             BLOCK_N)
++    rk = tl.max_contiguous(
++             tl.multiple_of(tl.arange(0, BLOCK_K), BLOCK_K),
++             BLOCK_K)
+ 
+     A = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+     B = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+@@ -49,7 +81,7 @@
+         k_remaining = K - k * BLOCK_K
+         a = tl.load(A, mask=(rm[:, None] < M) & (rk[None, :] < k_remaining), other=0.0)
+         b = tl.load(B, mask=(rk[:, None] < k_remaining) & (rn[None, :] < N), other=0.0)
+-        acc = tl.dot(a, b, acc, allow_tf32=False)
++        acc = tl.dot(a, b, acc, allow_tf32=True)
+         A += BLOCK_K * stride_ak
+         B += BLOCK_K * stride_bk
+ 
+@@ -75,6 +107,7 @@
+     key=['N'],
+ )
+ @triton.jit
++
+ def logsumexp_leakyrelu_gelu_kernel(
+     input_ptr, output_ptr,
+     M, N,

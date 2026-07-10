@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "d0437969",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_uncoalesced_store_and_tune_tile_sizes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (local loads/stores) + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_uncoalesced_store_and_tune_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_uncoalesced_store_and_tune_tile_sizes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.509e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.470e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.721e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The dominant bottleneck (79.9% of stall cycles) is L1TEX stalls from uncoalesced local loads/stores. R0_BLOCK=512 is 4x larger than r0_numel=128, wasting shared memory and limiting occupancy to only 3 blocks/SM (18.75%). Fixing R0_BLOCK=128 eliminates the over-allocation, reduces shared memory pressure, and allows more blocks per SM. Adding @triton.autotune explores XBLOCK sizes to find the best tile configuration.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.509e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.470e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.721e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_r0block_spill_fix",
+    "iteration": 1,
+    "speedup": 189.7827,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "match_r0_block_to_r0_numel_to_eliminate_local_memory_spill",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + TheoreticalOccupancy + MemoryCacheAccessPattern (local loads/stores)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 11.86,
+        "GPU Speed Of Light Throughput.Duration": 57.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 34.42,
+        "Scheduler Statistics.No Eligible": 91.31,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 3.41,
+        "Instruction Statistics.Executed Instructions": 3916892016.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 74.93,
+        "GPU Speed Of Light Throughput.Duration": 0.30282,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.09,
+        "Scheduler Statistics.No Eligible": 23.86,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Shared Mem": 7.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Launch Statistics.Registers Per Thread": 127.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 26.85,
+        "Instruction Statistics.Executed Instructions": 179855928.0
+      }
+    },
+    "strategy_title": "Match R0_BLOCK to r0_numel to Eliminate Register Spill",
+    "strategy_description": "When a Triton reduction kernel has R0_BLOCK set larger than r0_numel, intermediate accumulator tensors (e.g., online softmax max/sum buffers) are allocated with shape [XBLOCK, R0_BLOCK], causing massive register/local memory spill with strided access patterns (as low as 1/32 bytes utilized per sector). This manifests as >79% L1TEX scoreboard stalls, >91% scheduler no-eligible cycles, and very low compute throughput (<12%). Setting R0_BLOCK equal to r0_numel eliminates the oversized accumulators, removes local memory spill entirely, and can yield 100x+ speedups by converting a memory-latency-bound kernel into a compute-bound one.",
+    "slow_pseudocode": "# R0_BLOCK=512 >> r0_numel=128: allocates [XBLOCK=128, R0_BLOCK=512] accumulators\n# causing register spill to local memory with 1/32 byte utilization\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _tmp4_max = tl.zeros([XBLOCK, R0_BLOCK], ...)  # [128, 512] = huge spill\n    _tmp4_sum = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):  # executes once but allocates 512\n        ...\n\n# Fixed launch:\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# R0_BLOCK=128 == r0_numel=128: accumulators are [XBLOCK, 128], no spill\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 128}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _tmp4_max = tl.zeros([XBLOCK, R0_BLOCK], ...)  # [XBLOCK, 128], fits in registers\n    _tmp4_sum = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        ...\n\n# Autotuned launch (no explicit XBLOCK/R0_BLOCK kwargs):\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., xnumel, r0_numel)",
+    "applicable_when": "Triton reduction kernel where R0_BLOCK (constexpr tile size) is set larger than r0_numel (actual reduction dimension size); profiling shows >50% L1TEX scoreboard stalls (CPIStall rule), local load/store sectors with <4 bytes utilized per 32-byte sector, scheduler no-eligible >80%, and compute throughput <20% despite the kernel doing meaningful arithmetic work.",
+    "do_not_apply_when": "R0_BLOCK is already matched to r0_numel or smaller; the kernel is genuinely memory-bandwidth bound (DRAM throughput >80%); r0_numel is very large and R0_BLOCK must be smaller to avoid OOM or excessive register pressure from other sources.",
+    "framework_notes": "Triton-specific: R0_BLOCK is a tl.constexpr that controls the tile size for the reduction loop. When R0_BLOCK > r0_numel, the loop body executes only once but Triton still statically allocates accumulator tensors of shape [XBLOCK, R0_BLOCK], wasting register file and causing spill. The fix is to set R0_BLOCK = r0_numel and add @triton.autotune to explore XBLOCK values. In CUDA, the equivalent anti-pattern is allocating a shared memory or register array larger than the actual reduction size."
+  }
+]

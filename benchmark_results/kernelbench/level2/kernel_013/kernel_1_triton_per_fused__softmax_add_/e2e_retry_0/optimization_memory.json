@@ -1,0 +1,44 @@
+[
+  {
+    "item_id": "exp_001_triton_autotune_xblock_bank_conflict",
+    "iteration": 1,
+    "speedup": 7.8116,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 128.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 22.87,
+        "Occupancy.Block Limit Registers": 4.0,
+        "GPU Speed Of Light Throughput.Duration": 49.76,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 74492.0,
+        "SharedMemoryConflicts.shared_store_bank_conflict_way": 8.9,
+        "SharedMemoryConflicts.shared_load_bank_conflict_way": 8.6,
+        "SharedMemoryConflicts.shared_store_bank_conflicts_pct": 88.74,
+        "SharedMemoryConflicts.shared_load_bank_conflicts_pct": 88.42,
+        "UncoalescedSharedAccess.excessive_wavefronts_pct": 88.0,
+        "Instruction Statistics.Executed Instructions": 16826368.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 18.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 34.03,
+        "Occupancy.Block Limit Registers": 42.0,
+        "GPU Speed Of Light Throughput.Duration": 6.37,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9499.0,
+        "Instruction Statistics.Executed Instructions": 487424.0,
+        "Memory Workload Analysis.L2 Hit Rate": 94.72
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Eliminate Shared Memory Bank Conflicts",
+    "strategy_description": "When a Triton reduction kernel uses a large XBLOCK (e.g., 128) that tiles across multiple independent rows while reducing over a strided axis, shared memory reductions produce severe bank conflicts (8\u20139-way, affecting 88%+ of wavefronts) because threads from different rows access the same shared memory banks. Adding @triton.autotune to explore small XBLOCK values (1\u201316) allows the autotuner to select a configuration where each CTA handles fewer x-elements, eliminating cross-row bank conflicts and dramatically reducing register pressure (128 \u2192 18 regs/thread), which in turn raises theoretical occupancy from 25% to 100%. The resulting kernel ran 7.8x faster with elapsed cycles dropping from 74,492 to 9,499 and executed instructions dropping from 16.8M to 487K.",
+    "slow_pseudocode": "# Fixed XBLOCK=128, causes 8.9-way shared memory bank conflicts\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):\n    # XBLOCK=128 tiles 128 x-elements; R0_BLOCK=64 reduces over strided axis\n    xoffset = tl.program_id(0) * XBLOCK  # 128 x-elements per CTA\n    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # [128, 1]\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]         # [1, 64]\n    # 2D tile [128, 64] -> shared reduction has cross-row bank conflicts\n    tmp0 = tl.load(in_out_ptr0 + (x0 + 16384*r0_2 + 1048576*x1), None)\n    # ... compute ...\n    tmp7, tmp8 = tl.max2(tmp5, 1)  # reduction over dim=1, bank conflicts\n    tmp14 = tl.sum(tmp13, 1)       # reduction over dim=1, bank conflicts\n    tl.store(in_out_ptr0 + (...), tmp20, None)\n\ngrid = (triton.cdiv(xnumel, 128),)  # 2048 blocks\nkernel[grid](arg_0, arg_1, 262144, 64, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned XBLOCK (best=1 or small value), eliminates bank conflicts\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1},  num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 2},  num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 4},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 8},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 16}, num_warps=4, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n    restore_value=['in_out_ptr0'],\n)\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):\n    # Small XBLOCK: each CTA handles 1 (or few) x-elements\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel  # proper boundary check\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]\n    # 2D tile [XBLOCK, 64] with small XBLOCK -> no cross-row bank conflicts\n    tmp0 = tl.load(in_out_ptr0 + (x0 + 16384*r0_2 + 1048576*x1), xmask, other=0.0)\n    # ... compute (unchanged) ...\n    tl.store(in_out_ptr0 + (...), tmp20, xmask)\n\n# Grid uses lambda to pick up autotuned XBLOCK\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](arg_0, arg_1, 262144, 64)",
+    "applicable_when": "Triton reduction kernel with large XBLOCK (\u226564) tiles multiple independent rows while reducing over a strided axis; NCU reports UncoalescedSharedAccess with 80%+ excessive wavefronts and SharedMemoryConflicts with 8+ way bank conflicts on 80%+ of shared load/store requests; registers_per_thread is high (\u226564) causing low theoretical occupancy (\u226425%) due to Block Limit Registers.",
+    "do_not_apply_when": "The kernel is already memory-bandwidth bound at DRAM level with no shared memory bank conflicts; XBLOCK is already small (\u22644); the reduction axis is contiguous in memory (no stride), meaning shared reductions are already conflict-free; grid size is already too small to fill the GPU (waves_per_sm < 0.5 before the change).",
+    "framework_notes": "Triton-specific: use @triton.autotune with restore_value=[...] for in-place kernels to ensure correctness during autotuning. The xmask must be updated from tl.full([XBLOCK], True) to xindex < xnumel when XBLOCK is no longer guaranteed to divide xnumel evenly. The grid lambda must use meta['XBLOCK'] to pick up the autotuned value. In CUDA, the equivalent fix would be reducing the block's x-dimension tile size and using __launch_bounds__ to control register allocation."
+  }
+]
