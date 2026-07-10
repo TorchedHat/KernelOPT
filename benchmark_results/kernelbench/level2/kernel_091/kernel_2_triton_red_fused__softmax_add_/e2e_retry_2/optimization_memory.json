@@ -1,0 +1,69 @@
+[
+  {
+    "item_id": "1d518a49",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "online_softmax_single_pass_fused_with_tile_size_fix",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall + MemoryCacheAccessPattern (local loads/stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "online_softmax_single_pass_fused_with_tile_size_fix \u2014 correctness failure",
+    "strategy_description": "Plan 'online_softmax_single_pass_fused_with_tile_size_fix' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.509e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.470e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.721e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has two critical problems: (1) R0_BLOCK=512 is 4x larger than r0_numel=128, causing Triton to allocate oversized shared memory buffers (65 bytes dynamic SMEM) that limit blocks/SM to 3, crushing occupancy to 18.75%. With only 12 active warps/SM vs 64 max, the scheduler has almost nothing to hide the 27.6-cycle L1TEX latency, hence 91.32% of cycles have no eligible warp. (2) The kernel makes TWO full passes over in_ptr0 (the large 128x2130048 tensor), doubling global memory traffic. The uncoalesced local loads/stores (1.0/32 bytes utilized) indicate register spilling caused by the oversized R0_BLOCK tile. Fixing R0_BLOCK to match r0_numel=128 eliminates spilling, reduces SMEM, and allows more blocks/SM. Since r0_numel=128 fits entirely in registers with R0_BLOCK=128, the online softmax accumulation and the final normalization+sigmoid can be fused into a SINGLE pass.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.509e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.470e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.721e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_smem_reduction",
+    "iteration": 1,
+    "speedup": 189.4414,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_to_eliminate_local_spill_and_smem_bottleneck",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern (local stores/loads) + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 57.45,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 11.89,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 45.35,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 34.38,
+        "Scheduler Statistics.No Eligible (%)": 91.32,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.09,
+        "Occupancy.Theoretical Occupancy (%)": 18.75,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 3.39,
+        "Instruction Statistics.Executed Instructions": 3916892016.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 0.30326,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 75.14,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 35.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.15,
+        "Scheduler Statistics.No Eligible (%)": 23.95,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.62,
+        "Occupancy.Theoretical Occupancy (%)": 25.0,
+        "Occupancy.Block Limit Shared Mem": 7.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 16.38,
+        "Launch Statistics.Registers Per Thread": 127.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 26.89,
+        "Instruction Statistics.Executed Instructions": 179855928.0
+      }
+    },
+    "strategy_title": "Autotune R0_BLOCK to Eliminate Shared Memory Occupancy Bottleneck",
+    "strategy_description": "When a Triton reduction kernel is bottlenecked by shared memory per block (Block Limit Shared Mem = 3, Theoretical Occupancy ~19%), the R0_BLOCK tile size is likely too large, causing excessive dynamic shared memory allocation. Adding @triton.autotune to explore smaller R0_BLOCK values (e.g., 128 vs 512) dramatically reduces shared memory per block, increasing Block Limit Shared Mem from 3 to 7 and theoretical occupancy from 18.75% to 25%. The dominant stall (CPIStall: 80.2% of cycles waiting on L1TEX scoreboard, caused by local spills from oversized tiles) is eliminated, dropping Warp Cycles Per Issued Instruction from 34.4 to 5.2 and boosting Compute SM Throughput from 12% to 75%.",
+    "slow_pseudocode": "# Fixed large tile \u2014 causes shared memory bottleneck\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, in_ptr2, out_ptr2, xnumel, r0_numel,\n           XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # XBLOCK=128, R0_BLOCK=512 hardcoded at call site\n    # Dynamic smem = 65 KB/block \u2192 Block Limit Shared Mem = 3\n    # Theoretical occupancy = 18.75%\n    ...\n    tl.store(out_ptr2 + (x0 + 16641*r0_2 + 2130048*x1), tmp16, r0_mask & xmask)\n\n# Call site:\nkernel[grid](arg_0, arg_1, arg_2, arg_3, xnumel, r0_numel,\n             XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# Autotune explores smaller R0_BLOCK \u2014 reduces shared memory per block\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 128}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, in_ptr2, out_ptr2, xnumel, r0_numel,\n           XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # Best config: R0_BLOCK=128 \u2192 Dynamic smem = 16 KB/block\n    # Block Limit Shared Mem = 7, Theoretical occupancy = 25%\n    ...\n    tl.store(out_ptr2 + (x0 + 16641*r0_2 + 2130048*x1), tmp16, mask=r0_mask & xmask)\n\n# Call site (no tile args \u2014 autotune selects):\nkernel[grid](arg_0, arg_1, arg_2, arg_3, xnumel, r0_numel)",
+    "applicable_when": "Triton reduction kernel with: (1) Block Limit Shared Mem <= 3-4 blocks/SM, (2) Theoretical Occupancy <= 20%, (3) CPIStall rule triggered with L1TEX scoreboard stalls > 70% of cycles, (4) MemoryCacheAccessPattern rule for local loads/stores with <= 2 bytes utilized per 32-byte sector, (5) Warp Cycles Per Issued Instruction > 20, (6) Eligible Warps Per Scheduler < 0.2. These signals together indicate the tile size is too large, causing register/shared-memory spills to local memory.",
+    "do_not_apply_when": "Kernel is already compute-bound (Compute SM Throughput > 60%) or memory-bound by DRAM (DRAM Throughput > 70%) with no CPIStall rule. Also avoid when reducing R0_BLOCK would cause the reduction to span too few elements per block, requiring expensive cross-block synchronization or producing incorrect partial reductions.",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter. The key=['xnumel', 'r0_numel'] ensures autotuning re-runs when problem dimensions change. Removing hardcoded XBLOCK/R0_BLOCK from the call site is required when using autotune. In CUDA, the equivalent is using __launch_bounds__ and tuning shared memory tile sizes via template parameters or runtime configuration."
+  }
+]

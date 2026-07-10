@@ -1,0 +1,93 @@
+--- baseline
++++ rebuilt
+@@ -5,45 +5,50 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32}, num_warps=2, num_stages=1),
++        triton.Config({'XBLOCK': 32}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64}, num_warps=2, num_stages=1),
++        triton.Config({'XBLOCK': 64}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=1),
++    ],
++    key=['xnumel', 'r0_numel'],
++)
+ @triton.jit
+ def triton_per_fused_add_addmm_mul_native_group_norm_sigmoid_1(in_ptr0, in_ptr1, in_ptr2, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK : tl.constexpr):
+     xnumel = 2097152
+     r0_numel = 64
+     R0_BLOCK: tl.constexpr = 64
+-    rnumel = r0_numel
+-    RBLOCK: tl.constexpr = R0_BLOCK
+     xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+-    xmask = tl.full([XBLOCK], True, tl.int1)[:, None]
+-    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+-    r0_offset = 0
+-    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]
+-    roffset = r0_offset
+-    rindex = r0_index
+-    r0_2 = r0_index
+-    x0 = (xindex % 64)
+-    x3 = xindex
+-    tmp0 = tl.load(in_ptr0 + (r0_2 + 64*x0), None, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (r0_2 + 64*x3), None)
+-    tmp5 = tl.load(in_ptr2 + (r0_2 + 64*x0), None, eviction_policy='evict_last')
+-    tmp2 = tmp0 + tmp1
+-    tmp3 = tl.sigmoid(tmp2)
+-    tmp4 = tmp3 * tmp2
+-    tmp6 = tmp4 + tmp5
+-    tmp7 = tl.broadcast_to(tmp6, [XBLOCK, R0_BLOCK])
+-    tmp9 = tl.broadcast_to(tmp7, [XBLOCK, R0_BLOCK])
+-    tmp11 = tl.sum(tmp9, 1)[:, None].to(tl.float32)
+-    tmp12 = tl.full([1, 1], 64, tl.int32)
+-    tmp13 = tmp12.to(tl.float32)
+-    tmp14 = (tmp11 / tmp13)
+-    tmp15 = tmp7 - tmp14
+-    tmp16 = tmp15 * tmp15
+-    tmp17 = tl.broadcast_to(tmp16, [XBLOCK, R0_BLOCK])
+-    tmp19 = tl.sum(tmp17, 1)[:, None].to(tl.float32)
+-    tl.store(out_ptr0 + (x3), tmp14, None)
+-    tl.store(out_ptr1 + (x3), tmp19, None)
++    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # [XBLOCK, 1]
++    x0 = (xindex % 64)   # [XBLOCK, 1]
++    x3 = xindex           # [XBLOCK, 1]
++    xmask = xindex < xnumel  # [XBLOCK, 1]
+ 
++    r0_index = tl.arange(0, R0_BLOCK)[None, :]  # [1, 64]
+ 
++    # Three coalesced [XBLOCK, 64] tile loads
++    tmp0 = tl.load(in_ptr0 + (r0_index + 64 * x0), xmask, eviction_policy='evict_last', other=0.0)   # [XBLOCK, 64]
++    tmp1 = tl.load(in_ptr1 + (r0_index + 64 * x3), xmask, eviction_policy='evict_first', other=0.0)  # [XBLOCK, 64] large streaming
++    tmp5 = tl.load(in_ptr2 + (r0_index + 64 * x0), xmask, eviction_policy='evict_last', other=0.0)   # [XBLOCK, 64]
++
++    # Activation: SiLU(tmp0 + tmp1) + tmp5 using FMA for guaranteed FMAD emission
++    act_pre = tmp0 + tmp1
++    sig = tl.sigmoid(act_pre)
++    act = libdevice.fma(sig, act_pre, tmp5)  # maps to PTX fma.rn.f32 single FMAD
++
++    # Pass 1: mean
++    mean = tl.sum(act, 1)[:, None] / R0_BLOCK  # [XBLOCK, 1]
++
++    # Pass 2: M2 = sum of squared deviations
++    diff = act - mean                           # [XBLOCK, 64]
++    m2   = tl.sum(diff * diff, 1)[:, None]     # [XBLOCK, 1]
++
++    tl.store(out_ptr0 + x3, mean, xmask)  # mean  (matches tmp14)
++    tl.store(out_ptr1 + x3, m2,   xmask)  # M2 = sum((x_i-mean)^2) (matches tmp19)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -54,7 +59,7 @@
+     xnumel = 2097152
+     r0_numel = 64
+     grid = (triton.cdiv(xnumel, 128),)
+-    triton_per_fused_add_addmm_mul_native_group_norm_sigmoid_1[grid](arg_0, arg_1, arg_2, arg_3, arg_4, 2097152, 64, XBLOCK=128)
++    triton_per_fused_add_addmm_mul_native_group_norm_sigmoid_1[grid](arg_0, arg_1, arg_2, arg_3, arg_4, 2097152, 64)
+     return arg_4
+ 
+ def get_inputs():

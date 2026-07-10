@@ -1,0 +1,44 @@
+[
+  {
+    "item_id": "triton_autotune_vectorized_loads_contiguous_hint_001",
+    "iteration": 1,
+    "speedup": 1.7939,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_with_contiguous_hint_and_evict_first",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 5.92,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8782.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.3,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.93,
+        "Scheduler Statistics.No Eligible": 71.2,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.48,
+        "Memory Workload Analysis.L2 Hit Rate": 60.4,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Occupancy.Achieved Occupancy": 55.18,
+        "Compute Workload Analysis.Issue Slots Busy": 29.05
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.3,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4885.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.04,
+        "Scheduler Statistics.No Eligible": 54.76,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 76.07,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Occupancy.Achieved Occupancy": 45.77,
+        "Compute Workload Analysis.Issue Slots Busy": 41.05
+      }
+    },
+    "strategy_title": "Autotune Tile Shapes + Contiguous Hint + Evict-First for Streaming Loads",
+    "strategy_description": "When a Triton kernel shows high CPIStall on L1TEX (14.9 cycles/warp stalled on memory), low eligible warps per scheduler (<1.0), and uncoalesced global accesses (>20% excess sectors), applying tl.max_contiguous+tl.multiple_of on the load index enables the compiler to emit 128-bit vectorized loads instead of scalar 32-bit loads, directly reducing load transaction count. Switching the eviction policy from evict_last to evict_first on streaming (non-reused) loads avoids L1 cache pollution, improving L2 hit rate (60% \u2192 76%) and reducing register pressure (26 \u2192 18 registers/thread). Adding @triton.autotune over multiple (XBLOCK, YBLOCK, num_warps) configurations allows the runtime to select the tile shape that best matches the SM count and memory bandwidth, reducing warp cycles per issued instruction from 31.3 to 17.15 and improving issue slot utilization from 29% to 41%.",
+    "slow_pseudocode": "# Fixed tile shape, no vectorization hint, evict_last\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # no contiguous hint\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + stride2*y1), tmp0, mask)\n\n# Fixed grid, fixed tile\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, 30, 50176, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile shapes, vectorization hint, evict_first\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 1}, num_warps=4),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 4}, num_warps=8),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8}, num_warps=8),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 8}, num_warps=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK)[None, :], [1, XBLOCK]), [1, XBLOCK])\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_first')\n    tl.store(out_ptr + (y0 + 3*x2 + stride2*y1), tmp0, mask)\n\n# Lambda grid lets autotune pick XBLOCK/YBLOCK\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, 30, 50176)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "Triton pointwise/permutation kernel with: CPIStall on L1TEX >10 cycles/warp, eligible warps per scheduler <1.0, uncoalesced global accesses >15% excess sectors, fixed tile shape (no autotune), streaming load pattern (data not reused across iterations), and contiguous x-index access pattern where the compiler cannot infer alignment.",
+    "do_not_apply_when": "Kernel has non-contiguous or strided x-index access (tl.multiple_of hint would be incorrect and could cause wrong vectorization); data is reused across iterations (evict_first would hurt L1 hit rate for reuse patterns); kernel is already autotuned or tile shapes are constrained by shared memory layout; ynumel or xnumel are very small (autotune overhead may dominate).",
+    "framework_notes": "tl.max_contiguous and tl.multiple_of are Triton-specific compiler hints that inform the backend about index alignment and contiguity, enabling 128-bit (float4) vectorized loads. The [1, XBLOCK] form is used for 2D index tensors (shape [YBLOCK, XBLOCK]). evict_first is the Triton equivalent of CUDA's __ldcs (streaming cache hint). In CUDA, the equivalent is using __ldg with __builtin_assume_aligned or float4 casts for vectorized loads."
+  }
+]

@@ -1,0 +1,65 @@
+--- baseline
++++ rebuilt
+@@ -3,8 +3,10 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        # Existing large-tile configs (kept verbatim)
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+@@ -13,6 +15,18 @@
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        # NEW small-tile, low-register-pressure configs
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=2),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
++        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -54,8 +68,9 @@
+     # Pointers to first tiles
+     x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+     # Weight is stored as (N, K) i.e. w[out_feature, in_feature]
+-    # We want w.T so we load w[offs_n, offs_k] and treat as (K, N) for dot
+-    w_ptrs = w_ptr + (offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk)
++    # Load w tile directly as [BLOCK_K, BLOCK_N] to eliminate tl.trans() and
++    # the associated shared memory bank conflicts.
++    w_ptrs = w_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+ 
+     # Accumulate
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+@@ -66,10 +81,11 @@
+         x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+ 
+-        # Load w tile [BLOCK_K, BLOCK_N]
++        # Load w tile directly as [BLOCK_K, BLOCK_N] — no transpose needed
+         w_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+         w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+ 
++        # x_tile [BLOCK_M, BLOCK_K] x w_tile [BLOCK_K, BLOCK_N] = acc [BLOCK_M, BLOCK_N]
+         acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
+ 
+         x_ptrs += BLOCK_K * stride_xk
+@@ -92,7 +108,6 @@
+     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     out_ptrs = out_ptr + (offs_m[:, None] * stride_om + offs_n[None, :] * stride_on)
+     tl.store(out_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(w, bias, x):
+     # x: [M, K], w: [N, K] (Linear weight), bias: [N]

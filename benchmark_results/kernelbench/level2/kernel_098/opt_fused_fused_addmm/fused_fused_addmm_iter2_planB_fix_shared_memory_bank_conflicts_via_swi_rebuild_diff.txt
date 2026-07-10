@@ -1,0 +1,98 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,19 @@
+ 
+ 
+ # GEMM kernel: computes x @ W^T + bias, output shape [M, N]
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -40,20 +45,34 @@
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+     offs_k = tl.arange(0, BLOCK_K)
+ 
+-    A_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+-    B_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
++    # Use tl.make_block_ptr for conflict-free shared memory layout via order=(1,0)
++    # boundary_check handles M/K/N boundary conditions automatically with zero padding
++    a_block_ptr = tl.make_block_ptr(
++        base=A_ptr,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    b_block_ptr = tl.make_block_ptr(
++        base=B_ptr,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(1, 0),
++    )
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
++        # boundary_check=(0,1) replaces manual a_mask/b_mask for out-of-bounds handling
++        a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero', mask=None)
++        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero', mask=None)
+         acc = tl.dot(a, b, acc, allow_tf32=False)
+-        A_ptrs += BLOCK_K * stride_ak
+-        B_ptrs += BLOCK_K * stride_bk
++        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
++        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+ 
+     # Add bias
+     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+@@ -61,13 +80,10 @@
+ 
+     # Store result
+     C_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+-    tl.store(C_ptrs, acc, mask=mask)
+-
+-
+-# Fused kernel: avg_pool1d (kernel=16) + gelu + scale + max reduction
+-# Input: linear output [M, N] where N=8192, pool_size=16 -> pooled_N=512
+-# Output: max values [M]
++    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    tl.store(C_ptrs, acc, mask=c_mask)
++
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512}, num_stages=2, num_warps=4),
+@@ -80,6 +96,7 @@
+     key=['xnumel', 'r0_numel'],
+ )
+ @triton.jit
++
+ def pool_gelu_scale_max_kernel(
+     in_ptr,
+     out_max_ptr,

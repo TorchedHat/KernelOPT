@@ -1,0 +1,85 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ 
+ # GEMM kernel: computes out = x @ W.T + bias
+ # x: [M, K], W: [N, K], bias: [N], out: [M, N]
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+@@ -14,6 +15,9 @@
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -51,40 +55,37 @@
+         mask_k = offs_k < k_remaining
+         x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0)
+         w = tl.load(w_ptrs, mask=mask_k[:, None] & (offs_n[None, :] < N), other=0.0)
+-        acc = tl.dot(x, w, acc)
++        acc = tl.dot(x, w, acc, allow_tf32=True)
+         x_ptrs += BLOCK_K * stride_xk
+         w_ptrs += BLOCK_K * stride_wk
+ 
+-    offs_m_out = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    offs_n_out = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    mask_out = (offs_m_out[:, None] < M) & (offs_n_out[None, :] < N)
+-
+-    bias = tl.load(B_ptr + offs_n_out, mask=offs_n_out < N, other=0.0)
++    # Add bias
++    bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
+     acc = acc + bias[None, :]
+ 
+-    out_ptrs = Out_ptr + offs_m_out[:, None] * stride_om + offs_n_out[None, :] * stride_on
+-    tl.store(out_ptrs, acc.to(tl.float32), mask=mask_out)
++    # Fused epilogue: pairwise max-pool (kernel_size=2) + sum + scale
++    # acc shape: [BLOCK_M, BLOCK_N], BLOCK_N is always even in all configs
++    # Reshape to [BLOCK_M, BLOCK_N//2, 2] to extract even/odd pairs
++    BLOCK_N_HALF: tl.constexpr = BLOCK_N // 2
++    acc_pairs = tl.reshape(acc, (BLOCK_M, BLOCK_N_HALF, 2))
++    # Extract even (index 0) and odd (index 1) along last axis
++    acc_even = tl.reshape(acc_pairs[:, :, 0], (BLOCK_M, BLOCK_N_HALF))
++    acc_odd  = tl.reshape(acc_pairs[:, :, 1], (BLOCK_M, BLOCK_N_HALF))
++    pooled = tl.maximum(acc_even, acc_odd)  # [BLOCK_M, BLOCK_N_HALF]
+ 
++    # Mask out-of-bounds entries
++    offs_n_half = pid_n * BLOCK_N_HALF + tl.arange(0, BLOCK_N_HALF)
++    N_HALF = N // 2
++    mask_n_half = offs_n_half[None, :] < N_HALF
++    mask_m = offs_m[:, None] < M
++    pooled = tl.where(mask_m & mask_n_half, pooled, 0.0)
+ 
+-# Fused kernel: max_pool1d(kernel_size=2) + sum + scale
+-# Input: [M, N] (result of linear)
+-# max_pool: for each row, take max of pairs -> [M, N//2]
+-# sum: sum over N//2 -> [M]
+-# scale: multiply by scale_factor -> [M]
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BLOCK_N': 256}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_N': 512}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_N': 1024}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_N': 2048}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_N': 4096}, num_stages=2, num_warps=16),
+-        triton.Config({'BLOCK_N': 256}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_N': 512}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_N': 1024}, num_stages=3, num_warps=8),
+-    ],
+-    key=['N_HALF'],
+-)
+-@triton.jit
++    # Sum over pooled columns -> [BLOCK_M] partial row sums, then scale by 0.5
++    row_partial = tl.sum(pooled, axis=1) * 0.5
++
++    # Atomic accumulate into output (multiple pid_n tiles contribute to same row)
++    tl.atomic_add(Out_ptr + offs_m, row_partial, mask=(offs_m < M))
++
+ def maxpool_sum_scale_kernel(
+     In_ptr, Out_ptr,
+     M, N, N_HALF,

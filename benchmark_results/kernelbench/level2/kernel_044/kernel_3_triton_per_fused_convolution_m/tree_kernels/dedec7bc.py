@@ -1,0 +1,71 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 1},   num_warps=1, num_stages=1),
+        triton.Config({'XBLOCK': 2},   num_warps=1, num_stages=1),
+        triton.Config({'XBLOCK': 4},   num_warps=1, num_stages=1),
+        triton.Config({'XBLOCK': 8},   num_warps=1, num_stages=1),
+        triton.Config({'XBLOCK': 16},  num_warps=1, num_stages=2),
+        triton.Config({'XBLOCK': 32},  num_warps=2, num_stages=2),
+        triton.Config({'XBLOCK': 64},  num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),
+    ],
+    key=['xnumel'],
+)
+@triton.jit
+def triton_per_fused_convolution_mean_mul_3(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr):
+    xnumel = 1024
+    r0_numel = 128
+    R0_BLOCK: tl.constexpr = 128
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_offset = 0
+    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]
+    roffset = r0_offset
+    rindex = r0_index
+    r0_2 = r0_index
+    x_lastdim = xindex % 64
+    x_batch = xindex // 64
+    x3 = xindex
+    tmp0 = tl.load(in_ptr0 + (r0_index + 128*x_lastdim + 8192*x_batch), xmask, other=0.0, eviction_policy='evict_last')
+    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+    tmp3 = tl.where(xmask, tmp1, 0)
+    tmp4 = tl.sum(tmp3, 1)[:, None].to(tl.float32)
+    tmp8 = tmp4 * 1.52587890625e-05  # = 1/65536; folds /65536.0 and /1.0 into one multiply
+    tl.store(in_out_ptr0 + (x3), tmp8, xmask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    xnumel = 2048
+    r0_numel = 64
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_per_fused_convolution_mean_mul_3[grid](arg_0, arg_1, 2048, 64)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((16, 128, 1, 1), (128, 1, 1, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((16, 128, 1, 1, 64), (8192, 1, 131072, 131072, 128), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

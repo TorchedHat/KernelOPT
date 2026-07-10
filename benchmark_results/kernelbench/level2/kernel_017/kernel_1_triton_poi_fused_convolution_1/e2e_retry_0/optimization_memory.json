@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "b5caa084",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_triton_autotune \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'add_triton_autotune' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 229, in benchmark\n    timings = {config: self._bench(*args, c",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a transpose/copy that reads in_ptr0 with index (y0 + 128*x2 + 4032000*y1). The x-dimension stride of 128 floats between consecutive threads means each warp's 32 threads access addresses 128 floats apart \u2014 a strided (non-coalesced) load pattern. With L1 hit rate at 0% and L2 at 96.93% utilization, every load misses L1 and hammers L2. The 43.3-cycle average L1TEX stall (56.5% of all stalls) confirms the kernel is bottlenecked on memory latency from uncoalesced reads. Applying tl.max_contiguous and tl.multiple_of hints on the load index tells the Triton compiler the access is contiguous and aligned, enabling 128-bit (float4) vectorized loads that pack 4 elements per transaction and dramatically reduce L2 sector traffic.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packa",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_transpose_coalescing_2d_tile",
+    "iteration": 1,
+    "speedup": 1.9915,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "coalesced_2d_tile_transpose_reindex",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 96.93,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 19.63,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.Memory Throughput": 3.55,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 76.59,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.29,
+        "GPU Speed Of Light Throughput.Duration": 285.82
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 46.27,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.63,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.02,
+        "Memory Workload Analysis.Memory Throughput": 1.68,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.16,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.93,
+        "GPU Speed Of Light Throughput.Duration": 143.52
+      }
+    },
+    "strategy_title": "Reindex 2D Tile to Coalesce Strided Transpose Loads",
+    "strategy_description": "When a kernel performs a layout transpose (e.g., channels-last to NCHW) and the load address has a large stride between consecutive threads (e.g., stride-128 floats = 512 bytes), L1 hit rate collapses to 0% and L2 throughput saturates near 100%. Restructuring the 2D tile so that the stride-1 input dimension varies across one tile axis (making loads coalesced) while the stride-1 output dimension varies across the other axis (making stores coalesced) eliminates the L1TEX stall bottleneck. This halved warp cycles per issued instruction (76.6 \u2192 32.2) and doubled compute throughput (19.6% \u2192 47.6%), yielding ~2x speedup.",
+    "slow_pseudocode": "# Strided loads: consecutive x-threads are 512 bytes apart in input\nyindex = program_id(1)*YBLOCK + arange(YBLOCK)[:, None]  # shape [YBLOCK, 1]\nxindex = program_id(0)*XBLOCK + arange(XBLOCK)[None, :]  # shape [1, XBLOCK]\ny0 = yindex % 128; y1 = yindex // 128\n# load: stride-128 between consecutive x-threads \u2192 0% L1 hit\ntmp = load(in_ptr + y0 + 128*xindex + 4032000*y1, mask=xmask, eviction_policy='evict_last')\nstore(out_ptr + xindex + 31500*yindex, tmp, mask=xmask)",
+    "fast_pseudocode": "# Coalesced loads: consecutive y-threads read consecutive y0 (stride-1 in input)\nxindex = program_id(0)*XBLOCK + arange(XBLOCK)   # shape [XBLOCK]\nyindex = program_id(1)*YBLOCK + arange(YBLOCK)   # shape [YBLOCK]\ny0 = yindex % 128; y1 = yindex // 128\nload_addr = y0[None,:] + 128*xindex[:,None] + 4032000*y1[None,:]  # [XBLOCK, YBLOCK]\nload_mask = xmask[:,None] & ymask[None,:]\ntile = load(in_ptr + load_addr, mask=load_mask)   # coalesced along YBLOCK dim\nstore_addr = xindex[:,None] + 31500*yindex[None,:]  # coalesced along XBLOCK dim\nstore(out_ptr + store_addr, tile, mask=load_mask)\n# Also add @triton.autotune with multiple XBLOCK/YBLOCK configs",
+    "applicable_when": "Kernel performs a memory layout transpose where the load stride between consecutive threads exceeds one cache line (e.g., stride > 32 elements for float32); L1/TEX Hit Rate \u2248 0%, L2 Cache Throughput > 80%, Warp Cycles Per Issued Instruction > 50, CPIStall rule triggered with L1TEX stall as dominant cause.",
+    "do_not_apply_when": "Access pattern is already coalesced (L1 hit rate > 20%); kernel is compute-bound rather than memory-bound; tensor layout does not involve a transpose or large stride between consecutive threads.",
+    "framework_notes": "Triton-specific: use 1D arange vectors (not 2D slices) for each axis, then broadcast with [:, None] and [None, :] to form the 2D tile address. Add @triton.autotune with multiple XBLOCK/YBLOCK combinations and use lambda grid: `lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))`. Remove eviction_policy='evict_last' from loads when coalescing is achieved."
+  }
+]

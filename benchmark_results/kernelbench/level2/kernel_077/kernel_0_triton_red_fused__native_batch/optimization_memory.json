@@ -1,0 +1,309 @@
+[
+  {
+    "item_id": "8db042ae",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_via_xblock_increase_and_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_via_xblock_increase_and_autotune \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'vectorized_loads_via_xblock_increase_and_autotune' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\narget=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_m",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is launched with XBLOCK=1, meaning each CTA processes exactly one x-element (one of 2048 channels) and reduces over 25920 r-elements. With XBLOCK=1, the final store tl.store(in_out_ptr0 + x3, tmp24, xmask) writes a single scalar per CTA \u2014 no vectorization is possible. NCU confirms only 4 of 32 bytes per sector are utilized in global stores (12.5% efficiency), with 100% of sectors missing L1TEX. Increasing XBLOCK to 4 or 8 means each CTA handles multiple consecutive x-elements, making stores contiguous and enabling 128-bit vectorized memory transactions. Adding tl.max_contiguous and tl.multiple_of hints on the load pointer signals to the compiler that accesses are aligned and contiguous within each XBLOCK tile, enabling 128-bit (4xfloat32) vectorized loads. @triton.autotune will explore the optimal XBLOCK/R0_BLOCK/num_warps/num_stages combination.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\narget=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compile",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_autotune_xblock_register_spill_regression_001",
+    "iteration": 1,
+    "speedup": 0.0372,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_for_store_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 32.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 93.71,
+        "GPU Speed Of Light Throughput.Duration (us)": 53.92,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 81.09,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 33.32,
+        "Launch.Waves Per SM": 0.97
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.38,
+        "GPU Speed Of Light Throughput.Duration (us)": 1450.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 3.14,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 96.43,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.45,
+        "Launch.Waves Per SM": 7.76,
+        "Instruction Statistics.Executed Instructions": 853777120.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK for coalescing causes register spill regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs to a reduction kernel caused the compiler to spill registers massively (32 \u2192 255 registers/thread), collapsing theoretical occupancy from 100% to 12.5% and increasing kernel duration by ~27x. Although L1 hit rate improved (0.53% \u2192 96.43%) and warp stall cycles dropped (33.3 \u2192 2.45 cycles/instruction), the instruction count exploded ~48x (17.8M \u2192 853.8M instructions) due to local memory spill traffic, completely overwhelming any coalescing benefit. When a reduction kernel already has near-full occupancy with low register usage, introducing autotune configs that expand tile sizes (XBLOCK \u00d7 R0_BLOCK) can force the compiler into a high-register-pressure regime that causes catastrophic spilling.",
+    "slow_pseudocode": "# BEFORE: XBLOCK=1, R0_BLOCK=1024, 32 regs/thread, 100% occupancy, 53.92 us\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        # load + compute + accumulate\n        _acc = tl.where(mask, val, _acc)\n    result = tl.sum(_acc, 1)[:, None] / N\n    tl.store(out + x3, result, xmask)\n\ngrid = (triton.cdiv(xnumel, 1),)  # grid=2048\nkernel[grid](..., XBLOCK=1, R0_BLOCK=1024)",
+    "fast_pseudocode": "# AFTER (regressed): autotune with larger XBLOCK, 255 regs/thread, 12.5% occupancy, 1450 us\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64, 'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 32, 'R0_BLOCK': 1024}, num_warps=8, num_stages=2),\n        # ... more configs with large XBLOCK\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)  # XBLOCK*R0_BLOCK tile in registers\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        _acc = tl.where(mask, val, _acc)\n    result = tl.sum(_acc, 1)[:, None] / N\n    tl.store(out + x3, result, mask=xmask)\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](...)",
+    "applicable_when": "Kernel has very low register usage (<40 regs/thread), near-full occupancy (>90%), and the bottleneck is uncoalesced stores due to XBLOCK=1. The accumulator tile [XBLOCK, R0_BLOCK] is small enough to fit in registers.",
+    "do_not_apply_when": "The reduction accumulator is allocated as tl.full([XBLOCK, R0_BLOCK], ...) and XBLOCK*R0_BLOCK is large (e.g., 64*512=32768 elements). This forces the compiler to spill the accumulator to local memory, causing catastrophic register pressure (255 regs/thread), occupancy collapse (<15%), and massive local load/store traffic that dwarfs any coalescing benefit. Do not apply when the kernel already has near-full occupancy with low register count.",
+    "framework_notes": "In Triton, tl.full([XBLOCK, R0_BLOCK], 0, tl.float32) allocates the entire accumulator in registers. When XBLOCK*R0_BLOCK exceeds register file capacity per thread, the compiler spills to local memory (stack), visible as 'local loads/stores' in NCU with very low bytes-per-sector utilization (1/32 bytes). The TheoreticalOccupancy NCU rule firing with 'limited by number of required registers' is the key diagnostic signal."
+  },
+  {
+    "item_id": "exp_001_autotune_xblock_register_spill_regression",
+    "iteration": 1,
+    "speedup": 0.1781,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.RegistersPerThread": 32.0,
+        "Occupancy.TheoreticalOccupancy": 100.0,
+        "Occupancy.AchievedOccupancy": 93.71,
+        "Launch.WavesPerSM": 0.97,
+        "GPU_SOL.Duration_us": 53.92,
+        "GPU_SOL.DRAMThroughput_pct": 81.09,
+        "GPU_SOL.ComputeThroughput_pct": 43.01,
+        "Scheduler.EligibleWarpsPerScheduler": 0.9,
+        "WarpState.WarpCyclesPerIssuedInstruction": 33.32
+      },
+      "key_metric_after": {
+        "Launch.RegistersPerThread": 166.0,
+        "Occupancy.TheoreticalOccupancy": 18.75,
+        "Occupancy.AchievedOccupancy": 17.9,
+        "Launch.WavesPerSM": 5.17,
+        "GPU_SOL.Duration_us": 302.78,
+        "GPU_SOL.DRAMThroughput_pct": 14.42,
+        "GPU_SOL.ComputeThroughput_pct": 85.7,
+        "Scheduler.EligibleWarpsPerScheduler": 1.67,
+        "WarpState.WarpCyclesPerIssuedInstruction": 3.24,
+        "Instruction.ExecutedInstructions": 204878208.0
+      }
+    },
+    "strategy_title": "Increasing XBLOCK with autotune causes register spill and occupancy collapse",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs caused the compiler to select a configuration that exploded register usage from 32 to 166 registers per thread, collapsing theoretical occupancy from 100% to 18.75% and achieved occupancy from 93.71% to 17.9%. Although DRAM throughput dropped (from 81% to 14%) as intended, the 5.3x increase in waves per SM and 11.5x increase in executed instructions (17.8M to 204.8M) caused a 5.6x slowdown in duration (53.92 us to 302.78 us). The autotune search space included configs that forced the kernel to unroll large reduction loops into registers, trading memory bandwidth for catastrophic register pressure.",
+    "slow_pseudocode": "# BEFORE: XBLOCK=1, R0_BLOCK=1024, 32 regs/thread, 100% occupancy\n@triton.jit\ndef kernel(...):\n    # XBLOCK=1 hardcoded, single x-element per CTA\n    # R0_BLOCK=1024, reduction loop runs once\n    for r0_offset in range(0, r0_numel, R0_BLOCK):\n        ...\n    tl.store(out + x3, result, xmask)",
+    "fast_pseudocode": "# AFTER (regressed): autotune selects large XBLOCK, R0_BLOCK combos\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n        # ... other large configs\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    # Selected config: large XBLOCK * R0_BLOCK product\n    # -> 166 registers/thread, 18.75% occupancy, 5.17 waves/SM\n    for r0_offset in range(0, r0_numel, R0_BLOCK):\n        ...",
+    "applicable_when": "Never applicable as described \u2014 adding autotune with large XBLOCK/R0_BLOCK configs to a reduction kernel that already has high occupancy (>90%) and moderate register usage (~32 regs/thread) will cause register pressure explosion if the product XBLOCK*R0_BLOCK is large.",
+    "do_not_apply_when": "Do not add autotune configs with large XBLOCK*R0_BLOCK products to reduction kernels that already achieve near-100% theoretical occupancy with small tile sizes. When a kernel uses 32 registers/thread at XBLOCK=1/R0_BLOCK=1024, increasing both dimensions simultaneously will cause the compiler to allocate O(XBLOCK*R0_BLOCK) registers for loop-carried accumulators, collapsing occupancy. The original DRAM bottleneck (81%) is better addressed by other means (e.g., memory access pattern fixes) rather than tile size changes that risk register spill.",
+    "framework_notes": "Triton's @triton.autotune does not constrain register usage \u2014 configs with large XBLOCK*R0_BLOCK products can cause the JIT compiler to unroll accumulator arrays into registers. Always check that candidate configs keep registers/thread below ~64 for H100/H200 (to maintain >50% occupancy). The TheoreticalOccupancy NCU rule firing with 81.25% speedup_pct is a strong signal that the selected config was register-limited."
+  },
+  {
+    "item_id": "exp_003_fma_fusion_num_stages2_instruction_count_regression",
+    "iteration": 3,
+    "speedup": 0.8645,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fma_fusion_to_reduce_non_fused_fp32_instructions",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 53.5,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 81.7,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 37.29,
+        "Instruction Statistics.Executed Instructions": 15584256.0,
+        "Launch.Registers Per Thread": 28.0,
+        "Occupancy.Achieved Occupancy (%)": 93.71,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 38.11,
+        "Source Counters.Branch Instructions": 454144.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 62.37,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 70.13,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 43.34,
+        "Instruction Statistics.Executed Instructions": 21016000.0,
+        "Launch.Registers Per Thread": 23.0,
+        "Occupancy.Achieved Occupancy (%)": 93.88,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.61,
+        "Source Counters.Branch Instructions": 874176.0
+      }
+    },
+    "strategy_title": "FMA Fusion + num_stages=2 Increases Instruction Count and Latency",
+    "strategy_description": "Replacing separate FADD/FMUL/FSUB chains with explicit libdevice.fma calls and switching autotune configs from num_stages=1 to num_stages=2 caused executed instructions to increase by ~35% (15.6M \u2192 21.0M) and kernel duration to increase by ~17% (53.5 us \u2192 62.37 us), despite registers per thread dropping from 28 to 23 and occupancy remaining stable (~94%). The branch instruction count nearly doubled (454K \u2192 874K), suggesting num_stages=2 introduced additional software-pipelining control flow overhead that outweighed any FMA throughput benefit. The kernel was memory-bandwidth-bound (DRAM Throughput 81.7% before), not compute-bound, so reducing FP instruction count via FMA fusion did not address the actual bottleneck; the NCU FPInstructions rule's estimated speedup was misleading in this context.",
+    "slow_pseudocode": "# BEFORE: num_stages=1, XBLOCK=1, 28 regs/thread, 53.5 us, 15.6M instructions\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        # ... other configs with num_stages=1\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        tmp2 = tmp0 + tmp1          # FADD\n        tmp4 = tmp2 * 2.0           # FMUL\n        tmp6 = tmp4 - tmp5          # FSUB\n        tmp15 = tmp6 * tmp14        # FMUL\n        tmp17 = tmp15 * tmp16       # FMUL\n        tmp19 = tmp17 + tmp18       # FADD",
+    "fast_pseudocode": "# AFTER (regressed): num_stages=2, libdevice.fma, 23 regs/thread, 62.37 us, 21.0M instructions\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=2),\n        # ... all configs with num_stages=2\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    # Hoisted before loop:\n    tmp14 = 1.0 / tl.sqrt_rn(tmp7 + 1e-5)  # [XBLOCK, 1]\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        tmp2 = tmp0 + tmp1\n        tmp6 = libdevice.fma(tmp2, 2.0, -tmp5)   # FMA1\n        tmp15 = tmp6 * tmp14\n        tmp19 = libdevice.fma(tmp15, tmp16, tmp18)  # FMA2",
+    "applicable_when": "Kernel is genuinely compute-bound (Compute SOL >> Memory SOL, e.g., >70% compute vs <30% memory) AND the FPInstructions NCU rule fires with a large non-fused instruction count AND num_stages=1 is already confirmed optimal.",
+    "do_not_apply_when": "Do not apply FMA fusion via libdevice.fma when the kernel is memory-bandwidth-bound (DRAM Throughput >70%). The FPInstructions NCU rule can fire even on memory-bound kernels, but the estimated speedup is misleading \u2014 reducing compute instructions does not help when DRAM is the bottleneck. Also do not simultaneously switch from num_stages=1 to num_stages=2 in autotune configs, as software pipelining adds branch overhead (branch instructions nearly doubled here) that can increase total instruction count and duration even when register pressure is stable.",
+    "framework_notes": "In Triton, num_stages controls software pipelining depth in tl.range loops. Increasing num_stages from 1 to 2 adds prefetch/barrier instructions that increase branch count and total instruction count. For memory-bound reduction kernels with short loop bodies, num_stages=1 is typically optimal. libdevice.fma(a, b, c) maps to PTX fma.rn.f32 but Triton's compiler may already attempt FMA fusion internally; explicit libdevice.fma calls do not guarantee fewer instructions if the compiler's own fusion pass is already active."
+  },
+  {
+    "item_id": "exp_004_xblock4_scalar_acc_occupancy_collapse_regression",
+    "iteration": 4,
+    "speedup": 0.5507,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_scalar_accumulator_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 54.53,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 80.16,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 51.26,
+        "Launch.Registers Per Thread": 28.0,
+        "Occupancy.Theoretical Occupancy (%)": 100.0,
+        "Occupancy.Achieved Occupancy (%)": 92.87,
+        "Launch.Waves Per SM": 0.97,
+        "Instruction Statistics.Executed Instructions": 20760576.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.82,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.33
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 97.92,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 44.61,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 84.03,
+        "Launch.Registers Per Thread": 40.0,
+        "Occupancy.Theoretical Occupancy (%)": 75.0,
+        "Occupancy.Achieved Occupancy (%)": 59.74,
+        "Launch.Waves Per SM": 1.29,
+        "Instruction Statistics.Executed Instructions": 64242688.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.75,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.36
+      }
+    },
+    "strategy_title": "XBLOCK=4 with Scalar Accumulator Causes Occupancy Drop and Slowdown",
+    "strategy_description": "Increasing XBLOCK from 1 to 4 in a reduction kernel \u2014 even when the accumulator is a small [XBLOCK, 1] scalar form rather than [XBLOCK, R0_BLOCK] \u2014 caused registers per thread to increase from 28 to 40, dropping theoretical occupancy from 100% to 75% and achieved occupancy from 92.87% to 59.74%. Although DRAM throughput dropped (80% \u2192 45%) and warp stall cycles improved (27.8 \u2192 10.75 cycles/instruction), the 3x increase in executed instructions (20.8M \u2192 64.2M) and the occupancy collapse caused kernel duration to nearly double (54.5 us \u2192 97.9 us). The LaunchConfiguration NCU rule also fired, indicating a partial wave problem (1.29 waves/SM with 2048 blocks / 132 SMs), suggesting the grid reduction from 2048 to 512 CTAs introduced tail-effect overhead. Even with a scalar [XBLOCK, 1] accumulator, XBLOCK=4 in a memory-bandwidth-bound reduction kernel with near-full occupancy causes net regression due to register pressure increase and instruction count explosion.",
+    "slow_pseudocode": "# BEFORE: XBLOCK=1, 28 regs/thread, 100% theoretical occupancy, 54.53 us\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=2, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    _acc = tl.zeros([XBLOCK, 1], tl.float32)  # scalar accumulator\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        # load + compute\n        _acc += val\n    tl.store(out + x3, _acc / N, xmask)\n\ngrid = (triton.cdiv(xnumel, 1),)  # 2048 CTAs",
+    "fast_pseudocode": "# AFTER (regressed): XBLOCK=4 added, 40 regs/thread, 75% theoretical occupancy, 97.92 us\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 256},  num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=2, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    _acc = tl.zeros([XBLOCK, 1], tl.float32)  # [4,1] scalar accumulator\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        _acc += val\n    tl.store(out + x3, _acc / N, xmask)\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)  # 512 CTAs with XBLOCK=4",
+    "applicable_when": "Never applicable for this kernel pattern. Even with a [XBLOCK, 1] scalar accumulator, increasing XBLOCK in a memory-bandwidth-bound reduction kernel with near-full occupancy (>90%) and low register count (~28 regs/thread) causes register pressure increase and instruction count explosion that outweighs any store coalescing benefit.",
+    "do_not_apply_when": "Do not increase XBLOCK in reduction kernels that already achieve near-full theoretical occupancy (>90%) with low register usage (~28 regs/thread), even if the accumulator is a small [XBLOCK, 1] scalar form. The additional broadcast loads and per-x-element computations at XBLOCK=4 increase register pressure (28 \u2192 40 regs/thread), drop theoretical occupancy (100% \u2192 75%), and triple the executed instruction count (20.8M \u2192 64.2M). The grid reduction from 2048 to 512 CTAs also introduces a partial-wave tail effect (LaunchConfiguration rule fires). The store coalescing improvement (4/32 \u2192 16/32 bytes/sector) is insufficient to compensate for these costs when the kernel is already DRAM-bound at 80%.",
+    "framework_notes": "In Triton, even a [XBLOCK, 1] accumulator (not [XBLOCK, R0_BLOCK]) can cause register pressure increase when XBLOCK > 1, because each x-element requires its own set of broadcast scalar loads (BN parameters, etc.) that must be live simultaneously. The TheoreticalOccupancy NCU rule firing ('limited by number of required registers', Block Limit Registers dropping from 16 to 12) is the diagnostic signal. The LaunchConfiguration rule firing with 50% estimated speedup indicates the grid size reduction (2048 \u2192 512 CTAs) created a partial-wave problem on 132 SMs."
+  },
+  {
+    "item_id": "exp_004_doubling_block_size_num_warps_regression",
+    "iteration": 4,
+    "speedup": 0.8203,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_num_warps_and_block_size_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 54.53,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 80.16,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 51.26,
+        "Launch.Block Size": 128.0,
+        "Launch.Waves Per SM": 0.97,
+        "Instruction Statistics.Executed Instructions": 20760576.0,
+        "Occupancy.Achieved Occupancy (%)": 92.87,
+        "Scheduler.Eligible Warps Per Scheduler": 1.33,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.82,
+        "Launch.Registers Per Thread": 28.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 65.73,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 66.42,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 53.5,
+        "Launch.Block Size": 256.0,
+        "Launch.Waves Per SM": 1.94,
+        "Instruction Statistics.Executed Instructions": 27088512.0,
+        "Occupancy.Achieved Occupancy (%)": 93.99,
+        "Scheduler.Eligible Warps Per Scheduler": 1.58,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 26.36,
+        "Launch.Registers Per Thread": 28.0
+      }
+    },
+    "strategy_title": "Doubling num_warps/block_size hurts DRAM-bound reduction kernels",
+    "strategy_description": "Doubling the block size from 128 to 256 threads (num_warps 4\u21928) in a DRAM-bandwidth-bound reduction kernel increased kernel duration by ~20% (54.53 us \u2192 65.73 us) despite registers per thread remaining constant at 28 and achieved occupancy staying near-identical (~93%). DRAM throughput dropped from 80.16% to 66.42% while executed instructions increased ~30% (20.8M \u2192 27.1M), indicating that doubling the thread count doubled the work per SM wave without proportionally improving memory throughput. The autotune selected a config with waves_per_sm=1.94 (vs 0.97 before), meaning the grid now runs two full waves instead of one, adding scheduling overhead and a partial-wave tail effect (LaunchConfiguration rule fired with 50% estimated impact). When a kernel is already near the DRAM bandwidth ceiling with ~1 wave per SM, increasing block size doubles the wave count and instruction count without unlocking additional bandwidth.",
+    "slow_pseudocode": "# BEFORE: block_size=128, num_warps=4, waves_per_sm=0.97, 54.53 us\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=2, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc = tl.zeros([XBLOCK, 1], tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        # load + compute\n        _acc += tl.sum(tl.where(mask, val, zeros), 1)[:, None]\n    tl.store(out + x3, _acc / N, xmask)",
+    "fast_pseudocode": "# AFTER (regressed): block_size=256, num_warps=8, waves_per_sm=1.94, 65.73 us\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512},  num_warps=8, num_stages=1),\n        # ... autotune selected 256-thread config\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc = tl.zeros([XBLOCK, 1], tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        _acc += tl.sum(tl.where(r0_mask & xmask, val, zeros), 1)[:, None]\n    tl.store(out + x3, _acc / N, xmask)",
+    "applicable_when": "Kernel is compute-bound with low occupancy (<50%) and the bottleneck is insufficient warp-level parallelism to hide compute latency. Waves per SM should be well above 1 so doubling block size does not double the wave count.",
+    "do_not_apply_when": "Do not increase num_warps or block size when the kernel is DRAM-bandwidth-bound (DRAM Throughput >70%) and already achieves near-full occupancy (>90%) with ~1 wave per SM. Doubling block size in this regime doubles waves_per_sm (0.97\u21921.94), doubles executed instructions, introduces a partial-wave tail effect (LaunchConfiguration rule fires), and reduces DRAM throughput without any latency-hiding benefit since the bottleneck is bandwidth, not latency. The eligible warps per scheduler improved only marginally (1.33\u21921.58) while duration increased 20%.",
+    "framework_notes": "In Triton, num_warps directly sets the block size (num_warps \u00d7 32 threads). When grid_size is fixed (e.g., 2048 blocks) and num_warps doubles, waves_per_sm doubles. If the kernel was already running ~1 full wave, the new configuration runs ~2 waves, adding scheduling overhead and a partial-wave tail. The LaunchConfiguration NCU rule firing with 50% estimated impact is the key diagnostic signal for this anti-pattern."
+  },
+  {
+    "item_id": "exp_005_hoist_loop_invariant_xblock1_only_regression",
+    "iteration": 5,
+    "speedup": 0.5745,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "hoist_loop_invariant_computations_to_reduce_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 61.76,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 70.76,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 53.29,
+        "Launch.Registers Per Thread": 28.0,
+        "Occupancy.Achieved Occupancy (%)": 91.82,
+        "Launch.Waves Per SM": 0.97,
+        "Instruction Statistics.Executed Instructions": 25005056.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 25.78,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.38,
+        "Source Counters.Branch Instructions": 454144.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 93.86,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 46.56,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 55.41,
+        "Launch.Registers Per Thread": 26.0,
+        "Occupancy.Achieved Occupancy (%)": 92.27,
+        "Launch.Waves Per SM": 0.97,
+        "Instruction Statistics.Executed Instructions": 40681472.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.82,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.12,
+        "Source Counters.Branch Instructions": 2516992.0
+      }
+    },
+    "strategy_title": "Hoisting Loop Invariants with tl.rsqrt Explodes Instruction Count",
+    "strategy_description": "Hoisting loop-invariant BN scale computations (replacing tl.sqrt_rn + integer division with tl.rsqrt) outside the reduction loop, while keeping XBLOCK=1 in all autotune configs, caused executed instructions to increase by ~63% (25.0M \u2192 40.7M) and kernel duration to increase by ~52% (61.76 us \u2192 93.86 us). Critically, branch instructions exploded by ~5.5x (454K \u2192 2.52M), indicating the new autotune config set (adding R0_BLOCK=256 and R0_BLOCK=2048 options) caused autotune to select a smaller R0_BLOCK that runs far more loop iterations, dramatically increasing loop control overhead. Registers per thread actually decreased slightly (28 \u2192 26) and occupancy was unchanged (~92%), confirming the regression was not caused by register pressure but by the autotune selecting a suboptimal R0_BLOCK that multiplied loop overhead. The tl.max_contiguous/tl.multiple_of hints and the store eviction_policy change may also have contributed to the instruction count increase.",
+    "slow_pseudocode": "# BEFORE: R0_BLOCK=1024 (autotune), 28 regs/thread, 61.76 us, 25.0M instructions\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n    # ... XBLOCK=4 and XBLOCK=8 configs also present\n], key=['xnumel', 'r0_numel'])\n@triton.jit\ndef kernel(...):\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        tmp9 = tmp7 + 1e-5\n        tmp10 = tl.sqrt_rn(tmp9)   # inside loop (loop-invariant)\n        tmp14 = 1.0 / tmp10         # inside loop (loop-invariant)\n        tmp15 = tmp6 * tmp14\n        tmp17 = tmp15 * tmp16\n        tmp19 = tmp17 + tmp18\n        _acc += tl.sum(tl.where(mask, tmp19, zeros), 1)[:, None]",
+    "fast_pseudocode": "# AFTER (regressed): autotune selected small R0_BLOCK, 26 regs/thread, 93.86 us, 40.7M instructions\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 256},  num_warps=4, num_stages=1),  # NEW - autotune picks this\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4, num_stages=1),  # NEW\n], key=['xnumel', 'r0_numel'])\n@triton.jit\ndef kernel(...):\n    # Hoisted before loop:\n    inv_std = tl.rsqrt(tmp7 + 1e-5)\n    scaled_inv_std = inv_std * tmp16\n    _acc = tl.full([XBLOCK, 1], 0, tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        r0_2 = tl.max_contiguous(tl.multiple_of(r0_index, [1, 16]), [1, R0_BLOCK])  # NEW hint\n        tmp0 = tl.load(in_ptr0 + (r0_2 + 25920*x3), mask=r0_mask & xmask, eviction_policy='evict_first', other=0.0)\n        tmp2 = tmp0 + tmp1\n        tmp4 = tmp2 * 2.0\n        tmp6 = tmp4 - tmp5\n        tmp15 = tmp6 * scaled_inv_std\n        tmp19 = tmp15 + tmp18\n        _acc += tl.sum(tl.where(mask, tmp19, zeros), 1, keep_dims=True)\n    tl.store(in_out_ptr0 + xindex, _acc / 25920.0, mask=xmask, eviction_policy='evict_last')  # changed index",
+    "applicable_when": "Never applicable as described for this kernel pattern. Hoisting loop-invariant scalar computations (sqrt, rsqrt) in a DRAM-bandwidth-bound reduction kernel with XBLOCK=1 does not address the actual bottleneck and risks autotune selecting a suboptimal R0_BLOCK from an expanded config set.",
+    "do_not_apply_when": "Do not hoist loop-invariant computations in a DRAM-bandwidth-bound reduction kernel (DRAM Throughput >60%) when simultaneously expanding the autotune config set with new R0_BLOCK values. The autotune may select a smaller R0_BLOCK (e.g., 256 instead of 1024), causing the loop to run 4x more iterations and multiplying branch/loop-control instruction overhead (branch count increased 5.5x here). Even if registers per thread decrease slightly, the instruction count explosion dominates. Additionally, adding tl.max_contiguous/tl.multiple_of hints and changing store eviction policy alongside the hoisting makes it impossible to isolate the causal factor. The CPIStall and IssueSlotUtilization NCU rules firing on a memory-bound kernel indicate the bottleneck is DRAM latency, not arithmetic throughput \u2014 hoisting scalar FP ops does not reduce memory latency.",
+    "framework_notes": "In Triton, expanding the autotune config set with smaller R0_BLOCK values (e.g., adding R0_BLOCK=256) can cause autotune to select a config that runs more loop iterations, dramatically increasing branch instruction count. For a reduction over 25920 elements: R0_BLOCK=256 \u2192 102 iterations, R0_BLOCK=1024 \u2192 26 iterations, R0_BLOCK=2048 \u2192 13 iterations. The branch instruction count scales linearly with iteration count. When the autotune warm-up measurement is noisy, it may select a suboptimal config. Always verify which config autotune actually selected by checking branch instruction count in NCU (branch count \u2248 iterations \u00d7 2048 CTAs \u00d7 overhead_factor)."
+  },
+  {
+    "item_id": "exp_005_restrict_autotune_to_low_num_warps_eliminates_partial_wave",
+    "iteration": 5,
+    "speedup": 1.0472,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "restrict_autotune_configs_to_low_num_warps_to_eliminate_partial_wave",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 61.76,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 70.76,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 53.29,
+        "Launch.Block Size": 128.0,
+        "Launch.Waves Per SM": 0.97,
+        "Launch.Registers Per Thread": 28.0,
+        "Instruction Statistics.Executed Instructions": 25005056.0,
+        "Occupancy.Achieved Occupancy (%)": 91.82,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 25.78
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 51.49,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 84.87,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 44.68,
+        "Launch.Block Size": 128.0,
+        "Launch.Waves Per SM": 0.97,
+        "Launch.Registers Per Thread": 31.0,
+        "Instruction Statistics.Executed Instructions": 18151552.0,
+        "Occupancy.Achieved Occupancy (%)": 93.3,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.04,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.78
+      }
+    },
+    "strategy_title": "Restrict Autotune to num_warps\u22644 to Maximize DRAM Throughput",
+    "strategy_description": "When a DRAM-bandwidth-bound reduction kernel's autotune search space includes num_warps=8 configs (block_size=256), the autotuner may select a higher-warp config that increases executed instructions and reduces DRAM throughput. Restricting the autotune config list to XBLOCK=1 with num_warps\u22644 (block_size\u2264128) forces the autotuner to select a lower-thread-count config, reducing executed instructions by ~27% (25.0M\u219218.2M) and increasing DRAM throughput from 70.76% to 84.87%, yielding a ~4.7% speedup. The key diagnostic signal is DRAM Throughput below 80% on a memory-bound kernel where prior profiling confirms a lower-num_warps config achieved higher DRAM utilization.",
+    "slow_pseudocode": "# BEFORE: autotune includes num_warps=8 configs, autotuner selects block_size=128 but\n# search space pollution causes suboptimal selection; DRAM=70.76%, 25.0M instructions\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 256},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512},  num_warps=8, num_stages=1),\n        # ... other large configs\n    ],\n    key=['xnumel', 'r0_numel'],\n)",
+    "fast_pseudocode": "# AFTER: restrict to XBLOCK=1, num_warps<=4 only; DRAM=84.87%, 18.2M instructions\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 512},  num_warps=2, num_stages=1),\n    ],\n    key=['xnumel', 'r0_numel'],\n)",
+    "applicable_when": "Kernel is DRAM-bandwidth-bound (DRAM Throughput <80% but expected to be higher), autotune search space includes num_warps=8 configs, and prior profiling or memory history confirms that num_warps\u22644 achieves higher DRAM throughput for the same grid size. Executed instruction count is higher than expected for the problem size. XBLOCK=1 is required (increasing XBLOCK causes register spill regression).",
+    "do_not_apply_when": "Kernel is compute-bound or latency-bound with low occupancy (<50%), where higher num_warps is needed to hide latency. Do not apply if the kernel already achieves DRAM Throughput >80% with the current autotune selection. Do not apply if restricting num_warps causes waves_per_sm to increase above 1.5 (introducing partial-wave tail effects). Do not apply if the kernel body has high register pressure that would be worsened by any config change.",
+    "framework_notes": "In Triton, the @triton.autotune decorator selects the best config at runtime via benchmarking. Including high num_warps configs (num_warps=8, block_size=256) in the search space can cause the autotuner to select a suboptimal config for DRAM-bound kernels, as the benchmarking may favor configs that appear faster in isolation but reduce effective DRAM bandwidth utilization. Restricting the config list to num_warps\u22644 with XBLOCK=1 and num_stages=1 is a targeted intervention when prior profiling confirms the regression pattern. The SOLBottleneck rule changing from 'OPT' (memory more utilized than compute) to 'INF' (>80% utilization) confirms the kernel is now properly DRAM-saturated."
+  }
+]

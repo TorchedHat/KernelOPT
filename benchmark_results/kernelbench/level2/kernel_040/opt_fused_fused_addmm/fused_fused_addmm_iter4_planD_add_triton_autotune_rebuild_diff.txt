@@ -1,0 +1,79 @@
+--- baseline
++++ rebuilt
+@@ -7,6 +7,7 @@
+ # Computes: out = (x @ W.T + bias) * scale + (x @ W.T + bias)
+ # Which simplifies to: out = linear_out * (1 + scale)
+ # where scale = 0.5, so out = linear_out * 1.5
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -18,6 +19,11 @@
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        # New configs with BLOCK_K=128 and higher num_warps to reduce register pressure
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -59,7 +65,8 @@
+     # Pointers to X and W
+     X_ptrs = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
+     # W is stored as (N, K) -- weight matrix of linear layer
+-    W_ptrs = W_ptr + rn[None, :] * stride_wn + rk[:, None] * stride_wk
++    # Load W as [BLOCK_N, BLOCK_K] (coalesced: rn rows with stride_wn, rk cols with stride_wk=1)
++    W_ptrs = W_ptr + rn[:, None] * stride_wn + rk[None, :] * stride_wk
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+         k_offset = k * BLOCK_K
+@@ -69,23 +76,28 @@
+         x_tile = tl.load(
+             X_ptrs,
+             mask=mask_m[:, None] & mask_k[None, :],
+-            other=0.0
++            other=0.0,
++            cache_modifier='.ca'  # evict_last: keep in L2 for reuse across N tiles
+         )
+ 
+-        # Load W tile [BLOCK_K, BLOCK_N] -- W is (N, K), so W[n, k]
++        # Load W tile [BLOCK_N, BLOCK_K] -- coalesced: consecutive threads read consecutive K elements
+         w_tile = tl.load(
+             W_ptrs,
+-            mask=mask_k[:, None] & mask_n[None, :],
+-            other=0.0
++            mask=mask_n[:, None] & mask_k[None, :],
++            other=0.0,
++            cache_modifier='.ca'  # evict_last: keep in L2 for reuse across M tiles
+         )
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++        # tl.trans(w_tile) gives [BLOCK_K, BLOCK_N] for the dot product: [M,K] x [K,N]
++        # input_precision='tf32x3': Ozaki decomposition using 3 TF32 HMMA ops for FP32-equivalent accuracy
++        acc = tl.dot(x_tile, tl.trans(w_tile), acc, input_precision='tf32x3')
+ 
+         X_ptrs += BLOCK_K * stride_xk
+         W_ptrs += BLOCK_K * stride_wk
+ 
+     # Add bias
+-    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0)
++    bias = tl.load(B_ptr + rn, mask=mask_n, other=0.0,
++                   cache_modifier='.cg')  # cache at L2 only: tiny vector, read once per output tile
+     acc = acc + bias[None, :]
+ 
+     # Fuse: out = acc * scaling_factor + acc = acc * (1 + scaling_factor)
+@@ -97,9 +109,9 @@
+     tl.store(
+         out_ptrs,
+         acc.to(tl.float32),
+-        mask=mask_m[:, None] & mask_n[None, :]
++        mask=mask_m[:, None] & mask_n[None, :],
++        cache_modifier='.cs'  # evict_first: write-once streaming output, avoid polluting L2
+     )
+-
+ 
+ def kernel_function(p_matmul_weight, p_matmul_bias, x, scaling_factor=0.5):
+     M, K = x.shape

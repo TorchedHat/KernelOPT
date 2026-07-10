@@ -1,0 +1,109 @@
+--- baseline
++++ rebuilt
+@@ -3,16 +3,24 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        # Small tiles, 2 stages: smem=(64+64)*32*2*4=32KB -> 4+ blocks/SM
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        # Medium tiles, 2 stages: smem=(128+64)*32*2*4=49KB -> 4 blocks/SM
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        # Medium tiles, 2-3 stages: smem=(128+128)*32*2*4=64KB -> 3 blocks/SM
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # Larger M/N tiles, 2 stages: smem=(256+128)*32*2*4=96KB -> 2 blocks/SM
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        # Wide tile for N-heavy workload (N=8192)
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -46,37 +54,44 @@
+     pid_m = group_id * GROUP_M + (pid % group_size)
+     pid_n = (pid % width) // group_size
+     
+-    # Row/col offsets for this tile
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    rk = tl.arange(0, BLOCK_K)
+-    
+-    # Boundary-safe offsets
+-    offs_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    offs_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-    
+-    # Pointers to first tiles
+-    X_ptrs = X_ptr + offs_m[:, None] * stride_xm + rk[None, :] * stride_xk
+-    # W is stored as (N, K) i.e. weight matrix transposed from (K, N)
+-    W_ptrs = W_ptr + offs_n[None, :] * stride_wn + rk[:, None] * stride_wk
++    # Create block pointers for X and W using TMA-compatible make_block_ptr
++    # X has shape (M, K) with strides (stride_xm, stride_xk)
++    # order=(1, 0) means K-dimension (dim 1) is the fastest-varying in the block
++    X_block_ptr = tl.make_block_ptr(
++        base=X_ptr,
++        shape=(M, K),
++        strides=(stride_xm, stride_xk),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    # W is stored as (N, K) but we treat it as (K, N) for X @ W^T
++    # shape=(K, N), strides=(stride_wk, stride_wn) = (1, K)
++    # order=(0, 1) means N-dimension (dim 1) is the fastest-varying in the block
++    W_block_ptr = tl.make_block_ptr(
++        base=W_ptr,
++        shape=(K, N),
++        strides=(stride_wk, stride_wn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1),
++    )
+     
+     # Accumulate in float32
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+     
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        # Load X tile [BLOCK_M, BLOCK_K]
+-        x_mask = (offs_m[:, None] < M) & (rk[None, :] < k_remaining)
+-        x = tl.load(X_ptrs, mask=x_mask, other=0.0)
++        # Load X tile [BLOCK_M, BLOCK_K] using block pointer (TMA swizzled layout)
++        x = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option='zero')
+         
+-        # Load W tile [BLOCK_K, BLOCK_N]
+-        w_mask = (rk[:, None] < k_remaining) & (offs_n[None, :] < N)
+-        w = tl.load(W_ptrs, mask=w_mask, other=0.0)
++        # Load W tile [BLOCK_K, BLOCK_N] using block pointer (TMA swizzled layout)
++        w = tl.load(W_block_ptr, boundary_check=(0, 1), padding_option='zero')
+         
+         acc = tl.dot(x, w, acc, allow_tf32=False)
+         
+-        X_ptrs += BLOCK_K * stride_xk
+-        W_ptrs += BLOCK_K * stride_wk
++        # Advance block pointers to next K tile
++        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_K))
++        W_block_ptr = tl.advance(W_block_ptr, (BLOCK_K, 0))
+     
+     # Recompute rm, rn for output
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -96,7 +111,6 @@
+     out_mask = (rm[:, None] < M) & (rn[None, :] < N)
+     Out_ptrs = Out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+     tl.store(Out_ptrs, result.to(tl.float32), mask=out_mask)
+-
+ 
+ def kernel_function(p_linear_weight, p_linear_bias, x):
+     # x: [M, K], weight: [N, K] (linear weight is stored as [out, in])

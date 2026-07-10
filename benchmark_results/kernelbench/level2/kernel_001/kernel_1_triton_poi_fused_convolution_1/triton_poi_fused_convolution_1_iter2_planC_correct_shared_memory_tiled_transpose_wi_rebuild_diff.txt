@@ -1,0 +1,60 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,43 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    # Input  shape (32,128,126,250), strides (4032000,1,32000,128)
++    # Output shape (32,128,126,250), strides (4032000,31500,250,1)
++    # ynumel=4096=32*128, xnumel=31500=126*250
++    #
++    # Repurpose: XBLOCK=TILE_C (channel, stride-1 in input), YBLOCK=TILE_S (spatial, stride-1 in output)
++    # 2D grid: axis 0 = channel tiles (pid_c), axis 1 = batch*spatial tiles (pid_bs)
++    #
++    pid_c = tl.program_id(0)   # channel tile
++    pid_bs = tl.program_id(1)  # batch * spatial tile (combined)
+ 
++    # Decompose pid_bs into batch index and spatial tile
++    num_s_tiles = tl.cdiv(31500, YBLOCK)
++    b_idx = pid_bs // num_s_tiles   # batch index (0..31)
++    pid_s = pid_bs % num_s_tiles    # spatial tile index
+ 
++    # Channel offsets - innermost for LOAD (stride=1 in input)
++    c_off = pid_c * XBLOCK + tl.arange(0, XBLOCK)   # [XBLOCK=TILE_C]
++    c_mask = c_off < 128
++
++    # Spatial offsets - innermost for STORE (stride=1 in output)
++    s_off = pid_s * YBLOCK + tl.arange(0, YBLOCK)   # [YBLOCK=TILE_S]
++    s_mask = s_off < 31500
++
++    # COALESCED LOAD: consecutive threads vary c_off (stride=1 in input)
++    # flat address = channel + 128*spatial + 4032000*batch
++    in_addr = c_off[None, :] + 128 * s_off[:, None] + 4032000 * b_idx
++    full_mask = s_mask[:, None] & c_mask[None, :]
++    tile = tl.load(in_ptr0 + in_addr, mask=full_mask, other=0.0)
++    # tile shape: [YBLOCK, XBLOCK]
++
++    # COALESCED STORE: consecutive threads vary s_off (stride=1 in output)
++    # flat address = spatial + 31500*channel + 4032000*batch
++    out_addr = s_off[:, None] + 31500 * (c_off[None, :] + 128 * b_idx)
++    tl.store(out_ptr0 + out_addr, tile, mask=full_mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

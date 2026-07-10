@@ -1,0 +1,258 @@
+[
+  {
+    "item_id": "exp_triton_hoist_k_index_arithmetic_outside_loop_001",
+    "iteration": 2,
+    "speedup": 1.1482,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "hoist_k_index_arithmetic_outside_loop",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + CPIStall",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 56.0,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 55.07,
+        "Occupancy.Block Limit Registers": 18.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 8.82,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.34,
+        "Scheduler Statistics.No Eligible": 35.35,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.64,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.06,
+        "Memory Workload Analysis.L2 Hit Rate": 95.06,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.45,
+        "GPU Speed Of Light Throughput.Memory Throughput": 43.65,
+        "GPU Speed Of Light Throughput.Duration": 3.92,
+        "Source Counters.Branch Efficiency": 57.19
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 72.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 42.95,
+        "Occupancy.Block Limit Registers": 14.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 6.86,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.69,
+        "Scheduler Statistics.No Eligible": 38.98,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.25,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 64.79,
+        "Memory Workload Analysis.L2 Hit Rate": 83.5,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 60.96,
+        "GPU Speed Of Light Throughput.Memory Throughput": 92.78,
+        "GPU Speed Of Light Throughput.Duration": 3.71,
+        "Source Counters.Branch Efficiency": 50.0
+      }
+    },
+    "strategy_title": "Replace Flat K-Loop with Triple Nested Loop to Eliminate Vector Div/Mod",
+    "strategy_description": "When a convolution K-loop decodes (kh, kw, in_c) from a flat index using vector integer division and modulo on BLOCK_K-wide tensors, replacing it with a triple nested loop (kh, kw, ic_start) makes kh and kw scalar compile-time constants and in_c a simple sequential range, eliminating all vector div/mod from the hot path. In this case, the restructuring raised L1/TEX hit rate from 1.06% to 64.79% (sequential in_c access becomes cache-friendly), reduced warp cycles per issued instruction from 13.64 to 11.25, and eliminated the SharedMemoryConflicts and UncoalescedSharedAccess rules entirely, yielding a 1.15x speedup despite a slight increase in registers/thread (56\u219272) and a drop in theoretical occupancy (56%\u219244%). The key insight is that sequential, predictable memory access patterns can outweigh occupancy gains when L1 hit rate improves dramatically.",
+    "slow_pseudocode": "# Flat K-loop with vector integer div/mod \u2014 poor L1 locality\nacc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\nfor k_start in range(0, TOTAL_K, BLOCK_K):\n    offs_k = k_start + tl.arange(0, BLOCK_K)\n    valid_k = offs_k < TOTAL_K\n    in_c = offs_k % IN_C          # vector mod \u2014 breaks sequential access\n    tmp_k = offs_k // IN_C        # vector div\n    kw = tmp_k % KW               # vector mod\n    kh = tmp_k // KW              # vector div\n    ih = out_h[:, None] * STRIDE_H + kh[None, :] - PAD_H\n    iw = out_w[:, None] * STRIDE_W + kw[None, :] - PAD_W\n    valid_spatial = (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)\n    mask_x = valid_m[:, None] & valid_k[None, :] & valid_spatial\n    x_ptrs = X_ptr + batch[:, None]*s_xn + ih*s_xh + iw*s_xw + in_c[None,:]*s_xc\n    x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)\n    mask_w = valid_k[:, None] & valid_n[None, :]\n    w_ptrs = W_ptr + offs_n[None,:]*s_wn + kh[:,None]*s_wh + kw[:,None]*s_ww + in_c[:,None]*s_wc\n    w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)\n    acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=True)",
+    "fast_pseudocode": "# Triple nested loop \u2014 kh_i/kw_i are scalar constants, in_c is sequential\nacc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\nfor kh_i in tl.static_range(KH):        # KH constexpr, fully unrolled\n    for kw_i in tl.static_range(KW):    # KW constexpr, fully unrolled\n        ih = out_h * STRIDE_H + kh_i - PAD_H   # [BLOCK_M], computed once per (kh_i, kw_i)\n        iw = out_w * STRIDE_W + kw_i - PAD_W\n        valid_spatial = (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)\n        for ic_start in range(0, IN_C, BLOCK_K):\n            in_c = ic_start + tl.arange(0, BLOCK_K)  # sequential, no modulo\n            valid_k = in_c < IN_C\n            mask_x = valid_m[:, None] & valid_spatial[:, None] & valid_k[None, :]\n            x_ptrs = X_ptr + batch[:, None]*s_xn + ih[:, None]*s_xh + iw[:, None]*s_xw + in_c[None,:]*s_xc\n            x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)\n            mask_w = valid_k[:, None] & valid_n[None, :]\n            # kh_i*s_wh + kw_i*s_ww are compile-time constants after unrolling\n            w_ptrs = W_ptr + offs_n[None,:]*s_wn + kh_i*s_wh + kw_i*s_ww + in_c[:,None]*s_wc\n            w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)\n            acc = tl.dot(x_tile, w_tile, acc=acc, allow_tf32=True)",
+    "applicable_when": "Triton convolution kernel uses a flat K-loop that decodes (kh, kw, in_c) from a flat index via vector integer division/modulo; L1/TEX hit rate is very low (<5%); SharedMemoryConflicts or UncoalescedSharedAccess rules are triggered; KH and KW are tl.constexpr enabling tl.static_range unrolling; CPIStall is significant (>30% of cycles stalled on L1TEX).",
+    "do_not_apply_when": "KH and KW are not constexpr (tl.static_range requires constexpr bounds); the kernel is already using a nested loop structure; L1 hit rate is already high (>50%); the unrolling of KH*KW iterations would cause excessive code size bloat (e.g. KH*KW > 25); occupancy is the primary bottleneck and the register increase from unrolling would critically reduce block limit.",
+    "framework_notes": "Triton-specific: tl.static_range(N) requires N to be a tl.constexpr and fully unrolls the loop at compile time, allowing the compiler to constant-fold scalar offsets like kh_i*s_wh + kw_i*s_ww. In CUDA, the equivalent is using template parameters or #pragma unroll with compile-time bounds. The key effect is converting BLOCK_K-wide vector div/mod operations into scalar loop variables, dramatically improving memory access locality (L1 hit rate 1%\u219265%)."
+  },
+  {
+    "item_id": "exp_triton_increase_num_stages_latency_hiding_001",
+    "iteration": 2,
+    "speedup": 1.0867,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "increase_num_stages_for_l1tex_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.64,
+        "Scheduler Statistics.No Eligible": 35.35,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.06,
+        "Memory Workload Analysis.L2 Hit Rate": 95.06,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.45,
+        "GPU Speed Of Light Throughput.Duration": 3.92,
+        "Occupancy.Achieved Occupancy": 55.07,
+        "Launch Statistics.Registers Per Thread": 56.0
+      },
+      "key_metric_after": {
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.63,
+        "Scheduler Statistics.No Eligible": 35.32,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.35,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.05,
+        "Memory Workload Analysis.L2 Hit Rate": 95.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.44,
+        "GPU Speed Of Light Throughput.Duration": 3.92,
+        "Occupancy.Achieved Occupancy": 55.04,
+        "Launch Statistics.Registers Per Thread": 56.0
+      }
+    },
+    "strategy_title": "Add Higher num_stages Configs to Hide L1TEX Latency",
+    "strategy_description": "When a Triton kernel shows significant L1TEX scoreboard stalls (CPIStall rule triggered, ~5 stall cycles per warp accounting for ~37% of CPI) with a very low L1 hit rate (~1%) but high L2 hit rate (~95%), adding autotune configs with num_stages=4 and num_stages=5 is the canonical approach to hide L2 load latency via deeper software pipelining. However, when the K-loop iteration count is very short (e.g. only 5 K-iterations for TOTAL_K=72, BLOCK_K=16), Triton's pipeliner may not generate effective async prefetch for such short loops, and the benefit is marginal \u2014 in this case, all key metrics (CPI, No-Eligible %, L2 hit rate, compute throughput, duration) remained essentially unchanged despite the config expansion. The speedup observed (1.087x) appears to be attributable to the prior small-tile optimization already captured in iteration 1, not to the num_stages increase itself.",
+    "slow_pseudocode": "@triton.autotune(\n    configs=[\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=2),\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=2),\n        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),\n        Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),\n        # max num_stages=3\n    ],\n    key=[...],\n)\n# CPIStall L1TEX: 5.1 cycles, No-Eligible: 35.35%",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=2),\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=3, num_warps=2),\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=4, num_warps=2),\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=5, num_warps=2),\n        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=4, num_warps=4),\n        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=5, num_warps=4),\n        # ... other configs retained\n    ],\n    key=[...],\n)\n# CPIStall L1TEX: 5.0 cycles, No-Eligible: 35.32% \u2014 negligible change",
+    "applicable_when": "Triton matmul-style kernel with CPIStall rule triggered (L1TEX stall cycles >4 per warp, >30% of CPI); L1 hit rate <5%; L2 hit rate >80%; current max num_stages <=3; K-loop has many iterations (TOTAL_K / BLOCK_K >> 5) so the pipeline has room to overlap loads with compute.",
+    "do_not_apply_when": "K-loop iteration count is very short (e.g. <=5 iterations as in TOTAL_K=72, BLOCK_K=16); in this regime Triton's pipeliner cannot effectively overlap loads across iterations and the CPIStall metrics do not improve. Also avoid when register pressure is already high (registers_per_thread near block limit) as deeper stages consume more registers for prefetch buffers.",
+    "framework_notes": "Triton-specific: num_stages controls the software pipeline depth inserted by the Triton compiler. Higher values cause the compiler to emit async load instructions that prefetch the next K-block's tiles while the current block's tl.dot executes. In CUDA, the equivalent is manual double/triple buffering with cp.async. The benefit is only realized when the K-loop is long enough for the pipeline to fill \u2014 with only 5 K-iterations, num_stages=5 effectively unrolls the entire loop with no overlap benefit."
+  },
+  {
+    "item_id": "672bd1d5",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesce_output_store_via_nhwc_layout",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesce_output_store_via_nhwc_layout \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesce_output_store_via_nhwc_layout' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.216e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.947e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.002e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel stores results in NCHW layout: out_idx = batch*(OUT_C*OUT_H*OUT_W) + c*(OUT_H*OUT_W) + h*OUT_W + w. The M-tile covers (batch, h, w) and the N-tile covers c. For a fixed c (fixed pid_n), adjacent M-threads differ in w (stride=1) or h (stride=OUT_W=254) or batch (stride=OUT_H*OUT_W=64516). When the N-tile spans multiple c values, the store address jumps by OUT_H*OUT_W=64516 elements between consecutive N-threads. This creates a stride-64516 access pattern in the N dimension, causing 32 separate cache-line transactions where 1 would suffice. NCU confirms only 28.4/32 bytes per sector are utilized. Switching output allocation to NHWC (N,H,W,C) makes the store index out_idx = batch*(OUT_H*OUT_W*OUT_C) + h*(OUT_W*OUT_C) + w*OUT_C + c. Now adjacent N-threads (varying c) write to consecutive addresses (stride=1), and adjacent M-threads varying w write to addresses OUT_C=64 apart \u2014 both patterns are fully coalesced. L1/TEX is the binding bottleneck at 92.87%; reducing store traffic directly relieves it. The caller adds a single .permute(0,3,1,2).contiguous() to convert back to NCHW for downstream compatibility.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.216e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.947e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.002e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "479b0131",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesce_output_store_via_nhwc_layout_corrected",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesce_output_store_via_nhwc_layout_corrected \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesce_output_store_via_nhwc_layout_corrected' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.216e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.947e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.002e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel stores output in NCHW layout: out_idx = batch*(OUT_C*OUT_H*OUT_W) + c*(OUT_H*OUT_W) + h*OUT_W + w. The N-tile (pid_n) covers OUT_C channels. Adjacent threads in the N-dimension (varying c) write to addresses separated by OUT_H*OUT_W = 254*254 = 64516 elements = 258064 bytes, far beyond a cache line. This causes 32 separate L1/TEX sector transactions per warp store instead of 1, saturating L1/TEX at 92.91%. NCU confirms only 28.4/32 bytes per sector are utilized. Switching the output buffer to NHWC layout makes adjacent N-threads (varying c) write to consecutive addresses (stride=1 in the C dimension), achieving full coalescing. The previous attempt (item_id=672bd1d5) failed correctness with max_diff~22 due to a wrong index formula. The correct NHWC index is: batch*(OUT_H*OUT_W*OUT_C) + out_h*(OUT_W*OUT_C) + out_w*OUT_C + c. The caller must allocate y as NHWC and permute back to NCHW.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.216e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.947e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.002e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6c6d79e9",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fast_accumulation_fp16_tl_dot_inputs",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions + IssueSlotUtilization + TheoreticalOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fast_accumulation_fp16_tl_dot_inputs \u2014 correctness failure",
+    "strategy_description": "Plan 'fast_accumulation_fp16_tl_dot_inputs' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.212e-02 > atol=0.001\nseed=42 output[0]: max_diff=1.837e-02 > atol=0.001\nseed=1337 output[0]: max_diff=2.056e-02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel calls tl.dot(x_tile, w_tile, acc=acc) with FP32 inputs. On H200, FP32 Tensor Cores deliver 67 TFLOPS while FP16 Tensor Cores deliver 1979 TFLOPS (29x peak difference). By casting x_tile and w_tile to tl.float16 before tl.dot (keeping acc as FP32), the compiler routes the MMA through FP16 Tensor Cores. The accumulator remains FP32 so accumulated error is bounded. With K=72 (IN_C=8 x KH=3 x KW=3), worst-case accumulated FP16 rounding error is small. FP16 operand tiles also consume half the register space of FP32 tiles, potentially reducing the 72 registers/thread and improving occupancy above the current 43.75% ceiling. The 219M non-fused FP32 instructions (21% gain potential per NCU FPInstructions rule) are also reduced by routing through the Tensor Core path. FP8 was already tried and failed correctness (item 8f8bc775); FP16 has 3 more mantissa bits making it significantly more accurate.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.212e-02 > atol=0.001\nseed=42 output[0]: max_diff=1.837e-02 > atol=0.001\nseed=1337 output[0]: max_diff=2.056e-02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "e5dd4772",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "replace_libdevice_tanh_with_fused_fp32_tanh_approximation",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "replace_libdevice_tanh_with_fused_fp32_tanh_approximation \u2014 correctness failure",
+    "strategy_description": "Plan 'replace_libdevice_tanh_with_fused_fp32_tanh_approximation' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.416e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.850e+01 > atol=0.001\nseed=1337 output[0]: max_diff=3.944e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has 219M non-fused FP32 instructions (42.5% of all FP32 ops). NCU's FPInstructions rule estimates a 4.8% global speedup by converting non-fused pairs to FMAs. The primary source is the Mish epilogue: `result = acc * libdevice.tanh(softplus)`. The `libdevice.tanh` call is an opaque external function \u2014 the Triton/PTX compiler cannot fuse the surrounding multiply or the softplus computation into FMA chains because the libdevice boundary breaks the fusion graph. Replacing `libdevice.tanh` with an inline expression using only `tl.math.exp` allows the compiler to see the full expression and emit FMAs throughout the epilogue. The identity tanh(x) = 1 - 2/(1+exp(-2x)) is mathematically exact (not an approximation), so correctness is guaranteed.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.416e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.850e+01 > atol=0.001\nseed=1337 output[0]: max_diff=3.944e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_inline_tanh_via_exp_identity_001",
+    "iteration": 5,
+    "speedup": 1.1768,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "replace_libdevice_transcendentals_with_tl_math_intrinsics",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "Instruction Statistics.Executed Instructions": 1556641657.0,
+        "GPU Speed Of Light Throughput.Duration": 3.68,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 58.89,
+        "GPU Speed Of Light Throughput.Memory Throughput": 92.77,
+        "Compute Workload Analysis.Executed Ipc Active": 2.36,
+        "Scheduler Statistics.No Eligible": 41.05,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.65,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 28.82,
+        "Source Counters.Branch Instructions": 68128834.0,
+        "Source Counters.Avg. Divergent Branches": 31280.41
+      },
+      "key_metric_after": {
+        "Instruction Statistics.Executed Instructions": 1404900416.0,
+        "GPU Speed Of Light Throughput.Duration": 3.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 53.99,
+        "GPU Speed Of Light Throughput.Memory Throughput": 94.9,
+        "Compute Workload Analysis.Executed Ipc Active": 2.16,
+        "Scheduler Statistics.No Eligible": 45.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.7,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0,
+        "Source Counters.Branch Instructions": 2064512.0,
+        "Source Counters.Avg. Divergent Branches": 0.0
+      }
+    },
+    "strategy_title": "Inline tanh via exp Identity to Eliminate libdevice Boundary",
+    "strategy_description": "When a Triton kernel's epilogue retains a libdevice.tanh() call after other libdevice transcendentals have already been replaced with tl.math intrinsics, replacing it with the inline identity tanh(x) = (exp(2x)-1)/(exp(2x)+1) using tl.math.exp eliminates the last opaque LLVM IR function boundary. This reduced total executed instructions from 1.557B to 1.405B (~9.7% reduction) and kernel duration from 3.68ms to 3.62ms (1.18x speedup), while also eliminating all warp divergence (avg active threads per warp rose from 28.82 to 32.0, divergent branches dropped from 31K to 0). The FPInstructions NCU rule and high divergent branch count are the key signals: libdevice.tanh introduces both a fusion barrier and a divergent branch in its internal implementation, both of which are removed by the inline tl.math.exp formulation.",
+    "slow_pseudocode": "# libdevice.tanh \u2014 opaque LLVM boundary + internal divergent branch\nfrom triton.language.extra import libdevice\n# ... softplus computed via tl.math.exp / tl.math.log ...\nresult = acc * libdevice.tanh(softplus)",
+    "fast_pseudocode": "# Inline tanh via identity: tanh(x) = (exp(2x)-1)/(exp(2x)+1)\n# Upper clamp prevents exp(40) overflow; softplus >= 0 so lower clamp unreachable\nexp2x = tl.math.exp(2.0 * softplus)\ntanh_val = tl.where(softplus > 20.0, 1.0, (exp2x - 1.0) / (exp2x + 1.0))\nresult = acc * tanh_val\n# Remove: from triton.language.extra import libdevice",
+    "applicable_when": "Triton kernel epilogue uses libdevice.tanh() after other libdevice calls have already been replaced with tl.math; NCU FPInstructions rule triggered with non-fused FP32 fraction >25%; avg active threads per warp is below 32 (warp divergence present); branch efficiency is ~50% indicating internal divergent branches inside libdevice.tanh.",
+    "do_not_apply_when": "Kernel is purely memory-bandwidth bound with negligible epilogue compute; strict numerical precision is required (tl.math.exp uses ~1 ULP approximate PTX intrinsics); softplus values can exceed 20 in both directions (requiring both upper and lower clamps, complicating the tl.where); tl.math module is unavailable (Triton < 2.0).",
+    "framework_notes": "Triton-specific: libdevice.tanh compiles to a multi-instruction SFU sequence with an internal conditional branch (causing warp divergence) and an LLVM IR function call boundary (preventing FMA fusion). Replacing with tl.math.exp(2x) uses PTX ex2.approx.f32 which is transparent to LLVM's fusion pass and branch-free. The tl.where clamp (softplus > 20 \u2192 1.0) is a predicated select with no divergent branch. In CUDA, the equivalent is replacing tanhf() with __expf(2*x) inline arithmetic or using fast-math flags."
+  },
+  {
+    "item_id": "exp_triton_inline_tanh_via_exp_identity_001",
+    "iteration": 5,
+    "speedup": 1.1768,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "inline_transcendental_via_exp_identity_to_remove_opaque_libdevice_call",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "Instruction Statistics.Executed Instructions": 1556641657.0,
+        "GPU Speed Of Light Throughput.Duration": 3.68,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 58.89,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 92.86,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 28.82,
+        "Source Counters.Branch Instructions": 68128834.0,
+        "Source Counters.Branch Efficiency": 50.0,
+        "Source Counters.Avg. Divergent Branches": 31280.41
+      },
+      "key_metric_after": {
+        "Instruction Statistics.Executed Instructions": 1371868224.0,
+        "GPU Speed Of Light Throughput.Duration": 3.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 52.59,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.76,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0,
+        "Source Counters.Branch Instructions": 2064512.0,
+        "Source Counters.Branch Efficiency": 0.0,
+        "Source Counters.Avg. Divergent Branches": 0.0
+      }
+    },
+    "strategy_title": "Replace Opaque libdevice Transcendental with Inline PTX Identity",
+    "strategy_description": "When a Triton epilogue calls an opaque libdevice function (e.g. libdevice.tanh), the LLVM IR call boundary prevents FMA fusion across the call site, forces register save/restore, and uses a multi-step high-precision implementation instead of a single SFU instruction. Replacing the opaque call with an algebraic identity expressed entirely in tl.math.* intrinsics (e.g. tanh(x) = (exp(2x)-1)/(exp(2x)+1)) makes the entire epilogue a transparent sequence of PTX ex2/lg2 intrinsics, allowing the compiler to fuse FMAs and schedule SFU instructions optimally. In this case, total executed instructions dropped from 1.557B to 1.372B (~12%), divergent branches collapsed from 31K to 0, and average active threads per warp rose from 28.82 to 32.0 (full warp utilization), yielding a 1.18x wall-time speedup despite the kernel remaining L1/TEX-bound.",
+    "slow_pseudocode": "# Opaque libdevice call \u2014 blocks FMA fusion, forces register spill, multi-step impl\nfrom triton.language.extra import libdevice\n...\nresult = acc * libdevice.tanh(softplus)  # opaque LLVM IR call boundary",
+    "fast_pseudocode": "# Inline tanh via algebraic identity \u2014 all PTX ex2.approx.f32, FMA-fuseable\n# No libdevice import needed\nexp2s = tl.math.exp(2.0 * softplus)       # PTX ex2.approx.f32, single SFU cycle\ntanh_val = (exp2s - 1.0) / (exp2s + 1.0)  # 3 FP32 ops, compiler can FMA-fuse\nresult = acc * tanh_val",
+    "applicable_when": "Triton kernel epilogue uses libdevice.tanh (or other opaque libdevice transcendentals); FPInstructions NCU rule is triggered with significant non-fused FP32 instruction count (>100M); divergent branches are present in the epilogue (Branch Efficiency ~50%, Avg. Active Threads Per Warp < 32); the input to the transcendental is bounded by existing guards so the algebraic identity is numerically safe.",
+    "do_not_apply_when": "The transcendental input is unbounded and the algebraic identity would overflow FP32 (e.g. exp(2x) for large x without existing clamp guards); the kernel is compute-bound rather than memory-bound and the additional arithmetic ops (exp + div) would increase compute pressure; tl.math.exp is not available in the target Triton version.",
+    "framework_notes": "Triton-specific: libdevice functions (from triton.language.extra import libdevice) create opaque LLVM IR call boundaries that prevent the Triton/LLVM compiler from fusing surrounding FP32 arithmetic into FMAs or scheduling SFU instructions optimally. tl.math.exp/log/etc. compile to PTX ex2.approx.f32/lg2.approx.f32 intrinsics which are transparent to the compiler. In CUDA, the equivalent anti-pattern is calling __tanhf() vs. inlining the identity with __expf(). The identity tanh(x)=(e^2x-1)/(e^2x+1) is safe when x is bounded (here by a three-way softplus guard: x>20 -> tanh~1, x<-20 -> tanh~0, else exact)."
+  }
+]

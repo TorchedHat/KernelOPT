@@ -1,0 +1,47 @@
+--- baseline
++++ rebuilt
+@@ -4,8 +4,19 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        # NEW: small-tile low-warp entries to reduce register pressure
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 4},  num_stages=3, num_warps=2),  # min register footprint
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 4},  num_stages=3, num_warps=2),  # small tile low warp
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8},  num_stages=4, num_warps=2),  # deeper pipeline low warp
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4},  num_stages=3, num_warps=2),  # wider N low warp
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4},  num_stages=4, num_warps=2),  # narrow M low warp
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=3, num_warps=4),  # GROUP_M=16 for wave alignment
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=3, num_warps=4),  # GROUP_M=16 large tile
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 16}, num_stages=4, num_warps=4),  # GROUP_M=16 medium tile
++        # Original 8 configs unchanged
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+@@ -50,11 +61,12 @@
+         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+ 
+         # W has shape [N, K], stride_wn=K, stride_wk=1
+-        w_ptrs = W_ptr + offs_n[None, :] * stride_wn + k_offs[:, None] * stride_wk
+-        w_mask = (offs_n[None, :] < N) & (k_offs[:, None] < K)
+-        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
++        # Load as [BLOCK_N, BLOCK_K] for coalesced access (k_offs inner dim, stride 1)
++        w_ptrs = W_ptr + offs_n[:, None] * stride_wn + k_offs[None, :] * stride_wk
++        w_mask = (offs_n[:, None] < N) & (k_offs[None, :] < K)
++        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)  # shape [BLOCK_N, BLOCK_K]
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++        acc = tl.dot(x_tile, w_tile.T, acc, allow_tf32=False)  # w_tile.T -> [BLOCK_K, BLOCK_N]
+ 
+     # Add bias
+     bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
+@@ -75,6 +87,7 @@
+     key=['group_size'],
+ )
+ @triton.jit
++
+ def groupnorm_leakyrelu_add_kernel(
+     X_ptr, GN_W_ptr, GN_B_ptr, Out_ptr,
+     num_rows, N, num_groups, group_size,

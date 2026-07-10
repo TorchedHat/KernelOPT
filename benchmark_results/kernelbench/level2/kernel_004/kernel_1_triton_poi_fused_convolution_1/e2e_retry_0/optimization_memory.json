@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "8ee34b0c",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_contiguity_hints",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_contiguity_hints \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_contiguity_hints' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n/site-packages/triton/runtime/jit.py\", line 720, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a 4D tensor transpose reading from in_ptr0 with address y0 + 128*x2 + 4032000*y1. The input tensor has strides (4032000, 1, 32000, 128), meaning consecutive x-threads access memory with a stride of 128 floats (512 bytes) \u2014 severely non-coalesced. L1/TEX hit rate is 0%, L2 is at 97.28% saturation, and 56.9% of warp stall cycles are L1TEX scoreboard waits. Adding tl.max_contiguous and tl.multiple_of hints on the load pointer tells the Triton compiler that the access pattern is contiguous along the innermost dimension, enabling 128-bit (float4) vectorized loads. The store address x2 + 31500*y3 is already contiguous in x (stride-1), so the store is already coalesced \u2014 the load is the primary bottleneck. Applying contiguity hints will allow the compiler to emit LDG.128 instructions instead of scalar LDG.32, reducing memory transactions by up to 4x and alleviating L2 pressure.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n/site-packages/triton/runtime/jit.py\", line 720, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_transpose_coalescing_2d_tile_swap",
+    "iteration": 1,
+    "speedup": 1.2064,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "swap_2d_tile_fast_dim_for_coalesced_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Memory Throughput": 79.21,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 72.51,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 19.67,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 66.69,
+        "Memory Workload Analysis.Memory Throughput": 3.56,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 76.74,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.29,
+        "Scheduler Statistics.No Eligible": 80.04,
+        "GPU Speed Of Light Throughput.Duration": 284.58
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Memory Throughput": 52.52,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 21.38,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 43.7,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 54.07,
+        "Memory Workload Analysis.L2 Hit Rate": 76.65,
+        "Memory Workload Analysis.Memory Throughput": 1.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.97,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.78,
+        "Scheduler Statistics.No Eligible": 62.79,
+        "GPU Speed Of Light Throughput.Duration": 235.9
+      }
+    },
+    "strategy_title": "Swap 2D Tile Fast Dim to Coalesce Transpose Loads and Stores",
+    "strategy_description": "When a 2D Triton kernel performs a non-contiguous-to-contiguous transpose, the warp-lane fast dimension (the innermost arange axis) must align with the stride-1 dimension of each memory operation independently. If the fast dim is stride-1 for stores but stride-N (N>>1) for loads, every warp load touches N separate cache lines, causing 0% L1 hit rate, L2 saturation, and high L1TEX stall cycles. The fix is to swap the arange orientation: make yindex=[None,:] (fast for loads, stride-1 in source) and xindex=[:,None] (fast for stores, stride-1 in destination), so both loads and stores are coalesced. This reduced L1TEX stall cycles from ~77 cycles/instruction to ~40, raised L1 hit rate from 0% to 54%, dropped DRAM throughput from 72% to 21%, and improved compute throughput from 19.7% to 43.7%.",
+    "slow_pseudocode": "# Non-coalesced: xindex is warp-lane fast dim, but load stride is 128 along x\nyindex = yoffset + arange(0, YBLOCK)[:, None]  # slow dim for loads\nxindex = xoffset + arange(0, XBLOCK)[None, :]  # fast dim (warp-lane)\ny0 = yindex % 128  # stride-1 in input\nx2 = xindex        # stride-128 in input -> NON-COALESCED LOAD\nload(in_ptr + y0 + 128*x2 + batch_stride*y1)   # stride-128 per lane\nstore(out_ptr + x2 + out_stride*yindex)         # stride-1 per lane (coalesced)",
+    "fast_pseudocode": "# Coalesced: swap arange orientation so each op's fast dim is stride-1\nyindex = yoffset + arange(0, YBLOCK)[None, :]  # fast dim for loads (stride-1 in input)\nxindex = xoffset + arange(0, XBLOCK)[:, None]  # fast dim for stores (stride-1 in output)\ny0 = yindex % 128  # stride-1 in input, now warp-lane fast -> COALESCED LOAD\nx2 = xindex        # stride-1 in output, now warp-lane fast -> COALESCED STORE\nload(in_ptr + y0 + 128*x2 + batch_stride*y1, mask=xmask & ymask)\nstore(out_ptr + x2 + out_stride*yindex, mask=xmask & ymask)\n# Also add @triton.autotune over XBLOCK/YBLOCK configs",
+    "applicable_when": "Triton 2D pointwise/transpose kernel where L1/TEX Hit Rate is near 0%, L2 Cache Throughput exceeds 90%, Warp Cycles Per Issued Instruction exceeds 50, and the load index has a large stride (>>1) along the warp-lane fast dimension (innermost arange axis) while the store is already coalesced. CPIStall rule triggered with L1TEX stall cycles >30.",
+    "do_not_apply_when": "Both load and store are already coalesced (L1 hit rate >30%). The tensor layout does not involve a transpose (source and destination strides are both stride-1 along the same axis). Occupancy is the bottleneck rather than memory access pattern. The swap would make stores non-coalesced without a compensating shared memory stage.",
+    "framework_notes": "Triton-specific: the fast (warp-lane) dimension is controlled by which axis of arange() is [None,:] vs [:,None]. In a 2D tile [XBLOCK, YBLOCK], arange(0,XBLOCK)[:,None] makes X the slow dim and arange(0,YBLOCK)[None,:] makes Y the fast (warp-lane) dim. Swapping these orientations changes which memory dimension is accessed by consecutive threads in a warp. In CUDA, the equivalent is choosing which loop index maps to threadIdx.x."
+  }
+]

@@ -1,0 +1,84 @@
+[
+  {
+    "item_id": "exp_triton_autotune_layout_permute_uncoalesced_stores_001",
+    "iteration": 1,
+    "speedup": 1.8486,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_strided_layout_permutation_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 5.86,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8739.0,
+        "Occupancy.Achieved Occupancy": 55.98,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Block Size": 128.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.68,
+        "Memory Workload Analysis.L2 Hit Rate": 60.04,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.71,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4096.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4737.0,
+        "Occupancy.Achieved Occupancy": 25.39,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Launch Statistics.Block Size": 64.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 77.49,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 21.6,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes for Strided Layout Permutation Kernels",
+    "strategy_description": "For layout permutation kernels (e.g. NCHW\u2192NHWC) with strided store patterns, the default fixed tile configuration often causes uncoalesced global stores (23% excess sectors) and high L1TEX stall cycles (49% of warp cycles). Adding @triton.autotune with configs spanning XBLOCK in {64,128,256,512} and YBLOCK in {1,2,4,8} allows the autotuner to select a tile shape that minimizes store scatter (YBLOCK=1 keeps all threads in a warp at the same channel offset) and reduces register pressure (26\u219216 registers/thread), cutting elapsed cycles from 8739 to 4737 (1.85x speedup). The winning config also eliminated dynamic shared memory allocation (4KB\u21920), further reducing launch overhead.",
+    "slow_pseudocode": "# Fixed tile config, no autotune\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # YBLOCK=8 means y0 = yindex % 3 varies across warp \u2192 strided stores\n    tl.store(out_ptr + (y0 + stride * x2 + ...), tmp0, mask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, 30, 50176, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile config\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 1}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 1}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 1}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 2}, num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 2}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 2}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 4}, num_warps=8, num_stages=3),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Autotuner selects YBLOCK=1 \u2192 y0 constant per warp \u2192 coalesced stores\n    tl.store(out_ptr + (y0 + stride * x2 + ...), tmp0, mask)\n\n# Grid uses autotuned META params\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, 30, 50176)",
+    "applicable_when": "Triton kernel performs a layout permutation (e.g. NCHW\u2192NHWC) with strided store addresses where the stride dimension cycles over a small modulus (e.g. y0 = yindex % C for small C). NCU reports UncoalescedGlobalAccess (>15% excess sectors), CPIStall on L1TEX (>40% of warp cycles), and IssueSlotUtilization warning. Kernel uses a fixed XBLOCK/YBLOCK with no autotune. Waves per SM < 1.0.",
+    "do_not_apply_when": "Kernel is already autotuned. Kernel has perfectly coalesced memory access patterns (no UncoalescedGlobalAccess rule). Problem size is so small that autotuning overhead dominates. Output layout contract requires a specific tile shape for correctness.",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with key=['ynumel','xnumel'] caches the winning config per problem size. The grid must be changed from a fixed tuple to a lambda META: (...) expression so the autotuner can inject the winning XBLOCK/YBLOCK. Removing explicit YBLOCK/XBLOCK kwargs from the kernel call site is required when using autotune. Equivalent in CUDA: use __launch_bounds__ and template tile parameters with a host-side autotuning loop."
+  },
+  {
+    "item_id": "exp_triton_autotune_vectorize_regression_001",
+    "iteration": 1,
+    "speedup": 0.7094,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_with_vectorization_hints_on_strided_store_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 5.86,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8739.0,
+        "Occupancy.Achieved Occupancy": 55.98,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Block Size": 128.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.71,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Compute Workload Analysis.Issue Slots Busy": 28.3,
+        "Instruction Statistics.Executed Instructions": 771456.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 8.26,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 12175.0,
+        "Occupancy.Achieved Occupancy": 78.36,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Launch Statistics.Block Size": 256.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.03,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.66,
+        "Compute Workload Analysis.Issue Slots Busy": 56.82,
+        "Instruction Statistics.Executed Instructions": 2480576.0
+      }
+    },
+    "strategy_title": "Autotune + Vectorization Hints Regress Strided-Store Transpose Kernel",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs and tl.max_contiguous/tl.multiple_of vectorization hints improved occupancy (56% \u2192 78%) and scheduler utilization (0.95 \u2192 3.66 eligible warps/scheduler), but caused a 41% wall-time regression (5.86 \u00b5s \u2192 8.26 \u00b5s). The executed instruction count exploded 3.2x (771K \u2192 2.48M), indicating the autotuner selected a config (XBLOCK=256, block_size=256) that dramatically increased per-CTA work without proportional throughput gains. The uncoalesced store pattern (stride-3 in the output) was not fixed by vectorizing loads alone \u2014 the store bottleneck persisted (MemoryCacheAccessPattern speedup_pct rose from 11% to 19.78%), and the extra instruction overhead from larger tiles overwhelmed any latency-hiding benefit.",
+    "slow_pseudocode": "# BEFORE: fixed small tile, no vectorization hints\n@triton.jit\ndef kernel(in_ptr, out_ptr, YBLOCK: constexpr, XBLOCK: constexpr):\n    xindex = xoffset + arange(0, XBLOCK)[None, :]\n    x2 = xindex\n    tmp0 = load(in_ptr + (x2 + stride_y * y3), mask)\n    store(out_ptr + (y0 + 3*x2 + stride_x * y1), tmp0, mask)\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# AFTER (regressed): autotune + vectorization hints\n@triton.autotune(configs=[Config(XBLOCK=512,...), Config(XBLOCK=256,...), ...], key=[...])\n@triton.jit\ndef kernel(in_ptr, out_ptr, YBLOCK: constexpr, XBLOCK: constexpr):\n    xindex_1d = max_contiguous(multiple_of(xoffset + arange(0, XBLOCK), XBLOCK), XBLOCK)\n    xindex = xindex_1d[None, :]\n    x2_vec = xindex_1d[None, :]\n    tmp0 = load(in_ptr + (x2_vec + stride_y * y3), mask)  # vectorized load\n    store(out_ptr + (y0 + 3*x2 + stride_x * y1), tmp0, mask)  # store unchanged\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)  # autotuner picks XBLOCK=256, block_size=256",
+    "applicable_when": "Never \u2014 this specific combination caused regression. Vectorization hints alone (without fixing the strided store) are insufficient when the store access pattern is the dominant bottleneck.",
+    "do_not_apply_when": "When the kernel has a strided store pattern (e.g., NCHW\u2192NHWC transpose with stride-3 stores) that is the primary bottleneck: vectorizing only the load side while leaving the strided store unchanged does not reduce memory traffic. Increasing XBLOCK via autotune in this scenario multiplies instruction count without proportional bandwidth improvement, causing regression. Do not apply autotune with large XBLOCK configs when the store index has a non-unit stride in the thread dimension \u2014 fix the store coalescing first (e.g., via shared memory staging or output layout change).",
+    "framework_notes": "Triton-specific: tl.max_contiguous and tl.multiple_of are compiler hints that enable vectorized (128-bit) loads when the index is provably aligned and contiguous. They have no effect on store coalescing. The @triton.autotune overhead (warmup runs) also adds latency in short-running kernels. The grid lambda must be used with autotune; passing fixed XBLOCK/YBLOCK to the launch call is incompatible with autotune."
+  }
+]

@@ -1,0 +1,190 @@
+[
+  {
+    "item_id": "8ee31d98",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_xblock_and_autotune_tile_sizes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_xblock_and_autotune_tile_sizes \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_xblock_and_autotune_tile_sizes' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is launched with XBLOCK=1, meaning each of the 16,384 CTAs processes exactly one output element (x4). The global store in_out_ptr0+x4 is a scalar store \u2014 only 4 of 32 bytes per sector are used (12.5% efficiency). The global load in_ptr0+(r0_5+10933*x4) with XBLOCK=1 accesses a single column of the [16384,10933] tensor per CTA, producing stride-10933 access across CTAs \u2014 highly non-coalesced. Increasing XBLOCK to 16 or 32 means adjacent threads within a CTA handle adjacent x-indices, making both loads and stores fully coalesced. This also reduces the grid from 16,384 CTAs to 1,024 or 512 CTAs, lowering launch overhead and improving L2 reuse. Adding @triton.autotune allows the runtime to find the optimal (XBLOCK, R0_BLOCK, num_warps) combination.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_register_spill_occupancy_collapse_001",
+    "iteration": 1,
+    "speedup": 0.2915,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 31.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 95.33,
+        "GPU Speed Of Light Throughput.Duration": 186.02,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 78.76,
+        "Memory Workload Analysis.Memory Throughput": 3.87,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.62,
+        "Scheduler Statistics.Active Warps Per Scheduler": 15.24,
+        "Launch.Waves Per SM": 7.76
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 93.0,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 30.69,
+        "GPU Speed Of Light Throughput.Duration": 638.14,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 22.96,
+        "Memory Workload Analysis.Memory Throughput": 1.13,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.9,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.93,
+        "Launch.Waves Per SM": 24.82,
+        "Instruction Statistics.Executed Instructions": 410533888.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK increase causes register spill and occupancy collapse",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK values (4\u201316) to a reduction kernel that already had XBLOCK=1 caused registers per thread to jump from 31 to 93, collapsing theoretical occupancy from 100% to 31.25% (limited by Block Limit Registers: 5 blocks/SM). Despite DRAM throughput dropping from 78.76% to 22.96% (confirming the store coalescing goal was partially achieved), the 3x register pressure increase serialized warp scheduling so severely that total instruction count grew 4x and kernel duration increased from 186us to 638us. The anti-pattern is applying XBLOCK tiling to a kernel whose register budget is already near the per-thread limit \u2014 expanding the tile size forces the compiler to keep more live values simultaneously, triggering register spill or hard occupancy limits that dominate over any memory coalescing benefit.",
+    "slow_pseudocode": "# BEFORE: XBLOCK=1, 31 registers/thread, 100% occupancy, 186us\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]  # XBLOCK=1\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r in tl.range(0, r_numel, R0_BLOCK):\n        _acc += compute(load(ptr + r + R*xindex))\n    result = tl.sum(_acc, 1)[:, None] / r_numel\n    tl.store(out + xindex, result, None)  # scalar store per CTA\n\ngrid = (cdiv(xnumel, 1),)  # 16384 CTAs",
+    "fast_pseudocode": "# AFTER (REGRESSED): autotune XBLOCK in {4,8,16}, 93 registers/thread, 31% occupancy, 638us\n@triton.autotune(\n    configs=[Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=4),\n             Config({'XBLOCK': 8, 'R0_BLOCK': 1024}, num_warps=4), ...],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]  # XBLOCK=4..16\n    xmask = xindex < xnumel\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r in tl.range(0, r_numel, R0_BLOCK):\n        _acc += compute(load(ptr + r + R*xindex, mask=r_mask & xmask))\n    result = tl.sum(_acc, 1)[:, None] / r_numel\n    tl.store(out + xindex, result, mask=xmask)  # vector store per CTA\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']),)  # 1024-4096 CTAs",
+    "applicable_when": "Never \u2014 this specific pattern (increasing XBLOCK in a reduction kernel with high register usage) caused severe regression. The general direction of increasing XBLOCK for store coalescing is only safe when registers per thread are well below the occupancy-limiting threshold (typically <40 registers for 100% theoretical occupancy on H100/H200).",
+    "do_not_apply_when": "Kernel already uses 25+ registers per thread with XBLOCK=1; increasing XBLOCK will multiply live values in the accumulator array [XBLOCK, R0_BLOCK] and push register count past the Block Limit Registers threshold, collapsing occupancy. Also avoid when the kernel is already memory-bandwidth bound (DRAM Throughput >70%) and compute throughput is also high \u2014 the bottleneck is balanced and register pressure increase will not help.",
+    "framework_notes": "In Triton, the accumulator tensor _acc has shape [XBLOCK, R0_BLOCK] and all elements must be live simultaneously during the reduction loop. Increasing XBLOCK from 1 to 8 multiplies the accumulator register footprint by 8x. On H200 (SM 9.0), Block Limit Registers = floor(65536 / (93 * 128)) = 5 blocks/SM, giving only 31.25% theoretical occupancy vs 100% at 31 registers. The @triton.autotune overhead also added autotuning latency. Equivalent CUDA concern: __launch_bounds__ or maxrregcount pragma should be checked before expanding tile dimensions in register-heavy kernels."
+  },
+  {
+    "item_id": "exp_triton_fma_expression_collapse_register_pressure_002",
+    "iteration": 2,
+    "speedup": 0.2921,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_fma_and_expression_simplification",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 30.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 94.6,
+        "GPU Speed Of Light Throughput.Duration": 203.52,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 71.96,
+        "Memory Workload Analysis.Memory Throughput": 3.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.41,
+        "Scheduler Statistics.Active Warps Per Scheduler": 15.16,
+        "Launch.Waves Per SM": 7.76,
+        "Instruction Statistics.Executed Instructions": 130842624.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 80.0,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Occupancy.Achieved Occupancy": 36.74,
+        "GPU Speed Of Light Throughput.Duration": 636.8,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 23.01,
+        "Memory Workload Analysis.Memory Throughput": 1.13,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.99,
+        "Scheduler Statistics.Active Warps Per Scheduler": 5.85,
+        "Launch.Waves Per SM": 20.69,
+        "Instruction Statistics.Executed Instructions": 411451392.0
+      }
+    },
+    "strategy_title": "FMA expression collapse fails to reduce Triton register pressure",
+    "strategy_description": "Collapsing a 14-intermediate sequential computation chain into 4 FMA-friendly expressions and hoisting loop-invariant rsqrt/scale computations outside the reduction loop did NOT reduce register pressure in Triton. Registers per thread increased from 30 to 80, collapsing theoretical occupancy from 100% to 37.5% (Block Limit Registers dropped from 16 to 6 blocks/SM). The root cause is that the autotune config changes (adding larger XBLOCK values) forced the compiler to keep a larger [XBLOCK, R0_BLOCK] accumulator live simultaneously, dominating over any savings from expression simplification. Total executed instructions grew 3.1x (130M \u2192 411M) and duration tripled (203us \u2192 637us), confirming the occupancy collapse was the primary regression driver.",
+    "slow_pseudocode": "# BEFORE: 30 regs/thread, 100% occupancy, 203us\n# 14 intermediates inside loop, rsqrt inside loop\nfor r in tl.range(0, r_numel, R0_BLOCK):\n    tmp0 = load(...)\n    tmp2 = tmp0 + tmp1          # x + bias\n    tmp4 = tmp2 + 3.0\n    tmp6 = tl.maximum(tmp4, 0.0)\n    tmp8 = tl.minimum(tmp6, 6.0)\n    tmp9 = tmp2 * tmp8\n    tmp11 = tmp9 * (1/6)\n    tmp13 = tmp11 - tmp12       # hs - mean\n    tmp16 = tmp14 / 43732.0\n    tmp18 = tmp16 + 1e-5\n    tmp19 = libdevice.rsqrt(tmp18)  # inside loop (loop-invariant!)\n    tmp20 = tmp13 * tmp19\n    tmp22 = tmp20 * tmp21\n    tmp24 = tmp22 + tmp23\n    _acc = tl.where(r_mask, _acc + tmp24, _acc)",
+    "fast_pseudocode": "# AFTER (REGRESSED): 80 regs/thread, 37.5% occupancy, 637us\n# Hoisted rsqrt + precomputed scale/bias, 4 intermediates inside loop\n# BUT autotune added larger XBLOCK configs causing register explosion\ntmp19 = libdevice.rsqrt(tmp14 / 43732.0 + 1e-5)  # hoisted\ntmp_scale = tmp21 * tmp19\ntmp_bias_adj = tmp23 - tmp12 * tmp_scale\nfor r in tl.range(0, r_numel, R0_BLOCK):\n    tmp0 = load(...)\n    tmp_xb = tmp0 + tmp1\n    tmp_xb3 = tmp_xb + 3.0\n    tmp_clamp = tl.where(tmp_xb3 <= 0.0, 0.0, tl.where(tmp_xb3 >= 6.0, 6.0, tmp_xb3))\n    tmp_hs = tmp_xb * tmp_clamp * (1/6)\n    tmp_norm = tl.broadcast_to(tmp_hs * tmp_scale + tmp_bias_adj, [XBLOCK, R0_BLOCK])\n    _acc = tl.where(r_mask, _acc + tmp_norm, _acc)",
+    "applicable_when": "Never for this kernel configuration \u2014 expression simplification alone cannot overcome the register pressure introduced by XBLOCK tiling in Triton reduction kernels. Hoisting loop-invariant computations is generally sound but insufficient when the accumulator shape [XBLOCK, R0_BLOCK] dominates register usage.",
+    "do_not_apply_when": "Kernel already achieves 100% theoretical occupancy with low register count (\u226432 regs/thread). Any change that simultaneously modifies autotune configs to include larger XBLOCK values will inflate the [XBLOCK, R0_BLOCK] accumulator register footprint and collapse occupancy, regardless of how many intermediates are eliminated from the loop body. Do not combine expression simplification with XBLOCK expansion in the same change.",
+    "framework_notes": "In Triton, the dominant register consumer in a reduction kernel is the accumulator tensor _acc of shape [XBLOCK, R0_BLOCK] \u2014 all elements must be live throughout the loop. Reducing named intermediates from 14 to 4 saves only ~10 registers while XBLOCK=8 with R0_BLOCK=1024 forces the accumulator alone to consume many more. The tl.where-based clamp (vs tl.maximum/tl.minimum) did not produce measurable register savings. Hoisting libdevice.rsqrt outside the loop is correct and should be retained, but it alone cannot compensate for XBLOCK-driven register pressure."
+  },
+  {
+    "item_id": "exp_triton_licm_rsqrt_hoist_regression_001",
+    "iteration": 2,
+    "speedup": 0.8303,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "hoist_loop_invariant_rsqrt_and_reduce_nonfused_fp32_ops",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 203.52,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 85.35,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 71.96,
+        "Instruction Statistics.Executed Instructions": 130842624.0,
+        "Launch.Registers Per Thread": 30.0,
+        "Occupancy.Achieved Occupancy": 94.6,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.41,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 6.82,
+        "Source Counters.Branch Instructions": 802816.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 224.03,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 79.76,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 65.4,
+        "Instruction Statistics.Executed Instructions": 136445952.0,
+        "Launch.Registers Per Thread": 32.0,
+        "Occupancy.Achieved Occupancy": 94.85,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 5.4,
+        "Source Counters.Branch Instructions": 1523712.0
+      }
+    },
+    "strategy_title": "Hoisting Loop-Invariant rsqrt Worsens Triton Reduction Kernel",
+    "strategy_description": "Explicitly hoisting a loop-invariant rsqrt (transcendental) call out of a Triton reduction loop caused a 17% regression (203us \u2192 224us). Despite eliminating ~163K SFU instructions, executed instructions actually increased from 130.8M to 136.4M, branch instructions nearly doubled (802K \u2192 1.52M), and eligible warps per scheduler dropped from 6.82 to 5.4 \u2014 suggesting the Triton compiler already performs LICM automatically and the manual hoist introduced additional overhead (likely from the restricted autotune config set removing higher-performing configs). The FPInstructions NCU rule flagging non-fused FP32 instructions does not reliably indicate that manual LICM will help when the compiler already handles it, and restricting autotune configs to XBLOCK=1-only simultaneously removed potentially better-performing tile configurations.",
+    "slow_pseudocode": "# BEFORE: rsqrt inside loop, full autotune config set, 203us\n@triton.autotune(configs=[XBLOCK in {1,4,8,16}, R0_BLOCK in {512,1024,2048}], ...)\ndef kernel(...):\n    tmp14 = tl.load(in_ptr3 + x4//4, eviction_policy='evict_last')  # loop-invariant\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r in tl.range(0, r_numel, R0_BLOCK):\n        tmp13 = compute(r)\n        tmp19 = libdevice.rsqrt(tmp14 / 43732.0 + 1e-5)  # repeated each iteration\n        tmp20 = tmp13 * tmp19\n        _acc += tmp20 * weight + bias",
+    "fast_pseudocode": "# AFTER (REGRESSED): rsqrt hoisted, restricted autotune to XBLOCK=1 only, 224us\n@triton.autotune(configs=[XBLOCK=1, R0_BLOCK in {512,1024,2048}], ...)\ndef kernel(...):\n    tmp14 = tl.load(in_ptr3 + x4//4, eviction_policy='evict_last')\n    rsqrt_val = libdevice.rsqrt(tmp14 / 43732.0 + 1e-5)  # hoisted before loop\n    _acc = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)\n    for r in tl.range(0, r_numel, R0_BLOCK):\n        tmp13 = compute(r)\n        tmp20 = tmp13 * rsqrt_val  # pre-computed\n        _acc += tmp20 * weight + bias",
+    "applicable_when": "Never \u2014 this specific combination of manual LICM hoist + restricted autotune configs caused regression. The Triton compiler likely already performs LICM on loop-invariant transcendental calls, making explicit hoisting redundant or harmful.",
+    "do_not_apply_when": "Do not manually hoist loop-invariant transcendental calls (rsqrt, exp, log, etc.) in Triton kernels when: (1) the compiler is likely already performing LICM, (2) the change is bundled with restricting autotune configs (confounds the causal attribution), or (3) the FPInstructions NCU rule is the only signal \u2014 this rule flags non-fused vs fused FP32 counts but does not distinguish compiler-already-optimized LICM from genuinely redundant computation. Branch instruction count doubling post-change is a signal that the autotune config restriction (not the hoist) may be the primary regression cause.",
+    "framework_notes": "In Triton, the compiler backend (LLVM/MLIR) typically performs LICM on loop-invariant scalar computations including transcendental calls. Explicitly hoisting in Python-level Triton code may be a no-op or introduce subtle differences in how the compiler schedules the hoisted value. The simultaneous restriction of autotune configs from 9 options (XBLOCK in {1,4,8,16}) to 4 options (XBLOCK=1 only) confounds attribution \u2014 the regression may be primarily from removing better autotune configs rather than from the rsqrt hoist itself. Future experiments should isolate these two changes."
+  },
+  {
+    "item_id": "exp_triton_xblock1_restore_still_regresses_002",
+    "iteration": 2,
+    "speedup": 0.8503,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "restore_xblock1_to_fix_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch.Block Size": 128.0,
+        "Launch.Waves Per SM": 7.76,
+        "Launch.Registers Per Thread": 30.0,
+        "Occupancy.Achieved Occupancy": 94.6,
+        "GPU Speed Of Light Throughput.Duration": 203.52,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 71.96,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 85.35,
+        "Memory Workload Analysis.Memory Throughput": 3.54,
+        "Instruction Statistics.Executed Instructions": 130842624.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.41,
+        "Scheduler Statistics.Active Warps Per Scheduler": 15.16
+      },
+      "key_metric_after": {
+        "Launch.Block Size": 64.0,
+        "Launch.Waves Per SM": 3.88,
+        "Launch.Registers Per Thread": 32.0,
+        "Occupancy.Achieved Occupancy": 89.48,
+        "GPU Speed Of Light Throughput.Duration": 218.78,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 66.99,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 83.86,
+        "Memory Workload Analysis.Memory Throughput": 3.29,
+        "Instruction Statistics.Executed Instructions": 139591680.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.68,
+        "Scheduler Statistics.Active Warps Per Scheduler": 14.32
+      }
+    },
+    "strategy_title": "Halving block size via XBLOCK=1-only autotune reduces waves and occupancy",
+    "strategy_description": "Replacing a mixed XBLOCK autotune config set (containing XBLOCK=1 and XBLOCK>1 entries) with a XBLOCK=1-only set caused the autotuner to select a 64-thread block (num_warps=2) instead of the prior 128-thread block. This halved waves_per_sm from 7.76 to 3.88, dropped achieved occupancy from 94.6% to 89.5%, and increased total executed instructions from 130.8M to 139.6M, resulting in a 7.7% slower kernel (218.78us vs 203.52us). The register count barely changed (30\u219232), confirming the occupancy collapse from the prior iteration was already resolved in the baseline; the new autotune config set simply selected a suboptimal num_warps=2 / block_size=64 configuration that reduced parallelism without any compensating benefit.",
+    "slow_pseudocode": "# BEFORE (faster baseline): mixed configs including XBLOCK=1 with 128-thread blocks\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4),   # 128 threads\n        Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8),   # 256 threads\n        Config({'XBLOCK': 4, 'R0_BLOCK':  512}, num_warps=4),\n        Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=4),\n        ...  # XBLOCK>1 configs also present\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n# Autotuner selected: block_size=128, waves_per_sm=7.76, achieved_occ=94.6%, 203us",
+    "fast_pseudocode": "# AFTER (regressed): XBLOCK=1-only configs, autotuner picks num_warps=2\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 1, 'R0_BLOCK':  512}, num_warps=2),   # 64 threads  <-- selected\n        Config({'XBLOCK': 1, 'R0_BLOCK':  512}, num_warps=4),   # 128 threads\n        Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4),\n        Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4),\n        Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=8),\n        Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=8),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n# Autotuner selected: block_size=64, waves_per_sm=3.88, achieved_occ=89.5%, 219us",
+    "applicable_when": "Never \u2014 this specific change (restricting to XBLOCK=1-only configs with small num_warps options) caused regression by allowing the autotuner to select an under-parallelized configuration.",
+    "do_not_apply_when": "When the baseline kernel already achieves high occupancy (>90%) and high waves_per_sm (>7) with XBLOCK=1 configs present. Removing XBLOCK>1 configs while simultaneously introducing small num_warps (e.g. num_warps=2 / block_size=64) gives the autotuner a path to a lower-parallelism configuration that reduces waves_per_sm and hurts throughput. If register pressure is not the bottleneck (registers_per_thread ~30, occupancy ~95%), do not change the autotune config set.",
+    "framework_notes": "In Triton, num_warps directly sets block_size = num_warps * 32. Including num_warps=2 (64 threads) in the config set for a kernel with grid_size=16384 on 132 SMs yields only 3.88 waves_per_sm, which is insufficient to hide latency. The LaunchConfiguration NCU rule flagged a 25% tail-wave penalty in the after profile, confirming the partial-wave inefficiency introduced by the smaller block. Always ensure the minimum num_warps in autotune configs keeps waves_per_sm above ~6 for large grids on H100/H200."
+  }
+]

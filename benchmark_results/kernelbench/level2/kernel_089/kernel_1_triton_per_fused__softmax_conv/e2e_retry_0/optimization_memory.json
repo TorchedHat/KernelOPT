@@ -1,0 +1,46 @@
+[
+  {
+    "item_id": "triton_autotune_xblock_coalescing_001",
+    "iteration": 1,
+    "speedup": 7.6038,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "triton_autotune_xblock_for_memory_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 273.28,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 82.82,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 91.35,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 27.2,
+        "Memory Workload Analysis.L2 Hit Rate": 22.52,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.51,
+        "Compute Workload Analysis.Issue Slots Busy": 37.83,
+        "Scheduler Statistics.No Eligible": 62.44,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.56,
+        "Source Counters.excessive_sectors": 33554432.0,
+        "Source Counters.excessive_sector_fraction_pct": 50.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 35.94,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 77.94,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 83.4,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 50.14,
+        "Memory Workload Analysis.L2 Hit Rate": 1.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.79,
+        "Compute Workload Analysis.Issue Slots Busy": 67.65,
+        "Scheduler Statistics.No Eligible": 31.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.87,
+        "Source Counters.excessive_sectors": 4194304.0,
+        "Source Counters.excessive_sector_fraction_pct": 49.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Eliminate Stride-N Uncoalesced Loads",
+    "strategy_description": "When a Triton kernel's XBLOCK is fixed at a value that causes threads to index into a tensor dimension with stride > 1 (e.g., XBLOCK=128 with x0 = xindex % 32 and load address using 2*x0), consecutive threads access non-contiguous memory, producing ~50% excessive L2 sectors and high L1TEX stall cycles (CPIStall). Adding @triton.autotune over a range of XBLOCK values allows the autotuner to select the block size that aligns thread indices with the tensor's unit-stride dimension, eliminating the stride factor and halving memory transactions per warp. This reduced Warp Cycles Per Issued Instruction from 39.5 to 16.8, Issue Slots Busy from 37.8% to 67.7%, and kernel duration from 273 \u00b5s to 36 \u00b5s (7.6\u00d7 speedup).",
+    "slow_pseudocode": "# Fixed XBLOCK=128; x0 = xindex % 32 (range 0..31)\n# Load uses stride-2 factor: 2*x0 -> non-contiguous across warp\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    x0 = xindex % 32          # 0..31, stride-2 in memory -> UNCOALESCED\n    x1 = (xindex // 32) % 32\n    load = tl.load(ptr + (2*x0 + 128*x1 + ...))  # stride-2 gap between threads\n\ngrid = (cdiv(N, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# Autotune selects XBLOCK=64; x0 = xindex % 64 (range 0..63)\n# Load uses stride-1 factor: 1*x0 -> contiguous across warp -> COALESCED\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16},  num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 32},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 64},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256}, num_warps=8, num_stages=3),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel   # add bounds mask\n    x0 = xindex % 64          # 0..63, stride-1 in memory -> COALESCED\n    x1 = (xindex // 64) % 32\n    load = tl.load(ptr + (x0 + 64*x1 + ...), mask=xmask)\n\ngrid = lambda meta: (cdiv(N, meta['XBLOCK']),)  # dynamic grid\nkernel[grid](...)  # no explicit XBLOCK kwarg",
+    "applicable_when": "UncoalescedGlobalAccess NCU rule fires with \u226540% excessive sectors; load address contains a stride-N factor (N>1) on the x-thread index dimension; DRAM Throughput >75% and L1TEX stall cycles dominate (CPIStall fraction >50%); kernel uses a fixed XBLOCK that misaligns threads with the tensor's unit-stride dimension.",
+    "do_not_apply_when": "The tensor's innermost dimension size does not match any candidate XBLOCK value (no alignment possible); the kernel is compute-bound rather than memory-bound; the access pattern is inherently strided due to algorithm structure (e.g., transposed matrix multiply) where no XBLOCK choice can fix coalescing.",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['xnumel', 'r0_numel'] and a lambda grid (lambda meta: (cdiv(N, meta['XBLOCK']),)) so the grid adapts to the autotuned XBLOCK. Also add xmask = xindex < xnumel and pass mask=xmask to all tl.load/tl.store calls when XBLOCK may not evenly divide xnumel. The index decomposition (x0, x1, x2, ...) must be re-derived to match the tensor's actual strides for the chosen XBLOCK."
+  }
+]

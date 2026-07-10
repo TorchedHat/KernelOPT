@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "ec10003b",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_and_fix_r0_block_overprovisioning",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_and_fix_r0_block_overprovisioning \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_and_fix_r0_block_overprovisioning' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches with R0_BLOCK=512 but r0_numel=128, meaning the reduction tile is 4x the actual reduction dimension. This wastes registers and shared memory, limiting Block Limit Shared Mem to only 3 blocks per SM and theoretical occupancy to 18.75%. Additionally, the contiguous load in_ptr0 + (r0_2 + 128*x3) lacks tl.max_contiguous/tl.multiple_of hints, preventing the compiler from emitting 128-bit (float4) vectorized loads. With R0_BLOCK=128 (matching r0_numel exactly), the reduction loop body executes once without a loop, eliminating loop overhead and reducing SMEM usage. Adding vectorization hints on the contiguous r0_2 dimension enables 128-bit loads, reducing L1TEX stall cycles and improving memory throughput.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    ",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_r0block_oversize_shared_mem",
+    "iteration": 1,
+    "speedup": 46.131,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "right_size_r0_block_to_match_r0_numel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + TheoreticalOccupancy + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Scheduler Statistics.No Eligible": 94.12,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.06,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 45.74,
+        "GPU Speed Of Light Throughput.Duration (ms)": 1.24,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 10.76,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 39.83,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 6.49
+      },
+      "key_metric_after": {
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Block Limit Shared Mem": 5.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 16.38,
+        "Scheduler Statistics.No Eligible": 77.38,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.28,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.51,
+        "GPU Speed Of Light Throughput.Duration (us)": 26.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 20.01,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 14.55,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 87.94
+      }
+    },
+    "strategy_title": "Right-size R0_BLOCK to match actual reduction dimension",
+    "strategy_description": "When a Triton reduction kernel's R0_BLOCK tile parameter is set larger than the actual reduction dimension (r0_numel), shared memory is allocated proportional to R0_BLOCK even though most of it is unused. This artificially limits the number of concurrent blocks per SM (Block Limit Shared Mem), collapsing theoretical occupancy and leaving schedulers with almost no eligible warps (94% no-eligible cycles), causing severe L1TEX latency stalls (45.7 cycles/instruction). Setting R0_BLOCK \u2264 r0_numel via autotune reduces shared memory per block, raises Block Limit Shared Mem, cuts warp cycles per issued instruction from 45.7 to 8.5, and improves L1/TEX hit rate from 6.5% to 87.9%, yielding a 46x end-to-end speedup.",
+    "slow_pseudocode": "# R0_BLOCK=512 >> r0_numel=128 \u2192 wastes 4x shared memory\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc = tl.full([XBLOCK, R0_BLOCK], init_val, dtype)\n    for r0_offset in range(0, r0_numel, R0_BLOCK):  # only 1 iteration since 512>128\n        r0_mask = (r0_offset + r0_base) < r0_numel\n        ...\n    result = reduce(_acc, axis=1)\n    tl.store(out + x, result, None)\n\n# Launch with hardcoded oversized tile:\nkernel[grid](... , XBLOCK=128, R0_BLOCK=512)  # 512 >> 128",
+    "fast_pseudocode": "# R0_BLOCK matched to r0_numel via autotune\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 64},  num_warps=4, num_stages=3),\n        # ... more configs with R0_BLOCK <= r0_numel\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    xmask = xindex < xnumel  # also add xmask to loads/stores\n    _acc = tl.full([XBLOCK, R0_BLOCK], init_val, dtype)\n    for r0_offset in range(0, r0_numel, R0_BLOCK):\n        r0_mask = (r0_offset + r0_base) < r0_numel\n        tl.load(..., xmask & r0_mask, ...)\n        ...\n    result = reduce(_acc, axis=1)\n    tl.store(out + x, result, xmask)\n\n# Launch without hardcoded tile sizes:\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](...)  # autotune selects best config",
+    "applicable_when": "Triton reduction kernel where R0_BLOCK (or RBLOCK) is set larger than the actual reduction dimension r0_numel; Block Limit Shared Mem is very low (\u22643); theoretical occupancy <20%; no-eligible-warp cycles >90%; Warp Cycles Per Issued Instruction >30; L1/TEX Hit Rate <15%; CPIStall and TheoreticalOccupancy NCU rules both triggered.",
+    "do_not_apply_when": "R0_BLOCK is already \u2264 r0_numel; shared memory is not the occupancy bottleneck (Block Limit Registers or Block Limit Warps is the binding constraint); the kernel genuinely needs large R0_BLOCK for multi-pass reductions where r0_numel >> R0_BLOCK.",
+    "framework_notes": "Triton-specific: shared memory for reduction accumulators is allocated as XBLOCK \u00d7 R0_BLOCK elements. Setting R0_BLOCK > r0_numel wastes shared memory proportionally. The autotune decorator with key=['xnumel','r0_numel'] ensures configs are re-evaluated when problem shape changes. Also add xmask = xindex < xnumel and apply it to all tl.load/tl.store calls when XBLOCK may not evenly divide xnumel."
+  }
+]

@@ -1,0 +1,74 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,48 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'YBLOCK': 32,  'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 64,  'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 64,  'XBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'YBLOCK': 128, 'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'YBLOCK': 128, 'XBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'YBLOCK': 32,  'XBLOCK': 128}, num_warps=4, num_stages=3),
++        triton.Config({'YBLOCK': 64,  'XBLOCK': 128}, num_warps=4, num_stages=3),
++        triton.Config({'YBLOCK': 128, 'XBLOCK': 128}, num_warps=4, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++    # ynumel = 31500 (HW), xnumel = 128 (C), YBLOCK = HWBLOCK, XBLOCK = CBLOCK = 128
++    # pid(0) tiles HW, pid(1) tiles N (batch)
++    pid_hw = tl.program_id(0)
++    pid_n  = tl.program_id(1)
++    n = pid_n
+ 
++    hw_start = pid_hw * YBLOCK
++    hw_offs  = hw_start + tl.arange(0, YBLOCK)   # [YBLOCK] = [HWBLOCK]
++    c_offs   = tl.arange(0, XBLOCK)              # [XBLOCK] = [CBLOCK=128]
+ 
++    hw_mask  = hw_offs < ynumel                   # [YBLOCK], ynumel=31500
++
++    # Load tile shape [YBLOCK, XBLOCK] = [HWBLOCK, CBLOCK]:
++    # c_offs is innermost (stride=1 in input) -> COALESCED LOAD
++    # load index: c + 128*hw + 4032000*n
++    load_idx = c_offs[None, :] + 128 * hw_offs[:, None] + 4032000 * n
++    tmp = tl.load(in_ptr0 + load_idx, mask=hw_mask[:, None], other=0.0)
++
++    # Transpose tile in registers: [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK]
++    tmp_T = tl.trans(tmp)
++
++    # Store tile shape [XBLOCK, YBLOCK] = [CBLOCK, HWBLOCK]:
++    # hw_offs is innermost (stride=1 in output) -> COALESCED STORE
++    # store index: hw + 31500*c + 4032000*n
++    store_idx = hw_offs[None, :] + 31500 * c_offs[:, None] + 4032000 * n
++    tl.store(out_ptr0 + store_idx, tmp_T, mask=hw_mask[None, :])
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +54,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

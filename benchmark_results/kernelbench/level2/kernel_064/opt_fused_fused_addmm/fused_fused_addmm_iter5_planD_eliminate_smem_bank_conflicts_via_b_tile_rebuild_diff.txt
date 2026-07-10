@@ -1,0 +1,98 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,39 @@
+ import math
+ 
+ # GEMM kernel: computes x @ W^T + bias, output shape [M, N]
++
+ @triton.autotune(
+     configs=[
++        # === 2 blocks/SM configs: smem <= 114KB ===
++        # BLOCK_M=128, BLOCK_N=128, BLOCK_K=32: smem=(128*32+32*128)*4*stages
++        # stages=3: 98304 bytes OK   stages=4: 131072 bytes borderline
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=4, num_warps=8),
++        # BLOCK_M=128, BLOCK_N=128, BLOCK_K=16: smem=(128*16+16*128)*4*stages
++        # stages=4: 65536 bytes OK   stages=5: 81920 bytes OK
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16, 'GROUP_M': 4}, num_stages=5, num_warps=8),
++        # BLOCK_M=128, BLOCK_N=128, BLOCK_K=64: smem=(128*64+64*128)*4*stages
++        # stages=2: 131072 bytes borderline 2 blocks/SM
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=16),
++        # BLOCK_M=64, BLOCK_N=128, BLOCK_K=32: smem=(64*32+32*128)*4*stages
++        # stages=4: 98304 bytes OK   stages=5: 122880 bytes OK
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # BLOCK_M=64, BLOCK_N=64, BLOCK_K=32: smem=(64*32+32*64)*4*stages
++        # stages=5: 61440 bytes OK -- very small smem, highest occupancy
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        # === Keep existing small-warp configs for comparison ===
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -38,20 +63,32 @@
+ 
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    rk = tl.arange(0, BLOCK_K)
+-
+-    A = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+-    B = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
++
++    A_block_ptr = tl.make_block_ptr(
++        base=A_ptr,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),  # row-major: K is fast dim -> Triton pads smem to avoid conflicts
++    )
++    B_block_ptr = tl.make_block_ptr(
++        base=B_ptr,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(1, 0),  # N is fast dim in smem: matches Hopper wgmma N-major B read, eliminates 5.1-way bank conflicts
++    )
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        a = tl.load(A, mask=(rm[:, None] < M) & (rk[None, :] < k_remaining), other=0.0)
+-        b = tl.load(B, mask=(rk[:, None] < k_remaining) & (rn[None, :] < N), other=0.0)
+-        acc = tl.dot(a, b, acc, allow_tf32=False)
+-        A += BLOCK_K * stride_ak
+-        B += BLOCK_K * stride_bk
++        a = tl.load(A_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        b = tl.load(B_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        acc = tl.dot(a, b, acc, allow_tf32=True)
++        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
++        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+ 
+     # Add bias
+     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0)
+@@ -75,6 +112,7 @@
+     key=['N'],
+ )
+ @triton.jit
++
+ def logsumexp_leakyrelu_gelu_kernel(
+     input_ptr, output_ptr,
+     M, N,

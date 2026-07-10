@@ -1,0 +1,71 @@
+--- baseline
++++ rebuilt
+@@ -5,23 +5,34 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'YBLOCK': 64, 'XBLOCK': 64}, num_warps=4),
++        triton.Config({'YBLOCK': 128, 'XBLOCK': 64}, num_warps=4),
++        triton.Config({'YBLOCK': 256, 'XBLOCK': 64}, num_warps=8),
++        triton.Config({'YBLOCK': 512, 'XBLOCK': 64}, num_warps=8),
++        triton.Config({'YBLOCK': 1024, 'XBLOCK': 64}, num_warps=8),
++    ],
++    key=['ynumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_gelu_leaky_relu_mul_2(in_ptr0, in_ptr1, in_ptr2, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4129024
+-    xnumel = 64
+-    yoffset = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
++    # XBLOCK=64 covers all 64 channels in one block -- no xmask needed
++    # program_id(0) drives Y only
++    yoffset = tl.program_id(0) * YBLOCK
++    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # shape [YBLOCK, 1]
+     ymask = yindex < ynumel
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y3 = yindex
+-    y0 = (yindex % 64516)
++    xindex = tl.arange(0, XBLOCK)[None, :]             # shape [1, 64]
++    # Decompose yindex: y1=batch [0,64), y0=spatial [0,64516)
++    y0 = yindex % 64516
+     y1 = yindex // 64516
+-    tmp0 = tl.load(in_ptr0 + (x2 + 64*y3), xmask & ymask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (x2), xmask, eviction_policy='evict_last')
+-    tmp3 = tl.load(in_ptr2 + (x2), xmask, eviction_policy='evict_last')
++    # Load: in_ptr0 strides (4129024,1,16256,64) -> flat index = xindex + 64*yindex
++    tmp0 = tl.load(in_ptr0 + (xindex + 64 * yindex), ymask, eviction_policy='evict_last')
++    # Load bias per channel: in_ptr1 shape [64] stride (1,)
++    tmp1 = tl.load(in_ptr1 + xindex, eviction_policy='evict_last')
++    # Load scale per channel: in_ptr2 shape [64,1,1] stride (1,1,1)
++    tmp3 = tl.load(in_ptr2 + xindex, eviction_policy='evict_last')
+     tmp2 = tmp0 + tmp1
+     tmp4 = tmp2 * tmp3
+     tmp5 = tl.full([1, 1], 0.0, tl.float32)
+@@ -37,9 +48,8 @@
+     tmp15 = tl.full([1, 1], 1.0, tl.float32)
+     tmp16 = tmp14 + tmp15
+     tmp17 = tmp11 * tmp16
+-    tl.store(out_ptr0 + (y0 + 64516*x2 + 4129024*y1), tmp17, xmask & ymask)
+-
+-
++    # Store: out_ptr0 strides (4129024,64516,254,1) -> flat index = y0 + 64516*xindex + 4129024*y1
++    tl.store(out_ptr0 + (y0 + 64516 * xindex + 4129024 * y1), tmp17, ymask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -49,7 +59,7 @@
+     ynumel = 4129024
+     xnumel = 64
+     grid = (triton.cdiv(xnumel, 8),)
+-    triton_poi_fused_convolution_gelu_leaky_relu_mul_2[grid](arg_0, arg_1, arg_2, arg_3, 4129024, 64, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_gelu_leaky_relu_mul_2[grid](arg_0, arg_1, arg_2, arg_3, 4129024, 64)
+     return arg_3
+ 
+ def get_inputs():

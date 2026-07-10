@@ -1,0 +1,263 @@
+[
+  {
+    "item_id": "8938e47f",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_grid_parallelism_via_autotune_xblock",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_grid_parallelism_via_autotune_xblock \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_grid_parallelism_via_autotune_xblock' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", li",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 8 blocks (ceil(1024/128)=8) on a 132-SM GPU, achieving 0 full waves and 6.24% occupancy. Each SM runs at most 1 active warp, leaving 94% of scheduler slots idle. Shrinking XBLOCK expands the grid to cover more SMs. With XBLOCK=1, grid=1024 blocks (7.8 waves across 132 SMs). Autotuning across XBLOCK in {1,2,4,8,16,32} and R0_BLOCK in {256,512,1024,2048,4096,8192} will find the sweet spot balancing parallelism vs. per-block reduction efficiency.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_online_softmax_reduce_passes",
+    "iteration": 1,
+    "speedup": 1.1938,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "online_softmax_to_eliminate_intermediate_global_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.52,
+        "Scheduler Statistics.No Eligible": 94.29,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Launch Statistics.Stack Size": 8544.0,
+        "Instruction Statistics.Executed Instructions": 18730112.0,
+        "CPIStall_l1tex_stall_pct": 81.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.78,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.62,
+        "Scheduler Statistics.No Eligible": 92.08,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Launch Statistics.Stack Size": 6432.0,
+        "Instruction Statistics.Executed Instructions": 21590432.0,
+        "CPIStall_l1tex_stall_pct": 72.2
+      }
+    },
+    "strategy_title": "Online Softmax Eliminates Intermediate Global Store/Reload Pass",
+    "strategy_description": "When a reduction kernel implements softmax in 3 sequential passes (compute+store intermediate scores, reload+exp+accumulate sum, reload+divide+store), the intermediate global store and two subsequent reloads of the score tensor cause heavy L1TEX stall cycles (81.5% of cycles before, 72.2% after). Replacing the 3-pass approach with a 2-pass online softmax \u2014 where pass 1 computes scores inline and maintains running max/sum accumulators without writing intermediates, and pass 2 recomputes scores and writes final values \u2014 eliminates one full global memory round-trip over the reduction dimension. The warp cycles per issued instruction dropped from 17.52 to 12.62, and kernel duration fell from 6.9ms to 5.78ms (~16% reduction), despite instruction count increasing due to score recomputation.",
+    "slow_pseudocode": "# 3-pass softmax \u2014 intermediate global store causes L1TEX stalls\n_max = full(-inf)\nfor r in range(0, R, R_BLOCK):\n    score = compute_score(inputs, r)  # batch-norm + scale\n    store(out_ptr, score)             # WRITE intermediates to global mem\n    _max = maximum(_max, score)\nglobal_max = reduce_max(_max)\n\n_sum = full(0)\nfor r in range(0, R, R_BLOCK):\n    score = load(out_ptr, r)          # RELOAD 1 from global mem\n    _sum += exp(score - global_max)\nglobal_sum = reduce_sum(_sum)\n\nfor r in range(0, R, R_BLOCK):\n    score = load(out_ptr, r)          # RELOAD 2 from global mem\n    store(out_ptr, exp(score - global_max) / global_sum)",
+    "fast_pseudocode": "# 2-pass online softmax \u2014 no intermediate global store\nsign = where(scale >= 0, 1.0, -1.0)  # precompute once outside loops\nrunning_max = full(-inf)\nrunning_sum = full(0)\nfor r in range(0, R, R_BLOCK):\n    score = compute_score(inputs, r) * sign  # recompute inline, NO store\n    tile_max = max(score, axis=reduction)\n    new_max = maximum(running_max, tile_max)\n    running_sum = running_sum * exp(running_max - new_max) + sum(exp(score - new_max))\n    running_max = new_max\n\nfor r in range(0, R, R_BLOCK):\n    score = compute_score(inputs, r) * sign  # recompute for final pass\n    softmax_val = exp(score - running_max) / running_sum\n    store(out_ptr, softmax_val)",
+    "applicable_when": "Kernel implements softmax in 3+ sequential passes over a reduction dimension, with intermediate results written to global memory between passes. L1TEX stall percentage is high (>70% of cycles). The score computation is cheap enough to recompute (a few arithmetic ops per element). CPIStall rule is triggered with L1TEX as the dominant stall reason.",
+    "do_not_apply_when": "Score computation is very expensive (e.g., involves matrix multiplications or many transcendental ops), making recomputation in pass 2 costlier than the saved memory traffic. Reduction dimension is small enough to fit in shared memory, in which case tiling with smem is preferable. Grid is already large enough to saturate SMs \u2014 in that case the memory traffic reduction matters more than instruction overhead.",
+    "framework_notes": "Triton-specific: use tl.maximum() for element-wise max, tl.max(..., axis=1) for reduction. The online update formula is: running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(tl.exp(score - new_max), axis=1)[:, None]. Add @triton.autotune with configs varying XBLOCK to increase grid coverage across SMs. Stack size decreased from 8544 to 6432 bytes, indicating reduced register spill from eliminating intermediate accumulator arrays."
+  },
+  {
+    "item_id": "exp_002_triton_autotune_restore_value_fix",
+    "iteration": 2,
+    "speedup": 351.682,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_reduction_to_expand_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Scheduler Statistics.No Eligible": 81.14,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.19,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.39,
+        "GPU Speed Of Light Throughput.Duration": 19.84,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 1.01,
+        "Launch Statistics.Registers Per Thread": 255.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Scheduler Statistics.No Eligible": 81.75,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.52,
+        "GPU Speed Of Light Throughput.Duration": 19.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 1.0,
+        "Launch Statistics.Registers Per Thread": 255.0
+      }
+    },
+    "strategy_title": "Add restore_value to Autotune for In-Place Tensor Correctness",
+    "strategy_description": "When a Triton kernel with @triton.autotune writes to an in-place tensor (in_out_ptr pattern) across multiple reduction passes, omitting restore_value from the autotune decorator causes tensor corruption between benchmark trials, leading to crashes or incorrect results. Adding restore_value=['in_out_ptr0'] ensures autotune restores the tensor to its original state between config trials, enabling correct benchmarking. In this iteration, the profiling metrics before and after are nearly identical (duration 19.84us vs 19.62us, same grid/occupancy), indicating the 351x speedup came from correctness restoration enabling the previously-applied grid lambda fix to actually execute rather than crash \u2014 the NCU-visible kernel is the same small kernel, but the end-to-end benchmark no longer crashes.",
+    "slow_pseudocode": "# Missing restore_value causes corruption during autotune benchmarking\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 1, 'R0_BLOCK': 8192}, ...), ...],\n    key=['xnumel', 'r0_numel'],\n    # restore_value MISSING \u2014 in_out_ptr0 corrupted between trials\n)\n@triton.jit\ndef kernel(in_out_ptr0, ...):\n    # pass 1: writes to in_out_ptr0\n    # pass 2: reads from in_out_ptr0 (corrupted if restore_value absent)\n    # pass 3: reads from in_out_ptr0 again\n\ndef launch():\n    grid = (triton.cdiv(xnumel, 128),)  # hardcoded, always 8 blocks\n    kernel[grid](...)",
+    "fast_pseudocode": "# restore_value prevents corruption; grid lambda enables autotune to expand grid\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 1, 'R0_BLOCK': 8192}, ...), ...],\n    key=['xnumel', 'r0_numel'],\n    restore_value=['in_out_ptr0'],  # ADDED: restores tensor between benchmark trials\n)\n@triton.jit\ndef kernel(in_out_ptr0, ...):\n    # pass 1: writes to in_out_ptr0\n    # pass 2: reads from in_out_ptr0 (now safe)\n    # pass 3: reads from in_out_ptr0 again\n\ndef launch():\n    grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # dynamic grid\n    kernel[grid](...)  # autotune selects XBLOCK/R0_BLOCK automatically",
+    "applicable_when": "Triton kernel uses @triton.autotune and writes to an input tensor in-place (in_out_ptr pattern) across multiple passes; subsequent passes read back the written values; autotune benchmarking corrupts the tensor between config trials causing crashes or wrong results; LaunchConfiguration NCU rule triggered with high speedup_pct.",
+    "do_not_apply_when": "Kernel only reads from all input tensors (no in-place writes); kernel writes to a dedicated output tensor that is not read back in the same kernel; autotune is not used.",
+    "framework_notes": "Triton-specific: restore_value parameter in @triton.autotune accepts a list of argument names (strings matching the kernel parameter names) whose tensors will be saved and restored between each autotune benchmark trial. This is mandatory when any input tensor is written in-place and subsequently read in the same kernel invocation. Without it, the second and later benchmark trials operate on corrupted data. Combine with a grid lambda `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` to allow autotune to vary XBLOCK and expand grid coverage."
+  },
+  {
+    "item_id": "b2f1c9d4-autotune-grid-lambda-maxnreg",
+    "iteration": 2,
+    "speedup": 224.6094,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_lambda_and_cap_registers",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 19.84,
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Scheduler Statistics.No Eligible": 81.14,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.02
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 30.72,
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.02,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Scheduler Statistics.No Eligible": 87.35,
+        "Scheduler Statistics.Active Warps Per Scheduler": 0.99
+      }
+    },
+    "strategy_title": "Fix Autotune Grid Lambda + Cap Registers for SM Saturation",
+    "strategy_description": "When a Triton kernel uses @triton.autotune with configs varying XBLOCK but the grid is a fixed tuple hardcoded to a single XBLOCK value (e.g., `(cdiv(N, 128),)`), autotune selects configs but the grid never expands \u2014 the GPU remains severely underutilized regardless of which config wins. The fix is to change the grid to a lambda `lambda meta: (cdiv(N, meta['XBLOCK']),)` so the grid tracks the winning XBLOCK. Separately, when registers_per_thread is near the hardware maximum (255), Block Limit Registers is very low (2 blocks/SM), capping theoretical occupancy; adding `maxnreg=128` to each Config halves register usage and doubles Block Limit Registers (2\u21924), improving theoretical occupancy from 12.5% to 25%. Note: in this specific case the NCU-measured kernel duration actually increased (19.84\u219230.72 \u00b5s for the profiled kernel), but the end-to-end wall-clock speedup was 224x, suggesting the primary gain came from the autotune selecting a much better config (XBLOCK=1, grid=1024 blocks) that NCU profiled under a different condition.",
+    "slow_pseudocode": "# Grid hardcoded \u2014 ignores XBLOCK from autotune, always 8 blocks\ngrid = (triton.cdiv(xnumel, 128),)  # fixed 128, not meta['XBLOCK']\n\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 8192}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 8, 'R0_BLOCK': 4096}, num_warps=8, num_stages=1),\n    # ... more configs, no maxnreg\n], key=['xnumel', 'r0_numel'])\ndef kernel(...):\n    ...",
+    "fast_pseudocode": "# Grid lambda \u2014 expands with XBLOCK from winning autotune config\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\n\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1, 'R0_BLOCK': 8192}, num_warps=4, num_stages=1, maxnreg=128),\n    triton.Config({'XBLOCK': 2, 'R0_BLOCK': 4096}, num_warps=4, num_stages=1, maxnreg=128),\n    # ... more configs, all with maxnreg=128\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])\ndef kernel(...):\n    ...",
+    "applicable_when": "Triton kernel uses @triton.autotune with configs varying XBLOCK, but the grid passed at the call site is a fixed tuple using a hardcoded block size (not a lambda reading meta['XBLOCK']). LaunchConfiguration NCU rule fires with grid_size << sm_count and waves_per_sm < 0.1. Registers per thread is near 255 and Block Limit Registers is 2, indicating register pressure is the occupancy bottleneck. The kernel writes to an in-place output tensor across autotune benchmark runs.",
+    "do_not_apply_when": "Grid is already a lambda or the autotune configs all use the same XBLOCK (grid size is not config-dependent). Registers per thread is already low (<160) and Block Limit Registers is not the binding occupancy constraint. maxnreg may cause compiler spill for large R0_BLOCK configs \u2014 reduce to maxnreg=160 as fallback if compilation fails.",
+    "framework_notes": "Triton-specific: the grid must be a Python lambda `lambda meta: (triton.cdiv(N, meta['XBLOCK']),)` passed to `kernel[grid](...)`. The `maxnreg` parameter is a per-Config kwarg in triton.Config (not a kernel decorator argument). When the kernel writes in-place to a tensor that autotune benchmarks multiple times, `restore_value=['tensor_name']` must be added to @triton.autotune to prevent benchmark runs from corrupting the tensor. Do NOT pass XBLOCK or R0_BLOCK as explicit kwargs in the kernel call \u2014 autotune injects them automatically."
+  },
+  {
+    "item_id": "exp_003_hoist_loop_invariant_scalars_rsqrt_fma",
+    "iteration": 3,
+    "speedup": 699.7972,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "hoist_loop_invariant_scalars_and_fuse_fp32_instructions",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 16.03,
+        "Instruction Statistics.Executed Instructions": 118080.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.83,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 26.48,
+        "Warp State Statistics.Avg. Not Predicated Off Threads Per Warp": 21.72,
+        "Scheduler Statistics.No Eligible": 82.44,
+        "Source Counters.Branch Efficiency": 83.88,
+        "Source Counters.Avg. Divergent Branches": 3.88,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 16.25
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 9.86,
+        "Instruction Statistics.Executed Instructions": 91616.0,
+        "Launch Statistics.Registers Per Thread": 178.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.27,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0,
+        "Warp State Statistics.Avg. Not Predicated Off Threads Per Warp": 27.29,
+        "Scheduler Statistics.No Eligible": 75.98,
+        "Source Counters.Branch Efficiency": 100.0,
+        "Source Counters.Avg. Divergent Branches": 0.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 40.01
+      }
+    },
+    "strategy_title": "Hoist Loop-Invariant Scalars and Replace div-sqrt with rsqrt",
+    "strategy_description": "When a Triton reduction kernel recomputes the same scalar load and derived expressions (e.g., sign computation from a scale value) inside each of multiple sequential reduction loops, hoisting those computations before all loops eliminates redundant work and reduces register pressure. Replacing a two-step `(1 / sqrt_rn(x)) * 1.0` pattern with `tl.math.rsqrt(x)` collapses two non-fused instructions into a single MUFU.RSQ hardware instruction, enabling downstream FMA fusion for multiply-add chains. These changes together reduced executed instructions from 118K to 91K (~22%), registers per thread from 255 to 178, warp cycles per issued instruction from 5.83 to 4.27, branch divergence from 3.88 avg divergent branches to 0, and L1/TEX hit rate from 16.25% to 40.01%, cutting kernel duration from 16.03\u00b5s to 9.86\u00b5s (~38% reduction).",
+    "slow_pseudocode": "# Repeated scalar load + sign computation inside each of 3 loops\nfor r in range(0, R, R_BLOCK):  # loop 1\n    scale = load(in_ptr5 + zeros([XBLOCK,1]))  # redundant load\n    sign = where(scale >= 0, 1.0, -1.0)        # redundant sign\n    var_eps = var + 1e-5\n    inv_std = (int32(1) / sqrt_rn(var_eps)) * 1.0  # non-fused, no FMA\n    norm = (x - mean) * inv_std * weight + bias\n    score = norm * sign\n    ...\nfor r in range(0, R, R_BLOCK):  # loop 2\n    scale2 = load(in_ptr5 + zeros([XBLOCK,1]))  # redundant load again\n    sign2 = where(scale2 >= 0, 1.0, -1.0)       # redundant sign again\n    result = (val - global_max) * sign2 * scale2\n    ...\nfor r in range(0, R, R_BLOCK):  # loop 3\n    scale3 = load(in_ptr5 + zeros([XBLOCK,1]))  # redundant load again\n    sign3 = where(scale3 >= 0, 1.0, -1.0)       # redundant sign again\n    result = (val - global_max) * sign3 * scale3\n    ...",
+    "fast_pseudocode": "# Hoist scalar load and derived values BEFORE all loops\n_scale = load(in_ptr5 + zeros([XBLOCK,1]), mask=xmask)\n_sign = where(_scale >= 0.0, 1.0, -1.0)   # computed once; preserves +1 for scale=0\n_abs_scale = _sign * _scale                # |scale| = sign*scale, reused in loops 2&3\n\nfor r in range(0, R, R_BLOCK):  # loop 1\n    inv_std = tl.math.rsqrt(var + 1e-5)   # single MUFU.RSQ, enables FMA downstream\n    norm = (x - mean) * inv_std           # FMA-friendly chain\n    score = norm * weight + bias           # FFMA\n    result = score * _sign                 # hoisted sign, no recompute\n    ...\nfor r in range(0, R, R_BLOCK):  # loop 2\n    result = (val - global_max) * _abs_scale  # hoisted |scale|, no sign recompute\n    ...\nfor r in range(0, R, R_BLOCK):  # loop 3\n    result = (val - global_max) * _abs_scale  # hoisted |scale|, no sign recompute\n    ...",
+    "applicable_when": "FPInstructions NCU rule fires with high non-fused fraction (>80% non-fused FP32 instructions); kernel has multiple sequential reduction loops that each independently load the same scalar pointer and recompute derived expressions (sign, reciprocal-sqrt); registers_per_thread is near 255 (register pressure from repeated temporaries); branch divergence is non-zero (Avg. Divergent Branches > 0) due to repeated where() inside loops; L1/TEX hit rate is low (<25%) suggesting cache thrashing from redundant loads.",
+    "do_not_apply_when": "The scalar value changes between loop iterations (not truly loop-invariant); the sign/scale computation depends on per-element data rather than a single scalar pointer; rsqrt precision is insufficient (requires exact IEEE sqrt behavior); the kernel has only one reduction loop (no redundancy to eliminate).",
+    "framework_notes": "Triton-specific: tl.math.rsqrt(x) maps to MUFU.RSQ on SM 8.x/9.x (1-cycle latency) and enables FMA fusion for downstream multiply-add chains, unlike the two-step `(tl.full([1,1], 1, tl.int32) / tl.sqrt_rn(x)) * 1.0` pattern which prevents FMA. The where(scale >= 0, 1.0, -1.0) sign idiom must NOT be replaced with tl.sign() as tl.sign(0) = 0 while the original returns +1. Hoisting tl.load with mask=xmask before loops is safe when the pointer has shape (1,) and is constant across the reduction dimension."
+  },
+  {
+    "item_id": "exp_003_online_softmax_maxnreg_grid_lambda",
+    "iteration": 3,
+    "speedup": 258.5238,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_sm_utilization",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 16.03,
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Scheduler Statistics.No Eligible": 82.44,
+        "Instruction Statistics.Executed Instructions": 118080.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 26.69,
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.02,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.21,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Scheduler Statistics.No Eligible": 87.1,
+        "Instruction Statistics.Executed Instructions": 143712.0
+      }
+    },
+    "strategy_title": "Autotune Small XBLOCK + Online Softmax for Grid Expansion",
+    "strategy_description": "When a Triton kernel launches with far fewer blocks than available SMs (e.g., 8 blocks on 132 SMs, 0 full waves, <10% achieved occupancy), combining @triton.autotune with small XBLOCK configs (XBLOCK in {1,2,4}) and a lambda grid expands parallelism to fill all SMs. Adding restore_value for in-place tensors in the autotune decorator is mandatory for correctness during benchmarking. Pairing this with a 2-pass online softmax (eliminating intermediate global stores between passes) and maxnreg=128 to cap register pressure further reduces instruction count and improves theoretical occupancy from 12.5% to 25%, yielding a combined 258x speedup over the prior baseline.",
+    "slow_pseudocode": "# Fixed tile sizes -> 8 blocks on 132-SM GPU, 3-pass softmax, no maxnreg\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': 128, 'R0_BLOCK': 512}, ...)],\n    key=['xnumel', 'r0_numel'],\n    # NO restore_value -> correctness bug for in-place tensors\n)\n@triton.jit\ndef kernel(in_out_ptr0, ...):\n    # Pass 1: compute score, store to in_out_ptr0, track max\n    for r in range(0, R, R_BLOCK):\n        score = compute_score(...)\n        store(in_out_ptr0, score)  # intermediate global write\n        _max = maximum(_max, score)\n    global_max = reduce(_max)\n    # Pass 2: reload, exp, accumulate sum\n    for r in range(0, R, R_BLOCK):\n        score = load(in_out_ptr0, r)  # reload\n        _sum += exp(score - global_max)\n    global_sum = reduce(_sum)\n    # Pass 3: reload, divide, store\n    for r in range(0, R, R_BLOCK):\n        score = load(in_out_ptr0, r)  # reload again\n        store(in_out_ptr0, exp(score - global_max) / global_sum)\n\ngrid = (triton.cdiv(xnumel, 128),)  # fixed 8 blocks\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# Autotune with small XBLOCK + restore_value + maxnreg + 2-pass online softmax\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 8192}, num_warps=4, num_stages=1, maxnreg=128),\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 4096}, num_warps=4, num_stages=1, maxnreg=128),\n    triton.Config({'XBLOCK': 2,  'R0_BLOCK': 4096}, num_warps=4, num_stages=1, maxnreg=128),\n    triton.Config({'XBLOCK': 4,  'R0_BLOCK': 2048}, num_warps=4, num_stages=1, maxnreg=128),\n    # ... more configs, all with maxnreg=128 ...\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])  # CRITICAL\n@triton.jit\ndef kernel(in_out_ptr0, ...):\n    sign = where(scale >= 0, 1.0, -1.0)  # precompute once outside loops\n    running_max = full(-inf); running_sum = full(0)\n    # Pass 1: online max+sum, NO intermediate store\n    for r in range(0, R, R_BLOCK):\n        score = compute_score(...) * sign\n        tile_max = max(score, axis=1, keep_dims=True)\n        new_max = maximum(running_max, tile_max)\n        running_sum = running_sum * exp(running_max - new_max) + sum(exp(score - new_max), axis=1, keep_dims=True)\n        running_max = new_max\n    # Pass 2: recompute score, write final softmax\n    for r in range(0, R, R_BLOCK):\n        score = compute_score(...) * sign\n        store(in_out_ptr0, exp(score - running_max) / running_sum)\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # dynamic\nkernel[grid](...)  # no XBLOCK/R0_BLOCK kwargs; autotune injects them",
+    "applicable_when": "LaunchConfiguration NCU rule fires with high speedup_pct (>80%); grid_size << sm_count (e.g., grid_size < sm_count/4); Waves Per SM ~0; Achieved Occupancy <10%; Scheduler 'No Eligible' >80%; kernel has parametric XBLOCK/R0_BLOCK tile sizes; kernel implements multi-pass softmax with intermediate global memory writes; in-place tensors (in_out_ptr pattern) are present; registers_per_thread near 255 with Block Limit Registers = 2.",
+    "do_not_apply_when": "Grid already covers all SMs (waves_per_sm >= 1.0); kernel is memory-bandwidth bound with high DRAM throughput (>50%); in-place tensors exist and restore_value cannot be set (correctness risk); score recomputation in pass 2 is prohibitively expensive (e.g., involves matmul); XBLOCK reduction would exceed hardware grid limits; maxnreg causes excessive register spill for large R0_BLOCK configs.",
+    "framework_notes": "Triton-specific: restore_value=['in_out_ptr0'] in @triton.autotune is mandatory when the kernel reads and writes the same tensor across multiple reduction loops. The grid must be a lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. Do not pass XBLOCK/R0_BLOCK as explicit kwargs to the kernel call when using autotune. The online softmax update formula: running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(tl.exp(score - new_max), axis=1, keep_dims=True). maxnreg=128 per Config halves register usage and doubles Block Limit Registers (2->4), improving theoretical occupancy from 12.5% to 25%. Note: the NCU-profiled kernel duration increased (16.03->26.69us) because NCU profiled the XBLOCK=128 config (8 blocks), but the end-to-end wall-clock speedup was 258x from autotune selecting a better config at runtime."
+  },
+  {
+    "item_id": "exp_004_maxnreg_tiered_by_r0block_size",
+    "iteration": 4,
+    "speedup": 577.8894,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tiered_maxnreg_by_r0block_to_reduce_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 178.0,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "GPU Speed Of Light Throughput.Duration": 9.86,
+        "Scheduler Statistics.No Eligible": 75.98,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.24,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.27,
+        "Instruction Statistics.Executed Instructions": 91616.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "GPU Speed Of Light Throughput.Duration": 11.94,
+        "Scheduler Statistics.No Eligible": 80.34,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.2,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.16,
+        "Instruction Statistics.Executed Instructions": 94336.0
+      }
+    },
+    "strategy_title": "Tiered maxnreg Per Config Based on R0_BLOCK Size",
+    "strategy_description": "When a Triton kernel's register count (e.g., 178) limits Block Limit Registers to 2 blocks/SM and theoretical occupancy to 12.5%, adding per-Config maxnreg caps reduces registers and doubles Block Limit Registers (2\u21924), improving theoretical occupancy to 25%. Using a tiered approach \u2014 higher maxnreg (128) for large R0_BLOCK configs (8192, 4096) that need more registers for loop-carried accumulators, and lower maxnreg (96) for smaller R0_BLOCK configs \u2014 avoids register spill on large-tile configs while still capping pressure on small-tile configs. Note: the NCU-profiled kernel duration increased slightly (9.86\u219211.94\u00b5s) because the profiled config (XBLOCK=128, 8 blocks) is not the winning autotune config; the 577x end-to-end speedup reflects autotune selecting a better config at runtime.",
+    "slow_pseudocode": "# No maxnreg: registers=178, Block Limit Registers=2, theoretical occupancy=12.5%\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 8192}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 4096}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 2048}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 1024}, num_warps=4, num_stages=1),\n    # ... more configs, no maxnreg on any\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])",
+    "fast_pseudocode": "# Tiered maxnreg: large R0_BLOCK gets maxnreg=128, small gets maxnreg=96\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 8192}, num_warps=4, num_stages=1, maxnreg=128),  # large tile needs headroom\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 4096}, num_warps=4, num_stages=1, maxnreg=128),  # large tile needs headroom\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 2048}, num_warps=4, num_stages=1, maxnreg=96),   # smaller tile, tighter cap\n    triton.Config({'XBLOCK': 1,  'R0_BLOCK': 1024}, num_warps=4, num_stages=1, maxnreg=96),   # smaller tile, tighter cap\n    triton.Config({'XBLOCK': 8,  'R0_BLOCK': 4096}, num_warps=8, num_stages=1, maxnreg=128),\n    triton.Config({'XBLOCK': 8,  'R0_BLOCK': 2048}, num_warps=8, num_stages=1, maxnreg=96),\n    triton.Config({'XBLOCK': 8,  'R0_BLOCK': 1024}, num_warps=4, num_stages=1, maxnreg=96),\n    triton.Config({'XBLOCK': 32, 'R0_BLOCK': 1024}, num_warps=8, num_stages=1, maxnreg=96),\n    triton.Config({'XBLOCK': 32, 'R0_BLOCK': 512},  num_warps=4, num_stages=1, maxnreg=96),\n    triton.Config({'XBLOCK': 128,'R0_BLOCK': 512},  num_warps=4, num_stages=1, maxnreg=96),\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])",
+    "applicable_when": "Triton kernel has registers_per_thread between 128-200, causing Block Limit Registers of 2 and theoretical occupancy \u226412.5%. Autotune configs span a wide range of R0_BLOCK sizes (e.g., 512 to 8192). TheoreticalOccupancy NCU rule fires. The kernel has loop-carried accumulators whose register count scales with R0_BLOCK tile size.",
+    "do_not_apply_when": "Registers per thread is already below 128 (Block Limit Registers already \u22654). All autotune configs use the same R0_BLOCK size (no need for tiering). maxnreg causes register spill warnings for the largest R0_BLOCK configs even at maxnreg=128 \u2014 in that case raise to maxnreg=160 or remove the cap for those configs. Grid is already large enough to saturate all SMs (waves_per_sm \u2265 1.0).",
+    "framework_notes": "Triton-specific: maxnreg is a per-Config kwarg in triton.Config(), not a @triton.jit argument. The threshold for tiering is R0_BLOCK \u2265 4096 \u2192 maxnreg=128, R0_BLOCK \u2264 2048 \u2192 maxnreg=96. On H200 (65536 registers/SM, 128 threads/block = 4 warps): maxnreg=128 \u2192 128*128=16384 regs/block \u2192 4 blocks/SM (25% occupancy); maxnreg=96 \u2192 96*128=12288 regs/block \u2192 5 blocks/SM (31.25% occupancy). The NCU-profiled kernel may show duration increase because NCU profiles the first/default config, not the winning autotune config \u2014 end-to-end wall-clock speedup is the correct measure."
+  }
+]

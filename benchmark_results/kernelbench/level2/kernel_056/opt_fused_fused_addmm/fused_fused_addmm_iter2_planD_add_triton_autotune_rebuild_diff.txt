@@ -1,0 +1,58 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -10,6 +11,12 @@
+         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=4),
+         triton.Config({'BLOCK_N': 512, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+         triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 512, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 512, 'BLOCK_K': 128}, num_warps=8, num_stages=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -35,6 +42,7 @@
+     # We tile over the output dimension N
+     for n_start in tl.range(0, N, BLOCK_N):
+         n_offs = n_start + tl.arange(0, BLOCK_N)
++        n_offs = tl.max_contiguous(tl.multiple_of(n_offs, BLOCK_N), BLOCK_N)  # ADD: alignment+contiguity hint
+         n_mask = n_offs < N
+         
+         # Accumulate dot product for this block of output neurons
+@@ -42,15 +50,16 @@
+         
+         for k_start in tl.range(0, K, BLOCK_K):
+             k_offs = k_start + tl.arange(0, BLOCK_K)
++            k_offs = tl.max_contiguous(tl.multiple_of(k_offs, BLOCK_K), BLOCK_K)  # ADD: alignment+contiguity hint
+             k_mask = k_offs < K
+             
+             # Load X[row_m, k_offs]: shape [BLOCK_K]
+             x_ptrs = X_ptr + row_m * stride_xm + k_offs * stride_xk
+-            x_vals = tl.load(x_ptrs, mask=k_mask, other=0.0)  # [BLOCK_K]
++            x_vals = tl.load(x_ptrs, mask=k_mask, other=0.0)  # [BLOCK_K] — now emits 128-bit vectorized loads
+             
+             # Load W[n_offs, k_offs]: shape [BLOCK_N, BLOCK_K]
+             w_ptrs = W_ptr + n_offs[:, None] * stride_wn + k_offs[None, :] * stride_wk
+-            w_vals = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)  # [BLOCK_N, BLOCK_K]
++            w_vals = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)  # [BLOCK_N, BLOCK_K] — vectorized along K
+             
+             # acc[n] += sum_k(x[k] * w[n,k])
+             acc += tl.sum(w_vals * x_vals[None, :], axis=1)
+@@ -68,7 +77,6 @@
+     
+     # Store result
+     tl.store(Out_ptr + row_m, total_sum)
+-
+ 
+ def kernel_function(weight, bias, x):
+     M, K = x.shape

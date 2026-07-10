@@ -1,0 +1,91 @@
+--- baseline
++++ rebuilt
+@@ -5,46 +5,48 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 64}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32}, num_warps=4, num_stages=2),
++    ],
++    key=['xnumel', 'r0_numel'],
++)
+ @triton.jit
+-def triton_per_fused__softmax_add_convolution_exp_mean_mul_prepare_softmax_online_sub_tanh_1(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr):
++def triton_per_fused__softmax_add_convolution_exp_mean_mul_prepare_softmax_online_sub_tanh_1(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
+     xnumel = 262144
+     r0_numel = 64
+-    R0_BLOCK: tl.constexpr = 64
+-    rnumel = r0_numel
+-    RBLOCK: tl.constexpr = R0_BLOCK
++
+     xoffset = tl.program_id(0) * XBLOCK
+     xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+-    xmask = tl.full([XBLOCK], True, tl.int1)[:, None]
+-    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+-    r0_offset = 0
+-    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]
+-    roffset = r0_offset
+-    rindex = r0_index
+-    r0_2 = r0_index
+     x0 = (xindex % 16384)
+     x1 = xindex // 16384
+-    x3 = xindex
+-    tmp0 = tl.load(in_out_ptr0 + (x0 + 16384*r0_2 + 1048576*x1), None)
+-    tmp3 = tl.load(in_ptr0 + (r0_2), None, eviction_policy='evict_last')
+-    tmp1 = tl.full([1, 1], 32.0, tl.float32)
+-    tmp2 = (tmp0 / tmp1)
+-    tmp4 = tmp2 + tmp3
+-    tmp5 = tl.broadcast_to(tmp4, [XBLOCK, R0_BLOCK])
+-    tmp7 = tl.broadcast_to(tmp5, [XBLOCK, R0_BLOCK])
+-    tmp9 = triton_helpers.max2(tmp7, 1)[:, None].to(tl.float32)
+-    tmp10 = tmp5 - tmp9
+-    tmp11 = tl.exp(tmp10)
+-    tmp12 = tl.broadcast_to(tmp11, [XBLOCK, R0_BLOCK])
+-    tmp14 = tl.sum(tmp12, 1)[:, None].to(tl.float32)
+-    tmp15 = tmp4 - tmp9
+-    tmp16 = tl.exp(tmp15)
+-    tmp17 = (tmp16 / tmp14)
+-    tmp18 = libdevice.tanh(tmp17)
+-    tmp19 = tl.full([1, 1], 2.0, tl.float32)
+-    tmp20 = tmp18 * tmp19
+-    tl.store(in_out_ptr0 + (x0 + 16384*r0_2 + 1048576*x1), tmp20, None)
+ 
++    # Loop 1: compute online softmax statistics (m_i, d_i)
++    m_i = tl.full([XBLOCK, 1], float('-inf'), tl.float32)
++    d_i = tl.zeros([XBLOCK, 1], tl.float32)
+ 
++    for r in tl.range(0, 64):
++        r_idx = tl.full([XBLOCK, 1], r, tl.int32)
++        val = tl.load(in_out_ptr0 + (x0 + 16384 * r_idx + 1048576 * x1))
++        bias = tl.load(in_ptr0 + r_idx, eviction_policy='evict_last')
++        score = val / 32.0 + bias
++        m_new = tl.maximum(m_i, score)
++        d_i = d_i * tl.exp(m_i - m_new) + tl.exp(score - m_new)
++        m_i = m_new
++
++    # Loop 2: normalize, apply tanh * 2.0, and store
++    for r in tl.range(0, 64):
++        r_idx = tl.full([XBLOCK, 1], r, tl.int32)
++        val = tl.load(in_out_ptr0 + (x0 + 16384 * r_idx + 1048576 * x1))
++        bias = tl.load(in_ptr0 + r_idx, eviction_policy='evict_last')
++        score = val / 32.0 + bias
++        softmax_val = tl.exp(score - m_i) / d_i
++        out = libdevice.tanh(softmax_val) * 2.0
++        tl.store(in_out_ptr0 + (x0 + 16384 * r_idx + 1048576 * x1), out)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -52,7 +54,7 @@
+     xnumel = 262144
+     r0_numel = 64
+     grid = (triton.cdiv(xnumel, 128),)
+-    triton_per_fused__softmax_add_convolution_exp_mean_mul_prepare_softmax_online_sub_tanh_1[grid](arg_0, arg_1, 262144, 64, XBLOCK=128)
++    triton_per_fused__softmax_add_convolution_exp_mean_mul_prepare_softmax_online_sub_tanh_1[grid](arg_0, arg_1, 262144, 64)
+     return arg_1
+ 
+ def get_inputs():

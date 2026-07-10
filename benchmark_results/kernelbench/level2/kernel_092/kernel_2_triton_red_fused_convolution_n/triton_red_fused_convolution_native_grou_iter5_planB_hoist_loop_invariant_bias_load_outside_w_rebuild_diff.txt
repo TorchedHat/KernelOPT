@@ -1,0 +1,75 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,26 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 1024}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 2048}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 1024}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 2048}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 512},  num_warps=4, num_stages=2, maxnreg=48),
++        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=4, num_stages=3, maxnreg=48),
++        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=8, num_stages=4, maxnreg=48),
++        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 2048}, num_warps=8, num_stages=4, maxnreg=48),
++        triton.Config({'XBLOCK': 4, 'R0_BLOCK': 1024}, num_warps=8, num_stages=3, maxnreg=48),
++        triton.Config({'XBLOCK': 8, 'R0_BLOCK': 512},  num_warps=4, num_stages=2, maxnreg=48),
++        triton.Config({'XBLOCK': 8, 'R0_BLOCK': 1024}, num_warps=8, num_stages=3, maxnreg=48),
++        triton.Config({'XBLOCK': 16, 'R0_BLOCK': 512},  num_warps=8, num_stages=3, maxnreg=48),
++        triton.Config({'XBLOCK': 16, 'R0_BLOCK': 256},  num_warps=4, num_stages=2, maxnreg=48),
++    ],
++    key=['xnumel', 'r0_numel'],
++)
+ @triton.jit
+ def triton_red_fused_convolution_native_group_norm_2(in_ptr0, in_ptr1, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+     xnumel = 2048
+@@ -22,6 +42,13 @@
+     tmp4_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+     tmp4_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+     x4 = xindex
++    # Preload entire bias tensor (64 floats) once before the reduction loop.
++    # bias_offset = r0_2 + 4*x0 where r0_2 in [0,3] and x0 in [0,15], so values in [0,63].
++    # Load as [XBLOCK, 64] so we can gather along dim=1 inside the loop.
++    bias_all_idx = tl.arange(0, 64)[None, :]  # shape [1, 64]
++    # Broadcast to [XBLOCK, 64] so tl.gather dim sizes match
++    bias_all_idx_bcast = tl.broadcast_to(bias_all_idx, [XBLOCK, 64])
++    tmp1_all = tl.load(in_ptr1 + bias_all_idx_bcast, mask=xmask, eviction_policy='evict_last', other=0.0)  # [XBLOCK, 64]
+     for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+         r0_index = r0_offset + r0_base
+         r0_mask = r0_index < r0_numel
+@@ -31,10 +58,11 @@
+         r0_3 = r0_index // 4
+         flat_offset = r0_2 + 4*x0 + 64*r0_3
+         flat_offset = tl.max_contiguous(tl.multiple_of(flat_offset, [1, 4]), [1, 4])
+-        bias_offset = r0_2 + 4*x0
+-        bias_offset = tl.max_contiguous(tl.multiple_of(bias_offset, [1, 4]), [1, 4])
+         tmp0 = tl.load(in_ptr0 + (flat_offset + 1016064*x1), mask=r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+-        tmp1 = tl.load(in_ptr1 + bias_offset, mask=r0_mask & xmask, eviction_policy='evict_last', other=0.0)
++        # Gather bias from preloaded [XBLOCK, 64] using bias_idx = r0_2 + 4*x0
++        # r0_2 shape: [XBLOCK, R0_BLOCK], x0 shape: [XBLOCK, 1] -> bias_idx: [XBLOCK, R0_BLOCK]
++        bias_idx = r0_2 + 4*x0  # [XBLOCK, R0_BLOCK], values in [0, 63]
++        tmp1 = tl.gather(tmp1_all, bias_idx, 1)  # gather from [XBLOCK, 64] along dim=1 -> [XBLOCK, R0_BLOCK]
+         tmp2 = tmp0 + tmp1
+         tmp3 = tl.broadcast_to(tmp2, [XBLOCK, R0_BLOCK])
+         tmp4_mean_next, tmp4_m2_next, tmp4_weight_next = triton_helpers.welford_reduce(
+@@ -50,7 +78,6 @@
+     tl.store(out_ptr0 + (x4), tmp4, mask=xmask)
+     tl.store(out_ptr1 + (x4), tmp8, mask=xmask)
+ 
+-
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+     arg_1 = inputs[1]
+@@ -59,7 +86,7 @@
+     xnumel = 2048
+     r0_numel = 63504
+     grid = (triton.cdiv(xnumel, 1),)
+-    triton_red_fused_convolution_native_group_norm_2[grid](arg_0, arg_1, arg_2, arg_3, 2048, 63504, XBLOCK=1, R0_BLOCK=1024)
++    triton_red_fused_convolution_native_group_norm_2[grid](arg_0, arg_1, arg_2, arg_3, 2048, 63504)
+     return arg_3
+ 
+ def get_inputs():

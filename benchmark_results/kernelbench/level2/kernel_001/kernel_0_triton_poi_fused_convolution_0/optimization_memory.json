@@ -1,0 +1,286 @@
+[
+  {
+    "item_id": "e691d7d3",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_via_autotune_tile_swap",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_via_autotune_tile_swap \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_via_autotune_tile_swap' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.710e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.055e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel copies from NCHW (contiguous, stride-1 in x) to a non-contiguous layout with output stride (150528, 1, 672, 3). The store address is y0 + 3*x2 + 150528*y1 where y0=yindex%3 (0..2) and x2 is the XBLOCK dimension. With XBLOCK=128 threads and YBLOCK=8, consecutive threads in a warp write to addresses that mix y0 and x2 values, creating a stride-3 scatter pattern. This causes 23% excess sectors (112896 of 489216) and 14.9-cycle L1TEX stalls (49.5% of CPI). Reducing YBLOCK to 1 means all threads share the same y0 constant per block, making the store pattern stride-3 monotonic \u2014 far fewer cache line conflicts. Additionally, the grid has only 1568 blocks for 132 SMs (0.74 waves), so autotune with larger XBLOCK increases wave count dramatically.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.710e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.055e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_fix_autotune_grid_lambda_evict_first_001",
+    "iteration": 2,
+    "speedup": 1.8188,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_strided_store_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.52,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5216.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.86,
+        "Occupancy.Achieved Occupancy": 29.26,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 26.13,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 21.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 1024.0,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.67,
+        "Instruction Statistics.Executed Instructions": 279104.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4763.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.39,
+        "Occupancy.Achieved Occupancy": 26.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.37,
+        "Instruction Statistics.Executed Instructions": 119168.0
+      }
+    },
+    "strategy_title": "Fix Autotune Grid Lambda + evict_first for Streaming Copy",
+    "strategy_description": "When a Triton kernel has @triton.autotune but the launch grid is a fixed tuple (not a META lambda), the autotuner's winning tile config is silently ignored and the kernel always runs with the hardcoded tile sizes. Fixing the grid to `lambda META: (cdiv(N, META['XBLOCK']), cdiv(M, META['YBLOCK']))` ensures the autotuner's selection is actually applied, reducing register pressure (21\u219216 regs/thread), eliminating dynamic shared memory (1KB\u21920), and cutting executed instructions by 57% (279K\u2192119K). Additionally, changing `eviction_policy='evict_last'` to `evict_first` on streaming loads with no L1 reuse avoids L1 cache pollution. Together these changes delivered 1.82x speedup on a layout-permutation kernel with CPIStall and UncoalescedGlobalAccess signals.",
+    "slow_pseudocode": "# Autotune present but grid is a FIXED TUPLE \u2014 autotuner winner is silently ignored\n@triton.autotune(configs=[Config({'XBLOCK':64,'YBLOCK':4}), ...], key=[...])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # no contiguity hints\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + N*x2 + big_stride*y1), tmp0, mask)\n\n# BUG: fixed tuple ignores autotuner's winning XBLOCK/YBLOCK\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "fast_pseudocode": "# Autotune with META lambda grid \u2014 winner is actually applied\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 2}, num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 4}, num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 8}, num_warps=2, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=3),\n        # ... more configs ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    # Add contiguity hints for load index\n    xindex = tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), 16), 16)[None, :] + xoffset\n    # evict_first for streaming loads with no L1 reuse\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_first')\n    tl.store(out_ptr + (y0 + N*x2 + big_stride*y1), tmp0, mask)\n\n# FIXED: META lambda so grid adapts to winning tile sizes\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "Triton kernel has @triton.autotune but the launch grid is a fixed tuple (not a META lambda), meaning the autotuner's tile selection is never applied; kernel performs a layout permutation or streaming copy with CPIStall (L1TEX) and UncoalescedGlobalAccess signals; load data has no L1 reuse (streaming pattern); registers_per_thread is elevated (>16) and dynamic shared memory is non-zero despite no explicit shared memory use in the kernel body.",
+    "do_not_apply_when": "Grid is already a META lambda (autotune is already correctly wired); kernel has intentional shared memory usage that should not be removed; load data is reused across iterations (evict_first would hurt hit rate); kernel is compute-bound rather than memory-latency-bound.",
+    "framework_notes": "Triton-specific: @triton.autotune with constexpr tile params (XBLOCK, YBLOCK) REQUIRES the launch grid to be `lambda META: (cdiv(N, META['XBLOCK']), cdiv(M, META['YBLOCK']))`. A static tuple grid silently ignores the autotuner's winning config. Adding `tl.max_contiguous` and `tl.multiple_of` hints on the load index helps the compiler generate better memory access patterns. `eviction_policy='evict_first'` is appropriate for streaming loads with no temporal reuse; `evict_last` is appropriate when data will be reused soon."
+  },
+  {
+    "item_id": "f3a2c891",
+    "iteration": 2,
+    "speedup": 0.4874,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "triton_autotune_num_stages_reduction_regression",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall (MIO stall) + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.52,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5216.0,
+        "Instruction Statistics.Executed Instructions": 279104.0,
+        "Launch Statistics.Registers Per Thread": 21.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 1.02,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 29.26,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 26.13
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17849.0,
+        "Instruction Statistics.Executed Instructions": 2193632.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Occupancy.Theoretical Occupancy": 81.25,
+        "Occupancy.Achieved Occupancy": 55.73,
+        "Launch Statistics.Waves Per SM": 0.91,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 49.92
+      }
+    },
+    "strategy_title": "Reducing num_stages to 1 in Triton autotune configs causes regression",
+    "strategy_description": "Replacing autotune configs that use num_stages=3 or num_stages=4 with configs that all use num_stages=1 caused a 2x+ slowdown: executed instructions exploded from 279K to 2.19M (7.9x), dynamic SMEM per block jumped from 1KB to 16KB, registers per thread increased from 21 to 32, and theoretical occupancy dropped from 100% to 81.25%. The MIO stall became the dominant bottleneck (32.6% of CPI) replacing the prior L1TEX stall, indicating that num_stages=1 eliminates software pipelining and forces the hardware to serialize memory operations. The actual plan intent (fixing a hardcoded grid) was not implemented \u2014 the diff only changed autotune configs, not the grid lambda, so the root cause was never addressed.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 all configs use num_stages=1, no pipelining\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 8},  num_warps=8, num_stages=1),\n    # ... all num_stages=1\n], key=['ynumel', 'xnumel'])",
+    "fast_pseudocode": "# BEFORE (baseline) \u2014 configs use num_stages=3/4 for software pipelining\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 4}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 8}, num_warps=8, num_stages=4),\n    # ... num_stages=3 or 4\n], key=['ynumel', 'xnumel'])",
+    "applicable_when": "Triton autotune configs are being modified and num_stages is being reduced to 1 across all configs for a memory-bound pointwise kernel.",
+    "do_not_apply_when": "Never reduce all autotune configs to num_stages=1 for memory-bound Triton kernels \u2014 this eliminates software pipelining, causes MIO queue stalls, inflates instruction count 7-8x, increases register pressure, and reduces theoretical occupancy by capping block limits via shared memory. Keep num_stages=3 or higher for memory-bound kernels to allow async memory prefetching.",
+    "framework_notes": "Triton-specific: num_stages controls the software pipeline depth for async memory loads. num_stages=1 disables pipelining entirely. For memory-bound kernels on H100/H200, num_stages=3 or 4 is typically optimal. The MIO stall (CPIStall rule, 32.6% of CPI) is the diagnostic signal that pipelining has been disabled."
+  },
+  {
+    "item_id": "triton_meta_lambda_grid_fix_003",
+    "iteration": 3,
+    "speedup": 1.836,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_to_use_meta_lambda",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + CPIStall + UncoalescedGlobalAccess + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4763.0,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Occupancy.Achieved Occupancy": 26.34,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Scheduler Statistics.No Eligible": 84.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.37,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.39,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4702.0,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Occupancy.Achieved Occupancy": 25.84,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Scheduler Statistics.No Eligible": 80.25,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.47,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.04,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      }
+    },
+    "strategy_title": "Fix Triton Autotune Grid: Static Tuple to META Lambda",
+    "strategy_description": "When a Triton kernel uses @triton.autotune with variable tile-size constexprs (e.g. XBLOCK, YBLOCK), the launch grid must be a META lambda so it adapts to whichever config the autotuner selects. A static grid tuple hardcoded to specific tile sizes causes the autotuner's winning config to be silently ignored at runtime. Fixing the grid to `lambda META: (cdiv(N, META['XBLOCK']), cdiv(M, META['YBLOCK']))` allows the autotuner to properly explore all configs and select the optimal tile sizes, yielding 1.84x speedup on a layout-permutation kernel with CPIStall, UncoalescedGlobalAccess, and SOLBottleneck signals.",
+    "slow_pseudocode": "# BUG: static grid ignores autotuner's winning config\n@triton.autotune(configs=[Config({'XBLOCK':128,'YBLOCK':8}), Config({'XBLOCK':64,'YBLOCK':4}), ...], key=[...])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    ...\n\n# Grid hardcoded to XBLOCK=128, YBLOCK=8 \u2014 autotuner config ignored\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "fast_pseudocode": "# CORRECT: META lambda adapts grid to autotuner's winning config\n@triton.autotune(configs=[Config({'XBLOCK':128,'YBLOCK':8}), Config({'XBLOCK':64,'YBLOCK':4}), ...], key=[...])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    ...\n\n# Grid uses META to match whichever tile sizes the autotuner selects\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)",
+    "applicable_when": "A Triton kernel has @triton.autotune with configs that vary constexpr tile parameters (XBLOCK, YBLOCK, BLOCK_SIZE, etc.) but the launch grid is a static tuple hardcoded to specific tile values. Profiling shows low waves_per_sm (<0.5), low achieved occupancy (<35%), high no-eligible-warp percentage (>65%), CPIStall (L1TEX), and UncoalescedGlobalAccess, indicating the autotuner's config selection is not being honored at launch.",
+    "do_not_apply_when": "The autotune configs all use the same tile sizes (only varying num_warps or num_stages), in which case a static grid tuple is correct. Also do not apply if the kernel has no @triton.autotune decorator at all. Do not reduce num_stages to 1 when making this fix (see separate negative item f3a2c891).",
+    "framework_notes": "Triton-specific: when @triton.autotune varies constexpr tile parameters, the launch grid MUST be a Python lambda accepting a META dict, e.g. `lambda META: (cdiv(N, META['XBLOCK']), cdiv(M, META['YBLOCK']))`. The META dict keys must exactly match the constexpr parameter names in the @triton.jit signature. A static tuple grid will silently ignore the autotuner's selected config and always use the hardcoded tile sizes. Keep num_stages=3 or higher in configs for memory-bound kernels."
+  },
+  {
+    "item_id": "a7f3b2e9",
+    "iteration": 3,
+    "speedup": 0.4941,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_lambda_evict_first_and_pipeline_stages",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall (MIO stall) + UncoalescedGlobalAccess + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4763.0,
+        "Instruction Statistics.Executed Instructions": 119168.0,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 26.34,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.78,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17607.0,
+        "Instruction Statistics.Executed Instructions": 2193632.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Occupancy.Theoretical Occupancy": 81.25,
+        "Occupancy.Achieved Occupancy": 55.4,
+        "Launch Statistics.Waves Per SM": 0.91,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 50.2
+      }
+    },
+    "strategy_title": "num_stages=3 + large XBLOCK configs cause instruction explosion",
+    "strategy_description": "Switching all autotune configs to num_stages=3 with large tile sizes (XBLOCK up to 1024, YBLOCK up to 16) caused a 2x+ slowdown: executed instructions exploded from 119K to 2.19M (18x), dynamic SMEM per block jumped from 0 to 16KB, registers per thread doubled from 16 to 32, and theoretical occupancy dropped from 100% to 81.25%. The dominant stall shifted from L1TEX (CPIStall before) to MIO queue full (33.2% of CPI after), indicating that large num_stages with large tile sizes creates excessive shared memory pressure that limits block occupancy and serializes memory operations. The xindex contiguity hint was also incorrectly rewritten \u2014 the before version used `tl.arange(0, XBLOCK)[None, :] + xoffset` (correct 2D shape), while the after version used `tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]` which applies the hint to a 1D range before broadcasting, potentially altering semantics. The net effect was a kernel that ran 3.7x longer (3.2us \u2192 11.78us) despite higher occupancy (26% \u2192 55%).",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 num_stages=3 with large tiles, wrong contiguity hint shape\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 8},  num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 1024,'YBLOCK': 4},  num_warps=8, num_stages=3),\n    # ... all num_stages=3, large tiles\n], key=['ynumel', 'xnumel'])\n# xindex hint applied to 1D before broadcast \u2014 shape issue\nxindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\ntmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_first')\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "fast_pseudocode": "# BEFORE (baseline) \u2014 small tiles, no dynamic SMEM, 16 regs/thread\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 4}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n    # small tiles, num_stages=3\n], key=['ynumel', 'xnumel'])\n# xindex hint applied after broadcast \u2014 correct 2D shape\nxindex = tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), 16), 16)[None, :] + xoffset\ntmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_first')\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "applicable_when": "Triton autotune configs use num_stages=3 with large tile sizes (XBLOCK>=256, YBLOCK>=8) causing dynamic SMEM per block to jump to 16KB+, registers per thread to double, and theoretical occupancy to drop below 85%.",
+    "do_not_apply_when": "Kernel has small tile sizes (XBLOCK<=128, YBLOCK<=8) where num_stages=3 does not create excessive SMEM pressure; kernel is genuinely compute-bound where larger tiles improve arithmetic intensity.",
+    "framework_notes": "Triton-specific: num_stages controls software pipeline depth and allocates shared memory buffers proportional to tile_size * num_stages * dtype_bytes. For small kernels with ynumel=30 (very few rows), large YBLOCK values (16) combined with num_stages=3 create disproportionate SMEM usage that caps block occupancy via Block Limit Shared Mem (dropped from 32 to 13 blocks/SM). The MIO stall (CPIStall, 33.2% of CPI) is the diagnostic signal that SMEM pipeline pressure is the bottleneck. Additionally, applying tl.max_contiguous/tl.multiple_of hints to a 1D arange before [None,:] broadcasting may differ semantically from applying them after broadcasting."
+  },
+  {
+    "item_id": "894be967",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_num_stages_to_eliminate_mio_stall_and_fix_grid_lambda",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall (MIO queue full) + IssueSlotUtilization + AchievedOccupancy + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_num_stages_to_eliminate_mio_stall_and_fix_grid_lambda \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_num_stages_to_eliminate_mio_stall_and_fix_grid_lambda' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.319e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.504e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel is in a regressed state caused by autotune configs that combine num_stages=3 with large tile sizes (XBLOCK up to 1024, YBLOCK up to 16). Triton's software pipeline allocates SMEM buffers proportional to tile_size x num_stages x dtype_bytes. With XBLOCK=1024, YBLOCK=4, num_stages=3, this creates ~16KB of dynamic SMEM per block, which caps block occupancy at 13 blocks/SM via Block Limit Shared Mem. This SMEM pressure serializes memory operations and fills the MIO instruction queue (33.2% of CPI stalled). The fix is to use num_stages=1 across all configs (eliminating SMEM pipeline buffers entirely for this simple pointwise/permutation kernel) and restrict tile sizes to small-to-medium values (XBLOCK<=256, YBLOCK<=8). Additionally, the launch grid is a static tuple hardcoded to XBLOCK=128, YBLOCK=8, which silently ignores the autotuner's winning config and must be fixed to a META lambda. The xindex contiguity hint must be applied AFTER tl.arange(0, XBLOCK) but BEFORE the [None,:] broadcast to preserve correct 2D semantics.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.319e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.657e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.504e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "b2d4f7a1",
+    "iteration": 4,
+    "speedup": 1.836,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "prune_large_tile_autotune_configs_to_prevent_smem_regression",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + UncoalescedGlobalAccess + CPIStall + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4702.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.04,
+        "Occupancy.Achieved Occupancy": 25.84,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Instruction Statistics.Executed Instructions": 119168.0,
+        "Launch Statistics.Waves Per SM": 0.37
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4692.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.98,
+        "Occupancy.Achieved Occupancy": 24.75,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0,
+        "Instruction Statistics.Executed Instructions": 119168.0,
+        "Launch Statistics.Waves Per SM": 0.37
+      }
+    },
+    "strategy_title": "Prune Large-Tile Autotune Configs to Prevent SMEM Regression",
+    "strategy_description": "When a Triton kernel uses @triton.autotune with num_stages=3, including large tile configs (XBLOCK>=256) causes dynamic SMEM per block to balloon (0\u219216KB+), doubling register pressure and capping theoretical occupancy below 85%. Removing these large-tile configs (XBLOCK=256/512/1024) while retaining small-tile configs (XBLOCK<=128) with num_stages=3 prevents the autotuner from selecting a regressive config, keeping registers at 16/thread, dynamic SMEM at 0, and allowing the autotuner to find the optimal small tile. This pruning step is a prerequisite companion to fixing the static grid tuple to a META lambda \u2014 both changes together yielded 1.84x speedup on a layout-permutation kernel.",
+    "slow_pseudocode": "# Large-tile configs present \u2014 autotuner may select XBLOCK=256/512/1024\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64,   'YBLOCK': 1}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 64,   'YBLOCK': 4}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 8}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 4}, num_warps=4, num_stages=3),  # SMEM regression risk\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 8}, num_warps=4, num_stages=3),  # SMEM regression risk\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 4}, num_warps=8, num_stages=3),  # SMEM regression risk\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 8}, num_warps=8, num_stages=3),  # SMEM regression risk\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 2}, num_warps=8, num_stages=3),  # SMEM regression risk\n], key=['ynumel', 'xnumel'])",
+    "fast_pseudocode": "# Large-tile configs removed \u2014 autotuner restricted to safe small-tile space\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 1}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 2}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 4}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 8}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n    # XBLOCK >= 256 removed to prevent SMEM pressure regression with num_stages=3\n], key=['ynumel', 'xnumel'])",
+    "applicable_when": "Triton autotune config list includes large tile sizes (XBLOCK>=256) combined with num_stages>=3; profiling shows dynamic SMEM per block is 0 and registers per thread is 16 in the baseline (small-tile) state; prior profiling of large-tile configs showed dynamic SMEM jumping to 16KB+, registers doubling to 32, and theoretical occupancy dropping below 85% with an 18x instruction count explosion.",
+    "do_not_apply_when": "Kernel is compute-bound and genuinely benefits from larger tiles (higher arithmetic intensity); num_stages=1 is used (no SMEM pipeline buffers allocated); the kernel has explicit shared memory usage that already limits occupancy; XBLOCK>=256 configs have been empirically verified not to cause SMEM pressure on the target architecture.",
+    "framework_notes": "Triton-specific: num_stages controls software pipeline depth and allocates shared memory buffers proportional to tile_size * num_stages * dtype_bytes. For kernels with small problem dimensions (e.g. ynumel=30), large YBLOCK combined with large XBLOCK and num_stages=3 creates disproportionate SMEM usage that caps block occupancy via Block Limit Shared Mem. The diagnostic signal is dynamic SMEM per block jumping from 0 to 16KB+ and Instruction Statistics.Executed Instructions exploding 7-18x. Always pair this pruning with the META lambda grid fix (item triton_meta_lambda_grid_fix_003)."
+  },
+  {
+    "item_id": "triton_expanded_autotune_configs_004",
+    "iteration": 4,
+    "speedup": 1.836,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_for_strided_layout_permutation",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4702.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.04,
+        "Occupancy.Achieved Occupancy": 25.84,
+        "Scheduler Statistics.No Eligible": 80.25,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.47,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Instruction Statistics.Executed Instructions": 119168.0,
+        "Launch Statistics.Registers Per Thread": 16.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4701.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 21.65,
+        "Occupancy.Achieved Occupancy": 25.18,
+        "Scheduler Statistics.No Eligible": 79.21,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.49,
+        "Launch Statistics.Waves Per SM": 0.37,
+        "Instruction Statistics.Executed Instructions": 119168.0,
+        "Launch Statistics.Registers Per Thread": 16.0
+      }
+    },
+    "strategy_title": "Expand Autotune Config Space for Strided Layout Permutation",
+    "strategy_description": "For Triton layout-permutation kernels with strided stores (UncoalescedGlobalAccess + CPIStall signals), expanding the autotune config space to include a broader range of XBLOCK (64\u20131024) and YBLOCK (1\u201316) combinations \u2014 including YBLOCK=1 and YBLOCK=2 which were absent before \u2014 allows the autotuner to find tile configurations that reduce Warp Cycles Per Issued Instruction (27.04\u219221.65 cycles, ~20% reduction). The key structural change is adding small-YBLOCK configs (YBLOCK=1, YBLOCK=2) alongside the existing YBLOCK=4/8/16 configs, giving the autotuner more freedom to minimize per-warp stall cycles. The speedup (1.836x) matches the prior META lambda fix iteration, confirming the config expansion is complementary to the grid lambda fix and does not regress performance.",
+    "slow_pseudocode": "# Autotune configs missing YBLOCK=1 and YBLOCK=2 variants\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 4}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 8}, num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 4}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 8}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 1024,'YBLOCK': 2}, num_warps=8, num_stages=3),\n], key=['ynumel', 'xnumel'])\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "fast_pseudocode": "# Expanded configs: add YBLOCK=1 and YBLOCK=2 for all XBLOCK sizes\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64,   'YBLOCK': 1},  num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 1},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 1},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 1},  num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 64,   'YBLOCK': 2},  num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 2},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 2},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 2},  num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 64,   'YBLOCK': 4},  num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 4},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 4},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 4},  num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 64,   'YBLOCK': 8},  num_warps=2, num_stages=3),\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 8},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 8},  num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 8},  num_warps=8, num_stages=4),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 8},  num_warps=8, num_stages=4),\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 16}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 16}, num_warps=8, num_stages=4),\n], key=['ynumel', 'xnumel'])\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "applicable_when": "Triton layout-permutation or streaming-copy kernel with UncoalescedGlobalAccess + CPIStall (L1TEX) signals, where the autotune config space is sparse (missing small YBLOCK values like 1 or 2), and the grid is already a META lambda. Warp Cycles Per Issued Instruction >20 and Eligible Warps Per Scheduler <0.5 indicate the autotuner has not found the optimal tile shape.",
+    "do_not_apply_when": "Autotune config space already covers YBLOCK=1 through YBLOCK=16 for all XBLOCK sizes; kernel is compute-bound rather than memory-latency-bound; adding more configs would cause unacceptable autotuning overhead at first run; YBLOCK=1 configs would create too many CTAs for the problem size (grid >> SM count * max_blocks_per_sm).",
+    "framework_notes": "Triton-specific: expanding the autotune config space has zero runtime cost after the first autotuning pass (configs are cached). YBLOCK=1 configs are particularly valuable for kernels with small ynumel (e.g. ynumel=30) where each CTA processes a single row, maximizing XBLOCK parallelism and minimizing inter-row address mixing in strided stores. Keep num_stages=3 or 4 for all configs to preserve software pipelining. The xindex contiguity hint `tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), 16), 16)[None, :] + xoffset` should be applied after the [None,:] broadcast, not before."
+  }
+]

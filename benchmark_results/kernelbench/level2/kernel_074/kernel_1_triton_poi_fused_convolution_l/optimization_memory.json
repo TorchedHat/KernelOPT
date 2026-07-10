@@ -1,0 +1,110 @@
+[
+  {
+    "item_id": "exp_triton_autotune_evict_first_regression_001",
+    "iteration": 1,
+    "speedup": 0.2365,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_with_evict_first_on_strided_streaming_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 68.77,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 88.6,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 92.76,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 47.06,
+        "Memory Workload Analysis.L2 Hit Rate": 11.77,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Occupancy.Achieved Occupancy": 84.14,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Waves Per SM": 31.03,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 37.53,
+        "Compute Workload Analysis.Issue Slots Busy": 36.12
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 290.78,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 19.4,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 25.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 81.38,
+        "Memory Workload Analysis.L2 Hit Rate": 24.78,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Achieved Occupancy": 68.79,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Waves Per SM": 82.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.45,
+        "Compute Workload Analysis.Issue Slots Busy": 70.92,
+        "Instruction Statistics.Executed Instructions": 159580160.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK + evict_first Causes Register Spill Regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20131024) caused registers per thread to double from 20 to 40, reducing theoretical occupancy from 100% to 75% and achieved occupancy from 84% to 69%. The autotuner selected XBLOCK=256 (not the intended 1024), and the grid hardcoded to cdiv(xnumel, 128) was not updated to use the lambda form, so the kernel ran with a mismatched grid\u2014executing 2x more total threads (16M vs 8M) and 2.7x more waves per SM (82.75 vs 31.03), inflating total instruction count ~8.7x (159M vs 18M). The evict_first change alone did not cause the regression; the critical flaw was the grid not being updated to use `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`, causing the autotuner's chosen XBLOCK to be ignored at launch while the fixed grid over-launched blocks.",
+    "slow_pseudocode": "# BEFORE (working, 68.77 us)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = tl.full([XBLOCK], True, tl.int1)[:]\n    tmp0 = tl.load(in_ptr0 + offset0, None, eviction_policy='evict_last')\n    # ... 7 more loads with evict_last\n    tl.store(out_ptr0 + x3, tl.maximum(...), None)\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](arg0, arg1, 8388608, XBLOCK=128)",
+    "fast_pseudocode": "# AFTER (broken, 290.78 us) \u2014 grid not updated to use autotuner XBLOCK\n@triton.autotune(configs=[Config({'XBLOCK': 1024}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel  # changed from tl.full\n    tmp0 = tl.load(in_ptr0 + offset0, xmask, eviction_policy='evict_first')\n    # ... 7 more loads with evict_first\n    tl.store(out_ptr0 + x3, tl.maximum(...), xmask)\n\n# BUG: grid still hardcoded to XBLOCK=128, ignores autotuner selection\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](arg0, arg1, 8388608)  # XBLOCK kwarg missing, grid wrong",
+    "applicable_when": "Never apply this exact pattern. The autotune + evict_first combination is theoretically sound but requires the grid to be a lambda that reads meta['XBLOCK'].",
+    "do_not_apply_when": "Do not add @triton.autotune without simultaneously changing the grid from a fixed tuple `(triton.cdiv(xnumel, FIXED_XBLOCK),)` to a lambda `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. Failure to do so causes the autotuner's chosen XBLOCK to be injected into the kernel body while the grid is computed with the old fixed block size, resulting in 2x\u20138x over-launch and massive instruction count inflation. Also avoid changing `xmask = tl.full([XBLOCK], True, tl.int1)` to `xmask = xindex < xnumel` when xnumel is guaranteed divisible by all XBLOCK configs\u2014this adds unnecessary predication overhead.",
+    "framework_notes": "Triton-specific: when using @triton.autotune, the grid MUST be a callable (lambda or function) that receives `meta` dict and reads `meta['XBLOCK']` (or whichever constexpr is being autotuned). A fixed-tuple grid bypasses the autotuner's block size selection entirely, causing the kernel to launch with the autotuner's XBLOCK in registers but the old block count in the grid\u2014resulting in duplicate or missing work."
+  },
+  {
+    "item_id": "triton_vectorized_hints_regression_001",
+    "iteration": 1,
+    "speedup": 0.4015,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tl_multiple_of_max_contiguous_hints_for_strided_gather",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 68.77,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 88.6,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 92.76,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 47.06,
+        "Memory Workload Analysis.L2 Hit Rate": 11.77,
+        "Instruction Statistics.Executed Instructions": 18350080.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 37.53,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Occupancy.Achieved Occupancy": 84.14,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors": 8388608.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 171.3,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 36.26,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 44.88,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 79.14,
+        "Memory Workload Analysis.L2 Hit Rate": 31.68,
+        "Instruction Statistics.Executed Instructions": 77004800.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.73,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Achieved Occupancy": 91.52,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors": 58720256.0
+      }
+    },
+    "strategy_title": "tl.multiple_of/max_contiguous Hints Worsen Strided Gather",
+    "strategy_description": "Adding tl.multiple_of and tl.max_contiguous hints to a stride-2 gather pattern (e.g., 3D max-pool with stride 2) caused a 2.5x regression. Despite L1 hit rate improving (47% \u2192 79%) and DRAM throughput dropping (88.6% \u2192 36.3%), executed instructions exploded from 18M to 77M and elapsed cycles tripled (101K \u2192 252K). The hints appear to have forced scalar/non-vectorized code paths or triggered autotune overhead that selected a suboptimal config, while also increasing register pressure (20 \u2192 32 registers/thread) and worsening uncoalesced sectors (8.4M \u2192 58.7M). For inherently strided gathers where adjacent threads access non-contiguous addresses, these hints mislead the compiler and produce worse code.",
+    "slow_pseudocode": "# BEFORE (fast baseline)\nxindex = xoffset + tl.arange(0, XBLOCK)[:]\nxmask = tl.full([XBLOCK], True, tl.int1)[:]\nbase = 2*x0 + 128*x1 + 8192*x2\ntmp0 = tl.load(in_ptr0 + base, None, eviction_policy='evict_last')\ntmp1 = tl.load(in_ptr0 + base + 1, None, eviction_policy='evict_last')\n# ... 6 more loads with offsets {64,65,4096,4097,4160,4161}\ntl.store(out_ptr0 + x3, tl.maximum(...), None)",
+    "fast_pseudocode": "# AFTER (slow regression)\nxindex = tl.max_contiguous(\n    tl.multiple_of(xoffset + tl.arange(0, XBLOCK)[:], XBLOCK), XBLOCK)\nxmask = xindex < xnumel  # introduced masking where none was needed\nbase = 2*x0 + 128*x1 + 8192*x2\ntmp0 = tl.load(in_ptr0 + base, xmask, eviction_policy='evict_last')\n# ... 7 more masked loads\ntl.store(out_ptr0 + x3, tl.maximum(...), xmask)\n# + @triton.autotune with 6 configs across XBLOCK in {128,256,512,1024}",
+    "applicable_when": "Never: this specific combination of tl.multiple_of + tl.max_contiguous on a stride-2 gather index caused severe regression. Do not apply.",
+    "do_not_apply_when": "Kernels with inherent stride-2 (or any non-unit stride) gather patterns where adjacent threads access non-contiguous memory addresses. The hints falsely assert contiguity/alignment that does not hold at the hardware level, causing the compiler to emit more instructions and worsening uncoalesced access. Also avoid introducing xmask guards when xnumel is exactly divisible by XBLOCK \u2014 the unnecessary predication adds overhead.",
+    "framework_notes": "Triton-specific: tl.multiple_of(x, n) asserts x is a multiple of n; tl.max_contiguous(x, n) asserts n consecutive elements of x are contiguous. These are compiler hints only \u2014 they do not change runtime values but do affect code generation. When the assertion does not match the actual access pattern (e.g., stride-2 gather where base=2*x0 means adjacent threads are NOT contiguous), the compiler may generate worse code. Additionally, adding @triton.autotune when the grid is hardcoded to cdiv(xnumel, 128) rather than cdiv(xnumel, XBLOCK) means autotune configs with different XBLOCK values are ignored at launch, wasting autotune overhead without benefit."
+  },
+  {
+    "item_id": "d93c323a",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "2d_tiling_l2_reuse_strided_gather",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "2d_tiling_l2_reuse_strided_gather \u2014 correctness failure",
+    "strategy_description": "Plan '2d_tiling_l2_reuse_strided_gather' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.742e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.814e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.963e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel implements a 3D max-pool with stride 2 using a flat 1D index decomposition: base = 2*x0 + 128*x1 + 8192*x2. Adjacent threads in a warp differ by 1 in x0, so their base addresses differ by 2 floats (8 bytes), meaning every 32-thread warp accesses 32 non-contiguous pairs \u2014 only 50% of each 128-byte cache line is used (confirmed by MemoryCacheAccessPattern: 16/32 bytes utilized per sector). This produces 8.4M excessive sectors (47% waste). The L2 hit rate is only 11.75%, so nearly all 8 loads per output element go to DRAM. Prior attempts with tl.multiple_of/tl.max_contiguous hints and autotune-only changes both regressed badly. The untried approach is to restructure the kernel to use a 2D tile (XBLOCK x YBLOCK) where the Y dimension iterates over the x2 (batch*channel) axis and the X dimension covers x0*x1 (spatial), so that multiple output elements sharing the same x2 coordinate are processed together. This allows the 8 loads per output element to reuse L2 cache lines across the YBLOCK dimension, since adjacent outputs in the Y direction share the same spatial neighborhood in the input.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.742e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.814e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.963e+00 > atol=0.001",
+    "framework_notes": null
+  }
+]

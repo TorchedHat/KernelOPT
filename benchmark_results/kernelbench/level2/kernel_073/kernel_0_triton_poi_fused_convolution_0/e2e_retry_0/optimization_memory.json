@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "2fc25e70",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_coalesced_access_and_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall + UncoalescedGlobalAccess + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_for_coalesced_access_and_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_for_coalesced_access_and_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.710e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.085e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a layout permutation from contiguous (N,C,H,W) to channel-last-like strided layout. With YBLOCK=8 and ynumel=30, the Y-tile covers yindex values whose y0=yindex%3 varies within the tile, producing stride-3 scatter writes to global memory (only 20/32 bytes per sector utilized). The grid of 1568 blocks on 132 SMs yields only 0.74 waves, leaving SMs idle. Autotuning XBLOCK and YBLOCK can: (a) set YBLOCK=1 so all threads share the same y0 value eliminating the stride-3 Y-scatter, and (b) vary XBLOCK to balance grid coverage vs per-block work for better SM utilization.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.710e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.085e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton-autotune-tile-vectorize-layout-permute-001",
+    "iteration": 1,
+    "speedup": 1.3881,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_shape_with_vectorized_load_hints",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.08,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8993.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.45,
+        "Compute Workload Analysis.Issue Slots Busy": 26.4,
+        "Compute Workload Analysis.Executed Ipc Active": 1.04,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.66,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.95,
+        "Occupancy.Achieved Occupancy": 56.74,
+        "Source Counters.UncoalescedGlobalAccess excessive sectors": 112896.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.38,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6519.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.28,
+        "Compute Workload Analysis.Issue Slots Busy": 42.76,
+        "Compute Workload Analysis.Executed Ipc Active": 1.67,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 26.64,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.66,
+        "Occupancy.Achieved Occupancy": 47.56,
+        "Source Counters.UncoalescedGlobalAccess excessive sectors": 50176.0
+      }
+    },
+    "strategy_title": "Autotune Tile Shape + Vectorized Load Hints for Layout Permute",
+    "strategy_description": "When a Triton kernel performing a layout permutation shows high CPIStall on L1TEX (>40% of warp cycles) and UncoalescedGlobalAccess, adding tl.max_contiguous + tl.multiple_of hints on the contiguous load dimension enables 128-bit vectorized loads. Pairing this with @triton.autotune over XBLOCK/YBLOCK/num_warps configurations allows the compiler to find the tile shape that best balances coalescing and SM wave coverage. In this case, warp cycles per issued instruction dropped from 30.45 to 17.28 and issue slot utilization improved from 26.4% to 42.76%, yielding a 1.39x speedup despite a slight occupancy reduction.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # no hints\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask)   # no vectorization\n    tl.store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)\n\n# Fixed tile launch\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 2}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=8),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 2}, num_warps=8),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Apply vectorization hints to 1D arange before broadcasting\n    xarange = tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), 16), 16)\n    xindex = xoffset + xarange[None, :]\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask)  # now vectorized\n    tl.store(out_ptr + (y0 + 3*x2 + big_stride*y1), tmp0, mask)  # stride-3 store unchanged\n\n# Autotune-driven launch\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton kernel performing layout permutation (contiguous load, strided store) with CPIStall on L1TEX >40% of warp cycles, UncoalescedGlobalAccess flagged with >10% excessive sectors, and Issue Slots Busy <30%. The load dimension is stride-1 contiguous and aligned to at least 16 elements.",
+    "do_not_apply_when": "Load access pattern is already strided or non-contiguous (hints would be incorrect). Store pattern is also contiguous (full vectorization of both sides is possible via different strategy). Kernel is already autotuned or tile shape is constrained by shared memory usage that would be exceeded by larger XBLOCK.",
+    "framework_notes": "tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), N), N) must be applied to the 1D arange BEFORE broadcasting to 2D with [None, :]. The multiple_of value (16 here) must evenly divide XBLOCK and xoffset at every program_id step. In CUDA, the equivalent is __builtin_assume_aligned or vectorized load intrinsics (float4). The autotune key must include all shape parameters that affect tile coverage to avoid cache collisions."
+  }
+]

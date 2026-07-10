@@ -1,0 +1,60 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused_convolution_sub_tanh_2(in_ptr0, in_ptr1, in_ptr2, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+    # XBLOCK=64 covers the full channel dim (stride=1 in in_ptr0)
+    # YBLOCK=1 covers one spatial element per block
+    # pid_x = batch index (0..31), pid_y = spatial tile
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # shape [1, XBLOCK], channel 0..63
+    yoffset = tl.program_id(1) * YBLOCK
+    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # shape [YBLOCK, 1], spatial 0..263168
+    ymask = yindex < 263169
+
+    y0 = xindex          # channel index 0..63, stride=1 in in_ptr0 -> COALESCED
+    y1 = tl.program_id(0)  # batch index 0..31 (scalar)
+    x2 = yindex          # spatial index 0..263168
+    y3 = y1 * 64 + y0   # output row: batch*64 + channel, shape [1, XBLOCK]
+
+    tmp0 = tl.load(in_ptr0 + (y0 + 64*x2 + 16842816*y1), ymask, eviction_policy='evict_last')
+    tmp1 = tl.load(in_ptr1 + (y0), None, eviction_policy='evict_last')
+    tmp3 = tl.load(in_ptr2 + (y0), None, eviction_policy='evict_last')
+    tmp2 = tmp0 + tmp1
+    tmp4 = tmp2 - tmp3
+    tmp5 = libdevice.tanh(tmp4)
+    tl.store(out_ptr0 + (x2 + 263169*y3), tmp5, ymask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    ynumel = 2048
+    xnumel = 263169
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_convolution_sub_tanh_2[grid](arg_0, arg_1, arg_2, arg_3, 2048, 263169, YBLOCK=8, XBLOCK=128)
+    return arg_3
+
+def get_inputs():
+    arg_0 = rand_strided((32, 64, 513, 513), (16842816, 1, 32832, 64), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((64,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((64, 1, 1), (1, 1, 1), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((32, 64, 513, 513), (16842816, 263169, 513, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

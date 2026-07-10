@@ -1,0 +1,141 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,19 @@
+ import math
+ 
+ # GEMM kernel: computes x @ W^T + bias, output shape [M, N]
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 512, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 512, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 1024, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 1024, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -26,55 +31,71 @@
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+     GROUP_M: tl.constexpr,
+ ):
+-    pid = tl.program_id(0)
+-    grid_m = tl.cdiv(M, BLOCK_M)
+-    grid_n = tl.cdiv(N, BLOCK_N)
+-
+-    width = GROUP_M * grid_n
+-    group_id = pid // width
+-    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+-    pid_m = group_id * GROUP_M + (pid % group_size)
+-    pid_n = (pid % width) // group_size
+-
++    pid_m = tl.program_id(0)
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    rk = tl.arange(0, BLOCK_K)
+-
+-    A = A_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+-    B = B_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+-
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-
+-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        a = tl.load(A, mask=(rm[:, None] < M) & (rk[None, :] < k_remaining), other=0.0)
+-        b = tl.load(B, mask=(rk[:, None] < k_remaining) & (rn[None, :] < N), other=0.0)
+-        acc = tl.dot(a, b, acc, allow_tf32=False)
+-        A += BLOCK_K * stride_ak
+-        B += BLOCK_K * stride_bk
+-
+-    # Add bias
+-    bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0)
+-    acc = acc + bias[None, :]
+-
+-    # Store result
+-    C = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+-    mask = (rm[:, None] < M) & (rn[None, :] < N)
+-    tl.store(C, acc.to(tl.float32), mask=mask)
+-
+-
+-# Reduction kernel: logsumexp + leaky_relu x2 + gelu x2
++
++    # Online logsumexp accumulators (held in registers)
++    row_max = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
++    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
++
++    # Iterate over N dimension in BLOCK_N tiles
++    for n_start in tl.range(0, N, BLOCK_N):
++        rn = n_start + tl.arange(0, BLOCK_N)
++        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++        rk = tl.arange(0, BLOCK_K)
++
++        # Pointer setup for this (row, col) tile
++        A = A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak
++        B = B_ptr + rk[:, None] * stride_bk + rn[None, :] * stride_bn
++
++        # Inner K loop: accumulate GEMM tile
++        for k in tl.range(0, tl.cdiv(K, BLOCK_K)):
++            k_remaining = K - k * BLOCK_K
++            a = tl.load(A, mask=(rm[:, None] < M) & (rk[None, :] < k_remaining), other=0.0)
++            b = tl.load(B, mask=(rk[:, None] < k_remaining) & (rn[None, :] < N), other=0.0)
++            acc = tl.dot(a, b, acc, allow_tf32=True)
++            A += BLOCK_K * stride_ak
++            B += BLOCK_K * stride_bk
++
++        # Add bias before reduction
++        bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0)
++        acc = acc + bias[None, :]
++
++        # Online logsumexp update
++        tile_max = tl.max(acc, axis=1)
++        new_max = tl.maximum(row_max, tile_max)
++        row_sum = row_sum * tl.exp(row_max - new_max) + tl.sum(tl.exp(acc - new_max[:, None]), axis=1)
++        row_max = new_max
++
++    # Compute logsumexp
++    lse = tl.log(row_sum) + row_max
++
++    # leaky_relu 1
++    neg_slope = 0.01
++    lr1 = tl.where(lse > 0.0, lse, lse * neg_slope)
++
++    # leaky_relu 2
++    lr2 = tl.where(lr1 > 0.0, lr1, lr1 * neg_slope)
++
++    # gelu 1: x * 0.5 * (1 + erf(x / sqrt(2)))
++    sqrt2_inv = 0.7071067811865476
++    g1 = lr2 * 0.5 * (libdevice.erf(lr2 * sqrt2_inv) + 1.0)
++
++    # gelu 2
++    g2 = g1 * 0.5 * (libdevice.erf(g1 * sqrt2_inv) + 1.0)
++
++    # Store output: [BLOCK_M] values at column 0 of C_ptr
++    tl.store(C_ptr + rm * stride_cm, g2, mask=rm < M)
++
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_N': 1024}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_N': 2048}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_N': 4096}, num_stages=2, num_warps=16),
+-        triton.Config({'BLOCK_N': 8192}, num_stages=2, num_warps=16),
+-        triton.Config({'BLOCK_N': 512}, num_stages=3, num_warps=4),
+     ],
+     key=['N'],
+ )
+ @triton.jit
++
+ def logsumexp_leakyrelu_gelu_kernel(
+     input_ptr, output_ptr,
+     M, N,

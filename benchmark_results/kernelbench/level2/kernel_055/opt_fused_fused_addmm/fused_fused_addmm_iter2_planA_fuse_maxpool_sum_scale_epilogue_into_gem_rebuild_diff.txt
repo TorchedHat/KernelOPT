@@ -1,0 +1,96 @@
+--- baseline
++++ rebuilt
+@@ -4,16 +4,18 @@
+ 
+ # GEMM kernel: computes out = x @ W.T + bias
+ # x: [M, K], W: [N, K], bias: [N], out: [M, N]
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # --- Safe configs: BLOCK_N in {64, 128, 256} only ---
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -51,40 +53,39 @@
+         mask_k = offs_k < k_remaining
+         x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0)
+         w = tl.load(w_ptrs, mask=mask_k[:, None] & (offs_n[None, :] < N), other=0.0)
+-        acc = tl.dot(x, w, acc)
++        acc = tl.dot(x, w, acc, allow_tf32=True)
+         x_ptrs += BLOCK_K * stride_xk
+         w_ptrs += BLOCK_K * stride_wk
+ 
+-    offs_m_out = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    offs_n_out = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    mask_out = (offs_m_out[:, None] < M) & (offs_n_out[None, :] < N)
+-
+-    bias = tl.load(B_ptr + offs_n_out, mask=offs_n_out < N, other=0.0)
++    bias = tl.load(B_ptr + offs_n, mask=offs_n < N, other=0.0)
+     acc = acc + bias[None, :]
+ 
+-    out_ptrs = Out_ptr + offs_m_out[:, None] * stride_om + offs_n_out[None, :] * stride_on
+-    tl.store(out_ptrs, acc.to(tl.float32), mask=mask_out)
++    # Fused epilogue: max-pool over adjacent pairs, sum-reduce, scale=0.5, atomic_add
++    # BLOCK_N is always even in all autotune configs (64, 128, 256).
++    BLOCK_N_HALF: tl.constexpr = BLOCK_N // 2
+ 
++    # Reshape [BLOCK_M, BLOCK_N] -> [BLOCK_M * BLOCK_N_HALF, 2] to split even/odd pairs
++    acc_flat = tl.reshape(acc, (BLOCK_M * BLOCK_N_HALF, 2))
++    # tl.split splits along the last axis: returns two tensors of shape [BLOCK_M * BLOCK_N_HALF]
++    v0, v1 = tl.split(acc_flat)
++    # Reshape back to [BLOCK_M, BLOCK_N_HALF]
++    v0 = tl.reshape(v0, (BLOCK_M, BLOCK_N_HALF))
++    v1 = tl.reshape(v1, (BLOCK_M, BLOCK_N_HALF))
+ 
+-# Fused kernel: max_pool1d(kernel_size=2) + sum + scale
+-# Input: [M, N] (result of linear)
+-# max_pool: for each row, take max of pairs -> [M, N//2]
+-# sum: sum over N//2 -> [M]
+-# scale: multiply by scale_factor -> [M]
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BLOCK_N': 256}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_N': 512}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_N': 1024}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_N': 2048}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_N': 4096}, num_stages=2, num_warps=16),
+-        triton.Config({'BLOCK_N': 256}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_N': 512}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_N': 1024}, num_stages=3, num_warps=8),
+-    ],
+-    key=['N_HALF'],
+-)
+-@triton.jit
++    # Max-pool over pairs: [BLOCK_M, BLOCK_N_HALF]
++    pooled = tl.maximum(v0, v1)
++
++    # Mask out-of-bounds positions to 0.0 before summing
++    offs_n_half = pid_n * BLOCK_N_HALF + tl.arange(0, BLOCK_N_HALF)
++    global_N_HALF = N // 2
++    mask_n_half = offs_n_half < global_N_HALF
++    mask_m = offs_m < M
++    pooled = tl.where(mask_n_half[None, :] & mask_m[:, None], pooled, 0.0)
++
++    # Sum-reduce along N_HALF dimension, scale by 0.5, atomic_add into output row
++    partial_sum = tl.sum(pooled, axis=1) * 0.5  # [BLOCK_M]
++    tl.atomic_add(Out_ptr + offs_m, partial_sum, mask=mask_m)
++
+ def maxpool_sum_scale_kernel(
+     In_ptr, Out_ptr,
+     M, N, N_HALF,

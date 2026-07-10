@@ -1,0 +1,135 @@
+[
+  {
+    "item_id": "cadba65e",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_xblock_reduce_grid_improve_fma_utilization",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_xblock_reduce_grid_improve_fma_utilization \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_xblock_reduce_grid_improve_fma_utilization' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is compute-bound at 81% SM throughput with 35.6M non-fused FP32 instructions vs 21M fused. NCU estimates 9-31% headroom from FMA conversion. The current XBLOCK=128 generates 524,288 grid blocks (248 waves/SM), creating excessive scheduling overhead and preventing the compiler from unrolling/vectorizing the inner arithmetic into FMA chains. The 5 broadcast vectors (4096 elements each) are already L1-cached at 84.5%, but with XBLOCK=128 each CTA only covers 128 of the 4096 columns, so the evict_last loads are repeated across many CTAs. Increasing XBLOCK to 1024 or 2048 reduces the grid 8-16x, gives the Triton compiler a wider loop body to emit FMA instructions, and reduces warp scheduling overhead. Registers per thread is only 20 (block limit = 21 blocks/SM), so there is headroom to increase XBLOCK without spilling.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_xblock_register_spill_regression_001",
+    "iteration": 1,
+    "speedup": 0.1045,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune_for_compute_efficiency",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 81.61,
+        "Occupancy.Block Limit Registers": 21.0,
+        "GPU Speed Of Light Throughput.Duration": 359.52,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 81.03,
+        "Launch Statistics.Waves Per SM": 248.24,
+        "Instruction Statistics.Executed Instructions": 230686720.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 61.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 46.55,
+        "Occupancy.Block Limit Registers": 4.0,
+        "GPU Speed Of Light Throughput.Duration": 3440.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 88.93,
+        "Launch Statistics.Waves Per SM": 992.97,
+        "Instruction Statistics.Executed Instructions": 2424832000.0
+      }
+    },
+    "strategy_title": "Wider XBLOCK Autotune Causes Register Spill and 10x Regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK values (256\u20132048) to a pointwise kernel that was already compute-bound caused registers per thread to jump from 20 to 61, collapsing theoretical occupancy from 100% to 50% and Block Limit Registers from 21 to 4. This increased waves/SM from 248 to 993 and total executed instructions by 10x, resulting in a 9.6x slowdown. When a Triton kernel's register count is already near the per-SM register file limit, increasing XBLOCK forces the compiler to allocate more registers for the wider tile's live values, causing severe occupancy collapse that far outweighs any FMA fusion benefit.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    # XBLOCK=128, 20 registers/thread, 100% theoretical occupancy\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = tl.full([XBLOCK], True, tl.int1)\n    # pointwise BN + GELU + ReLU body\n    tl.store(out + xindex, result, None)\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# DO NOT DO THIS when registers/thread is already low (<=24)\n# Adding autotune with larger XBLOCK causes register explosion\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 512},  num_warps=4),\n        triton.Config({'XBLOCK': 256},  num_warps=4),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    # XBLOCK selected by autotune -> 61 registers/thread, 50% theoretical occupancy\n    # 10x more total instructions, 9.6x slower\n    ...",
+    "applicable_when": "Kernel has very high registers/thread (>40) AND low theoretical occupancy (<60%) AND is memory-bound \u2014 wider tiles can amortize memory latency without worsening occupancy further.",
+    "do_not_apply_when": "Kernel already has low registers/thread (<=24) and high theoretical occupancy (>=90%); increasing XBLOCK in Triton causes the compiler to allocate significantly more registers for the wider tile, collapsing occupancy and dramatically increasing total instruction count. Also avoid when the kernel is already compute-bound with high waves/SM \u2014 wider tiles increase serialization.",
+    "framework_notes": "In Triton, XBLOCK size directly controls how many elements each thread block processes; larger XBLOCK forces the compiler to keep more live values in registers simultaneously. Unlike CUDA where register count is fixed at compile time, Triton's JIT compiler re-allocates registers per XBLOCK config, so autotune configs with large XBLOCK can unexpectedly triple register usage. Always check registers/thread in NCU after adding autotune with wider tiles."
+  },
+  {
+    "item_id": "exp_triton_rsqrt_autotune_xblock_regression_002",
+    "iteration": 2,
+    "speedup": 0.5279,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_for_vectorized_loads_and_reduced_launch_overhead",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 86.32,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 26.63,
+        "GPU Speed Of Light Throughput.Duration": 390.02,
+        "Instruction Statistics.Executed Instructions": 266338304.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Occupancy.Achieved Occupancy": 84.86,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 85.35,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 15.25,
+        "GPU Speed Of Light Throughput.Duration": 681.02,
+        "Instruction Statistics.Executed Instructions": 456130560.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Achieved Occupancy": 87.43,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.27
+      }
+    },
+    "strategy_title": "rsqrt Simplification + XBLOCK Autotune Causes Instruction Explosion",
+    "strategy_description": "Combining libdevice.rsqrt arithmetic simplification with @triton.autotune over larger XBLOCK configs (512\u20132048) on a compute-bound kernel caused executed instructions to balloon from 266M to 456M (1.7x increase) and duration to increase from 390 \u00b5s to 681 \u00b5s (1.75x slower). Registers per thread rose from 20 to 32, and DRAM throughput dropped from 26.6% to 15.3%, indicating the wider tiles did not improve memory efficiency. The rsqrt substitution itself reduced branch instructions (from 20.9M to 2.6M) and eliminated divergent branches, but the XBLOCK increase dominated with its instruction count inflation and register pressure increase. This confirms that on compute-bound pointwise kernels with low initial register counts, any XBLOCK increase via autotune regresses performance regardless of arithmetic simplifications applied simultaneously.",
+    "slow_pseudocode": "# BEFORE: fixed XBLOCK=128, no autotune, sqrt+int_div path\n@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    # 20 registers/thread, 266M instructions, 390us\n    tmp8 = tl.sqrt_rn(tmp7)\n    tmp9 = tl.full([1], 1, tl.int32)\n    tmp10 = (tmp9 / tmp8)\n    tmp11 = tl.full([1], 1.0, tl.float32)\n    tmp12 = tmp10 * tmp11\n    tmp13 = tmp4 * tmp12\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# AFTER (SLOWER): autotune over larger XBLOCK + rsqrt substitution\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 512}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 1024}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 2048}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 512}, num_warps=8, num_stages=4),\n    triton.Config({'XBLOCK': 1024}, num_warps=4, num_stages=4),\n], key=['xnumel'], restore_value=['in_out_ptr0'])\n@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    # 32 registers/thread, 456M instructions, 681us \u2014 1.75x SLOWER\n    tmp8 = libdevice.rsqrt(tmp7)  # arithmetic simplified correctly\n    tmp13 = tmp4 * tmp8           # but XBLOCK increase dominates negatively",
+    "applicable_when": "Kernel is memory-latency-bound (low DRAM throughput <30%, high memory stall cycles), and XBLOCK is small enough that loads are not coalesced into 128-bit transactions.",
+    "do_not_apply_when": "Kernel is already compute-bound (SM throughput >80%) with low initial register count (<=24 registers/thread); increasing XBLOCK via autotune will increase register pressure from 20 to 32+, inflate total instruction count by 1.7x\u20132.8x, and cause 1.75x\u20132.5x slowdown regardless of any arithmetic simplifications applied simultaneously. The XBLOCK increase effect dominates over any arithmetic savings.",
+    "framework_notes": "In Triton, combining arithmetic simplification (e.g. libdevice.rsqrt replacing sqrt+int_div) with @triton.autotune XBLOCK increase is a compound change where the XBLOCK regression dominates. The rsqrt substitution alone reduced branch instructions from 20.9M to 2.6M and eliminated divergent branches, which is a valid optimization, but was masked by the XBLOCK-induced instruction explosion. Future iterations should test rsqrt substitution in isolation without changing XBLOCK configs."
+  },
+  {
+    "item_id": "exp_triton_maxnreg_autotune_register_spill_negative_002",
+    "iteration": 2,
+    "speedup": 0.642,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_maxnreg_to_restore_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 84.86,
+        "Occupancy.Block Limit Registers": 21.0,
+        "GPU Speed Of Light Throughput.Duration": 390.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 86.32,
+        "Instruction Statistics.Executed Instructions": 266338304.0,
+        "Launch Statistics.Waves Per SM": 248.24
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 88.26,
+        "Occupancy.Block Limit Registers": 16.0,
+        "GPU Speed Of Light Throughput.Duration": 559.97,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 88.33,
+        "Instruction Statistics.Executed Instructions": 390070272.0,
+        "Launch Statistics.Waves Per SM": 248.24
+      }
+    },
+    "strategy_title": "maxnreg Cap on Already-Low-Register Kernel Increases Instruction Count",
+    "strategy_description": "Applying maxnreg=32/40 to a Triton autotune config when the baseline kernel already uses only 20 registers/thread caused registers to increase to 28 and total executed instructions to jump from 266M to 390M (+46%), increasing duration from 390\u00b5s to 560\u00b5s (0.64x). The kernel was already at 100% theoretical occupancy and 84.9% achieved occupancy before the change; adding maxnreg alongside larger XBLOCK configs (256\u2013512) forced the compiler to spill or restructure register allocation in a way that increased instruction count without improving occupancy. When a kernel is already register-efficient and compute-bound with high occupancy, adding maxnreg constraints combined with wider XBLOCK tiles is counterproductive \u2014 the wider tiles increase total work per block and the register cap forces additional spill/reload instructions.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    # XBLOCK=128 (static), 20 registers/thread\n    # 100% theoretical occupancy, 84.9% achieved\n    # 266M total instructions, 390\u00b5s duration\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    # BN + GELU + ReLU pointwise body\n    tl.store(out + xindex, result)\n\ngrid = (cdiv(xnumel, 128),)",
+    "fast_pseudocode": "# DO NOT DO THIS when baseline registers/thread is already low (<=24)\n# and theoretical occupancy is already 100%\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 256}, num_warps=4, maxnreg=32),  # BAD\n        triton.Config({'XBLOCK': 512}, num_warps=4, maxnreg=32),  # BAD\n        triton.Config({'XBLOCK': 256}, num_warps=8, maxnreg=40),  # BAD\n        triton.Config({'XBLOCK': 512}, num_warps=8, maxnreg=40),  # BAD\n    ],\n    key=['xnumel'],\n    restore_value=['in_out_ptr0'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    # Result: 28 registers/thread, 390M instructions (+46%), 560\u00b5s (+44%)\n    ...",
+    "applicable_when": "maxnreg is useful when registers/thread is genuinely high (>40) AND Block Limit Registers is the binding occupancy constraint (e.g., Block Limit Registers << Block Limit Warps). The baseline kernel must have low theoretical occupancy (<75%) caused specifically by register pressure.",
+    "do_not_apply_when": "Kernel already has low registers/thread (<=24) and theoretical occupancy at or near 100%. In this regime, adding maxnreg combined with wider XBLOCK autotune configs increases total instruction count (spill/reload overhead + more work per block) without improving occupancy, causing regression. Also avoid when the kernel is already compute-bound at high SM throughput (>85%) with high achieved occupancy (>80%) \u2014 there is no occupancy headroom to recover.",
+    "framework_notes": "In Triton, maxnreg is a per-Config parameter in triton.Config() that maps to the PTX .maxnreg directive. It caps register allocation per thread but can force the compiler to emit additional load/store instructions for spilled values. When combined with larger XBLOCK (wider tiles), the compiler must manage more live values simultaneously, making spilling more likely even with a generous cap like maxnreg=40. Always verify that the baseline registers/thread is actually high before applying this optimization."
+  }
+]

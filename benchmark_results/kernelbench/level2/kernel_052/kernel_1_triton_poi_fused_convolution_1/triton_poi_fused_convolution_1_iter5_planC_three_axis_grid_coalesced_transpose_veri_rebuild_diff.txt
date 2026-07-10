@@ -1,0 +1,60 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,42 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+-def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
++def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
++    # Tensor: (B=32, C=128, H=126, W=250)
++    # Input strides:  (4032000, 1, 32000, 128)  -- C is stride-1
++    # Output strides: (4032000, 31500, 250, 1)  -- W is stride-1
++    # XBLOCK = spatial tile size (32), YBLOCK = channel tile size (128)
++    HW = 31500
++    pid_x = tl.program_id(0)   # spatial tile
++    pid_c = tl.program_id(1)   # channel tile
++    pid_b = tl.program_id(2)   # batch index
+ 
++    # Spatial offsets -- stride-1 in OUTPUT (W dimension)
++    x_off = pid_x * XBLOCK + tl.arange(0, XBLOCK)  # [XBLOCK]
++    x_mask = x_off < HW
++    h = x_off // 250   # [XBLOCK]
++    w = x_off % 250    # [XBLOCK]
+ 
++    # Channel offsets -- stride-1 in INPUT (exact fit: YBLOCK=C=128, no mask needed)
++    c_off = pid_c * YBLOCK + tl.arange(0, YBLOCK)  # [YBLOCK]
++
++    # Input index: b*4032000 + c*1 + h*32000 + w*128  => shape [XBLOCK, YBLOCK]
++    in_idx = (pid_b * 4032000
++              + c_off[None, :]        # [1, YBLOCK] stride-1 -> coalesced load
++              + h[:, None] * 32000    # [XBLOCK, 1]
++              + w[:, None] * 128)     # [XBLOCK, 1]
++
++    # Output index: b*4032000 + c*31500 + h*250 + w*1  => shape [XBLOCK, YBLOCK]
++    out_idx = (pid_b * 4032000
++               + c_off[None, :] * 31500  # [1, YBLOCK]
++               + h[:, None] * 250        # [XBLOCK, 1]
++               + w[:, None])             # [XBLOCK, 1] stride-1 -> coalesced store
++
++    mask = x_mask[:, None]  # [XBLOCK, 1] broadcast over YBLOCK
++    tmp0 = tl.load(in_ptr0 + in_idx, mask=mask)
++    tl.store(out_ptr0 + out_idx, tmp0, mask=mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

@@ -1,0 +1,67 @@
+[
+  {
+    "item_id": "a110f526",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "online_softmax_attention",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "online_softmax_attention \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'online_softmax_attention' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\nte-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compi",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses XBLOCK=128 with R0_BLOCK=64, creating a [128, 64] 2D tile per CTA. Each thread holds 64 fp32 values in registers simultaneously (for the broadcast + reduction), driving register usage to 128 registers/thread. This limits occupancy to 4 blocks/SM (25% theoretical). The 2D shared-memory layout for the reduction also causes severe bank conflicts (8.9-way for stores, 8.6-way for loads, ~88% excessive wavefronts). Switching to an online softmax eliminates the need to materialize the full [XBLOCK, R0_BLOCK] tile in registers: instead, each thread streams over the 64 elements in a loop, maintaining only scalar running_max and running_sum accumulators. This collapses register pressure dramatically, improves occupancy, and eliminates the shared-memory bank conflicts caused by the 2D tile layout.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nte-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_xblock_coalescing",
+    "iteration": 1,
+    "speedup": 6.4505,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_fix_uncoalesced_shared_and_global_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 128.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 22.89,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.76,
+        "Scheduler Statistics.No Eligible": 51.62,
+        "GPU Speed Of Light Throughput.Duration": 49.54,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 18.93,
+        "Memory Workload Analysis.L2 Hit Rate": 50.6,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 44.35,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 42.68,
+        "Launch.Waves Per SM": 3.88
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 18.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 70.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.89,
+        "Scheduler Statistics.No Eligible": 70.41,
+        "GPU Speed Of Light Throughput.Duration": 7.68,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 68.98,
+        "Memory Workload Analysis.L2 Hit Rate": 95.81,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 1.41,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.89,
+        "Launch.Waves Per SM": 0.97
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Fix Uncoalesced Access and Register Pressure",
+    "strategy_description": "When a Triton kernel has a large hardcoded XBLOCK (e.g. 128) but the reduction dimension has a large non-unit stride, each warp's threads access non-contiguous memory, causing massive shared/global memory bank conflicts (88%+ excessive wavefronts per NCU UncoalescedSharedAccess rule). Simultaneously, a large XBLOCK inflates register usage per thread (128 registers/thread), capping theoretical occupancy at 25%. Adding a @triton.autotune decorator with small XBLOCK configs (1, 4, 8, 16) allows the autotuner to select a tile size where threads access contiguous memory (stride-1 dimension), collapsing register count from 128 to 18, raising theoretical occupancy from 25% to 100%, and improving L1 hit rate from 19% to 69% and L2 hit rate from 51% to 96%.",
+    "slow_pseudocode": "# Hardcoded XBLOCK=128, no autotune\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\n    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]  # R0_BLOCK=64\n    # Non-contiguous load: stride between r0 elements = 16384\n    tmp0 = tl.load(ptr + (x0 + 16384*r0_2 + 1048576*x1), None)\n    ...\n    tl.store(ptr + (x0 + 16384*r0_2 + 1048576*x1), result, None)\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned XBLOCK from {1,4,8,16}, kernel body unchanged\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 4},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 8},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 16}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 4},  num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 8},  num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 16}, num_warps=8, num_stages=2),\n    ],\n    key=['xnumel', 'r0_numel'],\n    restore_value=['in_out_ptr0'],  # needed if kernel writes in-place\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # now small (e.g. 4)\n    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]\n    xmask = xindex < xnumel  # add mask since xnumel may not divide XBLOCK\n    r0_index = tl.arange(0, R0_BLOCK)[None, :]\n    tmp0 = tl.load(ptr + (x0 + 16384*r0_2 + 1048576*x1), xmask)\n    ...\n    tl.store(ptr + (x0 + 16384*r0_2 + 1048576*x1), result, xmask)\n\n# Grid is now a lambda; XBLOCK injected by autotuner\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](...)",
+    "applicable_when": "NCU reports UncoalescedSharedAccess or SharedMemoryConflicts with >80% excessive wavefronts; registers_per_thread is very high (>64) due to large XBLOCK; theoretical occupancy is low (<30%) with Block Limit Registers as the binding constraint; the tensor's reduction dimension has a large non-unit stride while the x-dimension has stride 1; XBLOCK is hardcoded to a large value (>=64) without autotuning.",
+    "do_not_apply_when": "The kernel is already memory-bandwidth bound at near-peak DRAM utilization (reducing XBLOCK would increase grid size without benefit); the reduction dimension is the contiguous dimension (stride 1) making large XBLOCK beneficial for coalescing; the kernel is compute-bound with high SM throughput (>80%); xnumel is very small and a large XBLOCK is needed to generate enough parallelism.",
+    "framework_notes": "Triton-specific: use @triton.autotune with configs varying XBLOCK; set key=['xnumel', 'r0_numel'] to cache per problem size; use restore_value for in-place kernels so autotuner can re-run trials. Grid must become a lambda: lambda META: (triton.cdiv(xnumel, META['XBLOCK']),). Remove the explicit XBLOCK= argument from the kernel call site. Add xmask = xindex < xnumel and pass it to tl.load/tl.store since small XBLOCK values may not evenly divide xnumel."
+  }
+]

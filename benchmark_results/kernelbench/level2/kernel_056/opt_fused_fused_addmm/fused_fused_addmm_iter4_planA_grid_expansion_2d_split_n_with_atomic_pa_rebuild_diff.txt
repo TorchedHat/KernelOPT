@@ -1,0 +1,122 @@
+--- baseline
++++ rebuilt
+@@ -1,6 +1,7 @@
+ import torch
+ import triton
+ import triton.language as tl
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -10,6 +11,12 @@
+         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=4),
+         triton.Config({'BLOCK_N': 512, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+         triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 512, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
++        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_N': 512, 'BLOCK_K': 128}, num_warps=8, num_stages=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -22,53 +29,54 @@
+     BLOCK_N: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+ ):
+-    # Each program handles one row of X (one batch element)
+-    # Computes: sum_n(sigmoid(sum_k(X[m,k] * W[n,k]) + B[n]))
+-    row_m = tl.program_id(0)
+-    
++    # Each program handles one (row_m, n_tile) pair
++    # Computes partial: sum_n_in_tile(sigmoid(sum_k(X[m,k] * W[n,k]) + B[n]))
++    row_m = tl.program_id(0)   # which input row
++    tile_n = tl.program_id(1)  # which N-tile
++
+     if row_m >= M:
+         return
+-    
+-    # Accumulate the final sum over all output neurons
+-    total_sum = tl.zeros((), dtype=tl.float32)
+-    
+-    # We tile over the output dimension N
+-    for n_start in tl.range(0, N, BLOCK_N):
+-        n_offs = n_start + tl.arange(0, BLOCK_N)
+-        n_mask = n_offs < N
+-        
+-        # Accumulate dot product for this block of output neurons
+-        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+-        
+-        for k_start in tl.range(0, K, BLOCK_K):
+-            k_offs = k_start + tl.arange(0, BLOCK_K)
+-            k_mask = k_offs < K
+-            
+-            # Load X[row_m, k_offs]: shape [BLOCK_K]
+-            x_ptrs = X_ptr + row_m * stride_xm + k_offs * stride_xk
+-            x_vals = tl.load(x_ptrs, mask=k_mask, other=0.0)  # [BLOCK_K]
+-            
+-            # Load W[n_offs, k_offs]: shape [BLOCK_N, BLOCK_K]
+-            w_ptrs = W_ptr + n_offs[:, None] * stride_wn + k_offs[None, :] * stride_wk
+-            w_vals = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)  # [BLOCK_N, BLOCK_K]
+-            
+-            # acc[n] += sum_k(x[k] * w[n,k])
+-            acc += tl.sum(w_vals * x_vals[None, :], axis=1)
+-        
+-        # Add bias
+-        b_vals = tl.load(B_ptr + n_offs, mask=n_mask, other=0.0)
+-        acc += b_vals
+-        
+-        # Apply sigmoid: 1 / (1 + exp(-x))
+-        sig = 1.0 / (1.0 + tl.exp(-acc))
+-        
+-        # Mask and accumulate into total sum
+-        sig = tl.where(n_mask, sig, 0.0)
+-        total_sum += tl.sum(sig, axis=0)
+-    
+-    # Store result
+-    tl.store(Out_ptr + row_m, total_sum)
+ 
++    # Compute n offsets for this tile
++    n_start = tile_n * BLOCK_N
++    n_offs = n_start + tl.arange(0, BLOCK_N)
++    n_offs = tl.max_contiguous(tl.multiple_of(n_offs, BLOCK_N), BLOCK_N)
++    n_mask = n_offs < N
++
++    # Accumulate dot product for this block of output neurons
++    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
++
++    for k_start in tl.range(0, K, BLOCK_K):
++        k_offs = k_start + tl.arange(0, BLOCK_K)
++        k_offs = tl.max_contiguous(tl.multiple_of(k_offs, BLOCK_K), BLOCK_K)
++        k_mask = k_offs < K
++
++        # Load X[row_m, k_offs]: shape [BLOCK_K]
++        x_ptrs = X_ptr + row_m * stride_xm + k_offs * stride_xk
++        x_vals = tl.load(x_ptrs, mask=k_mask, other=0.0)
++
++        # Load W[n_offs, k_offs]: shape [BLOCK_N, BLOCK_K]
++        w_ptrs = W_ptr + n_offs[:, None] * stride_wn + k_offs[None, :] * stride_wk
++        w_vals = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
++
++        # acc[n] += sum_k(x[k] * w[n,k])
++        acc += tl.sum(w_vals * x_vals[None, :], axis=1)
++
++    # Add bias
++    b_vals = tl.load(B_ptr + n_offs, mask=n_mask, other=0.0)
++    acc += b_vals
++
++    # Apply sigmoid: 1 / (1 + exp(-x))
++    sig = 1.0 / (1.0 + tl.exp(-acc))
++
++    # Mask out-of-bounds lanes before summing
++    sig = tl.where(n_mask, sig, 0.0)
++
++    # Partial sum for this N-tile
++    partial = tl.sum(sig, axis=0)
++
++    # Atomically accumulate into the output row
++    tl.atomic_add(Out_ptr + row_m, partial)
+ 
+ def kernel_function(weight, bias, x):
+     M, K = x.shape

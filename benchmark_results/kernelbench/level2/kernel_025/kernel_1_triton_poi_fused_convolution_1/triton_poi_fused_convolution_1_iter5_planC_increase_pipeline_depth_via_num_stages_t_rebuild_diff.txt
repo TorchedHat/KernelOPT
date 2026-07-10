@@ -1,0 +1,81 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,57 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        # Existing num_stages=2 configs
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=4, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=8, num_stages=2),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=2, num_stages=2),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=2, num_stages=2),
++        # New num_stages=3 configs
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 128}, num_warps=8, num_stages=3),
++        # New num_stages=4 configs (smaller tiles to control register pressure)
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=4, num_stages=4),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 64},  num_warps=8, num_stages=4),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+     ynumel = 4096
+     xnumel = 31500
++    # program_id(0) covers ynumel (channel+batch) — FAST dim for coalescing (stride-1 in input)
++    # program_id(1) covers xnumel (spatial) — SLOW dim (stride-128 in input)
+     yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
++    yindex = yoffset + tl.max_contiguous(tl.multiple_of(tl.arange(0, YBLOCK), YBLOCK), YBLOCK)[:, None]   # spatial (stride-128 in input)
++    ymask = yindex < xnumel
+     xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
+-
+-
++    xindex = xoffset + tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]   # channel+batch (stride-1 in input)
++    xmask = xindex < ynumel
++    x0 = (xindex % 128)   # channel within group, stride-1 in input — COALESCED!
++    x1 = xindex // 128    # batch index
++    y2 = yindex           # spatial index, stride-128 in input
++    # Load: consecutive threads (xindex) access x0 with stride-1 -> COALESCED
++    tmp0 = tl.load(in_ptr0 + (x0 + 128*y2 + 4032000*x1), xmask & ymask, eviction_policy='evict_last')
++    # Transpose register tile: [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK] (zero-cost register reorder)
++    tmp_t = tl.trans(tmp0)
++    # Re-derive store indices with swapped roles for coalesced store:
++    xindex_t = xoffset + tl.arange(0, XBLOCK)[:, None]   # slow dim: stride-31500 in output
++    yindex_t = yoffset + tl.arange(0, YBLOCK)[None, :]   # fast dim: stride-1 in output -> COALESCED
++    xmask_t = xindex_t < ynumel   # ynumel=4096
++    ymask_t = yindex_t < xnumel   # xnumel=31500
++    # Store: consecutive threads differ in yindex_t (stride-1) -> COALESCED (1 txn/warp)
++    tl.store(out_ptr0 + (yindex_t + 31500*xindex_t), tmp_t, xmask_t & ymask_t)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +63,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

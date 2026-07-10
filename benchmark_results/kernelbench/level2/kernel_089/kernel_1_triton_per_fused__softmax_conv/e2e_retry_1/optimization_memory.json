@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "69454392",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "online_softmax_attention",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "online_softmax_attention \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'online_softmax_attention' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n1/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/c",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is memory-bound (DRAM SOL 82%, L2 SOL 91%) with 50% excess sectors from uncoalesced global accesses. The 8 loads from in_ptr0 each stride by 131072 elements along the r0_4 reduction dimension, causing severe cache thrashing (L1 hit 27%, L2 hit 22%). The current implementation performs a multi-pass softmax over the 2D [XBLOCK, R0_BLOCK] tile with evict_last on a 524KB-strided tensor that pollutes L1/L2. Restructuring to an online softmax (single-pass loop over r0_4 with running max and normalizer) reduces simultaneous live registers, allows evict_first streaming policy, and eliminates the 2D broadcast pattern that causes uncoalesced access.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n1/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_stride2_coalescing_fix",
+    "iteration": 1,
+    "speedup": 3.7512,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_stride2_uncoalesced_global_loads_by_reindexing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 82.08,
+        "GPU Speed Of Light Throughput.Duration": 275.71,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 27.44,
+        "Memory Workload Analysis.L2 Hit Rate": 22.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.88,
+        "Compute Workload Analysis.Issue Slots Busy": 37.49,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 36.35,
+        "Source Counters (excessive sectors)": 33554432.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.DRAM Throughput": 10.9,
+        "GPU Speed Of Light Throughput.Duration": 73.5,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 67.77,
+        "Memory Workload Analysis.L2 Hit Rate": 74.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.49,
+        "Compute Workload Analysis.Issue Slots Busy": 67.05,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 96.74,
+        "Source Counters (excessive sectors)": 13631488.0
+      }
+    },
+    "strategy_title": "Reindex xindex decomposition to eliminate stride-2 warp loads",
+    "strategy_description": "When the innermost warp dimension (xindex % N) maps to a stride-2 position in a global tensor, consecutive threads access elements 8 bytes apart, causing every warp to touch 2 cache lines instead of 1 and generating ~50% excessive sectors (flagged by UncoalescedGlobalAccess). Fixing this by reducing XBLOCK so the innermost decomposition variable maps to the stride-1 dimension of the tensor (e.g., changing x0 = xindex%32 with offset 2*x0 to x0 = xindex%64 with offset x0) eliminates the stride-2 pattern, cuts DRAM throughput from 82% to 11%, raises L1 hit rate from 27% to 68%, and reduces warp stall cycles by ~44%. Switching eviction policy from evict_last to evict_first on streaming loads that are not reused across CTAs further prevents L1 cache pollution.",
+    "slow_pseudocode": "# XBLOCK=128, stride-2 uncoalesced\nx0 = xindex % 32          # maps to stride-2 dim -> UNCOALESCED\nx1 = (xindex // 32) % 32\nx2 = (xindex // 1024) % 16\nx3 = xindex // 16384\n# Load offset has factor 2*x0 -> stride-2\ntmp = tl.load(ptr + (2*x0 + 128*x1 + 8192*x2 + 131072*r + 2097152*x3),\n              eviction_policy='evict_last')",
+    "fast_pseudocode": "# XBLOCK=64, stride-1 coalesced\nx0 = xindex % 64          # maps to stride-1 dim -> COALESCED\nx1 = (xindex // 64) % 32\nx2 = (xindex // 2048) % 16\nx3 = xindex // 32768\n# Load offset has factor x0 (no multiplier) -> stride-1\ntmp = tl.load(ptr + (x0 + 64*x1 + 4096*x2 + 131072*r + 2097152*x3),\n              eviction_policy='evict_first')\n# Also add @triton.autotune with XBLOCK in [32,64,128], num_warps in [4,8]",
+    "applicable_when": "NCU UncoalescedGlobalAccess rule fires with >40% excessive sectors; DRAM throughput >70%; L1 hit rate <35%; warp stall cycles dominated by L1TEX dependency (CPIStall_L1TEX >60%); the load index contains a factor of 2 (or other integer >1) applied to the variable derived from xindex%N, indicating the innermost warp dimension maps to a non-unit stride in the tensor layout.",
+    "do_not_apply_when": "The tensor's innermost dimension is already stride-1 and the load index has no multiplier on the warp-lane variable; when DRAM throughput is low and the bottleneck is compute or shared memory; when reducing XBLOCK would break the correctness of the index decomposition for other tensors accessed in the same kernel.",
+    "framework_notes": "Triton-specific: XBLOCK controls how many x-dimension elements each program handles. Changing XBLOCK from 128 to 64 here was necessary to make xindex%64 align with the 64-element stride-1 last dimension of the tensor. Adding @triton.autotune allows the runtime to select the best XBLOCK. The evict_first policy in Triton is equivalent to CUDA's __ldcs (streaming cache hint) \u2014 use it for data that is read once and not reused across thread blocks."
+  }
+]

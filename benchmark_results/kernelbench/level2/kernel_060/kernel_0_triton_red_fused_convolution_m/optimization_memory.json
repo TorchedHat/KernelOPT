@@ -1,0 +1,40 @@
+[
+  {
+    "item_id": "triton-autotune-xblock-register-spill-regression-001",
+    "iteration": 1,
+    "speedup": 0.7031,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_r0block_tile_sizes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 128.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 21.37,
+        "Launch.Waves Per SM": 0.97,
+        "GPU Speed Of Light Throughput.Duration (us)": 892.93,
+        "Compute Workload Analysis.Executed Ipc Active": 2.4,
+        "Scheduler Statistics.No Eligible": 40.03,
+        "Occupancy.Block Limit Registers": 4.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 11.7,
+        "Launch.Waves Per SM": 1.94,
+        "GPU Speed Of Light Throughput.Duration (us)": 1270.0,
+        "Compute Workload Analysis.Executed Ipc Active": 1.75,
+        "Scheduler Statistics.No Eligible": 56.36,
+        "Occupancy.Block Limit Registers": 2.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK/R0_BLOCK Causes Register Spill Regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK and R0_BLOCK configs caused the compiler to allocate 255 registers per thread (up from 128), halving the block limit from 4 to 2 blocks/SM and dropping theoretical occupancy from 25% to 12.5%. This worsened scheduler eligibility (No Eligible rose from 40% to 56%) and increased kernel duration by ~42% despite waves/SM doubling from 0.97 to 1.94. The root cause is that autotuning configs with larger tile sizes (e.g. R0_BLOCK=4096, 8192) force the compiler to keep more live values in registers simultaneously, exhausting the register file and causing spills that dominate over any coalescing or wave-count benefit.",
+    "slow_pseudocode": "# BEFORE: fixed small config, 128 regs/thread, 25% occupancy\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # XBLOCK=1, R0_BLOCK=2048 at call site\n    for r0_offset in range(0, r0_numel, R0_BLOCK):\n        welford_accumulate(...)\n    tl.store(out_ptr0 + x4, mean, xmask)\n    tl.store(out_ptr1 + x4, m2, xmask)\n\ngrid = (triton.cdiv(xnumel, 1),)\nkernel[grid](..., XBLOCK=1, R0_BLOCK=2048)",
+    "fast_pseudocode": "# AFTER (regressed): autotune with large configs, 255 regs/thread, 12.5% occupancy\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 4096}, num_warps=4),\n        triton.Config({'XBLOCK': 2, 'R0_BLOCK': 4096}, num_warps=8),\n        triton.Config({'XBLOCK': 1, 'R0_BLOCK': 8192}, num_warps=8),\n        # ... other configs\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # autotuner selects config; large R0_BLOCK causes 255 regs/thread\n    ...\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](...)  # no explicit XBLOCK/R0_BLOCK",
+    "applicable_when": "Never apply this specific pattern when the kernel already uses 128+ registers/thread and the register block limit is already the binding occupancy constraint (Block Limit Registers < Block Limit Warps). Autotune with large tile configs is only safe when register pressure is low (e.g. <64 regs/thread) and occupancy is not register-limited.",
+    "do_not_apply_when": "Kernel already has registers_per_thread >= 128 and Block Limit Registers is the binding occupancy constraint. Adding autotune configs with R0_BLOCK > current value will push register count to 255 (hardware max), halving occupancy and worsening scheduler stall rates. Also avoid when the kernel has a Welford reduction accumulating multiple live tensors across a large R0_BLOCK loop body.",
+    "framework_notes": "Triton's @triton.autotune selects configs at runtime but the compiler must compile all configs. Large R0_BLOCK values (4096, 8192) in a Welford reduction kernel with multiple live accumulators (mean, m2, weight) cause the register allocator to spill or max out at 255 regs/thread. In CUDA, the equivalent risk is __launch_bounds__ with large tile sizes in reduction kernels. Always check that the winning autotune config does not increase registers_per_thread beyond the baseline."
+  }
+]

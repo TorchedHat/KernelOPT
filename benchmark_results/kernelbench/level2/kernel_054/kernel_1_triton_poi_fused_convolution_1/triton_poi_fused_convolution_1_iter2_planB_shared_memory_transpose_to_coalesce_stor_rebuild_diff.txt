@@ -1,0 +1,70 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,42 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 16}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 64,  'YBLOCK': 32}, num_warps=8, num_stages=1),
++        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=4, num_stages=1),
++        triton.Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=8, num_stages=1),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_1(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 4096
+-    xnumel = 31500
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y0 = (yindex % 128)
+-    y1 = yindex // 128
+-    y3 = yindex
+-    tmp0 = tl.load(in_ptr0 + (y0 + 128*x2 + 4032000*y1), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (x2 + 31500*y3), tmp0, xmask)
+-
+-
++    # XBLOCK = TILE_NC (NC dimension, stride-1 in channels-last input)
++    # YBLOCK = TILE_HW (spatial HW dimension, stride-1 in NCHW output)
++    nc_offset = tl.program_id(0) * XBLOCK
++    hw_offset = tl.program_id(1) * YBLOCK
++    nc_idx = nc_offset + tl.arange(0, XBLOCK)  # [XBLOCK] = [TILE_NC]
++    hw_idx = hw_offset + tl.arange(0, YBLOCK)  # [YBLOCK] = [TILE_HW]
++    # Load phase: NC fast (warp-fast), HW slow -> coalesced loads from channels-last input
++    nc_2d = nc_idx[None, :]   # [1, XBLOCK]
++    hw_2d = hw_idx[:, None]   # [YBLOCK, 1]
++    channel = nc_2d % 128     # stride-1 in input -> coalesced
++    batch   = nc_2d // 128
++    spatial = hw_2d
++    load_mask = (nc_2d < 4096) & (hw_2d < 31500)
++    vals = tl.load(in_ptr0 + (channel + 128*spatial + 4032000*batch), load_mask, other=0.0)
++    # vals shape: [YBLOCK, XBLOCK] = [TILE_HW, TILE_NC]
++    # Store phase: HW fast (warp-fast), NC slow -> coalesced stores to NCHW output
++    hw_store = hw_idx[None, :]   # [1, YBLOCK] fast dim, stride=1 in output
++    nc_store = nc_idx[:, None]   # [XBLOCK, 1] slow dim, stride=31500 in output
++    store_mask = (nc_store < 4096) & (hw_store < 31500)
++    # tl.trans(vals): [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK] = [TILE_NC, TILE_HW]
++    # store index hw_store + 31500*nc_store: hw_store is fast -> COALESCED
++    tl.store(out_ptr0 + (hw_store + 31500*nc_store), tl.trans(vals), store_mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +48,7 @@
+     ynumel = 4096
+     xnumel = 31500
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_1[grid](arg_0, arg_1, 4096, 31500)
+     return arg_1
+ 
+ def get_inputs():

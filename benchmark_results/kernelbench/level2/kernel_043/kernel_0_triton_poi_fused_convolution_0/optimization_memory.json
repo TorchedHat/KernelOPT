@@ -1,0 +1,321 @@
+[
+  {
+    "item_id": "d369eeb5",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_swap_tile_dimensions",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_swap_tile_dimensions \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_swap_tile_dimensions' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.120e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.085e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a layout permutation from NCHW contiguous (stride 1 in W) to NHWC interleaved (stride 1 in C, stride 3 in W). The store address is y0 + 3*x2 + 150528*y1 where y0 = yindex % 3 (range 0-2) and x2 = xindex (range 0-50175). With YBLOCK=8 and XBLOCK=128, consecutive warp threads differ in x2 (the X-dimension), so the store stride is 3 floats per thread \u2014 causing 3x sector amplification (non-coalesced). NCU confirms 23% excessive sectors and 49.8% of cycles stalled on L1TEX. The fix is to increase YBLOCK to 32 (covering all 30 Y-elements in one tile) and reduce XBLOCK, so that within a warp the Y-dimension's contiguous y0 values are the fast-varying axis, eliminating the stride-3 scatter.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.120e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.085e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_layout_permutation_001",
+    "iteration": 1,
+    "speedup": 1.0561,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_underutilized_layout_permutation_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + SOLBottleneck + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.02,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8971.0,
+        "Scheduler Statistics.No Eligible": 71.9,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.93,
+        "Occupancy.Achieved Occupancy": 54.89,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Memory Workload Analysis.Max Bandwidth": 40.79
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.7,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8530.0,
+        "Scheduler Statistics.No Eligible": 74.48,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.84,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.76,
+        "Occupancy.Achieved Occupancy": 54.79,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Memory Workload Analysis.Max Bandwidth": 43.06
+      }
+    },
+    "strategy_title": "Add @triton.autotune to Layout Permutation Kernel",
+    "strategy_description": "For Triton pointwise kernels performing layout permutations (e.g. NCHW\u2192NHWC) with a fixed small grid (< 1 wave/SM), adding @triton.autotune with a range of XBLOCK/YBLOCK/num_warps configurations allows the runtime to select the tile shape that best hides L1TEX latency and improves SM utilization. The speedup here is modest (5.6%) because the dominant bottlenecks\u2014uncoalesced stores (23% excess sectors), low waves/SM (0.74), and L1TEX stalls (~50% of warp cycles)\u2014were not fully resolved by tile-size tuning alone; the autotuner selected a config close to the original. This strategy is most impactful when the optimal tile size differs substantially from the hardcoded default.",
+    "slow_pseudocode": "# Fixed tile sizes, no autotuning\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # 2D pointwise load/store with strided scatter pattern\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile sizes\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 8},  num_warps=4),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 8},  num_warps=4),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 8},  num_warps=8),\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 16}, num_warps=4),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 64,   'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 32}, num_warps=8),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 4},  num_warps=8),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 8},  num_warps=16),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Same 2D pointwise load/store body unchanged\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no hardcoded XBLOCK/YBLOCK",
+    "applicable_when": "Triton pointwise kernel with hardcoded XBLOCK/YBLOCK tile sizes; waves/SM < 1.0; IssueSlotUtilization rule triggered; scheduler idle cycles > 60%; L1TEX stall fraction > 40% of warp cycles; kernel performs a 2D layout permutation with strided scatter stores.",
+    "do_not_apply_when": "The kernel already uses @triton.autotune; the bottleneck is purely uncoalesced memory access (autotuning tile sizes cannot fix stride-induced scatter patterns); the grid is already > 2 waves/SM and occupancy > 80%; the kernel has shared memory reductions where tile size changes affect correctness.",
+    "framework_notes": "Triton-specific: XBLOCK and YBLOCK must be powers of 2 (tl.constexpr requirement). The grid must be changed from a fixed tuple to a lambda that reads meta['XBLOCK'] and meta['YBLOCK']. Hardcoded keyword arguments (YBLOCK=8, XBLOCK=128) must be removed from the kernel call site when using autotune. The key=['ynumel','xnumel'] ensures the autotuner re-tunes when problem size changes."
+  },
+  {
+    "item_id": "triton_multistage_autotune_vectorized_hints_001",
+    "iteration": 2,
+    "speedup": 1.4828,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_with_multi_stage_pipelining_and_vectorized_hints",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + UncoalescedGlobalAccess + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.42,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6581.0,
+        "Scheduler Statistics.No Eligible": 52.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.26,
+        "Memory Workload Analysis.Memory Throughput": 182.72,
+        "Memory Workload Analysis.L2 Hit Rate": 76.04,
+        "Occupancy.Achieved Occupancy": 48.61,
+        "Launch Statistics.Waves Per SM": 0.74
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.06,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6028.0,
+        "Scheduler Statistics.No Eligible": 53.7,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.88,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.22,
+        "Memory Workload Analysis.Memory Throughput": 198.55,
+        "Memory Workload Analysis.L2 Hit Rate": 76.5,
+        "Occupancy.Achieved Occupancy": 49.79,
+        "Launch Statistics.Waves Per SM": 0.74
+      }
+    },
+    "strategy_title": "Add num_stages>1 Configs and tl.max_contiguous/multiple_of Hints",
+    "strategy_description": "When a Triton pointwise kernel's autotune config space covers only num_stages=1, expanding it to include num_stages=2,3,4 allows the autotuner to discover software pipelining depths that better overlap memory latency with compute, reducing elapsed cycles even when scheduler idle metrics remain similar. Simultaneously, wrapping the contiguous load index with tl.multiple_of(..., XBLOCK) and tl.max_contiguous(..., XBLOCK) signals stride-1 alignment to the compiler, enabling wider (128-bit) vectorized loads. Together these changes reduced kernel duration from 4.42 \u00b5s to 4.06 \u00b5s (8% reduction, 1.48x cumulative speedup from baseline), with memory throughput increasing from 182 GB/s to 198 GB/s while total elapsed cycles dropped from 6581 to 6028.",
+    "slow_pseudocode": "# All autotune configs use num_stages=1; no vectorized hints\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=4, num_stages=1),\n        # ... all num_stages=1\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # no alignment hints\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask)",
+    "fast_pseudocode": "# Autotune configs span num_stages=1,2,3,4; vectorized hints added\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=1),\n        # ... num_stages=1 subset ...\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=8, num_stages=4),\n        # ... more num_stages=3,4 configs ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.max_contiguous(\n        tl.multiple_of(tl.arange(0, XBLOCK), XBLOCK), XBLOCK\n    )[None, :]  # signals stride-1 alignment for 128-bit vectorized loads\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask)",
+    "applicable_when": "Triton pointwise or layout-permutation kernel where: (1) existing autotune configs all use num_stages=1; (2) IssueSlotUtilization rule triggered with scheduler idle >50%; (3) the load index in the fast-varying dimension is provably stride-1 (xoffset = pid * XBLOCK, so xoffset is always divisible by XBLOCK); (4) L2 hit rate is high (>70%) indicating data fits in cache; (5) waves_per_sm < 1.0.",
+    "do_not_apply_when": "The load dimension is not stride-1 (e.g. strided scatter stores \u2014 do NOT apply tl.multiple_of/tl.max_contiguous to non-contiguous dimensions); kernel uses shared memory reductions where num_stages>1 changes correctness; autotune config space already includes multi-stage variants; kernel is compute-bound (SM Throughput >70%).",
+    "framework_notes": "Triton-specific: tl.multiple_of(expr, N) asserts expr is divisible by N; tl.max_contiguous(expr, N) asserts N consecutive elements are contiguous. Both are compiler hints only \u2014 they do not change runtime values. Apply ONLY to the dimension where tl.program_id(axis)*BLOCK is the base (guaranteeing BLOCK-alignment). num_stages in triton.Config controls software pipelining depth for async memory prefetch; num_stages=3-4 is typically optimal for hiding ~20-cycle L1TEX latency on H100/A100."
+  },
+  {
+    "item_id": "triton_yblock32_full_y_coverage_autotune_003",
+    "iteration": 3,
+    "speedup": 1.505,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_with_vectorized_load_hints",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + IssueSlotUtilization + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.03,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5999.0,
+        "Scheduler Statistics.No Eligible (%)": 51.84,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.95,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.43,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 200.13,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 76.49,
+        "Occupancy.Achieved Occupancy (%)": 48.76,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "UncoalescedGlobalAccess.excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern.bytes_utilized_per_sector": 10.7
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5962.0,
+        "Scheduler Statistics.No Eligible (%)": 51.88,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.36,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 201.73,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 76.28,
+        "Occupancy.Achieved Occupancy (%)": 48.63,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "UncoalescedGlobalAccess.excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern.bytes_utilized_per_sector": 10.7
+      }
+    },
+    "strategy_title": "Expand Autotune with YBLOCK=32 to Cover Full Y-Dimension",
+    "strategy_description": "For Triton 2D layout-permutation kernels where ynumel is small (e.g. 30) and the current autotune config space caps YBLOCK below ynumel, adding YBLOCK configs that equal or exceed ynumel (e.g. YBLOCK=32 >= ynumel=30) collapses the Y-grid dimension to 1 CTA, reducing inter-CTA fragmentation and allowing the compiler to see the full Y-index range within a single tile. In this case, the profiling metrics between before and after are nearly identical (elapsed cycles 5999 vs 5962, memory throughput 200 vs 202 GB/s, occupancy 48.76% vs 48.63%), indicating the autotuner selected a YBLOCK=32 config that performed marginally better but did not fundamentally change the bottleneck profile\u2014the 1.505x speedup is measured end-to-end and likely reflects reduced kernel launch overhead or autotuner selection of a slightly better tile shape rather than a structural memory access improvement. The uncoalesced store pattern (50% excessive sectors, 10.7 bytes/sector) remained unchanged, confirming that YBLOCK=32 alone cannot fix stride-3 scatter stores.",
+    "slow_pseudocode": "# Autotune configs cap at YBLOCK=16; grid hardcoded\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 16}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 16}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 8},  num_warps=16, num_stages=4),\n    # max YBLOCK=16 < ynumel=30\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = xoffset + tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\n    tmp0 = tl.load(in_ptr + (x2 + 50176*y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), tmp0, mask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "fast_pseudocode": "# Autotune configs include YBLOCK=32 (>= ynumel=30) and large XBLOCK\n@triton.autotune(configs=[\n    # ... all prior configs preserved ...\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 32}, num_warps=4,  num_stages=2),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 32}, num_warps=4,  num_stages=3),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 32}, num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 32}, num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 32}, num_warps=16, num_stages=4),\n    triton.Config({'XBLOCK': 2048, 'YBLOCK': 32}, num_warps=16, num_stages=3),\n    triton.Config({'XBLOCK': 2048, 'YBLOCK': 1},  num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 4096, 'YBLOCK': 1},  num_warps=16, num_stages=4),\n    triton.Config({'XBLOCK': 4096, 'YBLOCK': 32}, num_warps=16, num_stages=4),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Kernel body unchanged\n    xindex = xoffset + tl.max_contiguous(tl.multiple_of(tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\n    tmp0 = tl.load(in_ptr + (x2 + 50176*y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), tmp0, mask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "applicable_when": "Triton 2D pointwise/permutation kernel where ynumel is small and the existing autotune config space has max YBLOCK < ynumel; SOLBottleneck rule triggered (waves_per_sm < 1.0); IssueSlotUtilization rule triggered; the Y-dimension is the slow-varying axis in the output store address. Adding YBLOCK >= ynumel collapses the Y-grid to 1 and may allow the compiler to optimize the full Y-index range within one CTA.",
+    "do_not_apply_when": "ynumel is large (e.g. > 64) making YBLOCK=ynumel impractical due to register pressure; the bottleneck is purely uncoalesced stores with a fixed stride (YBLOCK changes cannot fix stride-induced scatter); the autotune config space already includes YBLOCK >= ynumel; kernel is compute-bound (SM Throughput > 70%). Note: in this case the NCU metrics before/after were nearly identical, suggesting the speedup came from factors outside the profiled kernel window.",
+    "framework_notes": "Triton-specific: YBLOCK must be a power of 2 (tl.constexpr requirement); YBLOCK=32 is the smallest power-of-2 >= ynumel=30, so ymask (yindex < ynumel) correctly guards the 2 out-of-bounds rows. The grid lambda must use meta['YBLOCK'] dynamically. When YBLOCK >= ynumel, the Y-grid dimension collapses to 1 CTA, which may improve wave coverage if XBLOCK is simultaneously reduced to increase X-grid size."
+  },
+  {
+    "item_id": "triton_evict_first_expanded_autotune_iter3_003",
+    "iteration": 3,
+    "speedup": 1.4576,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_coalesced_stores_and_wave_coverage",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + IssueSlotUtilization + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.03,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5999.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 4.1,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 22.28,
+        "Scheduler Statistics.No Eligible": 51.84,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.95,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.43,
+        "Memory Workload Analysis.Memory Throughput": 200.13,
+        "Memory Workload Analysis.L2 Hit Rate": 76.49,
+        "Occupancy.Achieved Occupancy": 48.76,
+        "Launch Statistics.Waves Per SM": 0.74
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.13,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6098.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 4.05,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 22.69,
+        "Scheduler Statistics.No Eligible": 52.31,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.93,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.15,
+        "Memory Workload Analysis.Memory Throughput": 195.47,
+        "Memory Workload Analysis.L2 Hit Rate": 76.04,
+        "Occupancy.Achieved Occupancy": 48.82,
+        "Launch Statistics.Waves Per SM": 0.74
+      }
+    },
+    "strategy_title": "evict_first + Expanded Multi-Stage Autotune Configs (Iter 3)",
+    "strategy_description": "Switching the load eviction policy from 'evict_last' to 'evict_first' on a zero-reuse streaming permutation kernel, combined with expanding the autotune config space to include num_stages=1,2,3,4 variants, yielded a 1.46x speedup. Notably, the NCU profiling metrics before and after are nearly identical (duration 4.03\u21924.13 \u00b5s, DRAM throughput 4.1\u21924.05%), suggesting the speedup is measured at the wall-clock/benchmark level rather than reflected in single-kernel NCU traces \u2014 the autotuner likely selected a different config across runs. The uncoalesced access pattern (50% excessive sectors, 10.7 bytes/sector) and low DRAM throughput persist in the NCU snapshot, indicating the core memory access bottleneck remains unresolved by this change alone.",
+    "slow_pseudocode": "# evict_last on streaming load, configs spanning num_stages=2,3,4 but limited XBLOCK range\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=8, num_stages=3),\n    # ... num_stages=2,3,4 but max XBLOCK=1024\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + stride2*y1), tmp0, mask)",
+    "fast_pseudocode": "# evict_first on streaming load, expanded autotune configs num_stages=1,2,3,4\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 256,  'YBLOCK': 4}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=4),\n    # ... full sweep of num_stages=1,2,3,4\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    tmp0 = tl.load(in_ptr + (x2 + stride*y3), mask, eviction_policy='evict_first')\n    tl.store(out_ptr + (y0 + 3*x2 + stride2*y1), tmp0, mask)",
+    "applicable_when": "Triton streaming (zero-reuse) layout permutation kernels where load eviction_policy='evict_last' is set on data never reused; UncoalescedGlobalAccess triggered with >20% excessive sectors; existing autotune configs do not span all num_stages values (1-4); waves_per_sm < 1.0.",
+    "do_not_apply_when": "Kernel has genuine data reuse (evict_first would hurt L1 hit rate); autotune config space already spans num_stages=1-4 with large XBLOCK values (2048/4096); DRAM throughput already >50%; kernel is compute-bound (SM Throughput >70%).",
+    "framework_notes": "Triton-specific: eviction_policy='evict_first' on tl.load is a cache hint for streaming/non-reuse patterns. Expanding autotune configs to include num_stages=1,2,3,4 with varied XBLOCK/YBLOCK/num_warps allows the runtime to discover the optimal software pipelining depth. The speedup here (1.46x) is measured at benchmark level; NCU single-kernel traces may not reflect the improvement if the autotuner selects different configs between profiling runs."
+  },
+  {
+    "item_id": "triton_flat_output_index_coalesced_store_nchw_nhwc_004",
+    "iteration": 4,
+    "speedup": 1.6359,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "flat_output_index_remapping_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5962.0,
+        "Memory Workload Analysis.Memory Throughput": 201.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 76.28,
+        "Occupancy.Achieved Occupancy": 48.63,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Registers Per Thread": 25.0,
+        "Scheduler Statistics.No Eligible": 51.88,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.36,
+        "UncoalescedGlobalAccess.excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern.bytes_utilized_per_sector": 10.7
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.68,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5482.0,
+        "Memory Workload Analysis.Memory Throughput": 219.27,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 64.61,
+        "Memory Workload Analysis.L2 Hit Rate": 83.79,
+        "Occupancy.Achieved Occupancy": 58.4,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Registers Per Thread": 21.0,
+        "Scheduler Statistics.No Eligible": 67.44,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.44,
+        "UncoalescedGlobalAccess.excessive_sectors_pct": 63.0,
+        "MemoryCacheAccessPattern.bytes_utilized_per_sector": 7.4
+      }
+    },
+    "strategy_title": "Remap 2D Kernel to 1D Flat Output Index for Coalesced Stores",
+    "strategy_description": "When a Triton layout-permutation kernel (e.g. NCHW\u2192NHWC) iterates over the input address space with a 2D tile (Y=batch\u00d7channel, X=HW), the output store address has a stride equal to the number of channels (e.g. stride-3 scatter), causing ~50% excessive sectors as flagged by UncoalescedGlobalAccess. Converting the kernel to iterate over the flat output index space (1D, xnumel = total output elements) makes consecutive threads write to consecutive output addresses (stride-1, fully coalesced), while input loads become channel-strided gathers that are absorbed by L1/L2 cache. In this case, the rewrite reduced elapsed cycles from 5962 to 5482, improved L1 hit rate from 0% to 64.6%, raised achieved occupancy from 48.6% to 58.4%, and reduced registers per thread from 25 to 21, yielding a 1.64x speedup despite the uncoalesced load metric worsening (the load gather pattern is cache-friendly and cheap relative to the store scatter savings).",
+    "slow_pseudocode": "# 2D tiling over input space: Y=batch*channel, X=HW\n# Store has stride-C scatter (uncoalesced)\n@triton.autotune(configs=[...XBLOCK+YBLOCK configs...], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    # ynumel = N*C = 30, xnumel = H*W = 50176\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    y0 = yindex % C        # channel\n    y1 = yindex // C       # batch\n    tmp = tl.load(in_ptr + (xindex + HW*yindex), mask)\n    # stride-C scatter: consecutive threads differ by C in output\n    tl.store(out_ptr + (y0 + C*xindex + HW*C*y1), tmp, mask)",
+    "fast_pseudocode": "# 1D tiling over flat output index: xnumel = N*C*H*W\n# Store is stride-1 (fully coalesced); load is channel-strided gather (L1-cached)\n@triton.autotune(configs=[...XBLOCK-only configs, large sizes...], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    # xnumel_flat = N*C*H*W = 1505280\n    xindex = tl.program_id(0)*XBLOCK + tl.max_contiguous(\n        tl.multiple_of(tl.arange(0, XBLOCK), XBLOCK), XBLOCK)\n    xmask = xindex < xnumel_flat\n    # Decompose flat output (NHWC) index into coordinates\n    c  = xindex % C                    # channel (fast axis in output)\n    hw = (xindex // C) % HW            # pixel index\n    n  = xindex // (C * HW)            # batch index\n    # Gather from NCHW input: stride-HW in channel dim, but only C distinct offsets\n    in_idx = n * (C*HW) + c * HW + hw\n    tmp = tl.load(in_ptr + in_idx, xmask)\n    tl.store(out_ptr + xindex, tmp, xmask)  # stride-1, fully coalesced",
+    "applicable_when": "Triton layout-permutation kernel (e.g. NCHW\u2192NHWC) where: (1) UncoalescedGlobalAccess triggered with >40% excessive sectors in stores; (2) MemoryCacheAccessPattern shows <12 bytes/sector utilized in stores; (3) the output layout has a small fast-varying dimension (e.g. C=3) causing stride-C scatter; (4) the number of distinct channel offsets in the load gather is small (\u226416) so L1/L2 cache absorbs the gather cost; (5) L2 hit rate is already high (>70%) indicating data fits in cache.",
+    "do_not_apply_when": "The output layout is already contiguous in the thread-fast dimension (no scatter); the channel dimension is large (e.g. C>64) making the load gather expensive and not cache-friendly; the kernel has shared memory reductions that depend on 2D tile structure; the load pattern is already coalesced and the store pattern is the non-bottleneck; waves_per_sm is already >2.0 (grid size is sufficient).",
+    "framework_notes": "Triton-specific: switching from 2D (XBLOCK+YBLOCK) to 1D (XBLOCK-only) autotune configs requires removing YBLOCK from the kernel signature and config dicts. The autotune key should still include both 'ynumel' and 'xnumel' for cache correctness. Use tl.max_contiguous + tl.multiple_of on the 1D xindex to preserve vectorized load/store hints. Large XBLOCK values (4096\u201316384) are appropriate for 1D kernels to maximize work-per-CTA. Integer division/modulo for coordinate decomposition must use exact integer arithmetic."
+  },
+  {
+    "item_id": "triton_evict_first_yblock32_autotune_iter4_004",
+    "iteration": 4,
+    "speedup": 1.4938,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_with_yblock_covering_full_y_dimension",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + IssueSlotUtilization + WorkloadImbalance + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5962.0,
+        "Scheduler Statistics.No Eligible": 51.88,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.36,
+        "Memory Workload Analysis.Memory Throughput": 201.73,
+        "Memory Workload Analysis.L2 Hit Rate": 76.28,
+        "Occupancy.Achieved Occupancy": 48.63,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "GPU and Memory Workload Distribution.Total SMSP Elapsed Cycles": 3293024.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.03,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5976.0,
+        "Scheduler Statistics.No Eligible": 52.37,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.49,
+        "Memory Workload Analysis.Memory Throughput": 200.13,
+        "Memory Workload Analysis.L2 Hit Rate": 76.81,
+        "Occupancy.Achieved Occupancy": 48.46,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "GPU and Memory Workload Distribution.Total SMSP Elapsed Cycles": 3173960.0
+      }
+    },
+    "strategy_title": "evict_first + YBLOCK=32 Autotune Configs for Y-Grid Collapse",
+    "strategy_description": "For Triton 2D layout-permutation kernels with small ynumel (e.g. 30) and WorkloadImbalance triggered, adding YBLOCK=32 autotune configs (>= ynumel) collapses the Y-grid to 1 row and pairing with eviction_policy='evict_first' on streaming (zero-reuse) loads can yield ~1.49x speedup. Notably, the NCU single-kernel profiling metrics before and after are nearly identical (elapsed cycles 5962 vs 5976, memory throughput 201 vs 200 GB/s), indicating the speedup is captured at the benchmark/wall-clock level rather than in the profiled kernel snapshot \u2014 the autotuner selected a different winning config than the one profiled by NCU. The Total SMSP Elapsed Cycles decreased from 3,293,024 to 3,173,960 (~3.6%), suggesting modest improvement in SMSP-level workload balance.",
+    "slow_pseudocode": "# Autotune configs with max YBLOCK=16, evict_last on streaming load\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 128,  'YBLOCK': 8},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 8},  num_warps=16, num_stages=4),\n    # ... max YBLOCK=16 < ynumel=30\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    tmp0 = tl.load(in_ptr + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), tmp0, xmask & ymask)",
+    "fast_pseudocode": "# Autotune configs include YBLOCK=32 (>= ynumel=30), evict_first on streaming load\n@triton.autotune(configs=[\n    # ... existing configs preserved ...\n    # NEW: YBLOCK=32 collapses Y-grid to ceil(30/32)=1 row\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 32}, num_warps=4,  num_stages=2),\n    triton.Config({'XBLOCK': 512,  'YBLOCK': 32}, num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 32}, num_warps=8,  num_stages=2),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 32}, num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 1024, 'YBLOCK': 32}, num_warps=16, num_stages=4),\n    triton.Config({'XBLOCK': 2048, 'YBLOCK': 32}, num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 2048, 'YBLOCK': 32}, num_warps=16, num_stages=4),\n    triton.Config({'XBLOCK': 4096, 'YBLOCK': 32}, num_warps=16, num_stages=4),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # ymask guards out-of-bounds lanes when YBLOCK=32 > ynumel=30\n    tmp0 = tl.load(in_ptr + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_first')\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), tmp0, xmask & ymask)",
+    "applicable_when": "Triton 2D pointwise/permutation kernel where: (1) WorkloadImbalance NCU rule triggered with >20% above-average SM active cycles; (2) ynumel is small and no YBLOCK >= ynumel exists in the current autotune config space; (3) ymask=yindex<ynumel is already present for all loads/stores; (4) the load data has zero reuse (streaming pattern); (5) waves_per_sm < 1.0; (6) IssueSlotUtilization rule triggered with scheduler idle >50%.",
+    "do_not_apply_when": "ynumel is large (>64) making YBLOCK>=ynumel impractical due to register pressure; the autotune config space already includes YBLOCK >= ynumel; the kernel has genuine data reuse (evict_first would hurt L1 hit rate); kernel is compute-bound (SM Throughput >70%); ymask is absent (adding oversized YBLOCK would cause out-of-bounds access).",
+    "framework_notes": "Triton-specific: YBLOCK must be a power of 2 (tl.constexpr requirement); YBLOCK=32 is the smallest power-of-2 >= ynumel=30. The grid lambda triton.cdiv(ynumel, YBLOCK) automatically computes ceil(30/32)=1 when YBLOCK=32. eviction_policy='evict_first' on tl.load is a cache hint for streaming/non-reuse patterns \u2014 use only when loaded data is never reused within the kernel. The speedup is measured at benchmark level; NCU single-kernel traces may show nearly identical metrics if the autotuner selects a different winning config between profiling and benchmarking runs."
+  },
+  {
+    "item_id": "triton_store_vectorization_hints_x2vec_004",
+    "iteration": 4,
+    "speedup": 1.2809,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "store_side_vectorization_hints_for_scatter_permutation",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5962.0,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 201.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 76.28,
+        "Scheduler Statistics.No Eligible (%)": 51.88,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.36,
+        "Occupancy.Achieved Occupancy (%)": 48.63,
+        "UncoalescedGlobalAccess.excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern.bytes_utilized_per_sector": 10.7
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.7,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 7031.0,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 683.59,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 26.56,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 63.09,
+        "Scheduler Statistics.No Eligible (%)": 56.4,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.17,
+        "Occupancy.Achieved Occupancy (%)": 46.88,
+        "UncoalescedGlobalAccess.excessive_sectors_pct": 20.0,
+        "MemoryCacheAccessPattern.bytes_utilized_per_sector": 21.3
+      }
+    },
+    "strategy_title": "Apply tl.max_contiguous/multiple_of Hints to Store Index",
+    "strategy_description": "Applying tl.max_contiguous and tl.multiple_of hints to the store index in a Triton layout-permutation kernel (reusing the same x2_vec already used for loads) improved bytes-utilized-per-sector from 10.7 to 21.3 and reduced the uncoalesced excessive-sector fraction from 50% to 20%, indicating the compiler emitted more efficient store transactions for the stride-3 scatter pattern. However, the NCU-measured kernel duration increased from 4.0 \u00b5s to 4.7 \u00b5s (elapsed cycles 5962\u21927031), with L2 hit rate dropping from 76.3% to 63.1% and total instructions increasing from 609K to 730K, suggesting the hint caused the compiler to emit more instructions or a different code path that increased L2 pressure. The 1.28x wall-clock speedup is therefore likely attributable to the simultaneous autotune config space change (different winning config selected) rather than the store-side hint itself, which appears to have a neutral-to-negative effect on the NCU-profiled kernel.",
+    "slow_pseudocode": "# Store uses plain xindex (no hints); load uses x2_vec with hints\nx2 = xindex  # no alignment hints\nx2_vec = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\ntmp0 = tl.load(in_ptr + (x2_vec + stride*y3), mask, eviction_policy='evict_last')\ntl.store(out_ptr + (y0 + 3*x2 + stride2*y1), tmp0, mask)  # x2 has no hints",
+    "fast_pseudocode": "# Store reuses x2_vec (with hints); xmask still uses plain xindex\nx2 = xindex  # kept for xmask only\nx2_vec = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]\ntmp0 = tl.load(in_ptr + (x2_vec + stride*y3), mask, eviction_policy='evict_first')\ntl.store(out_ptr + (y0 + 3*x2_vec + stride2*y1), tmp0, mask)  # x2_vec used for store",
+    "applicable_when": "Triton layout-permutation kernel where the load index already uses tl.max_contiguous/tl.multiple_of hints but the store index does not; UncoalescedGlobalAccess triggered with >20% excessive sectors; MemoryCacheAccessPattern shows <16 bytes/sector utilized on stores; the store address has a fixed stride multiplier (e.g. stride-3 scatter).",
+    "do_not_apply_when": "The store address stride is not a small integer multiple of the contiguous index (hints cannot help non-stride-1 patterns at the hardware level); the kernel is already achieving >20 bytes/sector on stores; the autotune config space is being simultaneously changed (confounds attribution); NCU shows kernel duration increasing despite wall-clock improvement (indicates the hint may be causing instruction bloat or L2 pressure increase).",
+    "framework_notes": "Triton-specific: tl.max_contiguous(expr, N) and tl.multiple_of(expr, N) are compiler hints only \u2014 they do not change runtime values. Applying them to a store index with a stride multiplier (e.g. 3*x2_vec) may improve sector utilization metrics but can simultaneously increase instruction count and reduce L2 hit rate. The xmask must still be computed from the original xindex (without hints) to avoid masking errors from the tl.multiple_of assertion. The wall-clock speedup here (1.28x) is confounded by simultaneous autotune config changes."
+  }
+]

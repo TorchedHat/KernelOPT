@@ -1,0 +1,121 @@
+--- baseline
++++ rebuilt
+@@ -4,22 +4,25 @@
+ from triton.language.extra import libdevice
+ 
+ # Conv kernel: implicit GEMM with NHWC layout
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4, maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4, maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4, maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4, maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=4, maxnreg=128),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8, maxnreg=128),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=8, maxnreg=128),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4, maxnreg=128),
+     ],
+-    key=['BATCH', 'IN_C', 'IN_H', 'IN_W', 'OUT_C', 'OUT_H', 'OUT_W'],
++    key=['BATCH', 'IN_C', 'IN_H', 'IN_W', 'OUT_C', 'OUT_H', 'OUT_W', 'KERNEL_H', 'KERNEL_W'],
+ )
+ @triton.jit
+ def conv2d_nhwc_kernel(
+     X_ptr, W_ptr, Out_ptr,
+     BATCH, IN_C, IN_H, IN_W, OUT_C, OUT_H, OUT_W,
+-    KERNEL_H, KERNEL_W,
++    KERNEL_H: tl.constexpr, KERNEL_W: tl.constexpr,
+     stride_xn, stride_xh, stride_xw, stride_xc,
+     stride_wco, stride_wci, stride_wkh, stride_wkw,
+     stride_on, stride_oh, stride_ow, stride_oc,
+@@ -28,43 +31,47 @@
+ ):
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+-    
++
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    
++
+     # Decode M -> (batch, out_h, out_w)
+     out_w = offs_m % OUT_W
+     tmp = offs_m // OUT_W
+     out_h = tmp % OUT_H
+     batch = tmp // OUT_H
+-    
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    
+-    TOTAL_K = IN_C * KERNEL_H * KERNEL_W
+-    
+-    for k_off in range(0, TOTAL_K, BLOCK_K):
+-        offs_k = k_off + tl.arange(0, BLOCK_K)
+-        # Decode K -> (in_c, kh, kw)
+-        in_c = offs_k % IN_C
+-        kw = (offs_k // IN_C) % KERNEL_W
+-        kh = offs_k // (IN_C * KERNEL_W)
+-        
+-        ih = out_h[:, None] + kh[None, :]  # no padding, stride=1
+-        iw = out_w[:, None] + kw[None, :]
+-        
+-        valid_m = offs_m < M_TOTAL
+-        valid_k = offs_k < TOTAL_K
+-        valid_x = valid_m[:, None] & valid_k[None, :] & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
+-        
+-        x_ptrs = X_ptr + batch[:, None] * stride_xn + ih * stride_xh + iw * stride_xw + in_c[None, :] * stride_xc
+-        x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
+-        
+-        valid_w = valid_k[:, None] & (offs_n[None, :] < OUT_C)
+-        w_ptrs = W_ptr + offs_n[None, :] * stride_wco + in_c[:, None] * stride_wci + kh[:, None] * stride_wkh + kw[:, None] * stride_wkw
+-        w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+-        
+-        acc = tl.dot(x_tile, w_tile, acc=acc)
+-    
++
++    valid_m = offs_m < M_TOTAL
++    valid_n = offs_n < OUT_C
++
++    # Precompute M-side base pointers outside all loops
++    base_x_m = X_ptr + batch * stride_xn  # shape [BLOCK_M]
++
++    for kh_idx in range(KERNEL_H):   # dynamic range — NO unrolling
++        for kw_idx in range(KERNEL_W):  # dynamic range — NO unrolling
++            # Hoist spatial offset outside in_c loop
++            ih = out_h + kh_idx   # shape [BLOCK_M], scalar addition
++            iw = out_w + kw_idx   # shape [BLOCK_M], scalar addition
++            valid_spatial = valid_m & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
++            # Spatial pointer base for this (kh, kw)
++            x_spatial = base_x_m + ih * stride_xh + iw * stride_xw  # [BLOCK_M]
++            # Weight pointer base for this (kh, kw)
++            w_spatial = W_ptr + offs_n * stride_wco + kh_idx * stride_wkh + kw_idx * stride_wkw  # [BLOCK_N]
++            for ic_off in range(0, IN_C, BLOCK_K):  # innermost: contiguous in_c
++                offs_ic = ic_off + tl.arange(0, BLOCK_K)
++                valid_ic = offs_ic < IN_C
++                # x_ptrs: [BLOCK_M, BLOCK_K] stride_xc=1 in NHWC, fully coalesced
++                x_ptrs = x_spatial[:, None] + offs_ic[None, :] * stride_xc
++                valid_x = valid_spatial[:, None] & valid_ic[None, :]
++                x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
++                # w_ptrs: [BLOCK_K, BLOCK_N] contiguous in_c across BLOCK_K
++                w_ptrs = w_spatial[None, :] + offs_ic[:, None] * stride_wci
++                valid_w = valid_ic[:, None] & valid_n[None, :]
++                w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
++                acc = tl.dot(x_tile, w_tile, acc=acc)
++
+     # Store output in NCHW layout: [batch, out_c, out_h, out_w]
+     valid_out = (offs_m[:, None] < M_TOTAL) & (offs_n[None, :] < OUT_C)
+     out_ptrs = Out_ptr + batch[:, None] * stride_on + offs_n[None, :] * stride_oc + out_h[:, None] * stride_oh + out_w[:, None] * stride_ow
+@@ -83,6 +90,7 @@
+     key=['N_SPATIAL'],
+ )
+ @triton.jit
++
+ def gelu_avgpool_kernel(
+     Conv_ptr, Bias_ptr, Out_ptr,
+     BATCH, OUT_C, N_SPATIAL,
