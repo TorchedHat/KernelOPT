@@ -613,9 +613,19 @@ def run(
                     entry_point=entry_point,
                     input_shapes=_parse_shapes(input_shapes) if input_shapes else None,
                 )
-                if not results:
-                    console.print("[red]Synthesis produced no output[/]")
-                    raise typer.Exit(1)
+                has_triton = any(
+                    r.get("triton_kernels") for r in results
+                ) if results else False
+                if not has_triton:
+                    console.print(
+                        "[yellow]Inductor generated no Triton kernels for this model. "
+                        "Writing torch.compile baseline.[/]"
+                    )
+                    resolved_output = Path(cfg.output_dir)
+                    final_path = resolved_output / "final_model.py"
+                    _write_compile_fallback(final_path, kernel_path)
+                    console.print(f"  Final model: [cyan]{final_path}[/]")
+                    raise typer.Exit(0)
                 primary = results[0]
                 orig_source = kernel_path.read_text()
                 wrapped = wrap_inductor_output(
