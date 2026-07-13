@@ -100,7 +100,12 @@ def _write_compile_fallback(final_path: Path, original_path: Path) -> None:
     correctness check (which also seeds with 42) produces identical
     weights and max_diff=0.0.
     """
-    orig_source = original_path.read_text()
+    try:
+        orig_source = original_path.read_text()
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot read original kernel {original_path}: {e}"
+        ) from e
     fallback = (
         '"""KernelOPT output: torch.compile baseline.\n'
         '\n'
@@ -124,7 +129,13 @@ def _write_compile_fallback(final_path: Path, original_path: Path) -> None:
         '    with _torch.no_grad():\n'
         '        return _compiled(*inputs)\n'
     )
-    final_path.write_text(fallback)
+    try:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path.write_text(fallback)
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot write fallback to {final_path}: {e}"
+        ) from e
 
 
 @app.command()
