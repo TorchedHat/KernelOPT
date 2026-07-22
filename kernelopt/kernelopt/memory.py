@@ -1,14 +1,21 @@
-"""Optimization memory: bounded queue of experience items."""
+"""Optimization memory: bounded queue of experience items.
+
+Iterative experience curation inspired by AccelOpt
+(Zhang et al., "AccelOpt: A Self-Improving LLM Agentic System for
+AI Accelerator Kernel Optimization", MLSys 2026).
+Extended with cross-run strategy tracking, semantic retrieval,
+and pre-seeded benchmark guidelines.
+"""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-EXPN = 8        # queue capacity (default)
-T_POS = 1.04    # min speedup to store positive item (empirically tuned)
-T_NEG = 1.15    # min slowdown factor to store negative item (empirically tuned)
-TOP_K = 4       # max items added per iteration
+Q_CAP = 8        # queue capacity (default)
+SPE_GATE = 1.05  # min speedup to store positive item
+SLO_GATE = 1.20  # min slowdown factor to store negative item
+KEEP_N = 4       # max items added per iteration
 
 # Seeds for reproducible correctness testing.  Three random seeds plus
 # input diversity; used by both the agentic correctness agent and the
@@ -16,32 +23,32 @@ TOP_K = 4       # max items added per iteration
 CORRECTNESS_SEEDS = [0, 42, 1337]
 
 
-def should_store(speedup: float, t_pos: float = T_POS, t_neg: float = T_NEG) -> bool:
+def should_store(speedup: float, spe_gate: float = SPE_GATE, slo_gate: float = SLO_GATE) -> bool:
     """Return True if the speedup (or slowdown) is significant enough."""
-    if speedup >= t_pos:
+    if speedup >= spe_gate:
         return True
-    if speedup > 0 and (1.0 / speedup) >= t_neg:
+    if speedup > 0 and (1.0 / speedup) >= slo_gate:
         return True
     return False
 
 
 def select_top_k(
-    items: list[dict], top_k: int = TOP_K,
-    t_pos: float = T_POS, t_neg: float = T_NEG,
+    items: list[dict], keep_n: int = KEEP_N,
+    spe_gate: float = SPE_GATE, slo_gate: float = SLO_GATE,
 ) -> list[dict]:
     """
-    From a list of candidate experience items, select the top_k most
+    From a list of candidate experience items, select the keep_n most
     significant ones (by |speedup - 1.0|) that pass curation thresholds.
     """
     filtered = [
         item for item in items
-        if should_store(item.get("speedup", 1.0), t_pos, t_neg)
+        if should_store(item.get("speedup", 1.0), spe_gate, slo_gate)
     ]
     filtered.sort(key=lambda x: abs(x.get("speedup", 1.0) - 1.0), reverse=True)
-    return filtered[:top_k]
+    return filtered[:keep_n]
 
 
-def append_item(memory: list[dict], item: dict, capacity: int = EXPN) -> list[dict]:
+def append_item(memory: list[dict], item: dict, capacity: int = Q_CAP) -> list[dict]:
     """Append an experience item, evicting the oldest if over capacity."""
     memory = list(memory)
     memory.append(item)
@@ -51,7 +58,7 @@ def append_item(memory: list[dict], item: dict, capacity: int = EXPN) -> list[di
 
 
 def append_items(
-    memory: list[dict], items: list[dict], capacity: int = EXPN,
+    memory: list[dict], items: list[dict], capacity: int = Q_CAP,
 ) -> list[dict]:
     """Append multiple items, respecting capacity."""
     memory = list(memory)

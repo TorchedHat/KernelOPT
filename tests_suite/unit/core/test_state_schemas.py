@@ -35,10 +35,10 @@ class TestPipelineConfig:
         assert cfg.T > 0
         assert cfg.N > 0
         assert cfg.K > 0
-        assert cfg.TopK > 0
-        assert cfg.ExpN > 0
-        assert cfg.t_pos > 1.0
-        assert cfg.t_neg > 1.0
+        assert cfg.keep_n > 0
+        assert cfg.q_cap > 0
+        assert cfg.spe_gate > 1.0
+        assert cfg.slo_gate > 1.0
 
     def test_custom_values(self):
         """Test setting custom configuration values."""
@@ -48,14 +48,14 @@ class TestPipelineConfig:
             T=10,
             N=8,
             K=3,
-            TopK=5,
+            keep_n=5,
             model="test-model",
         )
 
         assert cfg.T == 10
         assert cfg.N == 8
         assert cfg.K == 3
-        assert cfg.TopK == 5
+        assert cfg.keep_n == 5
         assert cfg.model == "test-model"
 
     def test_kernel_args_list(self):

@@ -57,7 +57,7 @@ class TestSingleIterationE2E:
             T=1,  # Single iteration
             N=2,  # 2 plans
             K=1,  # 1 attempt per plan
-            TopK=2,
+            keep_n=2,
             model="claude-sonnet-4@20250514",
             kernel_args=["--profile-only"],
             output_dir=str(temp_output_dir),
@@ -112,7 +112,7 @@ class TestMultiIterationE2E:
             T=2,  # 2 iterations
             N=2,  # 2 plans per iteration
             K=1,  # 1 attempt per plan
-            TopK=2,
+            keep_n=2,
             model="claude-sonnet-4@20250514",
             kernel_args=["--profile-only"],
             output_dir=str(temp_output_dir / "multi_iter"),
@@ -161,7 +161,7 @@ class TestMultiIterationE2E:
             T=10,  # Allow many iterations
             N=1,  # Limited plans to increase chance of no improvement
             K=1,
-            TopK=1,
+            keep_n=1,
             model="claude-sonnet-4@20250514",
             kernel_args=["--profile-only"],
             output_dir=str(temp_output_dir / "early_stop"),
@@ -259,7 +259,7 @@ class TestOutputVerification:
             T=2,
             N=2,
             K=1,
-            TopK=2,
+            keep_n=2,
             model="claude-sonnet-4@20250514",
             kernel_args=["--profile-only"],
             output_dir=str(output_path),
@@ -289,7 +289,7 @@ class TestOutputVerification:
 
             assert isinstance(memory, list)
             # Memory should be within capacity
-            assert len(memory) <= cfg.ExpN
+            assert len(memory) <= cfg.q_cap
 
     @pytest.mark.slow
     @pytest.mark.optimization

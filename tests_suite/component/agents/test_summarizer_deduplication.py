@@ -586,7 +586,7 @@ class TestSummarizerDeduplicationEdgeCases:
 
         kernel_source = test_kernel_path.read_text()
 
-        # Memory near capacity (ExpN default is 8)
+        # Memory near capacity (q_cap default is 8)
         existing_memory = [
             {"item_id": f"item_{i}", "direction": f"opt_{i}", "speedup": 1.1 + i * 0.05}
             for i in range(7)

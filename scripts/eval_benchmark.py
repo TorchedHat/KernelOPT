@@ -955,7 +955,7 @@ def main():
     print(f"  kernelopt Phase {phase} Benchmark — GPU {gpu_id}")
     print(f"  Assignments: {', '.join(assignments)}")
     print(f"  Total problems: {len(problems)} | Already done: {len(done_ids)} | Remaining: {len(remaining)}")
-    print(f"  Config: T={args.T} N={args.N} K={args.K} TopK=4 model={args.model}")
+    print(f"  Config: T={args.T} N={args.N} K={args.K} keep_n=4 model={args.model}")
     print(f"  Memory bank: {bank_path}")
     print(f"  Output: {output_base}")
     print(f"{'='*70}\n")

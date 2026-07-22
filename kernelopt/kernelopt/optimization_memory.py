@@ -65,6 +65,31 @@ class OptimizationMemory:
                     for name, rec in strategies.items()
                 }
 
+        if not self._data:
+            self._data = self._load_defaults()
+
+    def _load_defaults(self) -> dict[str, dict[str, StrategyRecord]]:
+        """Load shipped benchmark-derived strategies as cold-start context.
+
+        These provide the LLM with guidance from 250 KernelBench runs
+        (L1/L2/L3) so first-time users benefit from accumulated knowledge.
+        User-accumulated data always takes full precedence.
+        """
+        try:
+            defaults_path = Path(__file__).parent / "data" / "default_strategies.json"
+            if not defaults_path.exists():
+                return {}
+            raw = json.loads(defaults_path.read_text())
+            result: dict[str, dict[str, StrategyRecord]] = {}
+            for kt, strategies in raw.items():
+                result[kt] = {
+                    name: StrategyRecord(**rec) if isinstance(rec, dict) else rec
+                    for name, rec in strategies.items()
+                }
+            return result
+        except Exception:
+            return {}
+
     def record(
         self,
         kernel_type: str,

@@ -26,22 +26,22 @@ class TestMemoryConstants:
 
     def test_expn_default(self):
         """Test default memory capacity."""
-        from kernelopt.memory import EXPN
+        from kernelopt.memory import Q_CAP
 
-        assert EXPN == 8  # As per README
+        assert Q_CAP == 8  # As per README
 
     def test_threshold_defaults(self):
         """Test default curation thresholds."""
-        from kernelopt.memory import T_POS, T_NEG
+        from kernelopt.memory import SPE_GATE, SLO_GATE
 
-        assert T_POS > 1.0  # Positive speedup threshold
-        assert T_NEG > 1.0  # Negative slowdown threshold
+        assert SPE_GATE > 1.0  # Positive speedup threshold
+        assert SLO_GATE > 1.0  # Negative slowdown threshold
 
     def test_top_k_default(self):
         """Test default top-K value."""
-        from kernelopt.memory import TOP_K
+        from kernelopt.memory import KEEP_N
 
-        assert TOP_K == 4  # As per README
+        assert KEEP_N == 4  # As per README
 
 
 class TestShouldStore:
@@ -52,49 +52,49 @@ class TestShouldStore:
         from kernelopt.memory import should_store
 
         # Significant speedup
-        assert should_store(1.10, t_pos=1.04) is True
-        assert should_store(1.50, t_pos=1.04) is True
-        assert should_store(2.00, t_pos=1.04) is True
+        assert should_store(1.10, spe_gate=1.05) is True
+        assert should_store(1.50, spe_gate=1.05) is True
+        assert should_store(2.00, spe_gate=1.05) is True
 
     def test_should_store_positive_below_threshold(self):
         """Test not storing insignificant positive speedup."""
         from kernelopt.memory import should_store
 
-        assert should_store(1.02, t_pos=1.04) is False
-        assert should_store(1.03, t_pos=1.04) is False
+        assert should_store(1.02, spe_gate=1.05) is False
+        assert should_store(1.03, spe_gate=1.05) is False
 
     def test_should_store_negative_significant(self):
         """Test storing significant slowdowns."""
         from kernelopt.memory import should_store
 
-        # 1/speedup >= t_neg
-        assert should_store(0.80, t_neg=1.15) is True  # 1/0.80 = 1.25
-        assert should_store(0.70, t_neg=1.15) is True  # 1/0.70 = 1.43
+        # 1/speedup >= slo_gate
+        assert should_store(0.80, slo_gate=1.20) is True  # 1/0.80 = 1.25
+        assert should_store(0.70, slo_gate=1.20) is True  # 1/0.70 = 1.43
 
     def test_should_store_negative_insignificant(self):
         """Test not storing insignificant slowdowns."""
         from kernelopt.memory import should_store
 
-        assert should_store(0.95, t_neg=1.15) is False  # 1/0.95 = 1.05
-        assert should_store(0.90, t_neg=1.15) is False  # 1/0.90 = 1.11
+        assert should_store(0.95, slo_gate=1.20) is False  # 1/0.95 = 1.05
+        assert should_store(0.90, slo_gate=1.20) is False  # 1/0.90 = 1.11
 
     def test_should_store_neutral(self):
         """Test not storing neutral changes."""
         from kernelopt.memory import should_store
 
-        assert should_store(1.00, t_pos=1.04, t_neg=1.15) is False
-        assert should_store(0.99, t_pos=1.04, t_neg=1.15) is False
+        assert should_store(1.00, spe_gate=1.05, slo_gate=1.20) is False
+        assert should_store(0.99, spe_gate=1.05, slo_gate=1.20) is False
 
     def test_should_store_custom_thresholds(self):
         """Test with custom thresholds."""
         from kernelopt.memory import should_store
 
         # Strict thresholds
-        assert should_store(1.10, t_pos=1.20) is False
-        assert should_store(1.25, t_pos=1.20) is True
+        assert should_store(1.10, spe_gate=1.20) is False
+        assert should_store(1.25, spe_gate=1.20) is True
 
         # Lenient thresholds
-        assert should_store(1.02, t_pos=1.01) is True
+        assert should_store(1.02, spe_gate=1.01) is True
 
 
 class TestSelectTopK:
@@ -111,7 +111,7 @@ class TestSelectTopK:
             {"speedup": 0.90},
         ]
 
-        top_2 = select_top_k(items, top_k=2, t_pos=1.04, t_neg=1.15)
+        top_2 = select_top_k(items, top_k=2, spe_gate=1.05, slo_gate=1.20)
 
         assert len(top_2) <= 2
 
@@ -126,7 +126,7 @@ class TestSelectTopK:
             {"speedup": 1.15},  # |0.15| = 0.15
         ]
 
-        top_items = select_top_k(items, top_k=4, t_pos=1.04, t_neg=1.15)
+        top_items = select_top_k(items, top_k=4, spe_gate=1.05, slo_gate=1.20)
 
         # First should be 1.30 (largest deviation)
         if len(top_items) > 0:
@@ -142,7 +142,7 @@ class TestSelectTopK:
             {"speedup": 1.03},
         ]
 
-        top = select_top_k(items, top_k=10, t_pos=1.04, t_neg=1.15)
+        top = select_top_k(items, top_k=10, spe_gate=1.05, slo_gate=1.20)
 
         # All should be filtered out
         assert len(top) == 0
@@ -158,7 +158,7 @@ class TestSelectTopK:
             {"speedup": 1.15},  # Significant positive
         ]
 
-        top = select_top_k(items, top_k=3, t_pos=1.04, t_neg=1.15)
+        top = select_top_k(items, top_k=3, spe_gate=1.05, slo_gate=1.20)
 
         # Should include both significant positive and negative
         assert len(top) > 0
@@ -183,7 +183,7 @@ class TestSelectTopK:
             {"speedup": 1.10},
         ]
 
-        top = select_top_k(items, top_k=10, t_pos=1.04, t_neg=1.15)
+        top = select_top_k(items, top_k=10, spe_gate=1.05, slo_gate=1.20)
 
         # Should return all qualifying items
         assert len(top) <= 2
@@ -372,7 +372,7 @@ class TestMemoryIntegration:
         ]
 
         # Select top-K
-        top = select_top_k(candidates, top_k=2, t_pos=1.04, t_neg=1.15)
+        top = select_top_k(candidates, top_k=2, spe_gate=1.05, slo_gate=1.20)
 
         # Append to memory
         memory = []
@@ -384,13 +384,13 @@ class TestMemoryIntegration:
 
     def test_memory_capacity_enforcement(self):
         """Test that memory capacity (8) is enforced."""
-        from kernelopt.memory import append_items, EXPN
+        from kernelopt.memory import append_items, Q_CAP
 
         # Create 10 items
         items = [{"id": i, "speedup": 1.1 + i * 0.01} for i in range(10)]
 
-        memory = append_items([], items, capacity=EXPN)
+        memory = append_items([], items, capacity=Q_CAP)
 
-        # Should only keep last EXPN items
-        assert len(memory) == EXPN
+        # Should only keep last Q_CAP items
+        assert len(memory) == Q_CAP
         assert memory[-1]["id"] == 9

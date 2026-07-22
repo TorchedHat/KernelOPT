@@ -25,6 +25,13 @@ class NCURule(BaseModel):
 
 
 class ProfilingContext(BaseModel):
+    """Structured NCU profiling data schema.
+
+    The pipeline passes profiling context as raw dicts at runtime for
+    flexibility. This model documents the expected shape and can be used
+    for optional validation or type hints.
+    """
+
     kernel_name: str
     kernel_name_full: str
     kernel_id: int = 0

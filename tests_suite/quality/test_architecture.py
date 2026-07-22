@@ -207,7 +207,7 @@ class TestDependencyInjection:
         assert hasattr(cfg, 'T')  # max iterations
         assert hasattr(cfg, 'N')  # plans per iteration
         assert hasattr(cfg, 'K')  # attempts per plan
-        assert hasattr(cfg, 'TopK')  # top K memory items
+        assert hasattr(cfg, 'keep_n')  # top K memory items
 
         # Should be able to override defaults
         custom_cfg = PipelineConfig(T=10, N=8, K=2)
