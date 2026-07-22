@@ -150,6 +150,31 @@ def profile_baseline(state: GraphState) -> dict:
     auto_kernel_id = (kernel_id == 0 and not cfg.kernel_name)
     _target_triton_name = None  # may be set in the multi-kernel branch below
 
+    # Ablation: skip NCU profiling entirely
+    if getattr(cfg, "skip_ncu", False):
+        from kernelopt.functions.benchmark import benchmark_kernel
+        pipe_print("[dim]NCU profiling skipped (--skip-ncu ablation)[/]")
+        wall_result = benchmark_kernel(kernel_path)
+        wall_ms = wall_result.get("median_ms", 1.0) if isinstance(wall_result, dict) else 1.0
+        wall_ns = wall_ms * 1e6
+        return {
+            "baseline_profiling_context": {},
+            "best_latency_ns": wall_ns,
+            "best_wall_ms": wall_ms,
+            "ncu_config": None,
+            "active_kernels": [{
+                "chain_id": "chain_0",
+                "kernel_source": state.get("kernel_source", ""),
+                "latency_ns": wall_ns,
+                "wall_ms": wall_ms,
+                "speedup": 1.0,
+                "profiling_context": {},
+                "history": [],
+                "depth": 0,
+                "alive": True,
+            }],
+        }
+
     ui = get_pipeline_ui()
     if ui:
         ui.set_phase("Baseline profiling", Path(kernel_path).name)
@@ -2461,6 +2486,10 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     from kernelopt.agents.profiler import get_latency_ns
 
     cfg = state.config
+
+    # Ablation overrides
+    if getattr(cfg, "no_memory", False):
+        cfg.q_cap = 0
     ext = Path(state.kernel_path).suffix
 
     graph = build_graph()

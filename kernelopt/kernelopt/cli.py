@@ -228,6 +228,18 @@ def run(
         help="Timeout in seconds for graph tracing subprocess (torch.export + torch.compile "
              "with autotuning). Complex architectures need longer. Default 1800s (30 min).",
     ),
+    no_memory: bool = typer.Option(
+        False, "--no-memory",
+        help="Disable experience memory accumulation (ablation). Queue capacity set to 0.",
+    ),
+    skip_ncu: bool = typer.Option(
+        False, "--skip-ncu",
+        help="Skip NCU profiling (ablation). Planner receives no hardware bottleneck context.",
+    ),
+    optimize_all_kernels: bool = typer.Option(
+        False, "--optimize-all-kernels",
+        help="Disable Inductor-aware synthesis (ablation). LLM may optimize extern_kernels too.",
+    ),
     multi_kernel: bool = typer.Option(
         True, "--multi-kernel/--single-kernel",
         help="Optimize ALL Triton kernels in a PyTorch model sequentially, re-stitching each back",
@@ -443,6 +455,9 @@ def run(
                 e2e_perf_margin=e2e_perf_margin,
                 e2e_correctness_timeout=e2e_correctness_timeout,
                 trace_timeout=trace_timeout,
+                no_memory=no_memory,
+                skip_ncu=skip_ncu,
+                optimize_all_kernels=optimize_all_kernels,
             )
     else:
         resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
@@ -483,6 +498,9 @@ def run(
             e2e_perf_gate=e2e_perf_gate,
             e2e_perf_margin=e2e_perf_margin,
             e2e_correctness_timeout=e2e_correctness_timeout,
+            no_memory=no_memory,
+            skip_ncu=skip_ncu,
+            optimize_all_kernels=optimize_all_kernels,
         )
 
     cfg.hud = hud
@@ -554,6 +572,12 @@ def run(
             console.print("  [dim]Tracing computation graph...[/]")
             kernel_groups = trace_model(str(kernel_path), timeout=cfg.trace_timeout)
             console.print(f"  [dim]Inductor generated {len(kernel_groups)} kernel(s)[/]")
+
+            # Ablation C6: disable Inductor-aware synthesis
+            if getattr(cfg, "optimize_all_kernels", False):
+                for kg in kernel_groups:
+                    kg["needs_triton_replacement"] = True
+                console.print("  [yellow]--optimize-all-kernels: extern kernels included in optimization[/]")
 
             # Phase 2: Merge fusible kernel groups
             kernel_groups = merge_fusible_groups(kernel_groups)
