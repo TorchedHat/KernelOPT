@@ -1,0 +1,53 @@
+--- baseline
++++ rebuilt
+@@ -5,21 +5,38 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+-def triton_poi_fused_clone_transpose_view_8(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+-    xnumel = 50331648
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+-    xmask = tl.full([XBLOCK], True, tl.int1)[:]
+-    x0 = (xindex % 96)
+-    x1 = ((xindex // 96) % 8)
+-    x2 = ((xindex // 768) % 512)
+-    x3 = xindex // 393216
+-    x4 = xindex
+-    tmp0 = tl.load(in_ptr0 + (x0 + 96*x2 + 49152*x1 + 393216*x3), None)
+-    tl.store(out_ptr0 + (x4), tmp0, None)
++def triton_poi_fused_clone_transpose_view_8(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):
++    # XBLOCK is repurposed as TILE_Y (chunk size along x2 / seq_len dimension)
++    # TILE_X = 96 (full head_dim, stride-1 in in_ptr0, hardcoded)
++    # N_CHUNKS = 512 // XBLOCK (number of x2 chunks per (x3,x1) pair)
++    TILE_X: tl.constexpr = 96
++    N_CHUNKS: tl.constexpr = 512 // XBLOCK
+ 
++    # Grid encodes (x3, x1, chunk_x2):
++    #   x3 in [0, 128), x1 in [0, 8), chunk in [0, N_CHUNKS)
++    pid = tl.program_id(0)
++    x3    = pid // (8 * N_CHUNKS)
++    x1    = (pid // N_CHUNKS) % 8
++    chunk = pid % N_CHUNKS
+ 
++    offs_x2 = chunk * XBLOCK + tl.arange(0, XBLOCK)   # [chunk*TILE_Y .. chunk*TILE_Y+TILE_Y-1]
++    offs_x0 = tl.arange(0, TILE_X)                    # [0 .. 95]
++
++    # Load: in_ptr0 shape (1024,512,96) strides (49152,96,1)
++    # address = x3*393216 + x1*49152 + x2*96 + x0
++    # Each row (fixed x2) is 96 contiguous floats -> coalesced!
++    base_in = x3 * 393216 + x1 * 49152
++    ptrs_in = in_ptr0 + base_in + offs_x2[:, None] * 96 + offs_x0[None, :]
++    tile = tl.load(ptrs_in, eviction_policy='evict_first')
++
++    # Store: out_ptr0 shape (128,512,8,96) strides (393216,768,96,1)
++    # address = x3*393216 + x2*768 + x1*96 + x0
++    # Each row (fixed x2) is 96 contiguous floats -> coalesced!
++    base_out = x3 * 393216 + x1 * 96
++    ptrs_out = out_ptr0 + base_out + offs_x2[:, None] * 768 + offs_x0[None, :]
++    tl.store(ptrs_out, tile, eviction_policy='evict_first')
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

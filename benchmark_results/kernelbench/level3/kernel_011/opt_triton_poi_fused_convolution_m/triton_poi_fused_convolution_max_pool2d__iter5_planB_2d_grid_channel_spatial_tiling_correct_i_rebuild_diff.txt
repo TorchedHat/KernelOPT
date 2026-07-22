@@ -1,0 +1,96 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,18 @@
+ import torch.nn.functional as F
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=2),
+     ],
+-    key=['numel'],
++    key=['spatial', 'channels'],
+ )
+ @triton.jit
+ def bias_relu_kernel(
+@@ -23,35 +27,49 @@
+     spatial,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    pid = tl.program_id(0)
+-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    mask = offsets < numel
+-    
+-    # Compute channel index for bias
+-    # Layout: [N, C, H, W] -> channel = (offset / spatial) % channels
+-    # But we store in NHWC-like after conv template, so need to handle both
+-    # For standard NCHW: channel = (offset // spatial) % channels
+-    chan_idx = (offsets // spatial) % channels
+-    
+-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+-    bias = tl.load(bias_ptr + chan_idx, mask=mask, other=0.0)
+-    
+-    result = x + bias
++    pid_c = tl.program_id(0)   # channel index — one CTA per channel
++    pid_s = tl.program_id(1)   # spatial tile index
++    # Scalar bias load: all threads in warp read same bias value (broadcast)
++    # pid_c is always in [0, C) by grid construction, so mask is always True
++    bias_mask = pid_c < channels
++    bias_val = tl.load(bias_ptr + pid_c, mask=bias_mask, other=0.0)
++    # Coalesced spatial tile
++    s_offsets = pid_s * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    s_mask    = s_offsets < spatial
++    base      = pid_c.to(tl.int64) * spatial
++    x      = tl.load(x_ptr   + base + s_offsets.to(tl.int64), mask=s_mask, other=0.0,
++                     eviction_policy='evict_first')
++    result = x + bias_val          # compiler can now fuse into FMA with relu
+     result = tl.maximum(result, 0.0)
+-    
+-    tl.store(out_ptr + offsets, result, mask=mask)
++    tl.store(out_ptr + base + s_offsets.to(tl.int64), result, mask=s_mask,
++             eviction_policy='evict_first')
+ 
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 512},   num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512},   num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},   num_warps=4,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 1024},  num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 1024},  num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024},  num_warps=4,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 2048},  num_warps=8,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 2048},  num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048},  num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 4096},  num_warps=8,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 4096},  num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096},  num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 8192},  num_warps=8,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 8192},  num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 8192},  num_warps=8,  num_stages=4),
++        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16, num_stages=4),
+     ],
+     key=['numel'],
+ )
+ @triton.jit
++
+ def bias_relu_nhwc_kernel(
+     x_ptr,
+     bias_ptr,

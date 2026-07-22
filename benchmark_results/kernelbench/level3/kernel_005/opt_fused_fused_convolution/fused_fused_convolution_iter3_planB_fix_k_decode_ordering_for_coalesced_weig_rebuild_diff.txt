@@ -1,0 +1,83 @@
+--- baseline
++++ rebuilt
+@@ -12,6 +12,7 @@
+ # ============================================================
+ # Fused Conv2d + Bias + ReLU kernel (implicit GEMM)
+ # ============================================================
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+@@ -55,10 +56,10 @@
+ 
+     for k_off in range(0, TOTAL_K, BLOCK_K):
+         offs_k = k_off + tl.arange(0, BLOCK_K)
+-        # Decode K -> (in_c, kh, kw)
+-        in_c = offs_k % IN_C
+-        kw = (offs_k // IN_C) % KERNEL_W
+-        kh = offs_k // (IN_C * KERNEL_W)
++        # Decode K -> (kw, kh, in_c) with kw innermost for coalesced W loads
++        kw   = offs_k % KERNEL_W
++        kh   = (offs_k // KERNEL_W) % KERNEL_H
++        in_c = offs_k // (KERNEL_H * KERNEL_W)
+ 
+         # Input coordinates
+         ih = out_h[:, None] * STRIDE_H + kh[None, :] - PAD_H
+@@ -73,17 +74,17 @@
+ 
+         # X is NCHW: stride = (IN_C*IN_H*IN_W, IN_H*IN_W, IN_W, 1)
+         x_ptrs = X_ptr + batch[:, None] * (IN_C * IN_H * IN_W) + in_c[None, :] * (IN_H * IN_W) + ih * IN_W + iw
+-        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)
++        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0, eviction_policy='evict_first')
+ 
+         # W is NCHW: (OUT_C, IN_C, KERNEL_H, KERNEL_W)
+         # stride = (IN_C*KERNEL_H*KERNEL_W, KERNEL_H*KERNEL_W, KERNEL_W, 1)
+         mask_w = (offs_k[:, None] < TOTAL_K) & (offs_n[None, :] < OUT_C)
+         w_ptrs = W_ptr + offs_n[None, :] * (IN_C * KERNEL_H * KERNEL_W) + in_c[:, None] * (KERNEL_H * KERNEL_W) + kh[:, None] * KERNEL_W + kw[:, None]
+-        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)
++        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0, eviction_policy='evict_first')
+ 
+         acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
+ 
+-    # Add bias
++    # Add bias (default eviction_policy — reused across M-tiles)
+     mask_n = offs_n < OUT_C
+     bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
+     acc = acc + bias[None, :]
+@@ -95,22 +96,26 @@
+     # Store: output is NCHW
+     mask_out = (offs_m[:, None] < M_TOTAL) & (offs_n[None, :] < OUT_C)
+     y_ptrs = Y_ptr + batch[:, None] * (OUT_C * OUT_H * OUT_W) + offs_n[None, :] * (OUT_H * OUT_W) + out_h[:, None] * OUT_W + out_w[:, None]
+-    tl.store(y_ptrs, acc.to(tl.float32), mask=mask_out)
+-
+-
+-# ============================================================
+-# MaxPool2d kernel (3x3, stride=2, pad=0)
+-# ============================================================
++    tl.store(y_ptrs, acc.to(tl.float32), mask=mask_out, eviction_policy='evict_first')
++
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4,  num_stages=1),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8,  num_stages=3),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8,  num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=3),
+     ],
+     key=['N_TOTAL'],
+ )
+ @triton.jit
++
+ def maxpool2d_kernel(
+     X_ptr, Y_ptr,
+     BATCH: tl.constexpr, C: tl.constexpr,

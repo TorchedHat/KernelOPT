@@ -1,0 +1,128 @@
+[
+  {
+    "item_id": "exp_persistent_loop_tiny_kernel_regression_001",
+    "iteration": 2,
+    "speedup": 0.0249,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_multiblock_pointwise_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4084.0,
+        "Occupancy.Achieved Occupancy (%)": 3.54,
+        "Launch Statistics.Waves Per SM": 0.04,
+        "Launch Statistics.Grid Size": 160.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (bytes)": 512.0,
+        "Instruction Statistics.Executed Instructions": 21920.0,
+        "Scheduler Statistics.No Eligible (%)": 90.08
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 111.46,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 167111.0,
+        "Occupancy.Achieved Occupancy (%)": 7.59,
+        "Launch Statistics.Waves Per SM": 0.08,
+        "Launch Statistics.Grid Size": 160.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 31.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (bytes)": 4096.0,
+        "Instruction Statistics.Executed Instructions": 11100800.0,
+        "Scheduler Statistics.No Eligible (%)": 87.07
+      }
+    },
+    "strategy_title": "Persistent Loop on Tiny Kernel Causes Massive Regression",
+    "strategy_description": "Adding a persistent while-loop inside a Triton kernel that iterates over tiles caused a 40x slowdown despite the original kernel being launch-latency bound (0.04 waves/SM, 3.54% occupancy). The loop body executed 11.1M instructions vs 21.9K before \u2014 a 500x increase \u2014 because the grid was not reduced to match the persistent pattern: the launcher still used the original 2D grid (160 CTAs) with XBLOCK=128/YBLOCK=8, so each CTA iterated over all 40 tiles instead of a single tile, multiplying total work by ~40x. The implementation flaw was that the grid size was not changed to a small persistent grid (e.g., 40 or 528 CTAs with loop stride = grid_size), so the persistent loop ran redundantly across all original CTAs rather than distributing work.",
+    "slow_pseudocode": "# Original: 2D grid, single tile per CTA, no loop\n@triton.autotune(...)\n@triton.jit\ndef kernel(in0, in1, out, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = program_id(1) * YBLOCK\n    xoffset = program_id(0) * XBLOCK\n    # ... single tile load/store\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # (1, 160)",
+    "fast_pseudocode": "# Attempted: persistent loop, but grid NOT reduced \u2014 each of 160 CTAs loops all 40 tiles\n@triton.jit\ndef kernel(in0, in1, out, ynumel, xnumel, YBLOCK, XBLOCK):\n    pid = program_id(0)\n    grid_size = num_programs(0)  # still 160!\n    total_tiles = cdiv(xnumel, XBLOCK) * cdiv(ynumel, YBLOCK)  # 40\n    tile_id = pid\n    while tile_id < total_tiles:  # each CTA covers all 40 tiles\n        # ... load/store\n        tile_id += grid_size  # stride=160 > total_tiles=40, so only 1 iter each\n    # BUG: grid was not changed to persistent size\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # still (1, 160) \u2014 NOT reduced!",
+    "applicable_when": "Never apply this pattern as implemented. The correct persistent kernel pattern requires reducing the grid to fewer CTAs than total_tiles so each CTA processes multiple tiles.",
+    "do_not_apply_when": "Do not add a persistent while-loop to a kernel without simultaneously reducing the grid size to a small persistent count (e.g., num_SMs * blocks_per_SM). If the grid size equals or exceeds total_tiles, the loop body executes at most once per CTA and the overhead of the loop + increased register pressure + shared memory allocation causes severe regression. Especially harmful for tiny kernels (< 100us, < 10K elements) where launch overhead is already the dominant cost.",
+    "framework_notes": "In Triton, the persistent kernel pattern requires: (1) grid = (min(num_SMs * blocks_per_SM, total_tiles),) as a 1D grid, (2) grid_size = tl.num_programs(0) used as the loop stride, (3) tile_id starting at program_id(0). If the grid is not reduced, each CTA still processes only one tile (since stride >= total_tiles) but incurs all the overhead of the loop, extra registers (18\u219231), and shared memory allocation (512\u21924096 bytes), causing massive slowdown."
+  },
+  {
+    "item_id": "exp_triton_autotune_grid_lambda_plus_large_tiles_001",
+    "iteration": 3,
+    "speedup": 1.112,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_hardcoded_grid_to_autotune_lambda",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + IssueSlotUtilization + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.66,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3945.0,
+        "Occupancy.Achieved Occupancy (%)": 3.66,
+        "Launch Statistics.Waves Per SM": 0.04,
+        "Launch Statistics.Grid Size": 160.0,
+        "Scheduler Statistics.No Eligible (%)": 84.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.3,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 32.67,
+        "GPU Speed Of Light Throughput.SM Active Cycles": 1033.48
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.5,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3704.0,
+        "Occupancy.Achieved Occupancy (%)": 3.62,
+        "Launch Statistics.Waves Per SM": 0.04,
+        "Launch Statistics.Grid Size": 160.0,
+        "Scheduler Statistics.No Eligible (%)": 84.6,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.2,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 34.87,
+        "GPU Speed Of Light Throughput.SM Active Cycles": 837.37
+      }
+    },
+    "strategy_title": "Expand Autotune Config Space with Large Tile Sizes",
+    "strategy_description": "After fixing a hardcoded autotune grid to a lambda (which itself yielded ~4.5% speedup), expanding the @triton.autotune config space with larger tile sizes (YBLOCK up to 1024, XBLOCK up to 64) yielded an additional ~6% speedup (1.112x total from this iteration's baseline). The key metric improvement was SM Active Cycles dropping from 1033 to 837 cycles (19% reduction) and duration from 2.66us to 2.50us, while the grid size remained 160 \u2014 indicating the autotuner selected a config that processes more work per CTA, reducing per-CTA overhead. This pattern is effective when the workload is too small to fill the GPU (waves/SM << 1) and the existing config space does not include tiles large enough to minimize the number of active CTAs.",
+    "slow_pseudocode": "# Config space capped at YBLOCK=256, XBLOCK=64\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 16, 'YBLOCK': 32},  num_warps=2),\n        # ... up to ...\n        Config({'XBLOCK': 64, 'YBLOCK': 256}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "fast_pseudocode": "# Config space extended to YBLOCK=1024, covering more elements per CTA\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 16, 'YBLOCK': 32},   num_warps=2),\n        # ... existing configs ...\n        Config({'XBLOCK': 64, 'YBLOCK': 256},  num_warps=8),\n        Config({'XBLOCK': 64, 'YBLOCK': 512},  num_warps=8),  # NEW\n        Config({'XBLOCK': 64, 'YBLOCK': 1024}, num_warps=8),  # NEW\n        Config({'XBLOCK': 32, 'YBLOCK': 256},  num_warps=4),  # NEW\n        Config({'XBLOCK': 16, 'YBLOCK': 256},  num_warps=4),  # NEW\n        Config({'XBLOCK': 16, 'YBLOCK': 512},  num_warps=8),  # NEW\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "applicable_when": "Triton kernel uses @triton.autotune with a lambda grid, workload is too small to fill the GPU (waves/SM << 1, achieved occupancy < 10%), and the existing config space has a maximum tile size that leaves many CTAs doing partial or redundant work. SM Active Cycles are high relative to the actual work being done.",
+    "do_not_apply_when": "Workload is large enough to fill the GPU (waves/SM >= 1) \u2014 in that case, larger tiles may reduce parallelism and hurt throughput. Also avoid tile sizes that exceed available shared memory or register file capacity, which would reduce occupancy further on already occupancy-limited kernels.",
+    "framework_notes": "Triton-specific: tile sizes in @triton.autotune configs must be powers of 2. The lambda grid (lambda meta: (cdiv(N, meta['XBLOCK']), cdiv(M, meta['YBLOCK']))) is a prerequisite for this strategy \u2014 without it, adding larger configs has no effect since the grid is hardcoded. The autotuner selects the config with lowest measured latency, so adding large-tile configs only helps if they genuinely reduce per-kernel time on the target hardware."
+  },
+  {
+    "item_id": "exp_revert_persistent_loop_restore_2d_grid_autotune_001",
+    "iteration": 3,
+    "speedup": 1.0451,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "revert_broken_persistent_loop_restore_2d_grid_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.66,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3945.0,
+        "Occupancy.Achieved Occupancy (%)": 3.66,
+        "Launch Statistics.Waves Per SM": 0.04,
+        "Launch Statistics.Grid Size": 160.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 31.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (bytes)": 2048.0,
+        "Instruction Statistics.Executed Instructions": 37280.0,
+        "Scheduler Statistics.No Eligible (%)": 84.21,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 32.67
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.66,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3905.0,
+        "Occupancy.Achieved Occupancy (%)": 7.14,
+        "Launch Statistics.Waves Per SM": 0.08,
+        "Launch Statistics.Grid Size": 160.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 30.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (bytes)": 4096.0,
+        "Instruction Statistics.Executed Instructions": 76800.0,
+        "Scheduler Statistics.No Eligible (%)": 86.91,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 125.3
+      }
+    },
+    "strategy_title": "Remove Persistent Loop, Restore Clean 2D Grid with Autotune",
+    "strategy_description": "When a broken persistent while-loop kernel (where grid size was not reduced to match the persistent pattern) is reverted to a clean 2D grid with one tile per CTA, the instruction inflation is eliminated and memory throughput recovers significantly (32.67 \u2192 125.3 GB/s). The fix involves removing all loop-related variables (tile_id, grid_size, total_tiles) and replacing with direct tl.program_id(0)/program_id(1) 2D indexing, then adding @triton.autotune with a lambda grid to allow the autotuner to select the best block shape. For tiny kernels (< 5us, < 1 wave) that are launch-latency bound, the clean single-tile-per-CTA pattern with autotune is strictly superior to any persistent loop variant that does not properly reduce the grid.",
+    "slow_pseudocode": "# Broken: persistent loop with unreduced grid \u2014 each CTA loops but stride >= total_tiles\n@triton.autotune(configs=[...], key=[...])\n@triton.jit\ndef kernel(in0, in1, out, ynumel, xnumel, YBLOCK, XBLOCK):\n    pid = program_id(0)\n    grid_size = num_programs(0)  # still equals total CTAs\n    num_x_tiles = cdiv(xnumel, XBLOCK)\n    num_y_tiles = cdiv(ynumel, YBLOCK)\n    total_tiles = num_x_tiles * num_y_tiles\n    tile_id = pid\n    while tile_id < total_tiles:\n        y_tile = tile_id // num_x_tiles\n        x_tile = tile_id % num_x_tiles\n        yoffset = y_tile * YBLOCK\n        xoffset = x_tile * XBLOCK\n        # ... load/store\n        tile_id += grid_size  # stride >= total_tiles: loop runs once, but overhead remains\ngrid = (cdiv(xnumel, XBLOCK) * cdiv(ynumel, YBLOCK),)  # 1D flat grid",
+    "fast_pseudocode": "# Fixed: clean 2D grid, one tile per CTA, autotune selects block shape\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 16}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 32}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 64}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8, num_stages=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in0, in1, out, ynumel, xnumel, YBLOCK, XBLOCK):\n    xoffset = program_id(0) * XBLOCK\n    yoffset = program_id(1) * YBLOCK\n    xindex = xoffset + arange(0, XBLOCK)[None, :]\n    yindex = yoffset + arange(0, YBLOCK)[:, None]\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel\n    # ... load/store with mask=xmask & ymask\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "applicable_when": "A kernel previously had a persistent while-loop added without reducing the grid size, causing instruction inflation (Executed Instructions >> expected) and low memory throughput relative to data size. The kernel is tiny (< 5us, < 1 wave/SM) and the profiling shows SOLBottleneck + high No Eligible % + low achieved occupancy despite the loop overhead.",
+    "do_not_apply_when": "Do not apply this revert if the persistent loop was correctly implemented with a reduced grid (grid_size << total_tiles), as that pattern can improve occupancy for medium-to-large kernels. Also do not apply if the kernel is large enough to fill the GPU (> 1 wave/SM), where persistent kernels with proper grid reduction can be beneficial.",
+    "framework_notes": "In Triton, the 2D grid pattern uses tl.program_id(0) for x-axis and tl.program_id(1) for y-axis. The lambda grid `lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))` is required when using @triton.autotune so the grid adapts to the chosen tile sizes. The mask keyword argument form `mask=xmask & ymask` is preferred over positional for clarity."
+  }
+]

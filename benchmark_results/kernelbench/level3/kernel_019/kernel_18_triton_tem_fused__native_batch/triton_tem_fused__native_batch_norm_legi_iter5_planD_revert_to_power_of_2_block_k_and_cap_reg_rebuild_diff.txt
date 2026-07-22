@@ -1,0 +1,81 @@
+--- baseline
++++ rebuilt
+@@ -5,13 +5,28 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3, maxnreg=128),
++        triton.Config({}, num_warps=8, num_stages=3, maxnreg=128),
++        triton.Config({}, num_warps=4, num_stages=4, maxnreg=128),
++        triton.Config({}, num_warps=8, num_stages=4, maxnreg=128),
++        triton.Config({}, num_warps=4, num_stages=2, maxnreg=128),
++        triton.Config({}, num_warps=8, num_stages=2, maxnreg=128),
++        triton.Config({}, num_warps=4, num_stages=1, maxnreg=128),
++        triton.Config({}, num_warps=8, num_stages=1, maxnreg=128),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_relu_18(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+-    USE_FAST_ACCUM : tl.constexpr = False
++    USE_FAST_ACCUM : tl.constexpr = True
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 64
+     BLOCK_N : tl.constexpr = 64
++    # Reverted to power-of-2: eliminates masking overhead that caused 255 regs/thread
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+@@ -54,27 +69,26 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
++    # BLOCK_K=32 is power-of-2: tl.arange works directly, no padding needed
+     offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
++    # K=512 is exactly divisible by BLOCK_K=32: no boundary masking on K dimension
++    for k_idx in range(K // BLOCK_K):
++
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+         b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+-        xindex = idx_n + 512*idx_m
+-        a = tl.load(A + (xindex))
++        xindex = idx_n + 512 * idx_m
++        a_mask = (idx_m < M) & (a_k_idx_vals < K)
++        a = tl.load(A + (xindex), mask=a_mask, other=0.0)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 1024*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++        b_mask = (b_k_idx_vals < K) & (offs_b_n[None, :] < N)
++        b = tl.load(B + (b_k_idx_vals + 512 * offs_b_n[None, :]), mask=b_mask, other=0.0)
+ 
+-        
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -84,10 +98,8 @@
+     mask = (idx_m < M) & (idx_n < N)
+ 
+     # inductor generates a suffix
+-    xindex = idx_n + 1024*idx_m
++    xindex = idx_n + 1024 * idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

@@ -1,0 +1,239 @@
+[
+  {
+    "item_id": "exp_tma_blockptr_regression_001",
+    "iteration": 1,
+    "speedup": 0.1694,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_block_ptr_gemm_hopper",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.Waves Per SM": 46.55,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.46,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "GPU Speed Of Light Throughput.Duration (ms)": 16.52,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 41.57,
+        "Scheduler Statistics.No Eligible": 58.11,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.76
+      },
+      "key_metric_after": {
+        "Launch.Waves Per SM": 93.09,
+        "Occupancy.Theoretical Occupancy": 6.25,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 1.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 131.07,
+        "GPU Speed Of Light Throughput.Duration (ms)": 97.53,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 8.56,
+        "Scheduler Statistics.No Eligible": 91.35,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.6
+      }
+    },
+    "strategy_title": "TMA block_ptr with autotune causes shared memory explosion",
+    "strategy_description": "Replacing scalar pointer arithmetic with tl.make_block_ptr in a Triton GEMM kernel doubled dynamic shared memory per block (65 KB \u2192 131 KB), collapsing Block Limit Shared Mem from 3 to 1 block/SM and halving theoretical occupancy from 12.5% to 6.25%. This caused waves-per-SM to double (46\u219293) and duration to increase 6x (16ms\u219297ms), despite the intent to reduce register pressure. The root cause is that tl.make_block_ptr with boundary_check and software pipelining (num_stages) allocates large shared memory buffers for async prefetch staging, which is catastrophic when the kernel is already shared-memory-limited.",
+    "slow_pseudocode": "# scalar loads \u2014 65 KB smem, 12.5% occupancy, 16ms\nfor k_idx in range(K // BLOCK_K):\n    xindex_a = offs_k[None,:] + k_idx*BLOCK_K + 768*offs_m[:,None]\n    a = tl.load(A + xindex_a)\n    xindex_b = offs_k[:,None] + k_idx*BLOCK_K + ...\n    b = tl.load(B + xindex_b)\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "# block_ptr loads \u2014 131 KB smem, 6.25% occupancy, 97ms (WORSE)\na_ptr = tl.make_block_ptr(A, shape=(M,K), strides=(K,1), ...)\nb_ptr = tl.make_block_ptr(B, shape=(K,N), strides=(1,K), ...)\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(a_ptr, boundary_check=(0,1))\n    b = tl.load(b_ptr, boundary_check=(0,1))\n    acc += tl.dot(a, b)\n    a_ptr = tl.advance(a_ptr, (0, BLOCK_K))\n    b_ptr = tl.advance(b_ptr, (BLOCK_K, 0))",
+    "applicable_when": "Never apply tl.make_block_ptr with boundary_check when the kernel is already at or near the shared memory block limit (Block Limit Shared Mem \u2264 3). Only beneficial when shared memory headroom is large and register pressure is the primary bottleneck.",
+    "do_not_apply_when": "Kernel has high dynamic shared memory per block (>32 KB) and Block Limit Shared Mem is already \u2264 3; the additional smem from async pipeline staging will further halve occupancy and cause severe latency stalls (No Eligible >90%, Warp Cycles Per Issued Instruction >10).",
+    "framework_notes": "In Triton, tl.make_block_ptr with num_stages>1 in @triton.autotune allocates (num_stages * BLOCK_M * BLOCK_K + num_stages * BLOCK_K * BLOCK_N) * dtype_bytes of shared memory for async prefetch buffers. With BLOCK_M=128, BLOCK_K=64, BLOCK_N=128, fp32, num_stages=3, this is ~3MB equivalent staging \u2014 far exceeding SM shared memory limits and collapsing occupancy."
+  },
+  {
+    "item_id": "5477a723",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_smaller_tiles_with_maxnreg_cap",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + UncoalescedSharedAccess + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_smaller_tiles_with_maxnreg_cap \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_smaller_tiles_with_maxnreg_cap' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses 255 registers/thread (hardware maximum), which is the direct cause of Block Limit Registers=2 and only 12.5% theoretical occupancy. With only ~2 active warps/scheduler and 58% idle scheduler cycles, the GPU cannot hide latency. The BLOCK_M=128 x BLOCK_N=128 accumulator alone requires 16,384 FP32 values in registers, exhausting the register file. BLOCK_K=32 creates 24 loop iterations with poor pipeline depth. Reducing tile sizes (e.g., BLOCK_M=64, BLOCK_N=64, BLOCK_K=64) cuts accumulator registers from 16K to 4K values, freeing registers for occupancy. Adding maxnreg as a hard cap prevents the compiler from re-inflating register usage. The prior attempt at this direction failed correctness due to an implementation bug (incorrect fixed grid), not a strategy flaw. TMA/block_ptr is excluded (causes smem explosion per memory item exp_tma_blockptr_regression_001). Smaller tiles also reduce shared memory bank conflicts by changing access stride patterns.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "8b0a7735",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_load_indexing_and_reduce_tile_sizes_for_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + UncoalescedSharedAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_load_indexing_and_reduce_tile_sizes_for_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_load_indexing_and_reduce_tile_sizes_for_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses 255 registers/thread (hardware maximum), which limits Block Limit Registers to 2 blocks/SM and theoretical occupancy to 12.5%. With only ~2 active warps per scheduler and 58% idle scheduler cycles, the GPU cannot hide latency. The BLOCK_M=128 x BLOCK_N=128 accumulator alone requires 16384 FP32 values in registers, exhausting the register file. A prior attempt (reduce_register_pressure_via_autotune_tile_sizes) failed correctness because the B matrix load uses a non-standard indexing pattern that must be preserved exactly when tile sizes change. The fix must: (1) correctly simplify the B load as B + b_k_offs*1 + offs_b_n[None,:]*768, and (2) reduce BLOCK_M and BLOCK_N to 64 to cut register usage by ~4x, targeting 25-50% occupancy. TMA/block_ptr was already tried and regressed 6x due to shared memory explosion.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_scalar_load_revert_regression_002",
+    "iteration": 2,
+    "speedup": 0.211,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "revert_block_ptr_to_scalar_loads_to_eliminate_smem_explosion",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 16.5,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 41.46,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.46,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Launch.Stack Size": 1024.0,
+        "Scheduler Statistics.No Eligible": 58.16,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.76,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 77.32,
+        "Memory Workload Analysis.L2 Hit Rate": 96.68
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 78.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 10.6,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.47,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Launch.Stack Size": 3104.0,
+        "Scheduler Statistics.No Eligible": 89.33,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.68,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 912.96,
+        "Memory Workload Analysis.L2 Hit Rate": 87.63
+      }
+    },
+    "strategy_title": "Incorrect scalar pointer arithmetic causes L1TEX stall explosion",
+    "strategy_description": "The revert from tl.make_block_ptr to scalar pointer arithmetic preserved occupancy (12.5%) and shared memory (65 KB) but caused a 4.75x duration regression (16ms \u2192 78ms). The stack size tripled (1024 \u2192 3104 bytes), indicating the new pointer arithmetic introduced spills or complex address computation. The dominant new bottleneck is CPIStall from L1TEX: 72.3% of warp cycles are stalled waiting on L1TEX loads, with Warp Cycles Per Issued Instruction rising from 4.76 to 18.68 and eligible warps dropping from 0.73 to 0.12 per scheduler. The b_ptrs indexing formula (offs_n[None,:]*K + offs_k[:,None]) was incorrect for the transposed B matrix layout, generating non-coalesced or strided accesses that thrash L1TEX and cause massive memory latency stalls.",
+    "slow_pseudocode": "# BEFORE: working scalar loads \u2014 16ms, 4.76 cycles/inst, stack=1024\nxindex_a = offs_k[None,:] + k_idx*BLOCK_K + 768*offs_m[:,None]\na = tl.load(A + xindex_a, eviction_policy='evict_first')\nxindex_b = offs_k[:,None] + k_idx*BLOCK_K  # + complex broadcast\nb = tl.load(B + tl.broadcast_to(idx_m + 768*idx_n, [BLOCK_K, BLOCK_N]))\nacc += tl.dot(a, b)",
+    "fast_pseudocode": "# AFTER: broken scalar loads \u2014 78ms, 18.68 cycles/inst, stack=3104 (WORSE)\noffs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\noffs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)\noffs_k = tl.arange(0, BLOCK_K)\na_ptrs = arg_A + offs_m[:, None] * K + offs_k[None, :]  # [BLOCK_M, BLOCK_K]\nb_ptrs = arg_B + offs_n[None, :] * K + offs_k[:, None]  # [BLOCK_K, BLOCK_N] \u2014 WRONG stride\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(a_ptrs)\n    b = tl.load(b_ptrs)\n    acc += tl.dot(a, b)\n    a_ptrs += BLOCK_K\n    b_ptrs += BLOCK_K  # wrong: advances wrong dimension",
+    "applicable_when": "Never: this specific rewrite caused regression. The original scalar load pattern with explicit broadcast indexing was correct and fast.",
+    "do_not_apply_when": "Always avoid this rewrite pattern. When reverting from tl.make_block_ptr to scalar loads, verify that pointer stride arithmetic exactly matches the original kernel's memory layout. Incorrect b_ptrs stride (using offs_n*K instead of offs_n*1 for a column-major or transposed matrix) causes non-coalesced L1TEX accesses, tripling warp stall cycles and causing CPIStall to dominate at 72%+ of execution time. The tripled stack size (1024\u21923104) is a diagnostic signal that address computation spilled to local memory.",
+    "framework_notes": "In Triton, when reverting from tl.make_block_ptr to scalar pointer arithmetic, the pointer increment in the K-loop must match the actual memory stride of the K dimension, not BLOCK_K elements. For a B matrix stored as (N, K) with strides (K, 1), advancing b_ptrs by BLOCK_K advances K-dimension correctly only if b_ptrs was constructed as arg_B + offs_n[None,:]*K + offs_k[:,None]*1. The stack size increase (1024\u21923104) indicates register spill from complex address expressions, which is a secondary performance penalty on top of the access pattern issue."
+  },
+  {
+    "item_id": "3d5e3ca7",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_smaller_tiles_with_maxnreg_and_correct_b_indexing",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_smaller_tiles_with_maxnreg_and_correct_b_indexing \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_smaller_tiles_with_maxnreg_and_correct_b_indexing' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses 255 registers/thread (hardware maximum), directly causing Block Limit Registers=2 and only 12.5% theoretical occupancy. With BLOCK_M=128 x BLOCK_N=128, the accumulator alone holds 16,384 FP32 values in registers, exhausting the register file. This leaves only ~2 active warps/scheduler, and with 89.33% of cycles having no eligible warp, the GPU is almost entirely idle. The dominant stall (72.3%) is L1TEX scoreboard \u2014 the GPU cannot hide these latencies without more active warps. Reducing tile sizes to BLOCK_M=64, BLOCK_N=64 cuts the accumulator to 4,096 FP32 values (~4x reduction), freeing registers to allow 4+ blocks/SM and targeting 25-50% occupancy. Adding maxnreg=128 as a hard compiler cap prevents re-inflation. The B-matrix indexing must be preserved exactly \u2014 all prior correctness failures (max_diff~166) were caused by breaking this transposed-load pattern. TMA/block_ptr is excluded (memory item exp_tma_blockptr_regression_001: causes smem explosion and 6x regression).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "373ea277",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_fix_b_indexing_dynamic_grid",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + CPIStall + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_fix_b_indexing_dynamic_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_fix_b_indexing_dynamic_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses 255 registers/thread (hardware maximum), caused by the BLOCK_M=128 x BLOCK_N=128 accumulator requiring 16,384 FP32 values in registers. This limits Block Limit Registers to 2 blocks/SM and theoretical occupancy to 12.5%. With only ~2 active warps/scheduler, the GPU cannot hide L1TEX latency (72.3% of stalls). Reducing BLOCK_M and BLOCK_N to 64 cuts the accumulator from 16K to 4K FP32 values, freeing ~75% of register usage and targeting 4x higher occupancy. Prior attempts all failed correctness with max_diff=1.664e+02 due to a systematic B-matrix indexing bug and hardcoded grid. This plan explicitly preserves the correct B indexing formula and uses a lambda grid.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "076d6d39",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_ptr_advance_and_reduce_tile_sizes_for_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + CPIStall + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_ptr_advance_and_reduce_tile_sizes_for_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_ptr_advance_and_reduce_tile_sizes_for_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses 255 registers/thread (hardware maximum) because the BLOCK_M=128 x BLOCK_N=128 accumulator alone requires 16,384 FP32 values in registers. This caps Block Limit Registers at 2 blocks/SM, yielding only 12.5% theoretical occupancy and ~2 active warps/scheduler. With so few warps, the GPU cannot hide the 13.5-cycle average L1TEX latency (72.3% of all stalls), leaving schedulers idle 89.33% of cycles. All prior attempts to reduce tile sizes failed correctness with max_diff~166 \u2014 a large, consistent error indicating a systematic implementation bug in the B-matrix pointer advance when tile sizes were changed. The B matrix is stored as (N=3072, K=768) with strides (768, 1), accessed transposed. The current b_ptrs advance of += BLOCK_K is correct for K-stride=1. Prior rewrites likely broke the grid computation (hardcoded 12288 instead of dynamic cdiv). This plan provides a complete, self-consistent rewrite with smaller tiles (BLOCK_M=64, BLOCK_N=64, BLOCK_K=64) and a dynamic grid.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_fix_b_ptr_arithmetic_no_improvement_003",
+    "iteration": 3,
+    "speedup": 0.2114,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_b_matrix_pointer_arithmetic_correctness",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 78.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 10.6,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.47,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Launch.Stack Size": 3104.0,
+        "Scheduler Statistics.No Eligible": 89.33,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.68,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 912.96,
+        "Memory Workload Analysis.L2 Hit Rate": 87.63
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 78.16,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 10.6,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.47,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Launch.Stack Size": 3104.0,
+        "Scheduler Statistics.No Eligible": 89.33,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.67,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 914.53,
+        "Memory Workload Analysis.L2 Hit Rate": 87.71
+      }
+    },
+    "strategy_title": "Per-iteration explicit index recomputation does not fix L1TEX stalls",
+    "strategy_description": "Replacing pre-loop pointer variables with per-iteration explicit index recomputation (offs_k_cur = k_idx*BLOCK_K + tl.arange(0,BLOCK_K)) produced no measurable improvement: duration remained 78.16ms vs 78.3ms before, stack size stayed at 3104 bytes, eligible warps stayed at 0.12, and CPIStall from L1TEX remained at 72%+ of warp cycles. The profiling metrics are essentially identical before and after, indicating the root cause of the regression is not the pointer increment direction but something deeper \u2014 likely the overall scalar load pattern itself or the kernel structure inherited from the prior broken rewrite. When all key metrics (duration, stack size, occupancy, scheduler eligibility, warp stall cycles) are unchanged after a structural pointer arithmetic fix, the bottleneck is not addressable by index recomputation alone.",
+    "slow_pseudocode": "# Pre-loop pointer variables with increment (broken, 78.3ms)\noffs_k = tl.arange(0, BLOCK_K)\na_ptrs = arg_A + offs_m[:, None] * K + offs_k[None, :]\nb_ptrs = arg_B + offs_n[None, :] * K + offs_k[:, None]\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(a_ptrs)\n    b = tl.load(b_ptrs)\n    acc += tl.dot(a, b)\n    a_ptrs += BLOCK_K\n    b_ptrs += BLOCK_K",
+    "fast_pseudocode": "# Per-iteration explicit index recomputation (still broken, 78.16ms)\nfor k_idx in range(K // BLOCK_K):\n    offs_k_cur = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)\n    a = tl.load(arg_A + offs_m[:, None] * K + offs_k_cur[None, :])\n    b = tl.load(arg_B + offs_k_cur[:, None] + offs_n[None, :] * K)\n    acc += tl.dot(a, b)",
+    "applicable_when": "Never: this rewrite produced no improvement. The underlying kernel state (stack=3104, CPIStall=72%, eligible warps=0.12) is unchanged by this structural change.",
+    "do_not_apply_when": "When the kernel is already in a degraded state with stack size 3104 bytes, CPIStall at 72%+ of warp cycles, and eligible warps at 0.12 per scheduler \u2014 switching from pre-loop pointer increments to per-iteration index recomputation does not recover performance. The bottleneck is not the pointer increment direction. Do not apply this as a standalone fix when all profiling metrics remain identical after the change.",
+    "framework_notes": "In Triton, replacing `ptr += stride` loop increments with `ptr = base + k_idx * BLOCK_K + tl.arange(0, BLOCK_K)` per-iteration recomputation is semantically equivalent for correct strides and produces no measurable performance difference when the kernel is register-spill-limited (stack=3104 bytes). The stack size remaining at 3104 bytes after this change confirms the spill is not caused by the pointer increment pattern but by the overall register pressure of the kernel (255 registers/thread, Block Limit Registers=2)."
+  }
+]

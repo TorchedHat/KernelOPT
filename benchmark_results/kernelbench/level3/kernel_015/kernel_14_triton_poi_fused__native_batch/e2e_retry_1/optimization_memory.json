@@ -1,0 +1,80 @@
+[
+  {
+    "item_id": "exp_reduce_xblock_autotune_small_xnumel_001",
+    "iteration": 1,
+    "speedup": 1.1287,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_xblock_autotune_for_small_xnumel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 28.0,
+        "Launch.dynamic_smem_per_block_bytes": 4.0,
+        "GPU Speed Of Light Throughput.Duration_us": 3.07,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4568.0,
+        "Occupancy.Achieved Occupancy_%": 33.16,
+        "Launch.waves_per_sm": 0.42,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.24,
+        "Compute Workload Analysis.Issue Slots Busy_%": 41.62,
+        "Scheduler Statistics.No Eligible_%": 55.63,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.34
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 20.0,
+        "Launch.dynamic_smem_per_block_bytes": 2.0,
+        "GPU Speed Of Light Throughput.Duration_us": 2.72,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4031.0,
+        "Occupancy.Achieved Occupancy_%": 33.81,
+        "Launch.waves_per_sm": 0.42,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.72,
+        "Compute Workload Analysis.Issue Slots Busy_%": 50.42,
+        "Scheduler Statistics.No Eligible_%": 51.69,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.56
+      }
+    },
+    "strategy_title": "Shrink XBLOCK to match small xnumel, autotune YBLOCK",
+    "strategy_description": "When a Triton kernel has a very small xnumel (e.g., 9) but a large XBLOCK (e.g., 128), the vast majority of threads per CTA are masked out and do no useful work, wasting register pressure and instruction slots. Reducing XBLOCK to just cover xnumel (e.g., 16 for xnumel=9) eliminates this thread waste, reduces registers-per-thread (28\u219220) and shared memory per block, and improves issue slot utilization (41.6%\u219250.4%) and warp cycles per issued instruction (15.24\u219210.72). Adding @triton.autotune over XBLOCK and YBLOCK configurations allows the runtime to select the optimal tile shape, yielding a ~13% kernel speedup.",
+    "slow_pseudocode": "# XBLOCK=128 with xnumel=9: 119/128 threads masked, wasted\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]  # ynumel divisible by YBLOCK\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel  # xnumel=9, XBLOCK=128 \u2192 119 threads wasted\n    tmp0 = tl.load(ptr + (x + stride*y), xmask, eviction_policy='evict_last')\n    tl.store(out_ptr + (...), tmp0, xmask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # grid=(1, 896)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=16 covers xnumel=9 with only 7 masked threads\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  32}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  64}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=8),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 32, 'YBLOCK':  32}, num_warps=4),\n        triton.Config({'XBLOCK': 32, 'YBLOCK':  64}, num_warps=8),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 128}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel  # guard in case YBLOCK doesn't divide ynumel\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(ptr + (x + stride*y), xmask & ymask, eviction_policy='evict_last')\n    tl.store(out_ptr + (...), tmp0, xmask & ymask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)  # autotune injects XBLOCK/YBLOCK",
+    "applicable_when": "xnumel is much smaller than XBLOCK (e.g., xnumel <= 16 but XBLOCK=128), causing >50% of threads per CTA to be masked; Issue Slots Busy < 50%; Warp Cycles Per Issued Instruction > 12; registers_per_thread is elevated due to oversized tile; kernel is a pointwise/elementwise op with 2D (Y, X) tiling",
+    "do_not_apply_when": "xnumel is large and close to XBLOCK (thread waste is minimal); kernel is already wave-limited and occupancy is near theoretical; autotuning overhead is unacceptable (e.g., very short-lived kernels called once); YBLOCK changes would break correctness assumptions (e.g., ynumel not divisible by all candidate YBLOCKs without proper masking)",
+    "framework_notes": "Triton-specific: @triton.autotune with key=['ynumel','xnumel'] triggers re-tuning when problem size changes. The grid must be a lambda using meta['XBLOCK'] and meta['YBLOCK'] rather than hardcoded values. ymask must be added (yindex < ynumel) when YBLOCK candidates may not evenly divide ynumel. Equivalent in CUDA: use dynamic block size selection via occupancy API or template parameters."
+  },
+  {
+    "item_id": "exp_001_autotune_tile_sizes_small_grid",
+    "iteration": 1,
+    "speedup": 1.1043,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_small_grid_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.42,
+        "Occupancy.Achieved Occupancy": 33.16,
+        "Scheduler Statistics.No Eligible": 55.63,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.34,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.24,
+        "GPU Speed Of Light Throughput.Duration": 3.07,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4568.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.21,
+        "Occupancy.Achieved Occupancy": 15.06,
+        "Scheduler Statistics.No Eligible": 62.69,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.71,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.18,
+        "GPU Speed Of Light Throughput.Duration": 2.78,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4163.0
+      }
+    },
+    "strategy_title": "Autotune tile sizes when XBLOCK wastes lanes on small xnumel",
+    "strategy_description": "When a 2D Triton kernel has a very small xnumel (e.g., 9) but XBLOCK is set to a large power-of-two (e.g., 128), the vast majority of threads per warp do no useful work, inflating instruction count and wasting scheduler slots. Adding @triton.autotune over smaller XBLOCK values (e.g., 16 or 32) eliminates wasted lanes and reduces total instructions, cutting elapsed cycles even when achieved occupancy also drops. The speedup comes from reduced per-element work overhead (Warp Cycles Per Issued Instruction dropped from 15.24 to 7.18) rather than from improved occupancy.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # xnumel=9, but XBLOCK=128 wastes 119 lanes\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    ...\n\ngrid = (cdiv(9, 128), cdiv(7168, 8))  # = (1, 896)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  32}, num_warps=2),\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  64}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 32, 'YBLOCK':  32}, num_warps=2),\n        triton.Config({'XBLOCK': 32, 'YBLOCK':  64}, num_warps=4),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 256}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # xnumel=9, XBLOCK autotuned to 16 or 32 \u2014 far fewer wasted lanes\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel  # also tighten ymask\n    tl.load(..., xmask & ymask)\n    tl.store(..., xmask & ymask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)  # no explicit XBLOCK/YBLOCK kwargs",
+    "applicable_when": "Triton 2D pointwise kernel where xnumel is much smaller than XBLOCK (e.g., xnumel <= 16 but XBLOCK=128), causing most threads per warp to be masked out; IssueSlotUtilization rule fires with >40% idle scheduler cycles; Warp Cycles Per Issued Instruction is high (>10); grid is small (<1 wave per SM).",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (lane utilization already high); kernel is already autotuned; grid is large enough to saturate the GPU (>2 waves/SM) and occupancy is the primary bottleneck rather than wasted lanes; autotune overhead would dominate for very short-lived kernels called once.",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] so the best config is cached per problem size. The grid must become a lambda using meta['XBLOCK'] and meta['YBLOCK']. Also tighten ymask to yindex < ynumel when YBLOCK may exceed ynumel in some configs. Equivalent in CUDA: choose block dimensions so threadIdx.x covers xnumel with minimal padding."
+  }
+]

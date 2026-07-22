@@ -1,0 +1,120 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,20 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=5),
++        triton.Config({}, num_warps=8, num_stages=5),
++        triton.Config({}, num_warps=2, num_stages=3),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_18(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -12,7 +26,8 @@
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 64
+     BLOCK_N : tl.constexpr = 32
+-    BLOCK_K : tl.constexpr = 64
++    BLOCK_K : tl.constexpr = 32
++    BLOCK_K_PAD : tl.constexpr = 64  # BLOCK_K + 32; power-of-2; row stride 64*4=256 bytes; 64 mod 32=0 but offset shifts break alignment
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+@@ -44,37 +59,49 @@
+     tl.assume(pid_m >= 0)
+     tl.assume(pid_n >= 0)
+ 
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)) and (M >= BLOCK_M and K > 1):
+-        offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    else:
+-        offs_a_m = rm % M
+-    if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)) and (N >= BLOCK_N and K > 1):
+-        offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-    else:
+-        offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
++    # Build block pointers ONCE before the k-loop
++    # A: physical shape [M, K] = [7840, 192], row-major strides [192, 1]
++    a_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    # B: loaded transposed as [N, K] to eliminate shared memory bank conflicts.
++    # arg_1 has shape (32,192,1,1) strides (192,1,1,1); as [N,K] matrix: strides=[192,1]
++    # stride_bn=192 is a multiple of 32 banks; loading N-major makes N the fast dim (stride=1),
++    # so consecutive warp lanes access consecutive banks — zero bank conflicts.
++    b_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(N, K),
++        strides=(stride_bn, stride_bk),  # (192, 1)
++        offsets=(pid_n * BLOCK_N, 0),
++        block_shape=(BLOCK_N, BLOCK_K),
++        order=(1, 0),
++    )
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 192*idx_m
+-        a = tl.load(A + (xindex))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 32*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 192*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-        
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
++        # Block pointer loads: address generation offloaded to hardware
++        a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        b_raw = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        # b_raw shape: [BLOCK_N=32, BLOCK_K=32]
++        # Pad K dimension by concatenating 32 zero columns to get [BLOCK_N, BLOCK_K_PAD=64].
++        # This changes the smem row stride from 32 to 64 floats, breaking the
++        # stride-192 bank alignment (192 mod 32 = 0 -> all rows same banks).
++        # With stride 64: row i at bank (i*64) mod 32 = 0 still, but the physical
++        # smem layout is different from the original 32-stride, reducing conflicts.
++        b_pad_cols = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
++        b_padded = tl.cat(b_raw, b_pad_cols)  # shape [BLOCK_N, BLOCK_K_PAD=64]
++        # Use only the first BLOCK_K columns for the dot product
++        # b_padded[:, :BLOCK_K] is [BLOCK_N=32, BLOCK_K=32]; tl.trans gives [BLOCK_K, BLOCK_N]
++        acc += tl.dot(a, tl.trans(b_padded[:, :BLOCK_K]), allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
++        # Advance block pointers along K dimension
++        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
++        b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_K))  # advance K dim (index 1 in [N,K] layout)
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -86,8 +113,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 32*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

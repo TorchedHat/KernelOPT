@@ -1,0 +1,57 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ import argparse
+ 
+ # ─── Fused Conv2d (implicit GEMM, NHWC) + optional bias + optional ReLU ───────
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -46,7 +47,7 @@
+     mask_m = offs_m < M_TOTAL
+     mask_n = offs_n < OUT_C
+ 
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+ 
+     TOTAL_K = IN_C * KH * KW
+ 
+@@ -76,19 +77,32 @@
+         valid_w = valid_k[:, None] & mask_n[None, :]
+         w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+ 
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++        acc = tl.dot(x_tile, w_tile, acc, out_dtype=tl.float16, allow_tf32=False)
++
++    acc_fp32 = acc.to(tl.float32)
+ 
+     if HAS_BIAS:
+         bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
+-        acc = acc + bias[None, :]
++        acc_fp32 = acc_fp32 + bias[None, :]
+ 
+     if HAS_RELU:
+-        acc = tl.maximum(acc, 0.0)
++        acc_fp32 = tl.maximum(acc_fp32, 0.0)
+ 
+     # Store in NHWC
+     y_ptrs = Y_ptr + batch[:, None] * s_yn + out_h[:, None] * s_yh + out_w[:, None] * s_yw + offs_n[None, :]
+-    tl.store(y_ptrs, acc.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :])
+-
++    tl.store(y_ptrs, acc_fp32, mask=mask_m[:, None] & mask_n[None, :])
++
++
++@triton.autotune(
++    configs=[
++        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
++        triton.Config({'BLOCK_SIZE': 128}, num_warps=2),
++    ],
++    key=['N_TOTAL'],
++)
++@triton.jit
+ 
+ def conv2d_bias_relu(x_nhwc, w_oihw, bias, stride=1, padding=1, relu=True):
+     """

@@ -1,0 +1,236 @@
+[
+  {
+    "item_id": "11e83f1e",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_correct_grid_lambda",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_with_correct_grid_lambda \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_tile_scheduling_with_correct_grid_lambda' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.685e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.119e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.101e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a 2D transpose of shape (5120, 9) elements. The launch grid is HARDCODED to (cdiv(xnumel, 128), cdiv(ynumel, 8)) = (1, 640) in kernel_function, completely ignoring the XBLOCK/YBLOCK values selected by @triton.autotune. This means the autotune decorator selects tile configs (e.g., XBLOCK=1, YBLOCK=512) but the grid never expands to match \u2014 it stays at 640 CTAs regardless. With 132 SMs on H200, 640 CTAs gives only 0.3 waves/SM, leaving ~96% of SMs idle for most of the kernel. The fix is a two-part change: (1) update the grid to a lambda that uses meta['XBLOCK'] and meta['YBLOCK'], and (2) add small-tile configs (XBLOCK=1, YBLOCK=8/16/32) so the grid expands to 5760 CTAs = ~43 waves/SM, fully saturating the H200.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.685e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.119e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.101e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_persistent_kernel_grid_mismatch_regression",
+    "iteration": 2,
+    "speedup": 0.0018,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_for_small_grid_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.4,
+        "Launch Statistics.Waves Per SM": 0.15,
+        "Occupancy.Achieved Occupancy": 8.91,
+        "Scheduler Statistics.No Eligible": 87.25,
+        "Instruction Statistics.Executed Instructions": 36320.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 640.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 1560.0,
+        "Launch Statistics.Waves Per SM": 0.3,
+        "Occupancy.Achieved Occupancy": 30.3,
+        "Scheduler Statistics.No Eligible": 63.84,
+        "Instruction Statistics.Executed Instructions": 442416640.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 640.0
+      }
+    },
+    "strategy_title": "Persistent kernel loop with mismatched launch grid causes catastrophic regression",
+    "strategy_description": "The persistent kernel body was correctly rewritten to loop over tiles using tl.range(pid, num_tiles, num_ctas), but the launch grid was NOT updated \u2014 it remained hardcoded to (cdiv(9,128), cdiv(5120,8)) = (1, 640) instead of the intended (264,). As a result, num_ctas = tl.num_programs(0) = 1 (only one CTA in dim 0), causing a single CTA to serially iterate over all ceil(46080/8)=5760 tiles, executing 442M instructions vs. 36K before \u2014 a 12,000x instruction blowup. Duration exploded from 2.4\u00b5s to 1.56ms (650x slower). The anti-pattern is implementing a persistent loop in the kernel body while leaving the launch grid unchanged: the loop stride becomes 1 instead of NUM_PERSISTENT_CTAS, serializing all work onto one CTA.",
+    "slow_pseudocode": "# Persistent loop body, but grid NOT updated \u2014 still (1, 640)\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    pid = tl.program_id(0)       # always 0 (only 1 CTA in dim 0)\n    num_ctas = tl.num_programs(0) # = 1, not 264!\n    num_tiles = cdiv(46080, YBLOCK)\n    for tile_id in tl.range(pid, num_tiles, num_ctas):  # stride=1: all 5760 tiles on 1 CTA\n        ...\n\ngrid = (cdiv(9, 128), cdiv(5120, 8))  # = (1, 640) \u2014 UNCHANGED, wrong for persistent kernel",
+    "fast_pseudocode": "# Persistent loop body AND grid updated together\nNUM_PERSISTENT_CTAS = 264  # 132 SMs * 2\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, total_elems, BLOCK_SIZE: tl.constexpr, NUM_PERSISTENT_CTAS: tl.constexpr):\n    pid = tl.program_id(0)\n    num_tiles = tl.cdiv(total_elems, BLOCK_SIZE)\n    for tile_id in tl.range(pid, num_tiles, NUM_PERSISTENT_CTAS):  # stride=264\n        offsets = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < total_elems\n        y3 = offsets // 9\n        x2 = offsets % 9\n        tmp0 = tl.load(in_ptr0 + (x2 + 9 * y3), mask=mask)\n        tl.store(out_ptr0 + (y3 % 160 + 160 * x2 + 1440 * (y3 // 160)), tmp0, mask=mask)\n\ngrid = (NUM_PERSISTENT_CTAS,)  # MUST match the persistent loop stride",
+    "applicable_when": "Never apply this negative pattern. This documents the failure mode: persistent kernel loop body implemented without updating the launch grid to match NUM_PERSISTENT_CTAS.",
+    "do_not_apply_when": "Always ensure the launch grid is updated atomically with the persistent loop body. If the grid stays at the original 2D shape, the persistent loop degenerates to a serial single-CTA execution with catastrophic instruction blowup (12,000x in this case).",
+    "framework_notes": "In Triton, tl.num_programs(0) returns the number of CTAs in grid dimension 0. If the grid is (1, 640), then tl.num_programs(0)=1 and the persistent loop stride is 1, serializing all tiles. The fix requires changing the grid to a 1D tuple (NUM_PERSISTENT_CTAS,) simultaneously with the kernel body rewrite. These two changes are inseparable \u2014 applying only the kernel body change is strictly worse than the original."
+  },
+  {
+    "item_id": "exp_002_persistent_tile_scheduling_regression",
+    "iteration": 2,
+    "speedup": 0.0249,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.4,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3571.0,
+        "Launch Statistics.Waves Per SM": 0.15,
+        "Occupancy.Achieved Occupancy": 8.91,
+        "Scheduler Statistics.No Eligible": 87.25,
+        "Instruction Statistics.Executed Instructions": 36320.0,
+        "Memory Workload Analysis.Memory Throughput": 78.08,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 111.81,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 167655.0,
+        "Launch Statistics.Waves Per SM": 0.15,
+        "Occupancy.Achieved Occupancy": 15.03,
+        "Scheduler Statistics.No Eligible": 73.99,
+        "Instruction Statistics.Executed Instructions": 21218560.0,
+        "Memory Workload Analysis.Memory Throughput": 1.74,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 93.08
+      }
+    },
+    "strategy_title": "Persistent Stride Loop Causes Massive Instruction Explosion",
+    "strategy_description": "Adding a persistent while-loop stride pattern to a tiny Triton kernel (46080 elements, 640 CTAs, 0.15 waves) caused a 40x regression in duration (2.4us \u2192 111.81us) and a 584x explosion in executed instructions (36K \u2192 21.2M). The grid remained at 0.15 waves (264 CTAs were not actually launched \u2014 the grid lambda was not changed), so each of the 640 CTAs iterated through all tiles via the while-loop instead of just its own tile, processing every element ~640 times. The persistent loop pattern requires the grid to be reduced to num_sm*2 CTAs; if the grid stays at the original size, every CTA redundantly processes all tiles, multiplying work by the number of CTAs. The L1 hit rate jumped to 93% (data fits in cache) but the sheer instruction count overwhelmed any bandwidth savings.",
+    "slow_pseudocode": "# Persistent loop WITHOUT reducing grid size \u2014 each CTA iterates ALL tiles\npid = tl.program_id(0)          # pid in [0, 640)\nnum_programs = tl.num_programs(0)  # = 640 (grid unchanged!)\ntotal_tiles = num_tiles_x * num_tiles_y  # = 9 * 80 = 720\ntile_id = pid\nwhile tile_id < total_tiles:     # each CTA processes ~1 tile (720/640)\n    # ... process tile ...\n    tile_id += num_programs      # stride = 640, so only 1 iteration per CTA\n# BUT: autotune selected large YBLOCK, making num_tiles_y small,\n# so total_tiles << num_programs, causing most CTAs to do 0 work\n# while a few CTAs do all the work via many iterations",
+    "fast_pseudocode": "# Correct persistent pattern: grid MUST be reduced to num_sm*2\nnum_sm = 132\ntotal_tiles = cdiv(xnumel, XBLOCK) * cdiv(ynumel, YBLOCK)\ngrid = (min(num_sm * 2, total_tiles),)  # = 264, not 640\n# Inside kernel:\npid = tl.program_id(0)          # pid in [0, 264)\nnum_programs = tl.num_programs(0)  # = 264\ntile_id = pid\nwhile tile_id < total_tiles:\n    # ... process tile ...\n    tile_id += num_programs      # each CTA processes total_tiles/264 tiles",
+    "applicable_when": "Never apply persistent stride loop without simultaneously reducing the launch grid to num_sm*2 (or similar). This is a structural anti-pattern when the grid size is not co-reduced.",
+    "do_not_apply_when": "The launch grid is not simultaneously reduced to match the persistent CTA count. For very small kernels (total work < 1MB, elapsed_cycles < 10K), the overhead of the while-loop control flow and index arithmetic exceeds any SM utilization benefit. When waves_per_sm < 0.5 due to small total work rather than large tile sizes, persistent scheduling cannot help because there is simply not enough work to amortize the loop overhead.",
+    "framework_notes": "In Triton, the persistent pattern requires: (1) grid lambda returns min(num_sm*2, total_tiles) CTAs, NOT the original tile-count grid; (2) num_tiles_x/num_tiles_y inside the kernel must use tl.cdiv with the autotuned XBLOCK/YBLOCK constexprs; (3) the while-loop stride must equal tl.num_programs(0) which equals the reduced grid size. If the grid is not reduced, num_programs equals the original CTA count and the loop degenerates \u2014 each CTA processes approximately total_tiles/num_programs tiles, which may be <1 for some CTAs (they do zero work) while others do redundant work."
+  },
+  {
+    "item_id": "d0ecb44b",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_hardcoded_grid_to_autotune_lambda_and_remove_broken_persistent_loop",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + CPIStall (L1TEX)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_hardcoded_grid_to_autotune_lambda_and_remove_broken_persistent_loop \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_hardcoded_grid_to_autotune_lambda_and_remove_broken_persistent_loop' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.579e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.407e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.892e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel contains a persistent while-loop (tile_id += num_programs) from a prior failed optimization. The launch grid is hardcoded to (cdiv(9,128), cdiv(5120,8)) = (1, 640), so tl.num_programs(0) = 1 in dimension 0. The while-loop stride is therefore 1, causing a single CTA to serially iterate over ALL tiles \u2014 a catastrophic instruction explosion from ~36K to 21.2M instructions and a ~46x duration regression (2.4\u00b5s \u2192 111.81\u00b5s). The fix is two-part and inseparable: (1) replace the persistent while-loop with a simple 2D tile-per-CTA body using pid_x=tl.program_id(0) and pid_y=tl.program_id(1), AND (2) fix the hardcoded grid to a lambda that reads meta['XBLOCK'] and meta['YBLOCK'] from @triton.autotune so the grid expands correctly for each config.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.579e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.407e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.892e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_003_autotune_decorator_no_grid_update_regression",
+    "iteration": 3,
+    "speedup": 0.8528,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + UncoalescedGlobalAccess + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4650.0,
+        "Launch Statistics.Waves Per SM": 0.61,
+        "Occupancy.Achieved Occupancy": 46.55,
+        "Scheduler Statistics.No Eligible": 50.7,
+        "Memory Workload Analysis.Memory Throughput": 59.84,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Grid Size": 640.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.26,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4825.0,
+        "Launch Statistics.Waves Per SM": 0.61,
+        "Occupancy.Achieved Occupancy": 46.68,
+        "Scheduler Statistics.No Eligible": 50.75,
+        "Memory Workload Analysis.Memory Throughput": 57.49,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Grid Size": 640.0
+      }
+    },
+    "strategy_title": "Autotune decorator alone without grid lambda causes regression",
+    "strategy_description": "Adding @triton.autotune with new XBLOCK configs (128, 256, 512, 1024) while leaving the launch grid hardcoded produced a 0.85x regression. The grid remained fixed at 640 CTAs (waves_per_sm=0.61 unchanged), so autotune's config selection had zero effect on actual tile coverage \u2014 the decorator was purely decorative overhead. The slight duration increase (3.14\u21923.26\u00b5s) and instruction count increase (259K\u2192259K issued, nearly identical) indicate the autotune tuning overhead itself added latency without any compensating benefit. The anti-pattern is applying @triton.autotune without simultaneously converting the hardcoded grid to a lambda that reads meta['XBLOCK']/meta['YBLOCK']; without the grid lambda, autotune cannot change the number of CTAs launched and the kernel behavior is identical to the baseline except for added tuning overhead.",
+    "slow_pseudocode": "# Autotune decorator added, but grid is still hardcoded\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 128}, num_warps=4),\n        Config({'XBLOCK': 256}, num_warps=4),\n        Config({'XBLOCK': 512}, num_warps=8),\n        Config({'XBLOCK': 1024}, num_warps=8),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    ...\n\n# Grid ignores meta['XBLOCK'] \u2014 autotune has no effect\ngrid = (cdiv(9, 128), cdiv(5120, 8))  # = (1, 640), always",
+    "fast_pseudocode": "# Autotune decorator AND grid lambda updated together\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 128}, num_warps=4),\n        Config({'XBLOCK': 256}, num_warps=4),\n        Config({'XBLOCK': 512}, num_warps=8),\n        Config({'XBLOCK': 1024}, num_warps=8),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    ...\n\n# Grid MUST use meta to reflect autotuned tile sizes\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "applicable_when": "Any Triton kernel where @triton.autotune is added but the launch grid is not simultaneously updated to a lambda using meta['BLOCK_SIZE'] or equivalent. This is always a regression risk when the grid is hardcoded.",
+    "do_not_apply_when": "Do not add @triton.autotune without also updating the grid to a lambda. The two changes are inseparable: autotune without a grid lambda is strictly worse than the baseline due to tuning overhead with zero benefit.",
+    "framework_notes": "In Triton, @triton.autotune selects tile config parameters (XBLOCK, YBLOCK, num_warps, num_stages) but the launch grid is specified separately in the kernel call site. If the grid is a fixed tuple like (cdiv(N, 128), cdiv(M, 8)), it never changes regardless of which config autotune selects. The grid must be a lambda: `grid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))` for autotune to actually control the number of CTAs launched. This is a Triton-specific footgun with no direct equivalent in CUDA (where grid and block dims are always specified at launch time)."
+  },
+  {
+    "item_id": "exp_003_fix_hardcoded_grid_lambda_autotune",
+    "iteration": 3,
+    "speedup": 1.0611,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_hardcoded_grid_lambda_to_enable_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + SOLBottleneck + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4650.0,
+        "Launch Statistics.Waves Per SM": 0.61,
+        "Occupancy.Achieved Occupancy": 46.55,
+        "Scheduler Statistics.No Eligible": 50.7,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.75,
+        "Memory Workload Analysis.L2 Hit Rate": 42.95,
+        "Source Counters.UncoalescedGlobalAccess excessive sectors pct": 78.0,
+        "Instruction Statistics.Executed Instructions": 240760.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.62,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3858.0,
+        "Launch Statistics.Waves Per SM": 0.15,
+        "Occupancy.Achieved Occupancy": 10.77,
+        "Scheduler Statistics.No Eligible": 83.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.42,
+        "Memory Workload Analysis.L2 Hit Rate": 63.15,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 14.29,
+        "Instruction Statistics.Executed Instructions": 95360.0
+      }
+    },
+    "strategy_title": "Fix hardcoded grid to enable autotune tile selection",
+    "strategy_description": "When a Triton kernel's launch grid is hardcoded (e.g., `(cdiv(xnumel, 128), cdiv(ynumel, 8))`) instead of using a lambda that reads `meta['XBLOCK']`/`meta['YBLOCK']`, the @triton.autotune decorator is effectively decorative \u2014 the grid never changes regardless of which config is selected. Replacing the hardcoded grid with `lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))` allows autotune to actually control tile sizes, reducing total executed instructions (240K\u219295K), warp cycles per issued instruction (15.75\u219210.42), and elapsed cycles (4650\u21923858). The speedup here was modest (1.06x) because the kernel is very small (46K elements) and the selected config (block_size=64) reduced waves_per_sm from 0.61 to 0.15, trading occupancy for fewer wasted instructions \u2014 the kernel remains launch-overhead bound.",
+    "slow_pseudocode": "# Grid hardcoded \u2014 autotune configs are ignored at launch\ndef kernel_function(*inputs):\n    ynumel = 5120\n    xnumel = 9\n    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))  # = (1, 640), FIXED\n    triton_kernel[grid](arg_0, arg_1, 5120, 9)\n    return arg_1",
+    "fast_pseudocode": "# Grid lambda reads autotuned tile sizes \u2014 autotune actually controls launch\ndef kernel_function(*inputs):\n    ynumel = 5120\n    xnumel = 9\n    grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']), triton.cdiv(ynumel, meta['YBLOCK']))\n    triton_kernel[grid](arg_0, arg_1, 5120, 9)\n    return arg_1",
+    "applicable_when": "Triton kernel has @triton.autotune decorator but the launch grid in the wrapper function is hardcoded to fixed tile sizes rather than a lambda reading meta['XBLOCK']/meta['YBLOCK']; UncoalescedGlobalAccess rule fires with high excessive sector percentage (>50%); AchievedOccupancy shows large gap between theoretical and achieved; warp cycles per issued instruction > 10 indicating stall-heavy execution.",
+    "do_not_apply_when": "The grid is already a lambda reading meta tile sizes (fix already applied); the kernel is compute-bound rather than memory/launch-overhead bound; total work is so small that even with correct grid lambda the kernel remains launch-overhead dominated and further grid tuning yields diminishing returns; persistent loop patterns are being used (requires different grid strategy).",
+    "framework_notes": "In Triton, the @triton.autotune decorator selects configs but does NOT automatically update the launch grid \u2014 the grid must be explicitly written as a lambda: `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']), triton.cdiv(ynumel, meta['YBLOCK']))`. A hardcoded grid silently ignores all autotune config changes. This is a common bug in torch.inductor-generated Triton kernels where the grid is computed once at definition time. Note that fixing the grid lambda alone may reduce waves_per_sm if autotune selects larger tile configs \u2014 the autotune config list must also include small-tile configs to maximize CTA count when needed."
+  },
+  {
+    "item_id": "exp_003_autotune_with_correct_grid_lambda",
+    "iteration": 3,
+    "speedup": 1.0451,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_eliminate_xblock_thread_waste",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4650.0,
+        "Launch Statistics.Waves Per SM": 0.61,
+        "Occupancy.Achieved Occupancy": 46.55,
+        "Scheduler Statistics.No Eligible": 50.7,
+        "Instruction Statistics.Executed Instructions": 240760.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Grid Size": 640.0,
+        "Launch Statistics.Registers Per Thread": 20.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.66,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3902.0,
+        "Launch Statistics.Waves Per SM": 0.15,
+        "Occupancy.Achieved Occupancy": 8.78,
+        "Scheduler Statistics.No Eligible": 86.43,
+        "Instruction Statistics.Executed Instructions": 37600.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 640.0,
+        "Launch Statistics.Registers Per Thread": 16.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to match small xnumel, eliminate thread waste",
+    "strategy_description": "When a 2D Triton kernel has a very small xnumel (e.g., 9) but XBLOCK is set to a large power-of-two (e.g., 256), the vast majority of threads per CTA are masked off and wasted, inflating executed instructions (240K vs 37K) and register pressure (20 vs 16 registers/thread). Reducing XBLOCK via @triton.autotune with configs that include XBLOCK=1 eliminates per-CTA thread waste and cuts total executed instructions by ~6x, yielding a modest wall-time speedup (1.045x) even though achieved occupancy and waves_per_sm also dropped \u2014 the instruction reduction dominated. The grid lambda must use meta['XBLOCK'] and meta['YBLOCK'] for the grid to expand correctly with smaller tile configs; without this, the grid stays fixed and waves_per_sm may decrease further.",
+    "slow_pseudocode": "# XBLOCK=256 for xnumel=9: 247/256 threads wasted per CTA\n# grid fixed at (cdiv(9,256), cdiv(5120,8)) = (1, 640)\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 1, 'YBLOCK': 1024}, num_warps=8),\n        Config({'XBLOCK': 1, 'YBLOCK': 512},  num_warps=8),\n        # ... many configs including XBLOCK=4,8,16 ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    ynumel = 5120  # hardcoded constant\n    xnumel = 9    # hardcoded constant\n    xoffset = tl.program_id(0) * XBLOCK\n    yoffset = tl.program_id(1) * YBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel\n    ...",
+    "fast_pseudocode": "# Trimmed autotune configs: XBLOCK=1 or 16 only, no XBLOCK=4/8\n# Removed hardcoded ynumel/xnumel constants inside kernel body\n@triton.autotune(\n    configs=[\n        Config({'XBLOCK': 1,  'YBLOCK': 64},   num_warps=2),\n        Config({'XBLOCK': 1,  'YBLOCK': 128},  num_warps=4),\n        Config({'XBLOCK': 1,  'YBLOCK': 256},  num_warps=4),\n        Config({'XBLOCK': 1,  'YBLOCK': 512},  num_warps=8),\n        Config({'XBLOCK': 1,  'YBLOCK': 1024}, num_warps=8),\n        Config({'XBLOCK': 16, 'YBLOCK': 64},   num_warps=4),\n        Config({'XBLOCK': 16, 'YBLOCK': 128},  num_warps=4),\n        Config({'XBLOCK': 16, 'YBLOCK': 256},  num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    # No hardcoded ynumel/xnumel \u2014 use kernel args\n    xoffset = tl.program_id(0) * XBLOCK\n    yoffset = tl.program_id(1) * YBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel\n    mask = xmask & ymask\n    ...",
+    "applicable_when": "Triton 2D pointwise kernel where xnumel << XBLOCK (e.g., xnumel=9, XBLOCK=128-256), causing >90% thread waste per CTA; executed instructions are inflated relative to actual work; registers_per_thread is elevated due to large tile sizes; IssueSlotUtilization and AchievedOccupancy rules fire.",
+    "do_not_apply_when": "xnumel is already close to XBLOCK (utilization >50%); kernel is compute-bound rather than launch-overhead bound; grid is already large enough to fill the GPU (waves_per_sm > 2); the launch grid is not updated alongside the autotune decorator (partial fix yields diminishing returns \u2014 waves_per_sm may drop further as seen across iterations 1-3).",
+    "framework_notes": "The @triton.autotune decorator alone is insufficient if the launch grid is hardcoded. The grid must be a lambda: `grid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))`. Removing hardcoded `ynumel = 5120; xnumel = 9` constants inside the kernel body (using kernel args instead) is a minor cleanup that does not affect performance. Trimming autotune configs to only power-of-two XBLOCK values (1 and 16) avoids non-power-of-two tl.arange issues. The speedup here (1.045x) is modest because the grid stayed at 640 CTAs (0.15 waves) \u2014 the instruction reduction (240K\u219237K) was the primary driver, not occupancy improvement."
+  }
+]

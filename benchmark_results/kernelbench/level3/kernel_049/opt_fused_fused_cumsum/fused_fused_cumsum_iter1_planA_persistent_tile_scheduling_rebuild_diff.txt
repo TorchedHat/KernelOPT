@@ -1,0 +1,81 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ import math
+ 
+ # ─── Kernel 1: cumsum over last dim with permute ───────────────────────────────
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'XBLOCK': 1}, num_warps=4),
+@@ -18,33 +19,37 @@
+     # in_ptr: [B, C, L, H] with strides [C*L*H, L*H, H, 1]  (after reshape from [B, C*L, H])
+     # We want out: [B, H, C, L] with cumsum over last dim
+     # xnumel = B * H * C
+-    pid = tl.program_id(0)
+-    xoffset = pid * XBLOCK
+-    xidx = xoffset + tl.arange(0, XBLOCK)
+-    xmask = xidx < xnumel
+-
+-    # decode: xidx -> (b, h, c)
+-    # xnumel = B * H * C
++    sm_id = tl.program_id(0)
++    num_sms = tl.num_programs(0)
++    total_tiles = tl.cdiv(xnumel, XBLOCK)
++
+     H = 8
+     C = 2
+-    B_HC = xnumel  # B*H*C
+-
+-    c_idx = xidx % C
+-    h_idx = (xidx // C) % H
+-    b_idx = xidx // (C * H)
+-
+-    acc = tl.zeros([XBLOCK], dtype=tl.float32)
+-    for l in range(L):
+-        # input index: b * C*L*H + c * L*H + l * H + h
+-        in_idx = b_idx * (C * L * H) + c_idx * (L * H) + l * H + h_idx
+-        val = tl.load(in_ptr + in_idx, mask=xmask, other=0.0)
+-        acc = acc + val
+-        # output index: b * H*C*L + h * C*L + c * L + l
+-        out_idx = b_idx * (H * C * L) + h_idx * (C * L) + c_idx * L + l
+-        tl.store(out_ptr + out_idx, acc, mask=xmask)
+-
+-
+-# ─── Kernel 2: segsum + masked_fill + exp ─────────────────────────────────────
++
++    tile_id = sm_id
++    while tile_id < total_tiles:
++        xoffset = tile_id * XBLOCK
++        xidx = xoffset + tl.arange(0, XBLOCK)
++        xmask = xidx < xnumel
++
++        c_idx = xidx % C
++        h_idx = (xidx // C) % H
++        b_idx = xidx // (C * H)
++
++        acc = tl.zeros([XBLOCK], dtype=tl.float32)
++        for l in range(L):
++            # input index: b * C*L*H + c * L*H + l * H + h
++            in_idx = b_idx * (C * L * H) + c_idx * (L * H) + l * H + h_idx
++            val = tl.load(in_ptr + in_idx, mask=xmask, other=0.0)
++            acc = acc + val
++            # output index: b * H*C*L + h * C*L + c * L + l
++            out_idx = b_idx * (H * C * L) + h_idx * (C * L) + c_idx * L + l
++            tl.store(out_ptr + out_idx, acc, mask=xmask)
++
++        tile_id += num_sms
++
++
++# ─── Kernel 2: segsum + masked_fill + exp (persistent) ────────────────────────
+ # For each (b, h, c) row of length L, compute:
+ #   x_cumsum[i] - x_cumsum[j], mask upper triangle with -inf, then exp
+ # Output shape: [B, H, C, L, L]
+@@ -58,6 +63,7 @@
+     key=['L'],
+ )
+ @triton.jit
++
+ def segsum_exp_kernel(
+     B: tl.constexpr, H: tl.constexpr, C: tl.constexpr, L: tl.constexpr,
+     BLOCK_L: tl.constexpr,

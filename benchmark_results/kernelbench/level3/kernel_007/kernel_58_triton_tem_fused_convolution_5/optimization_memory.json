@@ -1,0 +1,231 @@
+[
+  {
+    "item_id": "exp_scalar_ptr_revert_regression_002",
+    "iteration": 2,
+    "speedup": 0.8179,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "scalar_pointer_revert_with_masked_loads_regression",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 30.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 46267.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.61,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Memory Workload Analysis.Memory Throughput": 132.48,
+        "Scheduler Statistics.No Eligible": 86.86
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 37.79,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 56636.0,
+        "Launch Statistics.Registers Per Thread": 60.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8.19,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.38,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Memory Workload Analysis.Memory Throughput": 108.25,
+        "Scheduler Statistics.No Eligible": 89.35
+      }
+    },
+    "strategy_title": "Masked Scalar Loads Slower Than Unmasked Indexed Loads",
+    "strategy_description": "Replacing unmasked indexed scalar loads (using precomputed xindex with modular arithmetic) with explicitly masked scalar loads (using boundary mask guards on offs_m < M and offs_k < K) caused a 22% regression in kernel duration (30.88us \u2192 37.79us). Although registers per thread slightly decreased (64 \u2192 60) and dynamic shared memory halved (16KB \u2192 8KB), warp cycles per issued instruction worsened (7.61 \u2192 9.38) and memory throughput dropped (132 GB/s \u2192 108 GB/s). The theoretical and achieved occupancy remained identical (50%, 6.25%), so the regression is attributable to the overhead of evaluating predicate masks on every load in the inner loop, which increases instruction latency and reduces scheduler eligibility (No Eligible: 86.86% \u2192 89.35%). When the original kernel already handles boundary conditions implicitly via modular index arithmetic, adding explicit mask guards adds overhead without correctness benefit.",
+    "slow_pseudocode": "# AFTER (regressed): explicit masked loads\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    k_start = k_idx * BLOCK_K\n    a_ptrs = A + offs_m[:,None] * 512 + (k_start + offs_k[None,:]) * 1\n    mask_a = (offs_m[:,None] < M) & ((k_start + offs_k[None,:]) < K)\n    a = tl.load(a_ptrs, mask=mask_a, other=0.0)\n    b_ptrs = B + (k_start + offs_k[:,None]) * 1 + offs_n[None,:] * 512\n    mask_b = ((k_start + offs_k[:,None]) < K) & (offs_n[None,:] < N)\n    b = tl.load(b_ptrs, mask=mask_b, other=0.0)\n    acc += tl.dot(a, b)\n# Result: 60 regs/thread, 8KB smem/block, 37.79us",
+    "fast_pseudocode": "# BEFORE (faster): unmasked indexed loads with modular arithmetic\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a_k_vals = offs_k[None,:] + k_idx * BLOCK_K\n    xindex = a_k_vals + K * offs_a_m[:,None]\n    a = tl.load(A + xindex)  # no mask\n    b_k_vals = offs_k[:,None] + k_idx * BLOCK_K\n    xindex = offs_b_n[None,:] + N * b_k_vals  # broadcast\n    b = tl.load(B + broadcast_to(...))\n    acc += tl.dot(a, b)\n# Result: 64 regs/thread, 16KB smem/block, 30.88us",
+    "applicable_when": "Never: this strategy caused regression. The anti-pattern is adding explicit boundary mask guards (offs_m < M, offs_k < K) to scalar loads in a Triton matmul inner loop when the original kernel already handles boundaries via modular index arithmetic or when the problem dimensions make out-of-bounds access impossible in practice.",
+    "do_not_apply_when": "Do not replace unmasked indexed scalar loads with explicitly masked loads when: (1) the original kernel already handles boundary conditions implicitly, (2) the kernel is latency-bound with low occupancy (achieved occupancy ~6%), where predicate evaluation overhead per warp is amplified, (3) the inner loop is tight and mask computation adds non-trivial instruction count. The mask overhead increases warp cycles per instruction and reduces scheduler eligibility.",
+    "framework_notes": "In Triton, tl.load with a mask= argument generates predicated loads that require evaluating the boolean tensor on every iteration. When the original code used tl.max_contiguous + tl.multiple_of hints with modular arithmetic (offs_a_m = rm % M), the compiler could optimize away boundary checks. Adding explicit masks removes this optimization opportunity and adds predicate computation overhead in the inner loop."
+  },
+  {
+    "item_id": "f048c50f",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "split_k_to_expand_grid_and_fill_sms",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "split_k_to_expand_grid_and_fill_sms \u2014 correctness failure",
+    "strategy_description": "Plan 'split_k_to_expand_grid_and_fill_sms' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.262e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.461e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.014e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 CTAs on a 132-SM H200 GPU, yielding 0.06 waves/SM and 6.25% achieved occupancy. The N dimension is exactly 32 = BLOCK_N, so grid_n=1 \u2014 there is zero N-dimension parallelism. The M dimension gives grid_m=62 tiles. The GPU has 132 SMs, so 70 SMs sit completely idle. The LaunchConfiguration rule flags this directly (53% speedup potential). SPLIT_K partitions the K=512 reduction dimension across multiple CTAs: with SPLIT_K=4, each CTA handles K/4=128 K-steps, and the grid expands to 62x4=248 blocks \u2014 nearly 2 full waves across 132 SMs. Prior experiments confirm that large tiles (BLOCK_M=128) cause register explosion (64->168 regs) and 2.25x regression, so SPLIT_K with the existing small tile sizes is the safe path to increase parallelism without touching register pressure.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.262e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.461e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.014e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "e689ed4c",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "split_k_parallelism_to_fill_sm_utilization",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "split_k_parallelism_to_fill_sm_utilization \u2014 correctness failure",
+    "strategy_description": "Plan 'split_k_parallelism_to_fill_sm_utilization' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.810e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.919e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.124e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 blocks on a 132-SM H200, achieving 0.06 waves/SM and 6.25% occupancy. The scheduler is idle 86.85% of cycles with only 1 active warp per scheduler. The dominant stall (74.1% of cycles) is MIO/shared-memory scoreboard waits caused by 12-way shared memory bank conflicts (77.78% excessive wavefronts). All prior attempts to fix bank conflicts directly (transposed loads, padding, TMA, masked loads) either failed or regressed. The root cause of underutilization is that the K=512 reduction is serialized within each of the 62 blocks. Split-K partitions the K dimension across SPLIT_K CTAs per output tile, multiplying the grid from 62 to 62*SPLIT_K blocks. With SPLIT_K=8, the grid becomes 496 blocks (3.76 waves/SM), dramatically improving SM utilization. Each CTA handles K/SPLIT_K=64 K-steps instead of 512, reducing the inner loop from 16 iterations to 2, which also reduces the total shared-memory traffic per CTA and thus the cumulative bank-conflict penalty.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.810e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.919e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.124e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_autotune_num_stages_regression_003",
+    "iteration": 3,
+    "speedup": 0.7764,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_stages_to_hide_mio_latency",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 31.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 46497.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.62,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Scheduler Statistics.No Eligible": 86.87,
+        "Instruction Statistics.Executed Instructions": 1414336.0,
+        "Memory Workload Analysis.Memory Throughput": 131.81
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 39.81,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 59675.0,
+        "Launch Statistics.Registers Per Thread": 53.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8.19,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.44,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Scheduler Statistics.No Eligible": 90.42,
+        "Instruction Statistics.Executed Instructions": 1330512.0,
+        "Memory Workload Analysis.Memory Throughput": 102.74
+      }
+    },
+    "strategy_title": "Adding num_stages Autotune Worsens MIO Stalls on Small Grid",
+    "strategy_description": "Adding @triton.autotune sweeping num_stages=[1,2,3,4] alongside a B-matrix load layout change (from tl.trans(load([BLOCK_N, BLOCK_K])) to direct load([BLOCK_K, BLOCK_N])) caused a 22% regression in kernel duration (31.04us \u2192 39.81us). Despite registers per thread decreasing (64 \u2192 53) and theoretical occupancy slightly improving (50% \u2192 56.25%), warp cycles per issued instruction worsened (7.62 \u2192 10.44), scheduler No-Eligible increased (86.87% \u2192 90.42%), and memory throughput dropped (131.81 \u2192 102.74 GB/s). The achieved occupancy remained stuck at 6.25% regardless of the num_stages change, confirming the bottleneck is the severely under-sized grid (62 blocks on 132 SMs, 0.06 waves/SM) \u2014 software pipelining cannot hide latency when there is only one active warp per scheduler and no additional warps to interleave. The simultaneous B-load layout change likely disrupted the compiler's memory access pattern optimization, increasing effective MIO stall cycles.",
+    "slow_pseudocode": "# AFTER (regressed): autotune num_stages + direct B load\n@triton.autotune(configs=[Config({}, num_stages=1, num_warps=4), Config({}, num_stages=2, num_warps=4), ...], key=[])\n@triton.jit\ndef kernel(...):\n    for k_idx in range(cdiv(K, BLOCK_K)):\n        a = tl.load(A + k_offs + K*m_offs)  # [BLOCK_M, BLOCK_K]\n        k_offs2 = offs_k[:,None] + k_idx*BLOCK_K  # [BLOCK_K, 1]\n        n_offs = offs_b_n[None,:]               # [1, BLOCK_N]\n        b = tl.load(B + k_offs2 + n_offs*512)   # [BLOCK_K, BLOCK_N] direct\n        acc += tl.dot(a, b)\n# Result: 53 regs/thread, 8KB smem, 39.81us, warp_cycles=10.44",
+    "fast_pseudocode": "# BEFORE (faster): no autotune num_stages sweep + tl.trans B load\n@triton.autotune(configs=[Config({}, num_warps=4, num_stages=3), Config({}, num_warps=4, num_stages=4), ...], key=[])\n@triton.jit\ndef kernel(...):\n    for k_idx in range(cdiv(K, BLOCK_K)):\n        a = tl.load(A + xindex)  # [BLOCK_M, BLOCK_K]\n        b_ptrs = B + (offs_b_n[:,None]*512 + b_k_vals)  # [BLOCK_N, BLOCK_K]\n        b = tl.trans(tl.load(b_ptrs))  # transpose to [BLOCK_K, BLOCK_N]\n        acc += tl.dot(a, b)\n# Result: 64 regs/thread, 16KB smem, 31.04us, warp_cycles=7.62",
+    "applicable_when": "Never for this kernel configuration: this strategy caused regression. The anti-pattern is expecting num_stages software pipelining to hide MIO/shared-memory latency when the grid is severely undersized (grid_size << sm_count, waves_per_sm < 0.1) and achieved occupancy is already at minimum (6.25%). Software pipelining requires multiple active warps to interleave; with only 1 active warp per scheduler, there is nothing to pipeline with.",
+    "do_not_apply_when": "Do not apply num_stages autotune sweeps to hide MIO scoreboard stalls when: (1) achieved occupancy is already at the minimum possible given grid size (e.g., 6.25% with 62 blocks on 132 SMs), (2) active warps per scheduler is 1 \u2014 there are no additional warps to interleave with prefetched data, (3) the kernel is grid-limited (waves_per_sm < 0.1) rather than occupancy-limited by register/smem pressure. In these cases, software pipelining adds overhead (autotune cost, changed memory access patterns) without providing latency hiding benefit. The root cause (too few blocks) cannot be fixed by num_stages.",
+    "framework_notes": "In Triton, num_stages controls the software pipeline depth for async memory operations (cp.async on Hopper). It is only effective when there are multiple active warps per scheduler to interleave. When achieved_occupancy equals the minimum dictated by grid_size/sm_count (not by register/smem limits), increasing num_stages cannot improve performance. Also note: changing the B-matrix load from tl.trans(load([BLOCK_N, BLOCK_K])) to direct load([BLOCK_K, BLOCK_N]) simultaneously altered the memory access pattern in a way that increased MIO stall cycles despite using fewer registers."
+  },
+  {
+    "item_id": "exp_higher_num_stages_mio_stall_regression_003",
+    "iteration": 3,
+    "speedup": 0.8214,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_num_stages_to_hide_mio_scoreboard_stall_latency",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 31.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 46497.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.62,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Memory Workload Analysis.Memory Throughput": 131.81,
+        "Scheduler Statistics.No Eligible": 86.87,
+        "Instruction Statistics.Executed Instructions": 1414336.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 37.63,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 56378.0,
+        "Launch Statistics.Registers Per Thread": 60.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8.19,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.3,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Memory Workload Analysis.Memory Throughput": 108.71,
+        "Scheduler Statistics.No Eligible": 89.29,
+        "Instruction Statistics.Executed Instructions": 1393752.0
+      }
+    },
+    "strategy_title": "Expanding num_stages Autotune Range Regresses Small Latency-Bound Kernels",
+    "strategy_description": "Extending the Triton autotune config list to include num_stages in {5,6,7,8} (alongside the original {2,3,4}) caused a 22% regression in kernel duration (31.04us \u2192 37.63us). Despite the intent to hide MIO scoreboard stalls via deeper software pipelining, the winning autotuned config actually reduced dynamic shared memory per block (16KB \u2192 8KB) and registers per thread (64 \u2192 60), indicating the autotuner selected a lower-stage config \u2014 yet warp cycles per issued instruction worsened (7.62 \u2192 9.30) and memory throughput dropped (131.81 \u2192 108.71 GB/s). The profiling signals are nearly identical to the iteration-2 masked-load regression, strongly suggesting the code diff's introduction of explicit mask predicates (mask_a, mask_b) in the inner loop \u2014 not the num_stages change \u2014 is the actual causal regression, with the autotuner selecting a config that happens to use less shared memory. When a kernel is severely latency-bound with only 0.06 waves/SM and 6.25% achieved occupancy, adding more pipeline stages cannot compensate because there are not enough concurrent warps to fill the pipeline, and any accompanying code changes (e.g., masked loads) dominate the performance outcome.",
+    "slow_pseudocode": "# AFTER (regressed): expanded num_stages autotune + masked loads in inner loop\n@triton.autotune(configs=[\n    triton.Config({}, num_warps=4, num_stages=2),\n    ...\n    triton.Config({}, num_warps=8, num_stages=8),  # new high-stage configs\n], key=[])\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    k_start = k_idx * BLOCK_K\n    mask_a = (offs_m[:,None] < M) & ((k_start + offs_k[None,:]) < K)  # explicit mask\n    a = tl.load(A + offs_m[:,None]*512 + (k_start+offs_k[None,:])*1, mask=mask_a, other=0.0)\n    mask_b = ((k_start + offs_k[:,None]) < K) & (offs_n[None,:] < N)  # explicit mask\n    b = tl.load(B + (k_start+offs_k[:,None])*1 + offs_n[None,:]*512, mask=mask_b, other=0.0)\n    acc += tl.dot(a, b)\n# Result: 60 regs/thread, 8KB smem/block, 37.63us, warp cycles/inst=9.30",
+    "fast_pseudocode": "# BEFORE (faster): original num_stages {2,3,4} + unmasked indexed loads\n@triton.autotune(configs=[\n    triton.Config({}, num_warps=4, num_stages=3),\n    triton.Config({}, num_warps=4, num_stages=4),\n    triton.Config({}, num_warps=4, num_stages=2),\n    triton.Config({}, num_warps=2, num_stages=3),\n    triton.Config({}, num_warps=2, num_stages=4),\n    triton.Config({}, num_warps=8, num_stages=3),\n    triton.Config({}, num_warps=8, num_stages=4),\n], key=[])\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    xindex = (offs_k[None,:] + k_idx*BLOCK_K) + K*offs_a_m[:,None]\n    a = tl.load(A + xindex)  # no mask\n    b = tl.load(B + broadcast_to(...))  # no mask\n    acc += tl.dot(a, b)\n# Result: 64 regs/thread, 16KB smem/block, 31.04us, warp cycles/inst=7.62",
+    "applicable_when": "Never: this strategy caused regression. The anti-pattern is expanding the num_stages autotune range while simultaneously introducing explicit mask predicates in the inner loop. Even if the num_stages change alone were neutral, the masked loads dominate and cause regression.",
+    "do_not_apply_when": "Do not expand num_stages autotune configs when: (1) the kernel is severely latency-bound with waves_per_sm < 0.1 and achieved occupancy ~6%, where pipeline depth cannot be exploited without more concurrent warps; (2) the code change is bundled with other modifications (e.g., masked loads, pointer arithmetic refactoring) that independently cause regression; (3) the dominant bottleneck is shared memory bank conflicts (12-way, 77%+ excessive wavefronts) rather than pure pipeline latency \u2014 bank conflicts serialize within each pipeline stage regardless of num_stages. On small grids (grid_size << sm_count), the fundamental occupancy ceiling prevents software pipelining from being effective.",
+    "framework_notes": "In Triton, num_stages controls the depth of the software pipeline for async shared memory prefetch. Higher num_stages requires more shared memory per block (each stage buffers one tile of A and B). However, when the kernel is already severely underutilized (0.06 waves/SM), the autotuner may select a lower-stage config anyway, and any co-occurring code changes (masked loads, pointer arithmetic) dominate the measured outcome. The profiling signature after this change (60 regs, 8KB smem, 37.63us) is nearly identical to the iteration-2 masked-load regression (60 regs, 8KB smem, 37.79us), confirming the masked loads \u2014 not num_stages \u2014 are the causal regression."
+  },
+  {
+    "item_id": "9f300f99",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_and_block_n_to_expand_grid_and_fill_sms",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_and_block_n_to_expand_grid_and_fill_sms \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_and_block_n_to_expand_grid_and_fill_sms' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.531e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.047e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.140e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 blocks on a 132-SM H200, leaving 70 SMs completely idle (0.06 waves/SM, 6.25% achieved occupancy). N=32 exactly equals BLOCK_N=32, giving grid_n=1 (zero N-dimension parallelism). M=1960 with BLOCK_M=32 gives only grid_m=62. Every prior attempt to fix this via split-K failed correctness (2 attempts), TMA/large tiles caused 2.25x regression (register explosion 64->168 regs), and num_stages autotune caused 22% regression. The untried safe path is to REDUCE tile sizes: BLOCK_M=16 doubles grid_m to 123, and BLOCK_N=16 doubles grid_n to 2, yielding 246 total blocks ~1.86 waves across 132 SMs. Smaller accumulator tiles (16x16 vs 32x32) use FEWER registers (256 vs 1024 fp32 values in the acc tile), directly reducing register pressure from 60 regs/thread and potentially improving theoretical occupancy beyond 50%. The secondary bank-conflict penalty (12-way, 77.78% excessive wavefronts) is also reduced since each block issues fewer shared memory transactions.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.531e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.047e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.140e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "037d7bd2",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_expand_grid_and_fill_sms",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_to_expand_grid_and_fill_sms \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_to_expand_grid_and_fill_sms' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.531e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.654e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.140e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 CTAs on a 132-SM H200 (0.06 waves/SM), leaving 70 SMs completely idle. The root cause is that grid_m = ceil(1960/32) = 62 and grid_n = ceil(32/32) = 1, giving a 62x1 grid. Reducing BLOCK_M from 32 to 16 doubles grid_m to ceil(1960/16) = 123 blocks \u2014 nearly one full wave across all 132 SMs \u2014 without changing BLOCK_N or BLOCK_K. This is the safest possible grid-expansion strategy: it does not increase register pressure (smaller accumulator tile = fewer registers), does not increase shared memory, and does not change the algorithmic structure. Prior split-K attempts failed correctness; prior TMA/large-tile attempts exploded registers. Halving BLOCK_M is the minimal, safe change that directly addresses the LaunchConfiguration bottleneck.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.531e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.654e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.140e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "749739fa",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "split_k_with_correct_atomic_reduction",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "split_k_with_correct_atomic_reduction \u2014 correctness failure",
+    "strategy_description": "Plan 'split_k_with_correct_atomic_reduction' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.175e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.345e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.021e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 CTAs on a 132-SM GPU (0.05 waves/SM), leaving 70 SMs completely idle. N=32 exactly equals BLOCK_N so grid_n=1 \u2014 there is zero N-dimension parallelism. The M dimension yields grid_m=62 tiles. The scheduler is idle 90.4% of cycles with only 1 active warp per scheduler, making software pipelining (num_stages) useless. The K=512 reduction is serialized within each of the 62 blocks. Split-K partitions K across SPLIT_K CTAs per output tile, expanding the grid from 62 to 62*SPLIT_K blocks. With SPLIT_K=4 the grid becomes 248 blocks (~1.9 waves); with SPLIT_K=8 it becomes 496 blocks (~3.8 waves). Prior split-K attempts (memory items f048c50f, e689ed4c) failed correctness with max_diff ~88, consistent with missing output zero-initialization and/or double-counting the bias across all pid_k CTAs. The corrected implementation addresses both issues explicitly.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.175e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.345e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.021e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

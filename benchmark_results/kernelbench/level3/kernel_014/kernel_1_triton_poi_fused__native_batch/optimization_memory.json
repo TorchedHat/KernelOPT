@@ -1,0 +1,100 @@
+[
+  {
+    "item_id": "exp_persistent_tile_scheduling_triton_regression_001",
+    "iteration": 1,
+    "speedup": 0.0859,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.Duration_us": 2.46,
+        "Occupancy.AchievedOccupancy_pct": 6.07,
+        "Launch.WavesPerSM": 0.06,
+        "Instruction.ExecutedInstructions": 51200.0,
+        "Scheduler.NoEligible_pct": 90.3,
+        "GPU_SOL.ElapsedCycles": 3646.0
+      },
+      "key_metric_after": {
+        "Launch.Duration_us": 28.64,
+        "Occupancy.AchievedOccupancy_pct": 3.12,
+        "Launch.WavesPerSM": 0.03,
+        "Instruction.ExecutedInstructions": 796160.0,
+        "Scheduler.NoEligible_pct": 92.16,
+        "GPU_SOL.ElapsedCycles": 42869.0,
+        "CPIStall.L1TEX_pct": 77.67
+      }
+    },
+    "strategy_title": "Persistent Tile Loop Causes Massive Instruction Explosion",
+    "strategy_description": "Adding a persistent while-loop inside a Triton kernel to reuse CTAs across tiles caused a 11.6x slowdown despite the kernel being grid-size limited. The instruction count exploded from 51,200 to 796,160 (15.5x more), and the dominant stall shifted from barrier/instruction-fetch stalls to L1TEX memory stalls (77.7% of cycles). The grid was not updated to cap at SM count (still used the old 2D grid formula), so the persistent loop ran redundant iterations while also introducing per-tile index arithmetic overhead that dominated the tiny workload.",
+    "slow_pseudocode": "# Persistent loop version (SLOW)\npid = tl.program_id(0)\nnum_programs = tl.num_programs(0)\nx_tiles = tl.cdiv(xnumel, XBLOCK)  # cdiv(9, XBLOCK)\ny_tiles = tl.cdiv(ynumel, YBLOCK)\nnum_tiles = x_tiles * y_tiles\ntile_id = pid\nwhile tile_id < num_tiles:\n    x_tile = tile_id % x_tiles\n    y_tile = tile_id // x_tiles\n    xoffset = x_tile * XBLOCK\n    yoffset = y_tile * YBLOCK\n    # ... compute indices, load, store ...\n    tile_id += num_programs\n\n# Grid was NOT updated to cap at SM count:\ngrid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))  # old 2D grid",
+    "fast_pseudocode": "# Simple 2D grid version (FAST)\nyoffset = tl.program_id(1) * YBLOCK\nxoffset = tl.program_id(0) * XBLOCK\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]\nxmask = xindex < xnumel\ntmp0 = tl.load(in_ptr0 + (x2 + 9*y3), xmask, eviction_policy='evict_last')\ntl.store(out_ptr0 + (y0 + 32*x2 + 288*y1), tmp0, xmask)\n\n# Grid: (cdiv(9, 128), cdiv(1024, 8)) = (1, 128)",
+    "applicable_when": "Never: persistent tile scheduling is harmful for tiny kernels where the total work (tiles) is already smaller than or comparable to the number of SMs. The per-tile index arithmetic in the while-loop body dominates over actual memory work.",
+    "do_not_apply_when": "Kernel has very few total tiles (e.g., <200 tiles for a 132-SM GPU). The grid is already small but the kernel duration is already in the low microsecond range (< 5 us). The workload is so small that adding loop overhead and tile-index arithmetic (modulo, division) per iteration costs more than the occupancy gain. Also avoid when the grid launch formula is not updated to actually cap at SM count \u2014 the persistent loop then runs with the same number of CTAs as before, adding overhead with no benefit.",
+    "framework_notes": "In Triton, persistent kernels require the grid to be explicitly capped at num_SMs (e.g., min(132, num_tiles)) for the pattern to work. If the grid formula is left unchanged (still uses cdiv-based 2D grid), the persistent while-loop runs with the original number of CTAs and each CTA iterates through all tiles assigned to it \u2014 but since num_programs equals the original grid size, each CTA only processes ~1 tile anyway, adding pure overhead. The autotune overhead also adds latency for tiny kernels."
+  },
+  {
+    "item_id": "11d4d539",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesce_strided_stores_via_shared_memory_staging",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesce_strided_stores_via_shared_memory_staging \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesce_strided_stores_via_shared_memory_staging' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.417e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.019e+00 > atol=0.001\nseed=1337 output[0]: max_diff=4.491e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a layout permutation: reads in_ptr0 with stride 9 in y (contiguous in x, so loads are coalesced across the XBLOCK dimension) but writes out_ptr0 with pattern y0 + 32*x2 + 288*y1. The output stride is 32 in the y0 dimension (y0 = yindex % 32), meaning consecutive threads in the YBLOCK dimension write to addresses 32 floats apart \u2014 a stride-32 scatter that causes 78% of all L2 sectors to be 'excessive' (only 4 of 32 bytes per sector are used). This is the dominant bottleneck. The fix is to reorder the store loop so that y (the fast-moving dimension in the output, stride-1 in y0) is the inner loop within each tile, converting the strided scatter into sequential writes.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.417e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.019e+00 > atol=0.001\nseed=1337 output[0]: max_diff=4.491e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "e61c0979",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_grid_formula_and_swap_xy_for_coalesced_access",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + IssueSlotUtilization + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_grid_formula_and_swap_xy_for_coalesced_access \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_grid_formula_and_swap_xy_for_coalesced_access' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.533e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.300e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.367e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The grid formula in kernel_function is hardcoded as (cdiv(xnumel, 128), cdiv(ynumel, 8)) = (cdiv(9,128), cdiv(1024,8)) = (1, 128). This completely ignores the autotuned XBLOCK and YBLOCK values, so the autotune is broken \u2014 the grid always launches exactly 128 blocks regardless of tile size. With 132 SMs and only 128 blocks, waves_per_sm=0.03 and achieved occupancy=3.12%. The correct grid must be a lambda using meta['XBLOCK'] and meta['YBLOCK']. Additionally, the memory access pattern is uncoalesced: NCU reports only 24/32 bytes per sector utilized. Swapping so that the Y dimension (1024 elements) maps to program_id(0) makes the store to y0=yindex%32 (stride-1) coalesced across threads in a warp.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.533e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.300e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.367e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "fef31679",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "kernel_fusion_inline_layout_permutation",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + UncoalescedGlobalAccess + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "kernel_fusion_inline_layout_permutation \u2014 correctness failure",
+    "strategy_description": "Plan 'kernel_fusion_inline_layout_permutation' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 710, in run\n    bound_args, specialization, options = binder(*args, **kwargs)\n                                          ^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: dynamic_func() missing 1",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "This kernel is a pure layout permutation of a 32x32x3x3 weight tensor (9,216 floats = 36 KB). It runs in only 2.53 us with 3.05% occupancy and 0.03 waves/SM. The grid is hardcoded as (cdiv(9,128), cdiv(1024,8)) = (1, 128), ignoring autotuned XBLOCK/YBLOCK entirely. The store pattern y0 + 32*x2 + 288*y1 is a stride-32 scatter causing 78% excessive L2 sectors. All single-kernel fixes have been tried and failed. The correct fix is kernel fusion: inline this layout permutation into the consumer kernel, eliminating the intermediate global memory buffer and the separate kernel launch.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 710, in run\n    bound_args, specialization, options = binder(*args, **kwargs)\n ",
+    "framework_notes": null
+  }
+]

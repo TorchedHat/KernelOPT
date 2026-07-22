@@ -1,0 +1,132 @@
+--- baseline
++++ rebuilt
+@@ -5,13 +5,14 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_mean_relu_29(arg_A, arg_B, out_ptr1):
+     EVEN_K : tl.constexpr = True
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+-    BLOCK_M : tl.constexpr = 16
+-    BLOCK_N : tl.constexpr = 32
++    BLOCK_M : tl.constexpr = 2
++    BLOCK_N : tl.constexpr = 16
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+@@ -30,66 +31,63 @@
+     stride_bk = 1
+     stride_bn = 1728
+ 
+-    # based on triton.ops.matmul
+     pid = tl.program_id(0).to(INDEX_DTYPE)
+-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
++    grid_size = tl.num_programs(0).to(INDEX_DTYPE)
++    grid_m = (M + BLOCK_M - 1) // BLOCK_M  # = 1
++    grid_n = (N + BLOCK_N - 1) // BLOCK_N  # = 27
++    num_tiles = grid_m * grid_n             # = 27
+ 
+-    # re-order program ID for better L2 performance
+-    width = GROUP_M * grid_n
+-    group_id = pid // width
+-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+-    pid_m = group_id * GROUP_M + (pid % group_size)
+-    pid_n = (pid % width) // (group_size)
+-    tl.assume(pid_m >= 0)
+-    tl.assume(pid_n >= 0)
++    # Persistent loop: each SM processes multiple tiles
++    tile_id = pid
++    while tile_id < num_tiles:
++        # re-order program ID for better L2 performance
++        width = GROUP_M * grid_n
++        group_id = tile_id // width
++        group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
++        pid_m = group_id * GROUP_M + (tile_id % group_size)
++        pid_n = (tile_id % width) // group_size
++        tl.assume(pid_m >= 0)
++        tl.assume(pid_n >= 0)
+ 
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)) and (M >= BLOCK_M and K > 1):
+-        offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    else:
++        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++        # CRITICAL: keep % M and % N exactly as original for boundary-safe modular indexing
+         offs_a_m = rm % M
+-    if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)) and (N >= BLOCK_N and K > 1):
+-        offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-    else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
++        offs_k = tl.arange(0, BLOCK_K)
++        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
++        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
++            a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
++            b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 1728*idx_m
+-        a = tl.load(A + (xindex))
++            idx_m = offs_a_m[:, None]
++            idx_n = a_k_idx_vals
++            xindex = idx_n + 1728*idx_m
++            a = tl.load(A + (xindex))
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
++            idx_m = b_k_idx_vals
++            idx_n = offs_b_n[None, :]
++            xindex = idx_n + 432*idx_m
++            b = tl.load(B + ((tl.broadcast_to(idx_m + 1728*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++
++            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
++
++        # rematerialize rm and rn to save registers
++        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++        idx_m = rm[:, None]
++        idx_n = rn[None, :]
++        mask = (idx_m < M) & (idx_n < N)
++
++        # inductor generates a suffix
+         xindex = idx_n + 432*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 1728*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++        tmp0 = tl.full([1], 0, tl.int32)
++        tmp1 = tl.maximum(tmp0, acc)
++        tl.store(out_ptr1 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+ 
+-
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
+-
+-    # rematerialize rm and rn to save registers
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    idx_m = rm[:, None]
+-    idx_n = rn[None, :]
+-    mask = (idx_m < M) & (idx_n < N)
+-
+-    # inductor generates a suffix
+-    xindex = idx_n + 432*idx_m
+-    tmp0 = tl.full([1], 0, tl.int32)
+-    tmp1 = tl.maximum(tmp0, acc)
+-    tl.store(out_ptr1 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+-
++        tile_id += grid_size  # advance to next tile
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

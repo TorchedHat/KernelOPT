@@ -1,0 +1,89 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4),
+        triton.Config({'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4),
+        triton.Config({'XBLOCK': 16, 'YBLOCK': 64}, num_warps=4),
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 64}, num_warps=8),
+        triton.Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=8),
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=8),
+        triton.Config({'XBLOCK': 16, 'YBLOCK': 32}, num_warps=4),
+        triton.Config({'XBLOCK': 32, 'YBLOCK': 16}, num_warps=4),
+    ],
+    key=['ynumel', 'xnumel'],
+)
+@triton.jit
+def triton_poi_fused_cat_convolution_11(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
+    # Repurpose: XBLOCK tiles C (stride-1 in input), YBLOCK tiles HW (stride-512 in input)
+    # ynumel = N*C = 5120, xnumel = HW = 50176
+    # N=10, C=512, HW=50176
+    # Grid: pid(0) -> HW tiles (YBLOCK wide), pid(1) -> N*C tiles (XBLOCK wide)
+    # num_c_tiles = C // XBLOCK = 512 // XBLOCK
+    C = 512
+    HW = 50176
+    N = 10
+    num_c_tiles = C // XBLOCK  # exact division when XBLOCK divides 512
+
+    pid_hw = tl.program_id(0)   # tiles HW dimension with YBLOCK
+    pid_nc = tl.program_id(1)   # tiles N * C_tiles
+
+    n_idx = pid_nc // num_c_tiles
+    c_tile = pid_nc % num_c_tiles
+
+    # Channel offsets: stride-1 in input (NHWC-like layout)
+    c_off = c_tile * XBLOCK + tl.arange(0, XBLOCK)   # [XBLOCK]
+    c_mask = c_off < C
+
+    # HW offsets: stride-512 in input, stride-1 in output
+    hw_off = pid_hw * YBLOCK + tl.arange(0, YBLOCK)  # [YBLOCK]
+    hw_mask = hw_off < HW
+
+    # PHASE 1: Load coalesced in C (stride-1 in input)
+    # Input layout: in_ptr0[n, hw, c] = n*25690112 + hw*512 + c*1
+    # tile shape: [YBLOCK, XBLOCK] — innermost dim is C (stride-1) -> coalesced
+    load_idx = (n_idx * 25690112
+                + hw_off[:, None] * 512
+                + c_off[None, :])   # [YBLOCK, XBLOCK]
+    load_mask = hw_mask[:, None] & c_mask[None, :]
+    tile = tl.load(in_ptr0 + load_idx, mask=load_mask, other=0.0)
+
+    # PHASE 2: Transpose tile [YBLOCK, XBLOCK] -> [XBLOCK, YBLOCK]
+    # Store coalesced in HW (stride-1 in output)
+    # Output layout: out_ptr0[n, c, hw] = n*25690112 + c*50176 + hw*1
+    store_idx = (n_idx * 25690112
+                 + c_off[:, None] * 50176
+                 + hw_off[None, :])  # [XBLOCK, YBLOCK]
+    store_mask = c_mask[:, None] & hw_mask[None, :]
+    tl.store(out_ptr0 + store_idx, tl.trans(tile), mask=store_mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 5120
+    xnumel = 50176
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_cat_convolution_11[grid](arg_0, arg_1, 5120, 50176)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((10, 512, 224, 224), (25690112, 1, 114688, 512), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((10, 512, 224, 224), (25690112, 50176, 224, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

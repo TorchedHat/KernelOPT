@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "bedad104",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.067e-01 > atol=0.001\nseed=42 output[0]: max_diff=9.332e-02 > atol=0.001\nseed=1337 output[0]: max_diff=1.039e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a GEMM (M=490, N=160, K=832) with ALLOW_TF32=False, forcing tl.dot to use scalar FP32 FFMA units instead of Tensor Cores. The H200 SXM5 delivers 989 TFLOPS via FP32 Tensor Cores vs only 67 TFLOPS via scalar FFMA \u2014 a ~14.8x peak ratio. Currently Compute SOL is only 7.93%, meaning the kernel is severely underutilized. Enabling TF32 (allow_tf32=True) routes tl.dot through the Tensor Core pipeline, which operates at ~8x the throughput of scalar FFMA. The K=832 dimension is modest, so accumulated TF32 rounding error is acceptable for a convolution epilogue. Additionally, adding @triton.autotune will explore larger tile sizes to better fill the 132 SMs (currently only 80 blocks = 0.2 waves) and reduce the shared memory bank conflict impact.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.067e-01 > atol=0.001\nseed=42 output[0]: max_diff=9.332e-02 > atol=0.001\nseed=1337 output[0]: max_diff=1.039e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_tile_size_change_regression",
+    "iteration": 1,
+    "speedup": 0.4675,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "change_tile_sizes_without_autotune_to_fix_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 49.73,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 74544.0,
+        "Instruction Statistics.Executed Instructions": 3121880.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.31,
+        "Launch Statistics.Registers Per Thread": 94.0,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.25
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 106.37,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 159481.0,
+        "Instruction Statistics.Executed Instructions": 9935848.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.92,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.25
+      }
+    },
+    "strategy_title": "Hardcoded Tile Size Change Without Autotune Causes Regression",
+    "strategy_description": "Changing BLOCK_M/BLOCK_N/BLOCK_K from 32/32/128 to 64/64/64 via hardcoded constexpr values (instead of using @triton.autotune) caused a 2.14x slowdown. The plan called for adding @triton.autotune but the implementation only changed the hardcoded constants, so the new tile sizes were never empirically validated. The larger tiles (64x64x64) increased register pressure from 94 to 128 registers/thread, reducing Block Limit Registers from 5 to 4 blocks/SM, and tripled the executed instruction count (3.1M \u2192 9.9M) without improving occupancy (still 6.25%), resulting in 2.14x longer kernel duration (49.73 \u00b5s \u2192 106.37 \u00b5s).",
+    "slow_pseudocode": "# Plan: add @triton.autotune with 10 configs exploring BLOCK_K in {32,64}\n# Implementation: only changed hardcoded constexpr values\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 32  # before\n    BLOCK_N: tl.constexpr = 32\n    BLOCK_K: tl.constexpr = 128\n    # registers_per_thread = 94, executed_instructions = 3.1M",
+    "fast_pseudocode": "# What was actually done (wrong approach):\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64  # changed without autotune\n    BLOCK_N: tl.constexpr = 64\n    BLOCK_K: tl.constexpr = 64\n    # registers_per_thread = 128 (+36%), executed_instructions = 9.9M (+218%)\n    # Duration: 106.37 us vs 49.73 us before\n\n# What should have been done:\n@triton.autotune(\n    configs=[triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4), ...],\n    key=['M', 'N', 'K'],\n)\n@triton.jit\ndef kernel(in_ptr0, arg_A, arg_B, out_ptr0,\n           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ...):\n    ...",
+    "applicable_when": "Kernel has severe shared memory bank conflicts (12-way, 77%+ conflict wavefront ratio) with BLOCK_K=128 and float32 elements; SharedMemoryConflicts NCU rule triggered with >70% speedup potential; occupancy limited by shared memory (Block Limit Shared Mem < Block Limit Registers).",
+    "do_not_apply_when": "Do not change tile sizes via hardcoded constexpr without @triton.autotune \u2014 larger tiles increase register pressure and instruction count without guarantee of improvement. Never blindly increase BLOCK_M and BLOCK_N together with BLOCK_K reduction, as the combined effect on register file can negate any bank conflict savings. Avoid this pattern when registers_per_thread is already near 96 (the 128-register limit will reduce Block Limit Registers and worsen occupancy).",
+    "framework_notes": "In Triton, tile sizes set as tl.constexpr inside the kernel body are fixed at compile time. To explore tile configurations, they must be promoted to kernel arguments decorated with @triton.autotune and the grid must be changed to a lambda (META dict). Simply changing the hardcoded values is an implementation flaw \u2014 the plan required autotune but the diff shows only constant reassignment. The grid was also not updated to match the new tile sizes (still 80 blocks hardcoded), which would have caused incorrect results with larger tiles anyway."
+  }
+]

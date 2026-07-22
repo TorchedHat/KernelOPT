@@ -1,0 +1,84 @@
+[
+  {
+    "item_id": "exp_001_autotune_larger_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.4202,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "eliminate_partial_wave_via_larger_xblock_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 2940.0,
+        "Launch Statistics.Waves Per SM": 1.39,
+        "GPU Speed Of Light Throughput.Duration (us)": 4.45,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 25.79,
+        "Occupancy.Achieved Occupancy (%)": 62.49,
+        "Scheduler Statistics.No Eligible (%)": 45.96,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Instruction Statistics.Executed Instructions": 917280.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Block Size": 512.0,
+        "Launch Statistics.Grid Size": 2940.0,
+        "Launch Statistics.Waves Per SM": 5.57,
+        "GPU Speed Of Light Throughput.Duration (us)": 10.59,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 67.77,
+        "Occupancy.Achieved Occupancy (%)": 82.18,
+        "Scheduler Statistics.No Eligible (%)": 15.42,
+        "Launch Statistics.Registers Per Thread": 31.0,
+        "Instruction Statistics.Executed Instructions": 5697720.0
+      }
+    },
+    "strategy_title": "Autotune Larger XBLOCK to Eliminate Partial Wave",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (512, 1024, 2048) to a pointwise kernel that had a partial-wave launch (waves_per_sm=1.39, grid=2940, block=128) caused a 2.38x slowdown. The autotuner selected XBLOCK=512 but the grid remained at 2940 blocks (same as before), meaning the grid was not recomputed via a lambda \u2014 it was hardcoded to cdiv(xnumel, 128). This caused 4x more threads to be launched (1.5M vs 376K) with 31 registers/thread instead of 18, inflating total instruction count from 917K to 5.7M (6.2x) and duration from 4.45 \u00b5s to 10.59 \u00b5s. The root cause is a code bug: the grid was not updated to use meta['XBLOCK'], so the kernel ran with a fixed grid of 2940 blocks but each block now processed 4x more elements, causing massive redundant work and register pressure increase.",
+    "slow_pseudocode": "# BEFORE: fixed grid, fixed XBLOCK=128\ngrid = (triton.cdiv(xnumel, 128),)  # = 2940 blocks\nkernel[grid](..., xnumel, XBLOCK=128)",
+    "fast_pseudocode": "# INTENDED AFTER (not what was implemented):\n# grid must be a lambda using meta['XBLOCK']\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](..., xnumel)  # autotuner picks XBLOCK\n\n# ACTUAL AFTER (buggy - grid still hardcoded to 2940):\ngrid = (triton.cdiv(xnumel, 128),)  # still 2940 blocks!\nkernel[grid](..., xnumel)  # XBLOCK chosen by autotune but grid not updated",
+    "applicable_when": "Kernel has a partial wave (waves_per_sm between 1.0 and 2.0), low compute throughput (<30%), and NCU LaunchConfiguration rule fires with high estimated speedup (>30%). Registers per thread are low (<24) and no shared memory is used.",
+    "do_not_apply_when": "The grid is hardcoded and not updated to use meta['XBLOCK'] \u2014 this is the exact failure mode observed here. Do not apply autotune for XBLOCK without simultaneously converting the grid to a lambda that uses meta['XBLOCK']. Also avoid when register count per thread is already high (>24), as larger blocks will further increase register pressure and reduce occupancy.",
+    "framework_notes": "In Triton, when using @triton.autotune with variable XBLOCK, the grid MUST be specified as a lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. If the grid remains a static tuple computed with the old XBLOCK value, the autotuner will select a larger XBLOCK but the grid will not shrink, causing each block to process more elements than the total problem size divided by grid size \u2014 leading to massive over-computation and register pressure increase."
+  },
+  {
+    "item_id": "exp_003_persistent_kernel_while_loop_regression",
+    "iteration": 2,
+    "speedup": 0.2081,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.45,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6635.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 39.48,
+        "Instruction Statistics.Executed Instructions": 1428840.0,
+        "Occupancy.Achieved Occupancy (%)": 67.31,
+        "Launch Statistics.Grid Size": 2940.0,
+        "Launch Statistics.Registers Per Thread": 31.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 30.34,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 59.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.73
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 21.38,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 31876.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 59.5,
+        "Instruction Statistics.Executed Instructions": 9383712.0,
+        "Occupancy.Achieved Occupancy (%)": 85.76,
+        "Launch Statistics.Grid Size": 2940.0,
+        "Launch Statistics.Registers Per Thread": 29.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 77.65,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 85.45,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.48
+      }
+    },
+    "strategy_title": "Persistent While-Loop Kernel Causes Massive Instruction Inflation",
+    "strategy_description": "Converting a standard pointwise Triton kernel to a persistent while-loop kernel (launching NUM_SMS=132 CTAs each iterating over tiles) caused a 4.8x slowdown, with duration increasing from 4.45 \u00b5s to 21.38 \u00b5s and executed instructions exploding from 1.43M to 9.38M (6.6x). The root cause is a grid/dispatch mismatch: the kernel_function still launched grid=(triton.cdiv(xnumel, 128),)=2940 blocks instead of grid=(132,), so 2940 persistent CTAs each ran the full while-loop over all tiles, processing the data ~22x more than intended. Despite improved L1 hit rate (30% \u2192 78%) and L2 hit rate (59% \u2192 85%) from the evict_last reuse, the massive over-computation from the incorrect grid completely dominated. The persistent kernel pattern requires the grid to be exactly NUM_SMS; if the grid remains at cdiv(xnumel, XBLOCK), each CTA will iterate through all tiles instead of its assigned stripe.",
+    "slow_pseudocode": "# INTENDED persistent kernel (correct)\ngrid = (NUM_SMS,)  # = 132\nwhile xoffset < xnumel:\n    # process tile\n    xoffset += NUM_SMS * XBLOCK\n\n# ACTUAL (buggy): grid still = 2940, not 132\ngrid = (triton.cdiv(xnumel, 128),)  # = 2940 blocks!\n# Each of 2940 CTAs runs the full while-loop -> 2940/132 * full_work = ~22x over-computation",
+    "fast_pseudocode": "# Standard pointwise kernel (no persistent loop)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    # compute and store\n    tl.store(out_ptr + xindex, result, xmask)\n\ngrid = (triton.cdiv(xnumel, XBLOCK),)  # correct grid\nkernel[grid](..., XBLOCK=128)",
+    "applicable_when": "Never beneficial in this form. Persistent while-loop kernels require the grid to be exactly NUM_SMS; if the dispatch grid is not simultaneously changed to (NUM_SMS,), the while-loop causes each CTA to process all tiles, resulting in massive instruction inflation proportional to grid_size/NUM_SMS.",
+    "do_not_apply_when": "The kernel_function dispatch grid is not updated to (NUM_SMS,) when adding the persistent while-loop body. This is the exact failure mode: the while-loop was added to the kernel body but grid=(triton.cdiv(xnumel, 128),)=2940 was left unchanged, causing 2940 CTAs to each iterate over all 23 tiles instead of 1 tile each. Also avoid for short-duration kernels (<10 \u00b5s) where the overhead of the while-loop control flow and the risk of grid mismatch bugs outweigh any cache reuse benefit.",
+    "framework_notes": "In Triton, a persistent kernel requires TWO coordinated changes: (1) the kernel body must use a while-loop with stride=NUM_SMS*XBLOCK, AND (2) the grid in the dispatch call must be changed to (NUM_SMS,). Changing only the kernel body while leaving the grid as cdiv(xnumel, XBLOCK) causes every CTA to iterate over the entire problem space, multiplying total work by grid_size/NUM_SMS. The diff shows the grid was NOT changed: `grid = (triton.cdiv(xnumel, 128),)` remained in kernel_function."
+  }
+]

@@ -1,0 +1,89 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ import argparse
+ 
+ # ─── Fused Conv2d (implicit GEMM, NHWC) + optional bias + optional ReLU ───────
++
+ 
+ @triton.autotune(
+     configs=[
+@@ -48,35 +49,41 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    TOTAL_K = IN_C * KH * KW
+-
+-    for k_off in range(0, TOTAL_K, BLOCK_K):
+-        offs_k = k_off + tl.arange(0, BLOCK_K)
+-        # Decode K -> (kh, kw, in_c)  -- layout: in_c fastest
+-        in_c = offs_k % IN_C
+-        kw_   = (offs_k // IN_C) % KW
+-        kh_   = offs_k // (IN_C * KW)
+-
+-        ih = out_h[:, None] * STRIDE_H + kh_[None, :] - PAD_H
+-        iw = out_w[:, None] * STRIDE_W + kw_[None, :] - PAD_W
+-
+-        valid_k = offs_k < TOTAL_K
+-        valid_x = (
+-            mask_m[:, None]
+-            & (ih >= 0) & (ih < IN_H)
+-            & (iw >= 0) & (iw < IN_W)
+-        )
+-
+-        x_ptrs = X_ptr + batch[:, None] * s_xn + ih * s_xh + iw * s_xw + in_c[None, :]
+-        x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
+-
+-        # Weight layout: (OUT_C, KH, KW, IN_C) -> BLOCK_K x BLOCK_N
+-        # w index: offs_n * KH*KW*IN_C + kh_*KW*IN_C + kw_*IN_C + in_c
+-        w_ptrs = W_ptr + offs_n[None, :] * (KH * KW * IN_C) + kh_[:, None] * (KW * IN_C) + kw_[:, None] * IN_C + in_c[:, None]
+-        valid_w = valid_k[:, None] & mask_n[None, :]
+-        w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+-
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++    # Three explicit nested loops: kh_ (static), kw_ (static), ic_start (dynamic)
++    # Each innermost tile covers a contiguous in_c range at a fixed (kh_, kw_) position,
++    # giving stride-1 access in both X (NHWC, s_xc=1) and W (OKHWI, s_wi=1).
++    for kh_ in tl.static_range(KH):
++        for kw_ in tl.static_range(KW):
++            # Hoist ih, iw, valid_hw outside the ic_start loop
++            ih = out_h * STRIDE_H + kh_ - PAD_H   # shape: (BLOCK_M,)
++            iw = out_w * STRIDE_W + kw_ - PAD_W   # shape: (BLOCK_M,)
++            valid_hw = mask_m & (ih >= 0) & (ih < IN_H) & (iw >= 0) & (iw < IN_W)
++
++            for ic_start in range(0, IN_C, BLOCK_K):
++                offs_ic = ic_start + tl.arange(0, BLOCK_K)  # shape: (BLOCK_K,)
++                valid_ic = offs_ic < IN_C
++
++                # X tile: (BLOCK_M, BLOCK_K) — stride-1 in in_c
++                x_ptrs = (X_ptr
++                          + batch[:, None] * s_xn
++                          + ih[:, None] * s_xh
++                          + iw[:, None] * s_xw
++                          + offs_ic[None, :])  # s_xc = 1
++                valid_x = valid_hw[:, None] & valid_ic[None, :]
++                x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
++
++                # W tile: (BLOCK_K, BLOCK_N) — stride-1 in in_c
++                # W layout: (OUT_C, KH, KW, IN_C)
++                # w_base is a scalar offset for fixed (kh_, kw_, ic_start)
++                w_base = kh_ * (KW * IN_C) + kw_ * IN_C + ic_start
++                w_ptrs = (W_ptr
++                          + offs_n[None, :] * (KH * KW * IN_C)
++                          + w_base
++                          + offs_ic[:, None])  # stride-1 in IN_C
++                valid_w = valid_ic[:, None] & mask_n[None, :]
++                w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
++
++                acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
+ 
+     if HAS_BIAS:
+         bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0)
+@@ -88,7 +95,6 @@
+     # Store in NHWC
+     y_ptrs = Y_ptr + batch[:, None] * s_yn + out_h[:, None] * s_yh + out_w[:, None] * s_yw + offs_n[None, :]
+     tl.store(y_ptrs, acc.to(tl.float32), mask=mask_m[:, None] & mask_n[None, :])
+-
+ 
+ def conv2d_bias_relu(x_nhwc, w_oihw, bias, stride=1, padding=1, relu=True):
+     """

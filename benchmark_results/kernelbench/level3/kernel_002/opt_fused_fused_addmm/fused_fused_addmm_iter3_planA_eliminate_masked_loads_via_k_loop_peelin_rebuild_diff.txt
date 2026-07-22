@@ -1,0 +1,64 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,17 @@
+ 
+ 
+ # Fused GEMM + bias + ReLU kernel
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -46,15 +49,26 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
++    # Hoist M and N masks outside the loop
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    num_k_blocks = tl.cdiv(K, BLOCK_K)
++
++    # Interior iterations: no K-boundary mask, enables FMA fusion
++    for k in range(0, num_k_blocks - 1):
++        a = tl.load(A_ptrs, mask=m_mask[:, None], other=0.0)
++        b = tl.load(B_ptrs, mask=n_mask[None, :], other=0.0)
+         acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+         A_ptrs += BLOCK_K * stride_ak
+         B_ptrs += BLOCK_K * stride_bk
++
++    # Final (peeled) iteration: apply K-boundary mask only here
++    k_remaining = K - (num_k_blocks - 1) * BLOCK_K
++    a_mask = m_mask[:, None] & (offs_k[None, :] < k_remaining)
++    b_mask = (offs_k[:, None] < k_remaining) & n_mask[None, :]
++    a = tl.load(A_ptrs, mask=a_mask, other=0.0)
++    b = tl.load(B_ptrs, mask=b_mask, other=0.0)
++    acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+ 
+     if APPLY_BIAS:
+         bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+@@ -66,7 +80,6 @@
+     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     C_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     tl.store(C_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def run_gemm_bias_relu(A, B, bias, apply_relu=True):
+     """

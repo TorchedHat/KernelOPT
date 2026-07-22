@@ -1,0 +1,66 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_addmm_mean_relu_t_view_129(in_ptr0, arg_A, arg_B, out_ptr0):
+@@ -32,6 +33,7 @@
+ 
+     # based on triton.ops.matmul
+     pid = tl.program_id(0).to(INDEX_DTYPE)
++    pid_k = tl.program_id(1)
+     grid_m = (M + BLOCK_M - 1) // BLOCK_M
+     grid_n = (N + BLOCK_N - 1) // BLOCK_N
+ 
+@@ -57,8 +59,14 @@
+     offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
++    # Split-K: each pid_k handles a partition of the K dimension
++    # SPLIT_K=8, K=1024, BLOCK_K=128 => k_per_split=128, each partition has 1 BLOCK_K tile
++    SPLIT_K : tl.constexpr = 8
++    k_per_split = tl.cdiv(K, SPLIT_K)
++    k_start = pid_k * k_per_split
++    k_end = min(k_start + k_per_split, K)
++
++    for k_idx in range(k_start // BLOCK_K, tl.cdiv(k_end, BLOCK_K)):
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+         b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+@@ -72,9 +80,7 @@
+         xindex = idx_n + 10*idx_m
+         b = tl.load(B + ((tl.broadcast_to(idx_m + 1024*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+ 
+-        
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -85,11 +91,16 @@
+ 
+     # inductor generates a suffix
+     xindex = idx_n + 10*idx_m
+-    tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+-    tmp1 = acc + tmp0
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+ 
+-
++    # For split-K: pid_k==0 adds bias and stores; other pid_k blocks use atomic_add to out_ptr0
++    # But since multiple blocks write to out_ptr0, we use atomic_add for all partitions
++    # and handle bias only for pid_k==0 after zeroing out_ptr0 in kernel_function
++    if pid_k == 0:
++        tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
++        tmp1 = acc + tmp0
++        tl.atomic_add(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask=mask)
++    else:
++        tl.atomic_add(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask=mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

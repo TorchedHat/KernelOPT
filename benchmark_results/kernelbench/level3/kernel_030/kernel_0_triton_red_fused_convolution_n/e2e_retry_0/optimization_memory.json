@@ -1,0 +1,48 @@
+[
+  {
+    "item_id": "exp_001_reduce_block_size_vectorize_contiguous_loads",
+    "iteration": 1,
+    "speedup": 225.8052,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "right_size_r0_block_and_vectorize_contiguous_reduction_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 788.06,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 1182060.0,
+        "Occupancy.Theoretical Occupancy (%)": 18.75,
+        "Occupancy.Block Limit Shared Mem (blocks)": 3.0,
+        "Occupancy.Achieved Occupancy (%)": 11.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.98,
+        "Scheduler Statistics.No Eligible (%)": 94.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.05,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 4.42,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 74.14,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Launch Statistics.Waves Per SM": 0.62
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 3.49,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5205.0,
+        "Occupancy.Theoretical Occupancy (%)": 100.0,
+        "Occupancy.Block Limit Shared Mem (blocks)": 28.0,
+        "Occupancy.Achieved Occupancy (%)": 11.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.87,
+        "Scheduler Statistics.No Eligible (%)": 81.84,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.2,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 46.92,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 93.54,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 0.048,
+        "Launch Statistics.Waves Per SM": 0.12
+      }
+    },
+    "strategy_title": "Right-size R0_BLOCK and vectorize contiguous reduction loads",
+    "strategy_description": "When R0_BLOCK is set much larger than r0_numel (e.g., 512 vs 96), shared memory per block is grossly over-allocated, capping Block Limit Shared Mem to 3 and theoretical occupancy to 18.75%. Reducing R0_BLOCK to the next power-of-2 at or above r0_numel (128 for r0_numel=96) cuts dynamic shared memory from 65 KB to 48 bytes per block, raising Block Limit Shared Mem from 3 to 28 and theoretical occupancy to 100%. Simultaneously, applying tl.max_contiguous + tl.multiple_of hints on the reduction index for stride-1 contiguous pointer loads (bias, weight, scale vectors) improves L1/TEX hit rate from 4.4% to 46.9% and reduces warp stall cycles per instruction from 36 to 10, together yielding a 225x end-to-end speedup.",
+    "slow_pseudocode": "# R0_BLOCK=512 >> r0_numel=96 \u2192 65 KB shared mem/block \u2192 only 3 blocks/SM\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        r0_index = r0_offset + r0_base          # no contiguity hints\n        r0_mask = r0_index < r0_numel\n        tmp1 = tl.load(bias_ptr + r0_index, r0_mask, ...)   # no vectorization\n        tmp2 = tl.load(scale_ptr + r0_index, r0_mask, ...)\n        ...\n# Fixed launch:\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# R0_BLOCK=128 \u2248 r0_numel=96 \u2192 48 bytes shared mem/block \u2192 28 blocks/SM possible\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': x, 'R0_BLOCK': 128}, num_warps=w)\n             for x in [1,4,8,16,32,128] for w in [4,8]],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        r0_index = r0_offset + r0_base\n        # Apply contiguity hints for stride-1 vectors only:\n        r0_vec = tl.max_contiguous(tl.multiple_of(r0_index, [1, R0_BLOCK]), [1, R0_BLOCK])\n        r0_mask = r0_vec < r0_numel\n        tmp1 = tl.load(bias_ptr + r0_vec, r0_mask, ...)   # vectorized\n        tmp2 = tl.load(scale_ptr + r0_vec, r0_mask, ...)\n        # strided pointer (stride != 1) keeps original index, not r0_vec\n        tmp0 = tl.load(strided_ptr + (x0 + STRIDE*r0_vec + ...), r0_mask & xmask, ...)\n        ...\n# Autotuned launch:\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](..., xnumel=xnumel, r0_numel=r0_numel)",
+    "applicable_when": "Triton reduction kernel where R0_BLOCK constexpr is set significantly larger than r0_numel (e.g., 2x or more); NCU reports Block Limit Shared Mem <= 4 and Theoretical Occupancy < 25%; MemoryCacheAccessPattern rule fires with <4 bytes/sector utilization on local loads/stores; CPIStall reports >20 avg cycles stalled on L1TEX scoreboard; reduction dimension accesses include stride-1 contiguous 1D vectors (bias, scale, weight) alongside strided multi-dimensional tensors.",
+    "do_not_apply_when": "R0_BLOCK is already close to r0_numel (within 2x); shared memory is not the occupancy bottleneck (Block Limit Shared Mem >> Block Limit Registers); all reduction loads are strided (no stride-1 contiguous vectors to vectorize); kernel is already compute-bound rather than memory-latency-bound.",
+    "framework_notes": "tl.max_contiguous and tl.multiple_of are Triton-specific compiler hints that enable 128-bit vectorized loads. Apply only to indices that are provably stride-1 contiguous. The [1, R0_BLOCK] shape argument matches a 2D [XBLOCK, R0_BLOCK] tile where the reduction dimension (axis 1) is contiguous. In CUDA, the equivalent is using __ldg or float4 loads with __builtin_assume_aligned. The autotune wrapper is essential because the optimal XBLOCK depends on the grid/SM ratio after R0_BLOCK is corrected."
+  }
+]

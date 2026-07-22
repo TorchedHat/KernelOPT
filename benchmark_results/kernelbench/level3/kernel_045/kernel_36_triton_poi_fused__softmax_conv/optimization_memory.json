@@ -1,0 +1,257 @@
+[
+  {
+    "item_id": "exp_001_fix_xblock_overallocation_autotune",
+    "iteration": 1,
+    "speedup": 1.0556,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_xblock_overallocation_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.48,
+        "Occupancy.Achieved Occupancy": 40.18,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch.block_size": 128.0,
+        "Launch.Registers Per Thread": 27.0,
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "Scheduler Statistics.No Eligible": 59.53,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 33.33
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.24,
+        "Occupancy.Achieved Occupancy": 9.37,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Launch.block_size": 32.0,
+        "Launch.Registers Per Thread": 16.0,
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "Scheduler Statistics.No Eligible": 91.36,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.17
+      }
+    },
+    "strategy_title": "Fix XBLOCK Overallocation When xnumel << XBLOCK",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 with xnumel=4), nearly all threads in the X dimension are immediately masked out, wasting thread slots and causing low waves/SM and low achieved occupancy. Reducing XBLOCK to match xnumel (\u2264 xnumel) eliminates this waste and reduces register pressure (27\u219216 registers/thread), yielding a shorter kernel duration despite lower theoretical occupancy. Adding @triton.autotune over XBLOCK/YBLOCK combinations allows the runtime to find the optimal tile shape for the actual problem dimensions.",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=4: 96.9% of X threads are masked\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel  # masks out 124/128 threads\n    tmp0 = tl.load(ptr + (x + 4*y), xmask, ...)\n    tl.store(out + (...), tmp0, xmask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # = (1, 1024)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK capped at xnumel=4, autotune explores YBLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 32},  num_warps=1),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 64},  num_warps=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 2, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 1, 'YBLOCK': 256}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    tmp0 = tl.load(ptr + (x + 4*y), mask=xmask & ymask, ...)\n    tl.store(out + (...), tmp0, mask=xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)  # autotune injects XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel has a 2D tile (XBLOCK, YBLOCK) where xnumel is much smaller than XBLOCK (e.g., xnumel=4 with XBLOCK=128), causing the majority of X-dimension threads to be masked out immediately. Symptoms: waves_per_sm < 1.0, achieved occupancy well below theoretical, IssueSlotUtilization and AchievedOccupancy NCU rules triggered, high 'No Eligible' warp percentage (>50%).",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (no significant masking waste). Also avoid if the grid is already large enough to saturate the GPU (waves_per_sm >> 1) \u2014 reducing XBLOCK further would shrink the grid and hurt occupancy. Note: in this case the speedup was modest (1.06x) and achieved occupancy actually dropped further (40%\u21929%), suggesting the kernel is too small to benefit fully; the duration reduction came primarily from fewer instructions and lower register pressure.",
+    "framework_notes": "Triton-specific: @triton.autotune with key=['ynumel','xnumel'] ensures re-tuning when problem size changes. The grid must be a lambda using META['XBLOCK'] and META['YBLOCK'] when autotune is used. CUDA equivalent: choose block dimensions to match actual work dimensions, avoiding large blocks with many idle threads."
+  },
+  {
+    "item_id": "1a5ebcaa",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "pid_swizzle_for_l2_locality_and_workload_balance",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "WorkloadImbalance + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "pid_swizzle_for_l2_locality_and_workload_balance \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'pid_swizzle_for_l2_locality_and_workload_balance' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nthon3.11/site-packages/triton/runtime/autotuner.py\", line 229, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a 2D transpose: reads in_ptr0[x2 + 4*y3] (contiguous in x, stride-4 in y) and writes out_ptr0[y0 + 64*x2 + 256*y1] (permuted). With grid=(1,1024) and 132 SMs, only 0.48 waves/SM are launched. The 1024 CTAs are distributed unevenly across the 132 SMs (WorkloadImbalance: L2 slices 25.77% above average, SMs 22.98% above average). The CPIStall rule shows 8.7 cycles stalled on L1TEX per warp caused by non-coalesced stores in the transpose. Two targeted fixes: (1) Add program-ID swizzling (GROUP_SIZE_Y grouping) so adjacent CTAs map to nearby output tiles, improving L2 spatial reuse and reducing L2 slice imbalance. (2) Change the load eviction policy from evict_last to evict_first since this is a streaming transpose where input data is read once and never reused. These two changes address CPIStall and WorkloadImbalance without altering the grid size or tile parameters.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nthon3.11/site-packages/triton/runtime/autotuner.py\", line 229, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n           ",
+    "framework_notes": null
+  },
+  {
+    "item_id": "19166bd0",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "revert_broken_persistent_loop_to_flat_single_pass_kernel",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "revert_broken_persistent_loop_to_flat_single_pass_kernel \u2014 correctness failure",
+    "strategy_description": "Plan 'revert_broken_persistent_loop_to_flat_single_pass_kernel' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.771e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.619e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel body contains a `while tile_start < numel` persistent loop with `num_progs = tl.num_programs(0)`. However, the grid is still launched as `(triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8)) = (1, 1024)` \u2014 1024 CTAs. With XBLOCK=64 and numel=32768, num_progs=1024 means each CTA iterates over ALL 512 tiles independently, causing 1024x512=524288 redundant tile iterations. This explains the 26.3M executed instructions (vs ~340K expected for a flat kernel), the 185us duration (vs ~3us expected), and the 81.75% No Eligible stall rate from serialized L1TEX loads. The fix is to remove the while loop entirely and rewrite as a flat single-pass kernel with a 1D grid sized to cdiv(numel, BLOCK), combined with autotune over flat BLOCK sizes and num_warps.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.534e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.771e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.619e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_num_stages_autotune_configs",
+    "iteration": 2,
+    "speedup": 1.0556,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "add_num_stages_to_autotune_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4238.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 21.37,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 23.68,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.17,
+        "Memory Workload Analysis.L2 Hit Rate": 56.18,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.85,
+        "Occupancy.Achieved Occupancy": 9.37
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4248.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.16,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 22.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.54,
+        "Memory Workload Analysis.L2 Hit Rate": 56.77,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.74,
+        "Occupancy.Achieved Occupancy": 9.37
+      }
+    },
+    "strategy_title": "Add num_stages=2 Variants to Triton Autotune Configs",
+    "strategy_description": "Adding num_stages=2 variants to Triton @triton.autotune configs enables software pipelining of memory loads, which can reduce warp stall cycles per issued instruction (21.37 \u2192 20.16 cycles) and slightly improve L1/TEX and L2 hit rates. The speedup is modest (~5.6%) and the kernel duration in microseconds did not change (2.88us), suggesting the benefit comes from the autotuner selecting a better config with pipelining rather than from a structural memory access change. The planned shared-memory staged transpose was not actually implemented \u2014 only the autotune config list was expanded with num_stages=2 entries.",
+    "slow_pseudocode": "# Autotune configs without num_stages (default num_stages=1)\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 32},  num_warps=1),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 64},  num_warps=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 2, 'YBLOCK': 64},  num_warps=2),\n        triton.Config({'XBLOCK': 2, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 1, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 1, 'YBLOCK': 256}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)",
+    "fast_pseudocode": "# Autotune configs with num_stages=2 variants added\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 32},  num_warps=1, num_stages=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 64},  num_warps=2, num_stages=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 32},  num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 64},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 128}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 2, 'YBLOCK': 64},  num_warps=2, num_stages=2),\n        triton.Config({'XBLOCK': 2, 'YBLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1, 'YBLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1, 'YBLOCK': 256}, num_warps=8, num_stages=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)",
+    "applicable_when": "Triton kernel has CPIStall on L1TEX (warp cycles per issued instruction > 15, stall fraction > 40%), low achieved occupancy (<15%), and the autotune config list uses only default num_stages=1. Adding num_stages=2 allows the autotuner to select software-pipelined configs that overlap memory latency with compute.",
+    "do_not_apply_when": "Kernel is already using num_stages > 1, or the kernel uses shared memory staging that conflicts with Triton's software pipelining (num_stages > 1 with explicit tl.debug_barrier may cause correctness issues). Also avoid if the kernel is already compute-bound rather than memory-latency-bound. Gains are modest (~5%) for very short kernels (<3us) where the absolute cycle reduction is small.",
+    "framework_notes": "Triton-specific: num_stages in triton.Config controls software pipelining depth for global memory loads. num_stages=2 prefetches the next tile's data while computing the current tile. This is distinct from CUDA's cooperative groups or explicit prefetch intrinsics. The autotuner selects the best config at runtime, so adding num_stages=2 variants alongside num_stages=1 variants is safe \u2014 the autotuner will pick whichever is faster."
+  },
+  {
+    "item_id": "01cf8d32",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "kernel_fusion_fuse_transpose_with_adjacent_pointwise_exp_sub",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "kernel_fusion_fuse_transpose_with_adjacent_pointwise_exp_sub \u2014 correctness failure",
+    "strategy_description": "Plan 'kernel_fusion_fuse_transpose_with_adjacent_pointwise_exp_sub' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.600e+01 > atol=0.001\nseed=42 output[0]: max_diff=2.598e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.784e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "This kernel is a pure transpose/copy (no arithmetic) named 'fused__softmax_convolution_exp_sub_36', indicating it is one step in a multi-kernel softmax pipeline (sub -> exp -> this transpose -> softmax normalization). The kernel reads input[x2 + 4*y3] and writes output[y0 + 64*x2 + 256*y1] \u2014 a pure memory permutation with zero compute. At only 0.24 waves/SM and 9.37% achieved occupancy, the kernel is severely underutilized and too small to saturate the GPU on its own. All prior tile-sizing and scheduling optimizations have been exhausted. The diversity instruction explicitly targets 'kernel_fusion' to eliminate intermediate global memory round-trips. By fusing the adjacent pointwise exp(x - max_val) computation INTO this transpose kernel, we eliminate one full global memory write+read cycle: instead of writing the exp/sub result to a temporary buffer and then reading it back for the transpose, we compute exp(x - max_val) inline during the transpose store. This halves the memory traffic for the fused operation and reduces kernel launch overhead by one launch.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.600e+01 > atol=0.001\nseed=42 output[0]: max_diff=2.598e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.784e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_003_evict_first_streaming_load",
+    "iteration": 3,
+    "speedup": 1.0667,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_load_policy_for_streaming_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4248.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.16,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 22.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.54,
+        "Memory Workload Analysis.L2 Hit Rate": 56.77,
+        "Occupancy.Achieved Occupancy": 9.37,
+        "Scheduler Statistics.No Eligible": 91.36,
+        "CPIStall_fraction_pct": 53.7
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.85,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4233.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.66,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 27.35,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.25,
+        "Memory Workload Analysis.L2 Hit Rate": 57.15,
+        "Occupancy.Achieved Occupancy": 9.5,
+        "Scheduler Statistics.No Eligible": 92.19,
+        "CPIStall_fraction_pct": 45.19
+      }
+    },
+    "strategy_title": "Use evict_first for Streaming (No-Reuse) Loads in Triton",
+    "strategy_description": "For streaming memory access patterns where each input element is loaded exactly once (no L1 reuse), changing the Triton tl.load eviction_policy from 'evict_last' to 'evict_first' reduces L1 cache pollution across concurrent CTAs sharing the same SM. In this transpose kernel with ~1.5% L1 hit rate, the CPIStall fraction dropped from 53.7% to 45.2% of warp cycles, and kernel duration decreased from 2.88us to 2.85us (~1.05% wall-clock reduction), yielding a measured 1.067x speedup. The benefit is modest because the kernel is extremely short and the absolute cycle savings are small, but the direction is correct: evict_first frees L1 lines sooner, reducing contention between the many CTAs (1024 CTAs, 0.24 waves/SM) sharing each SM's L1 cache.",
+    "slow_pseudocode": "# evict_last retains streaming data in L1 unnecessarily\ntmp0 = tl.load(in_ptr0 + (x2 + 4*y3),\n               mask=xmask & ymask,\n               eviction_policy='evict_last')\ntl.store(out_ptr0 + (y0 + 64*x2 + 256*y1), tmp0, mask=xmask & ymask)",
+    "fast_pseudocode": "# evict_first marks streaming data as low-priority for L1 eviction\ntmp0 = tl.load(in_ptr0 + (x2 + 4*y3),\n               mask=xmask & ymask,\n               eviction_policy='evict_first')\ntl.store(out_ptr0 + (y0 + 64*x2 + 256*y1), tmp0, mask=xmask & ymask)",
+    "applicable_when": "Triton kernel performs streaming reads where each input element is accessed exactly once (no temporal reuse), L1/TEX hit rate is near zero (<5%), CPIStall rule is triggered with stall fraction >40% on L1TEX, and many CTAs share the same SM (waves_per_sm < 1.0). The current load uses eviction_policy='evict_last' (or default). Transpose, copy, and elementwise kernels over large tensors are typical candidates.",
+    "do_not_apply_when": "Data has meaningful L1 reuse (e.g., weights in matmul, reduction accumulators, tiled GEMM where the same tile is reused across the inner loop). Also avoid if the kernel is already compute-bound rather than memory-latency-bound, or if L1 hit rate is already high (>20%). Gains are very small (<2% wall-clock) for extremely short kernels (<3us) where measurement noise may dominate.",
+    "framework_notes": "Triton-specific: eviction_policy is a hint passed to the L1/TEX cache hardware. 'evict_first' maps to cache-at-global-level semantics (similar to CUDA's __ldg with streaming hint or ld.global.cs PTX instruction), telling the cache to evict this line first when space is needed. 'evict_last' (default) maps to cache-at-all-levels, retaining the line in L1. In CUDA, the equivalent is using __builtin_nontemporal_load or the .cs (cache streaming) cache operator on ld.global PTX instructions."
+  },
+  {
+    "item_id": "exp_003_evict_first_streaming_transpose",
+    "iteration": 3,
+    "speedup": 1.0667,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_for_streaming_load_in_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4248.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.16,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 22.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.54,
+        "Memory Workload Analysis.L2 Hit Rate": 56.77,
+        "Occupancy.Achieved Occupancy": 9.37,
+        "Scheduler Statistics.No Eligible": 91.36
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.85,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4228.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.87,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 22.02,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.22,
+        "Memory Workload Analysis.L2 Hit Rate": 56.98,
+        "Occupancy.Achieved Occupancy": 9.82,
+        "Scheduler Statistics.No Eligible": 91.09
+      }
+    },
+    "strategy_title": "Use evict_first for Streaming (Read-Once) Global Loads",
+    "strategy_description": "Changing the eviction policy of a streaming global load from evict_last to evict_first in a Triton transpose kernel reduced warp cycles per issued instruction from 20.16 to 19.87 and elapsed cycles from 4248 to 4228, yielding a ~6.7% speedup. The evict_first hint tells the L1/TEX cache to deprioritize the loaded cache line for eviction, freeing cache capacity for other data and reducing cache pollution in streaming (read-once) access patterns. This is appropriate when each input element is loaded exactly once and will never be reused, as in a pure transpose or streaming copy kernel.",
+    "slow_pseudocode": "# Streaming load with evict_last (default/wrong for read-once data)\ntmp0 = tl.load(in_ptr0 + (x2 + 4*y3), mask=xmask & ymask, eviction_policy='evict_last')\ntl.store(out_ptr0 + (y0 + 64*x2 + 256*y1), tmp0, mask=xmask & ymask)",
+    "fast_pseudocode": "# Streaming load with evict_first (correct for read-once data)\ntmp0 = tl.load(in_ptr0 + (x2 + 4*y3), mask=xmask & ymask, eviction_policy='evict_first')\ntl.store(out_ptr0 + (y0 + 64*x2 + 256*y1), tmp0, mask=xmask & ymask)",
+    "applicable_when": "Triton kernel performs a streaming or transpose load where each input element is read exactly once (no reuse). CPIStall on L1TEX is the dominant stall reason (>40% of cycles). The kernel is memory-latency-bound with low L1 hit rate (<5%). Using evict_last on such data pollutes the L1/TEX cache with lines that will never be reused, displacing potentially reusable data (e.g., broadcast values or reduction accumulators).",
+    "do_not_apply_when": "Input data is reused across multiple iterations or tiles within the same CTA (e.g., a tiled GEMM where the same A/B tile is reused across the K dimension). Also avoid if the kernel already uses evict_first, or if the access pattern has significant spatial/temporal reuse that benefits from L1 caching. Do not apply when the kernel is compute-bound rather than memory-latency-bound.",
+    "framework_notes": "Triton-specific: eviction_policy='evict_first' is passed as a keyword argument to tl.load(). It maps to the PTX/SASS cache hint .cs (cache streaming) which marks the line as low-priority for eviction. The equivalent in CUDA C++ is __ldcs() or using the __cacheop__ attribute. In contrast, evict_last maps to .ca (cache all / L1 persistent). For pure transpose or streaming copy kernels, evict_first is almost always the correct choice for the input load."
+  },
+  {
+    "item_id": "exp_003_evict_first_streaming_transpose",
+    "iteration": 3,
+    "speedup": 1.0556,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_policy_for_streaming_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4248.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.16,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 22.34,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.54,
+        "Memory Workload Analysis.L2 Hit Rate": 56.77,
+        "Occupancy.Achieved Occupancy": 9.37,
+        "Instruction Statistics.Executed Instructions": 47104.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4236.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.02,
+        "Warp State Statistics.Warp Cycles Per Executed Instruction": 22.25,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 1.34,
+        "Memory Workload Analysis.L2 Hit Rate": 56.88,
+        "Occupancy.Achieved Occupancy": 9.6,
+        "Instruction Statistics.Executed Instructions": 46080.0
+      }
+    },
+    "strategy_title": "Use evict_first Cache Policy for Streaming Transpose Loads/Stores",
+    "strategy_description": "For streaming kernels (transpose, memcpy) where each input element is read exactly once, changing tl.load eviction_policy from 'evict_last' to 'evict_first' and adding eviction_policy='evict_first' to tl.store signals the hardware to evict cache lines immediately after use, freeing L1 capacity for concurrent warps. When L1/TEX hit rate is near zero (~1.5%), 'evict_last' wastes L1 capacity by retaining lines that will never be reused, increasing L1TEX pressure and contributing to CPIStall cycles. The change reduced elapsed cycles (4248\u21924236) and executed instructions (47104\u219246080) with a modest ~5.6% wall-clock speedup, though the kernel duration in microseconds remained at 2.88us due to the tiny problem size (32768 elements, 0.24 waves/SM).",
+    "slow_pseudocode": "# evict_last on streaming load: retains lines that are never reused\ntmp0 = tl.load(in_ptr0 + (x2 + 4*y3), mask=xmask & ymask, eviction_policy='evict_last')\n# store with no cache hint: default policy on strided non-coalesced write\ntl.store(out_ptr0 + (y0 + 64*x2 + 256*y1), tmp0, mask=xmask & ymask)",
+    "fast_pseudocode": "# evict_first on streaming load: frees L1 immediately after use\ntmp0 = tl.load(in_ptr0 + (x2 + 4*y3), mask=xmask & ymask, eviction_policy='evict_first')\n# evict_first on store: bypasses L1 for write-once strided data\ntl.store(out_ptr0 + (y0 + 64*x2 + 256*y1), tmp0, mask=xmask & ymask, eviction_policy='evict_first')",
+    "applicable_when": "Triton kernel performs a streaming access pattern (transpose, memcpy, gather/scatter) where L1/TEX hit rate is near zero (<5%), CPIStall rule is triggered with L1TEX stall fraction >40%, and the load uses eviction_policy='evict_last'. Each element is read/written exactly once with no temporal reuse.",
+    "do_not_apply_when": "Kernel reuses loaded data within the same CTA (e.g., GEMM weight tiles, reduction accumulators) \u2014 'evict_last' is correct when L1 hit rate is meaningful (>10%). Also avoid if the kernel is already using 'evict_first' or 'evict_normal'. Gains are modest (<6%) for very short kernels (<3us) where the absolute cycle reduction is small and the bottleneck is primarily the small grid size (waves/SM << 1).",
+    "framework_notes": "Triton-specific: eviction_policy='evict_first' maps to the CUDA .cs (cache streaming) cache operator, the standard hint for streaming/transpose kernels per the CUDA Best Practices Guide. Valid Triton eviction policy strings are 'evict_first', 'evict_last', and 'evict_normal'. The policy can be set independently on tl.load and tl.store. On SM 8.x/9.x (A100/H100/H200), L1TEX is a unified cache; 'evict_first' on stores effectively bypasses L1 for write-once strided data, reducing cache pollution from non-coalesced writes."
+  }
+]

@@ -1,0 +1,227 @@
+[
+  {
+    "item_id": "9d5fed0e",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_eviction_policies_and_autotune_tile_sizes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_eviction_policies_and_autotune_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'add_eviction_policies_and_autotune_tile_sizes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.779e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.511e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.543e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a GEMM (M=490, N=1024, K=1024) with fixed tile sizes BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 and no autotuning. The B matrix load pattern uses tl.broadcast_to(idx_m + 1024*idx_n, ...) which creates a transposed/column-major access causing 12-way shared memory bank conflicts \u2014 the single largest bottleneck at 70.6% potential speedup. A and B tile loads are streaming (each tile read once per k-loop iteration), making them ideal candidates for evict_first cache policy to avoid polluting L2. With 128 registers/thread, occupancy is capped at 25% theoretical and only 6.25% achieved. Smaller tile sizes (e.g., BLOCK_M=32, BLOCK_N=32) reduce register pressure, improve occupancy, and increase active warps. Adding @triton.autotune allows the runtime to find the optimal combination of tile sizes, num_warps, and num_stages.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.779e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.511e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.543e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_block_ptr_regression",
+    "iteration": 1,
+    "speedup": 0.4191,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_block_ptr_with_larger_tiles_on_register_limited_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess / SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 112.67,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 168872.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Registers Per Thread": 128.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Instruction Statistics.Executed Instructions": 19410752.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.33,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 21.65,
+        "Memory Workload Analysis.Mem Busy": 85.01
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 268.86,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 403186.0,
+        "Occupancy.Achieved Occupancy": 12.5,
+        "Occupancy.Registers Per Thread": 255.0,
+        "Occupancy.Block Limit Registers": 1.0,
+        "Instruction Statistics.Executed Instructions": 75410176.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.38,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 35.52,
+        "Memory Workload Analysis.Mem Busy": 81.73
+      }
+    },
+    "strategy_title": "Larger Tiles + block_ptr Explodes Register Count, Kills Occupancy",
+    "strategy_description": "Increasing BLOCK_M/BLOCK_N/BLOCK_K and switching to tl.make_block_ptr caused registers per thread to jump from 128 to 255, reducing Block Limit Registers from 4 to 1 block/SM and theoretical occupancy from 25% to 12.5%. Despite achieved occupancy doubling (6.25%\u219212.5%), the 3.9x increase in executed instructions (19M\u219275M) and 2.4x longer elapsed cycles (169K\u2192403K) produced a 2.4x slowdown. The new MemoryCacheAccessPattern rule (79% speedup potential) appeared for uncoalesced local loads/stores, indicating the larger register file spilled to local memory, adding a new bottleneck that did not exist before.",
+    "slow_pseudocode": "# BEFORE: block_size=128, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32\n# registers=128/thread, Block Limit Registers=4, achieved_occ=6.25%\n# Manual pointer arithmetic, 12-way shared mem bank conflicts\nfor k in range(K // BLOCK_K):\n    a = tl.load(A + manual_index_arithmetic(...))\n    b = tl.load(B + manual_index_arithmetic(...))\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "# AFTER (REGRESSED): block_size=256, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64\n# registers=255/thread, Block Limit Registers=1, achieved_occ=12.5%\n# block_ptr loads, but register spill to local memory (new bottleneck)\nA_ptr = tl.make_block_ptr(arg_A, shape=(M,K), strides=(...), ...)\nB_ptr = tl.make_block_ptr(arg_B, shape=(K,N), strides=(...), ...)\nfor k in range(K // BLOCK_K):\n    a = tl.load(A_ptr, boundary_check=(0,1))\n    b = tl.load(B_ptr, boundary_check=(0,1))\n    acc += tl.dot(a, b)\n    A_ptr = tl.advance(A_ptr, (0, BLOCK_K))\n    B_ptr = tl.advance(B_ptr, (BLOCK_K, 0))",
+    "applicable_when": "Kernel has low shared memory bank conflicts and registers per thread well below 128; tile size increase does not push registers to hardware maximum (255); no register spill risk.",
+    "do_not_apply_when": "Kernel already uses 128+ registers per thread; increasing tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) will push registers to 255/thread, reducing Block Limit Registers to 1 and causing register spill to local memory (MemoryCacheAccessPattern rule appears). Do not combine block_ptr + larger tiles when the kernel is already register-pressure-limited.",
+    "framework_notes": "In Triton, tl.make_block_ptr enables TMA-style hardware address generation on Hopper (SM 9.0), but the associated larger tile sizes dramatically increase register usage. The autotune configs did not vary BLOCK_M/BLOCK_N/BLOCK_K (they were hardcoded as constexprs), so autotune only explored num_warps/num_stages \u2014 it could not select smaller tiles to reduce register pressure. When registers hit 255/thread, Block Limit Registers drops to 1 block/SM, and any register spill creates uncoalesced local memory traffic that is worse than the original shared memory bank conflicts."
+  },
+  {
+    "item_id": "exp_001_triton_blocksize_increase_shared_bank_conflict",
+    "iteration": 1,
+    "speedup": 0.5756,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_block_size_to_fix_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 112.67,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 90.8,
+        "Memory Workload Analysis.Mem Busy": 85.01,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.33,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Block Size": 128.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 77.71
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 195.74,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 96.66,
+        "Memory Workload Analysis.Mem Busy": 92.74,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.58,
+        "Occupancy.Achieved Occupancy": 12.5,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Launch Statistics.Registers Per Thread": 80.0,
+        "Launch Statistics.Block Size": 256.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 82.32
+      }
+    },
+    "strategy_title": "Doubling Block Size Worsens Bank Conflicts When Shared Mem Bottlenecked",
+    "strategy_description": "When a kernel is bottlenecked by severe shared memory bank conflicts (77%+ excessive wavefronts, 12-way average conflict, CPIStall at 67% of cycles), increasing block size from 128 to 256 threads does not resolve the conflicts and instead makes them worse (17-way average, 82% excessive wavefronts). The larger block size doubled Warp Cycles Per Issued Instruction from 4.33 to 14.58 cycles, increasing duration by ~74% despite reducing registers per thread (128\u219280) and improving theoretical occupancy (25%\u219237.5%). The root cause is that the shared memory access pattern itself is pathological \u2014 more threads accessing the same conflicted layout amplifies the problem rather than hiding it.",
+    "slow_pseudocode": "# block_size=128, registers=128, theoretical_occ=25%\n# 12-way bank conflicts, 77.71% excessive wavefronts\n# Warp Cycles Per Issued Instruction = 4.33\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + xindex_a)\n    b = tl.load(B + tl.broadcast_to(idx_m + 1024*idx_n, [BLOCK_K, BLOCK_N]).broadcast_to(xindex.shape))\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "# block_size=256, registers=80, theoretical_occ=37.5%\n# 17-way bank conflicts, 82.32% excessive wavefronts  <-- WORSE\n# Warp Cycles Per Issued Instruction = 14.58  <-- MUCH WORSE\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + xindex_a)\n    rk = offs_k[:, None] + k_idx * BLOCK_K\n    b = tl.load(B + rk * stride_bk + offs_b_n[None, :] * stride_bn)\n    acc += tl.dot(a, b)",
+    "applicable_when": "Never applicable as a standalone fix when the kernel has severe shared memory bank conflicts (>70% excessive wavefronts). Increasing block size alone does not fix the underlying access pattern.",
+    "do_not_apply_when": "Kernel is bottlenecked by shared memory bank conflicts (SharedMemoryConflicts rule triggered, >70% excessive wavefronts, CPIStall >60% of cycles due to MIO). In this regime, increasing block size amplifies conflicts and dramatically increases Warp Cycles Per Issued Instruction. Fix the shared memory access pattern (padding, transposition, or eliminating the conflicted layout) before changing block size.",
+    "framework_notes": "In Triton, adding @triton.autotune with only num_warps/num_stages variants (no tile size changes) effectively just doubles the block size without changing the fundamental memory access pattern. The double tl.broadcast_to pattern for B matrix loads was replaced with a clean strided load, but this alone was insufficient to eliminate bank conflicts \u2014 the conflict rate actually increased from 12-way to 17-way, suggesting the strided load pattern also has alignment issues with the shared memory layout."
+  },
+  {
+    "item_id": "exp_tf32_block_k_regression_001",
+    "iteration": 1,
+    "speedup": 0.8694,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts, UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 168872.0,
+        "GPU Speed Of Light Throughput.Duration (us)": 112.67,
+        "GPU Speed Of Light Throughput.Memory Throughput (%)": 85.01,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 21.65,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 90.8,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.33,
+        "Occupancy.Theoretical Occupancy (%)": 25.0,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 32.77,
+        "Memory Workload Analysis.Mem Busy (%)": 85.01
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 194326.0,
+        "GPU Speed Of Light Throughput.Duration (us)": 129.6,
+        "GPU Speed Of Light Throughput.Memory Throughput (%)": 74.32,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 18.8,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 80.45,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.91,
+        "Occupancy.Theoretical Occupancy (%)": 18.75,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Memory Workload Analysis.Mem Busy (%)": 74.32
+      }
+    },
+    "strategy_title": "Doubling BLOCK_K Increases Shared Memory, Reduces Occupancy",
+    "strategy_description": "Increasing BLOCK_K from 32 to 64 doubled the dynamic shared memory per block (32.77 KB \u2192 65.54 KB), which reduced the shared-memory block limit from 4 to 3 blocks per SM and dropped theoretical occupancy from 25% to 18.75%. Despite the intent to enable TF32 Tensor Cores, the diff shows ALLOW_TF32 was never changed from False, so no Tensor Core benefit was realized. The net effect was more shared memory pressure, lower occupancy, higher warp stall cycles (4.33 \u2192 4.91 cycles/instruction), and a 15% longer kernel duration. When a kernel is already bottlenecked by shared memory bank conflicts (77% excessive wavefronts) and low occupancy, increasing BLOCK_K worsens the shared memory footprint and further constrains occupancy without delivering any compute throughput improvement.",
+    "slow_pseudocode": "BLOCK_K = 32\nALLOW_TF32 = False\n# dynamic smem per block: ~32 KB\n# Block Limit Shared Mem: 4\n# Theoretical Occupancy: 25%\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)",
+    "fast_pseudocode": "# INTENDED (never applied \u2014 ALLOW_TF32 stayed False in diff):\nBLOCK_K = 64\nALLOW_TF32 = True  # <-- was NOT changed in actual diff\n# dynamic smem per block: ~65 KB\n# Block Limit Shared Mem: 3  (regression)\n# Theoretical Occupancy: 18.75%  (regression)\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)",
+    "applicable_when": "Never beneficial as applied here. The BLOCK_K increase without the corresponding ALLOW_TF32=True flip is a pure regression.",
+    "do_not_apply_when": "Do NOT increase BLOCK_K when: (1) the kernel already has severe shared memory bank conflicts (>70% excessive wavefronts), (2) shared memory is already a block-limit bottleneck (Block Limit Shared Mem \u2264 4), (3) the ALLOW_TF32 flag was not actually changed (implementation flaw). Increasing tile size in a shared-memory-bound kernel with bank conflicts amplifies the bottleneck rather than relieving it.",
+    "framework_notes": "In Triton, BLOCK_K controls the K-dimension tile size for tl.dot. Larger BLOCK_K increases shared memory allocation proportionally (A tile: BLOCK_M\u00d7BLOCK_K, B tile: BLOCK_K\u00d7BLOCK_N). The ALLOW_TF32 flag must be explicitly set to True at the tl.dot call site or via the constexpr \u2014 a diff error left it as False, so no Tensor Core benefit was realized. Always verify the diff actually changed the intended constant before attributing performance changes to the planned optimization."
+  },
+  {
+    "item_id": "exp_002_triton_transposed_b_load_bank_conflict_regression",
+    "iteration": 2,
+    "speedup": 0.5754,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_b_matrix_shared_memory_bank_conflicts_via_transposed_load",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 129.6,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 194326.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 80.45,
+        "Memory Workload Analysis.Mem Busy": 74.32,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.91,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Block Size": 128.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 77.72
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 195.81,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 293643.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 96.6,
+        "Memory Workload Analysis.Mem Busy": 92.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.57,
+        "Occupancy.Achieved Occupancy": 12.5,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Launch Statistics.Registers Per Thread": 80.0,
+        "Launch Statistics.Block Size": 256.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 82.32
+      }
+    },
+    "strategy_title": "Transposed B Load + tl.trans() Does Not Fix Bank Conflicts",
+    "strategy_description": "Loading the B matrix as [BLOCK_N, BLOCK_K] and calling tl.trans() before tl.dot() was expected to eliminate shared memory bank conflicts by changing the in-register layout, but the bank conflict rate actually worsened (12-way \u2192 17-way, 77.72% \u2192 82.32% excessive wavefronts) and Warp Cycles Per Issued Instruction tripled (4.91 \u2192 14.57). The profiling data shows that the confounding factor was a simultaneous block_size increase from 128 to 256 (introduced via @triton.autotune), which amplified the conflicts as documented in prior iterations \u2014 the transposed load alone was never isolated. The net result was a 51% longer kernel duration, with L1/TEX Cache Throughput rising to 96.6% and Mem Busy to 92.75%, indicating the shared memory bottleneck intensified rather than resolved.",
+    "slow_pseudocode": "# block_size=128, BLOCK_K=64, registers=128/thread\n# B loaded as [BLOCK_K, BLOCK_N] with broadcast_to pattern\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + xindex_a)\n    b = tl.load(B + tl.broadcast_to(idx_m + 1024*idx_n, [BLOCK_K, BLOCK_N]))\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# REGRESSED: block_size=256 (via autotune), BLOCK_K=32, registers=80/thread\n# B loaded as [BLOCK_N, BLOCK_K] transposed \u2014 but block_size doubled simultaneously\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + xindex_a)\n    rk = offs_k[None, :] + k_idx * BLOCK_K  # shape [1, BLOCK_K]\n    b_T = tl.load(B + rk * stride_bk + offs_b_n[:, None] * stride_bn)  # [BLOCK_N, BLOCK_K]\n    acc += tl.dot(a, tl.trans(b_T), allow_tf32=False)",
+    "applicable_when": "Never demonstrated to work in isolation for this kernel. The transposed load strategy may be valid in principle but has not been tested without the confounding block_size increase.",
+    "do_not_apply_when": "Do NOT combine a B-matrix transposed load change with a block_size increase via @triton.autotune when the kernel already has severe shared memory bank conflicts (>70% excessive wavefronts). The block_size increase dominates and amplifies conflicts regardless of the load pattern change. If testing transposed B load, hold block_size constant at the original value (128) to isolate the effect. Also do not apply when the autotune config space includes larger block sizes that will be selected over the original.",
+    "framework_notes": "In Triton, adding @triton.autotune with num_warps=8 configs effectively doubles block_size from 128 to 256 (8 warps \u00d7 32 threads = 256 threads/block). This block_size change was the dominant effect observed in iteration 1 (exp_001_triton_blocksize_increase_shared_bank_conflict, 0.5756x speedup) and repeated here. The tl.trans() call on a [BLOCK_N, BLOCK_K] tensor produces [BLOCK_K, BLOCK_N] as expected for tl.dot's second operand, so the mathematical transformation is correct \u2014 but the shared memory layout at runtime is still determined by how Triton stages the tile, not just the logical transpose."
+  },
+  {
+    "item_id": "exp_002_triton_b_load_double_broadcast_no_effect",
+    "iteration": 2,
+    "speedup": 0.869,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_b_matrix_load_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 129.6,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 194326.0,
+        "Memory Workload Analysis.Mem Busy": 74.32,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.91,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "SharedMemoryConflicts.bank_conflict_way_avg": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.72,
+        "UncoalescedSharedAccess.excessive_wavefronts": 14680064.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 129.66,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 194391.0,
+        "Memory Workload Analysis.Mem Busy": 74.34,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.92,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "SharedMemoryConflicts.bank_conflict_way_avg": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.72,
+        "UncoalescedSharedAccess.excessive_wavefronts": 14680064.0
+      }
+    },
+    "strategy_title": "Replacing Double-Broadcast B Load Has Zero Effect on Bank Conflicts",
+    "strategy_description": "Replacing a double tl.broadcast_to B-matrix load with a clean strided pointer expression (b_k_idx_vals * stride_bk + offs_b_n[None, :] * stride_bn) produced no measurable change in any profiling metric: bank conflict rate remained 12-way average, excessive wavefronts stayed at 77.72%, Warp Cycles Per Issued Instruction held at ~4.91, and duration was unchanged at ~129.6 \u00b5s. This indicates the shared memory bank conflicts are not caused by the Python-level broadcast expression in the Triton source \u2014 Triton's compiler generates the same shared memory staging layout regardless of whether the index is expressed as a double broadcast or a clean strided product. The root cause of the bank conflicts lies deeper in the kernel's shared memory layout (tile shape, padding, or access stride relative to the 32-bank structure) and cannot be fixed by reformulating the pointer arithmetic alone.",
+    "slow_pseudocode": "# BEFORE: double broadcast B load\nidx_m = b_k_idx_vals  # shape [BLOCK_K, 1]\nidx_n = offs_b_n[None, :]  # shape [1, BLOCK_N]\nxindex = idx_n + 1024*idx_m\nb = tl.load(B + tl.broadcast_to(idx_m + 1024*idx_n, [BLOCK_K, BLOCK_N]).broadcast_to(xindex.shape))\n# Result: 12-way bank conflicts, 77.72% excessive wavefronts",
+    "fast_pseudocode": "# AFTER: clean strided load (NO IMPROVEMENT)\nb = tl.load(B + b_k_idx_vals * stride_bk + offs_b_n[None, :] * stride_bn)\n# Result: still 12-way bank conflicts, 77.72% excessive wavefronts\n# Duration unchanged: 129.6 \u00b5s -> 129.66 \u00b5s",
+    "applicable_when": "Never applicable as a standalone fix for shared memory bank conflicts in Triton GEMM kernels. Reformulating the pointer arithmetic expression does not change the shared memory staging layout.",
+    "do_not_apply_when": "When the kernel shows SharedMemoryConflicts (12-way average, >70% excessive wavefronts) and UncoalescedSharedAccess rules triggered: do NOT attempt to fix bank conflicts by reformulating the B-matrix load pointer expression from double-broadcast to strided arithmetic. Triton generates the same shared memory layout regardless of the Python-level index expression. The fix must address the shared memory tile layout itself (e.g., adding padding to the shared memory allocation, changing tile dimensions to avoid bank-stride alignment, or restructuring the access pattern at the tl.dot level).",
+    "framework_notes": "In Triton, the compiler determines shared memory staging layout based on tile shapes and data types, not the Python-level pointer arithmetic expression. Changing tl.broadcast_to(idx_m + 1024*idx_n, ...) to b_k_idx_vals * stride_bk + offs_b_n[None, :] * stride_bn produces mathematically identical addresses and identical compiled shared memory access patterns. To fix bank conflicts in Triton GEMM, consider: (1) adding shared memory padding (not directly exposed in Triton), (2) changing BLOCK_K to a non-power-of-2 or non-stride-of-32 value, (3) transposing the B tile before storing to shared memory, or (4) using tl.make_block_ptr with swizzle hints if available."
+  }
+]

@@ -1,0 +1,141 @@
+[
+  {
+    "item_id": "exp_001_autotune_register_pressure_regression",
+    "iteration": 1,
+    "speedup": 0.4924,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_to_reduce_register_pressure_via_smaller_reduction_block",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 255.0,
+        "Occupancy.Theoretical_Occupancy_pct": 12.5,
+        "Occupancy.Achieved_Occupancy_pct": 6.25,
+        "GPU_SOL.Duration_us": 11.36,
+        "GPU_SOL.DRAM_Throughput_pct": 46.65,
+        "Scheduler.No_Eligible_pct": 84.99,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 6.66,
+        "Launch.waves_per_sm": 0.42
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 62.0,
+        "Occupancy.Theoretical_Occupancy_pct": 50.0,
+        "Occupancy.Achieved_Occupancy_pct": 6.25,
+        "GPU_SOL.Duration_us": 23.07,
+        "GPU_SOL.DRAM_Throughput_pct": 22.74,
+        "Scheduler.No_Eligible_pct": 92.89,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 14.04,
+        "Launch.waves_per_sm": 0.11
+      }
+    },
+    "strategy_title": "Autotune Smaller Reduction Block to Cut Register Pressure",
+    "strategy_description": "Adding @triton.autotune with smaller R0_BLOCK configs successfully reduced registers/thread from 255 to 62 and raised theoretical occupancy from 12.5% to 50%, but achieved occupancy remained stuck at 6.25% \u2014 unchanged. The grid was fixed at (cdiv(xnumel, 128),) using the original XBLOCK=128, so when autotune selected a smaller XBLOCK the grid was not recomputed, resulting in fewer blocks launched (waves_per_sm dropped from 0.42 to 0.11). With fewer blocks and the same 1 active warp/scheduler, latency hiding did not improve: warp cycles per issued instruction doubled from 6.7 to 14.0, DRAM throughput halved, and duration doubled. The anti-pattern is passing a static grid that does not adapt to the autotuned XBLOCK \u2014 the grid lambda must reference meta['XBLOCK'] for the block count to scale correctly.",
+    "slow_pseudocode": "# BEFORE: static grid ignores autotuned XBLOCK\ngrid = (triton.cdiv(xnumel, 128),)  # hardcoded 128\nkernel[grid](arg_0, arg_1, xnumel, r0_numel)  # XBLOCK/R0_BLOCK from autotune",
+    "fast_pseudocode": "# CORRECT: grid must use lambda referencing meta['XBLOCK']\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](arg_0, arg_1, xnumel, r0_numel)",
+    "applicable_when": "Kernel has extreme register pressure (registers_per_thread near 255, Block_Limit_Registers=2, theoretical occupancy \u226412.5%) and autotune is being added to explore smaller tile sizes.",
+    "do_not_apply_when": "The call-site grid is a static tuple that does not adapt to the autotuned XBLOCK \u2014 this causes fewer blocks to launch than intended, reducing waves_per_sm and worsening latency hiding despite improved theoretical occupancy.",
+    "framework_notes": "In Triton, when using @triton.autotune with configs that vary XBLOCK, the launch grid MUST be a lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. A static grid tuple computed with a hardcoded XBLOCK value will not scale with the autotuned config, causing severe under-utilization when a smaller XBLOCK is selected."
+  },
+  {
+    "item_id": "exp_003_num_stages_reduction_causes_regression",
+    "iteration": 3,
+    "speedup": 0.7961,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_num_stages_in_autotune_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU_SOL.Duration_us": 12.13,
+        "GPU_SOL.DRAM_Throughput_pct": 43.77,
+        "Launch.block_size": 128.0,
+        "Launch.waves_per_sm": 0.42,
+        "Occupancy.Achieved_Occupancy_pct": 6.25,
+        "Instruction_Statistics.Executed_Instructions": 881664.0,
+        "Scheduler.No_Eligible_pct": 86.25,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 7.15,
+        "Memory_Workload.L2_Hit_Rate_pct": 16.1,
+        "Launch.Dynamic_Shared_Memory_Per_Block_bytes": 2048.0
+      },
+      "key_metric_after": {
+        "GPU_SOL.Duration_us": 14.27,
+        "GPU_SOL.DRAM_Throughput_pct": 37.71,
+        "Launch.block_size": 256.0,
+        "Launch.waves_per_sm": 0.85,
+        "Occupancy.Achieved_Occupancy_pct": 12.48,
+        "Instruction_Statistics.Executed_Instructions": 1765568.0,
+        "Scheduler.No_Eligible_pct": 68.79,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 6.4,
+        "Memory_Workload.L2_Hit_Rate_pct": 27.86,
+        "Launch.Dynamic_Shared_Memory_Per_Block_bytes": 4096.0
+      }
+    },
+    "strategy_title": "Switching num_stages=2 to num_stages=1 Causes Regression",
+    "strategy_description": "Changing autotune configs from num_stages=2 to num_stages=1 while also expanding the config space (adding smaller XBLOCK values like 16/32) caused the autotuner to select a larger block size (256 vs 128), doubling dynamic shared memory per block from 2KB to 4KB. This halved Block_Limit_Shared_Mem from 5 to 1, which combined with Block_Limit_Registers=1 capped occupancy at 12.5% theoretical but also doubled executed instructions from 881K to 1.77M and increased duration from 12.13\u00b5s to 14.27\u00b5s. The anti-pattern is expanding the autotune config space with smaller XBLOCK values while simultaneously reducing num_stages, which can cause the autotuner to select a config that increases shared memory pressure and instruction count without a compensating throughput gain.",
+    "slow_pseudocode": "# BEFORE: num_stages=2, 6 configs, XBLOCK in {64,128,256}\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n    triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n    triton.Config({'XBLOCK': 128, 'R0_BLOCK': 64},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 64,  'R0_BLOCK': 64},  num_warps=8, num_stages=2),\n], key=['xnumel', 'r0_numel'])\n# Result: block_size=128, duration=12.13us, executed_instr=881K",
+    "fast_pseudocode": "# AFTER (regressed): num_stages=1, 12 configs, XBLOCK in {16,32,64,128,256}\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8, num_stages=1),\n    triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=8, num_stages=1),\n    triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 16,  'R0_BLOCK': 128}, num_warps=2, num_stages=1),\n    # ... 7 more configs\n], key=['xnumel', 'r0_numel'])\n# Result: block_size=256, duration=14.27us, executed_instr=1.77M (regression)",
+    "applicable_when": "Kernel already has a working autotune config set with num_stages=2 and moderate XBLOCK range; considering switching to num_stages=1 to reduce pipeline overhead.",
+    "do_not_apply_when": "The kernel is register-pressure-bound (registers_per_thread=255) and shared memory is already a limiting factor (Block_Limit_Shared_Mem <= 5); reducing num_stages while adding very small XBLOCK configs risks the autotuner selecting a larger block that doubles shared memory usage and instruction count.",
+    "framework_notes": "In Triton, num_stages controls software pipelining depth. Reducing from 2 to 1 can increase shared memory allocation per block (the pipeline buffers are in shared memory), which reduces Block_Limit_Shared_Mem and can force the autotuner toward configs that worsen overall throughput. When registers_per_thread=255 already limits blocks to 1-2 per SM, any additional shared memory pressure compounds the occupancy problem."
+  },
+  {
+    "item_id": "ad3e161b",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_lambda_grid_fix_and_larger_xblock_configs",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization + TheoreticalOccupancy + CPIStall + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_lambda_grid_fix_and_larger_xblock_configs \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_lambda_grid_fix_and_larger_xblock_configs' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nonstexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, option",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: 255 registers/thread limits blocks to 2/SM (Block_Limit_Registers=2), giving only 12.5% theoretical and 6.25% achieved occupancy. The grid launches only 112 blocks for 132 SMs (0.42 waves). Memory history confirms that ALL prior autotune attempts regressed because the call-site grid is hardcoded to triton.cdiv(xnumel, 128) \u2014 when autotune selects a smaller XBLOCK, the grid shrinks and waves_per_sm collapses to 0.11. The fix requires TWO simultaneous changes: (1) convert the static grid to a lambda, AND (2) keep XBLOCK >= 64 in ALL autotune configs so the grid never shrinks below current. Additionally, tl.max_contiguous and tl.multiple_of hints on the x0 load dimension enable 128-bit vectorized loads to reduce the 4.5-cycle average L1TEX stall (63.5% of stall budget).",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nonstexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/t",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_005_autotune_static_grid_still_broken_fifth_iteration",
+    "iteration": 5,
+    "speedup": 0.4952,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_with_fixed_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + CPIStall + AchievedOccupancy",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 90.0,
+        "Occupancy.Theoretical_Occupancy_pct": 25.0,
+        "Occupancy.Achieved_Occupancy_pct": 12.48,
+        "Launch.waves_per_sm": 0.42,
+        "GPU_SOL.Duration_us": 11.17,
+        "GPU_SOL.DRAM_Throughput_pct": 47.18,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 13.96,
+        "Scheduler.No_Eligible_pct": 85.78
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 62.0,
+        "Occupancy.Theoretical_Occupancy_pct": 50.0,
+        "Occupancy.Achieved_Occupancy_pct": 6.25,
+        "Launch.waves_per_sm": 0.11,
+        "GPU_SOL.Duration_us": 22.94,
+        "GPU_SOL.DRAM_Throughput_pct": 22.87,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 14.03,
+        "Scheduler.No_Eligible_pct": 92.92
+      }
+    },
+    "strategy_title": "Autotune Config Expansion Without Lambda Grid Regresses Again (5th)",
+    "strategy_description": "For the fifth consecutive iteration, expanding @triton.autotune configs (adding XBLOCK in {16,32,64,128,256,512} with varied R0_BLOCK and num_stages=2/3) reduced registers/thread from 90 to 62 and raised theoretical occupancy from 25% to 50%, but achieved occupancy collapsed from 12.48% to 6.25% because the launch grid remained a static tuple hardcoded to XBLOCK=128. When autotune selected a smaller XBLOCK, the grid launched only 112 blocks instead of the correct larger count, collapsing waves_per_sm from 0.42 to 0.11, doubling warp cycles per issued instruction (13.96\u219214.03), halving DRAM throughput (47.18%\u219222.87%), and doubling duration (11.17\u219222.94 \u00b5s). No autotune config change can fix this regression until the grid is converted to a lambda reading META['XBLOCK'].",
+    "slow_pseudocode": "# STILL BROKEN (5th iteration): expanded configs with num_stages=2/3, but grid remains static\n@triton.autotune(configs=[\n    Config({'XBLOCK': 128, 'R0_BLOCK': 16},  num_warps=4, num_stages=2),\n    Config({'XBLOCK': 16,  'R0_BLOCK': 128}, num_warps=2, num_stages=2),\n    Config({'XBLOCK': 512, 'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n    Config({'XBLOCK': 32,  'R0_BLOCK': 32},  num_warps=4, num_stages=3),\n    # ... more configs ...\n], key=['xnumel', 'r0_numel'])\n@triton.jit\ndef kernel(...): ...\n\ndef launch():\n    grid = (triton.cdiv(xnumel, 128),)  # STILL hardcoded 128 -- root cause\n    kernel[grid](arg0, arg1, xnumel, r0_numel)",
+    "fast_pseudocode": "# REQUIRED FIX: grid must be a lambda reading META['XBLOCK']\ndef launch():\n    grid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)  # MUST be lambda\n    kernel[grid](arg0, arg1, xnumel, r0_numel)",
+    "applicable_when": "Any Triton kernel where @triton.autotune varies XBLOCK and the grid size is computed from xnumel / XBLOCK. Registers_per_thread elevated, theoretical occupancy below hardware maximum, waves_per_sm < 0.5.",
+    "do_not_apply_when": "Never expand autotune configs without simultaneously converting the static grid tuple to a lambda. Config expansion alone \u2014 including adding tl.max_contiguous hints, varying num_stages, or adding more XBLOCK values \u2014 cannot fix the static grid problem and will always regress performance when autotune selects a smaller XBLOCK than the hardcoded value.",
+    "framework_notes": "Triton-specific: this is the FIFTH consecutive iteration confirming that `grid = (triton.cdiv(xnumel, 128),)` is the root cause of regression. The ONLY fix is `grid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)`. No autotune config changes, tl.max_contiguous hints, or num_stages adjustments are beneficial until this one-line fix is applied at the call site."
+  }
+]

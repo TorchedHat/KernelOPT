@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "fd7a9a5e",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.685e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.024e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.983e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has ALLOW_TF32=False, forcing tl.dot to use FP32 FFMA instructions instead of Tensor Cores. On H200 SXM5, FP32 Tensor Cores deliver 989 TFLOPS vs 67 TFLOPS for FFMA \u2014 a ~14.8x peak throughput difference. The kernel currently achieves only 12.47% compute SOL (10% of FP32 peak). Enabling TF32 (allow_tf32=True) routes tl.dot through Tensor Core MMA instructions. K=480 is moderate; accumulated TF32 rounding error is acceptable for this fused batch-norm+convolution context where the output is subsequently clipped by hardtanh. The grid has only 124 blocks for 132 SMs (0.19 waves/SM), so the kernel is severely underutilized \u2014 Tensor Core throughput will directly reduce kernel duration.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.685e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.024e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.983e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "0c5d8b53",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_lower_register_pressure_and_bank_conflicts",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_lower_register_pressure_and_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_lower_register_pressure_and_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.051e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.028e+02 > atol=0.001\nseed=1337 output[0]: max_diff=9.695e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely bottlenecked by L1/shared memory bank conflicts (16.9-way average, 82.27% of shared load wavefronts are conflicts). This is the #1 NCU rule by speedup (77.92%). The root cause is the large tile configuration BLOCK_M=32 x BLOCK_N=64 x BLOCK_K=32 with 128 threads, which drives register usage to 94/thread \u2014 limiting blocks/SM to only 5 (register-bound) and achieved occupancy to just 6.25% (vs 31.25% theoretical). With only 0.19 waves/SM and 124 blocks for 132 SMs, the GPU is severely underutilized. Reducing tile sizes (especially BLOCK_N from 64->32 and BLOCK_K from 32->16) will: (1) cut register pressure so more blocks fit per SM, (2) reduce the shared memory footprint per block reducing bank conflict severity, (3) increase the grid from 124 to 248 blocks covering all 132 SMs. The diversity instruction also calls for evict_first on streaming loads (A and B matrix tiles are read once per k-loop iteration and never reused in L2), which will free L2 capacity for the output buffer.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.051e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.028e+02 > atol=0.001\nseed=1337 output[0]: max_diff=9.695e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "31e4f25b",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_matrix_load_coalescing_to_eliminate_bank_conflicts",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_matrix_load_coalescing_to_eliminate_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_matrix_load_coalescing_to_eliminate_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.329e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.375e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.502e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B matrix (arg_B) has shape (112, 480, 1, 1) stored with stride (480, 1, 1, 1), meaning it is laid out as (N=112, K=480) in row-major \u2014 i.e., N is the outer dimension and K is contiguous. The current kernel hardcodes stride_bk=1 and stride_bn=480, treating B as if it were (K, N) layout, but then computes xindex = idx_n + 112*idx_m where idx_m is the K-tile index and idx_n is the N-tile index. This produces a gather with stride 480 in K, causing 16.9-way bank conflicts when the (BLOCK_K=32, BLOCK_N=64) tile is staged through shared memory. The fix is to correct the B load to use the actual (N, K) layout: stride_bk=112 (K is inner, stride=N=112 between K rows) and stride_bn=1 (N is contiguous). With this correction, the N-dimension load becomes contiguous (stride 1), enabling coalesced global loads and conflict-free shared memory access. Additionally, applying tl.max_contiguous and tl.multiple_of hints on offs_b_n will allow the compiler to emit vectorized 128-bit loads. This directly attacks the #1 bottleneck (77.97% estimated speedup) and the CPIStall (76.5% of stall cycles).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.329e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.375e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.502e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

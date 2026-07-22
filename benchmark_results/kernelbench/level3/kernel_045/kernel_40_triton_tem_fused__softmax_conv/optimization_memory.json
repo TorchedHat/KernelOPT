@@ -1,0 +1,238 @@
+[
+  {
+    "item_id": "1792b123",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_autotune_to_fix_tile_shape_and_bank_conflicts",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_autotune_to_fix_tile_shape_and_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'add_autotune_to_fix_tile_shape_and_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.619e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.174e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.209e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is bottlenecked at L1/TEX (95.67%) due to severe shared memory bank conflicts (11.8-way average, 74% of wavefronts). The current tile shape BLOCK_M=128, BLOCK_N=16, BLOCK_K=32 creates a very tall-narrow tile. The B matrix has stride_bn=64 (non-unit column stride), so loading B tiles into shared memory with BLOCK_N=16 causes threads in the same warp to access columns that are 64 elements apart, landing on the same bank repeatedly. Additionally, 96 registers/thread limits occupancy to 31.25% (5 blocks/SM), leaving the scheduler starved (78.1% no-eligible cycles). Adding @triton.autotune will explore tile shapes and pipeline stages that eliminate these conflicts.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.619e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.174e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.209e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_block_n_align_to_actual_dim",
+    "iteration": 1,
+    "speedup": 1.5077,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "align_tile_dim_to_actual_matrix_dim_to_reduce_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 95.67,
+        "GPU Speed Of Light Throughput.Memory Throughput": 89.92,
+        "GPU Speed Of Light Throughput.Duration": 79.17,
+        "Memory Workload Analysis.Memory Throughput": 890.01,
+        "Occupancy.Registers Per Thread": 96.0,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 29.02,
+        "Scheduler Statistics.No Eligible": 78.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 21.18,
+        "Instruction Statistics.Executed Instructions": 12787712.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 75.32,
+        "GPU Speed Of Light Throughput.Memory Throughput": 64.44,
+        "GPU Speed Of Light Throughput.Duration": 52.51,
+        "Memory Workload Analysis.Memory Throughput": 1340.0,
+        "Occupancy.Registers Per Thread": 39.0,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Occupancy.Achieved Occupancy": 34.11,
+        "Scheduler Statistics.No Eligible": 86.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 40.76,
+        "Instruction Statistics.Executed Instructions": 4726784.0
+      }
+    },
+    "strategy_title": "Align BLOCK_N tile to actual N dimension to cut bank conflicts",
+    "strategy_description": "When a GEMM tile dimension (e.g., BLOCK_N) is set larger than the actual matrix dimension (e.g., N=4 but BLOCK_N=16), threads access shared memory with large strides that cause severe bank conflicts (11.8-way) on 74% of shared load wavefronts. Reducing BLOCK_N to match the actual N dimension eliminates wasted masked-out computation, aligns shared memory access patterns to the data layout, and dramatically cuts register pressure (96\u219239 registers/thread), improving theoretical occupancy (31.25%\u219237.5%) and reducing L1/TEX throughput from 95.67% to 75.32%. The total instruction count dropped by ~63% (12.8M\u21924.7M), confirming that the oversized tile was causing massive redundant work.",
+    "slow_pseudocode": "# BLOCK_N=16 but actual N=4 \u2014 75% of N-tile is masked/wasted\nBLOCK_M = 128\nBLOCK_N = 16  # 4x larger than actual N=4\nBLOCK_K = 32\n# B matrix loaded with stride causing 11.8-way bank conflicts\nfor k in range(0, K, BLOCK_K):\n    a = load_A_tile(BLOCK_M, BLOCK_K)\n    b = load_B_tile(BLOCK_K, BLOCK_N)  # strided access, bank conflicts\n    acc += dot(a, b)",
+    "fast_pseudocode": "# BLOCK_N=4 matches actual N=4 \u2014 no wasted compute, aligned access\nBLOCK_M = 128\nBLOCK_N = 4   # matches actual N exactly\nBLOCK_K = 64\n# B matrix loaded with aligned stride, bank conflicts reduced\nfor k in range(0, K, BLOCK_K):\n    a = load_A_tile(BLOCK_M, BLOCK_K)\n    b = load_B_tile(BLOCK_K, BLOCK_N)  # aligned access\n    acc += dot(a, b)",
+    "applicable_when": "SharedMemoryConflicts NCU rule fires with >5-way bank conflicts; BLOCK_N (or BLOCK_M) tile dimension is set significantly larger than the actual matrix dimension; L1/TEX Cache Throughput >80%; high register pressure (>64 registers/thread) limiting occupancy; executed instruction count is suspiciously high relative to problem size",
+    "do_not_apply_when": "Tile dimensions already match or are smaller than actual matrix dimensions; bank conflicts are low (<2-way); the matrix dimension is large enough that any reasonable tile size is smaller than it; reducing tile size would cause too many kernel launches or insufficient parallelism",
+    "framework_notes": "In Triton, constexpr tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) are set at compile time. When using @triton.autotune, the key insight is to constrain BLOCK_N configs to be <= actual N so that tl.cdiv(N, BLOCK_N) produces valid grid dimensions and masking handles boundary correctly. The same principle applies in CUDA: choosing threadblock tile dimensions larger than the actual matrix dimension wastes shared memory bandwidth and causes strided bank-conflicting access patterns."
+  },
+  {
+    "item_id": "600062eb",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_increase_occupancy_and_reduce_smem_pressure",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_to_increase_occupancy_and_reduce_smem_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_to_increase_occupancy_and_reduce_smem_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.619e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.174e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.209e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a tall-thin GEMM (M=262144, N=4, K=64). The binding occupancy limiter is shared memory: Block Limit Shared Mem=6 blocks/SM gives only 37.5% theoretical occupancy. With BLOCK_M=128 (4 warps/block), only 24 warps/SM are active, far below the 64-warp hardware maximum. The scheduler is starved: 86.53% of cycles have no eligible warp, and 56.5% of stall cycles are MIO (shared memory) latency. Halving BLOCK_M from 128 to 64 halves the shared memory footprint per block (A tile: 128x64x4=32KB to 64x64x4=16KB), allowing 2x more blocks per SM (6 to 12), doubling the warp pool to 48 warps/SM (75% theoretical occupancy). This directly addresses the scheduler starvation by providing more warps to hide the 23-cycle MIO latency. The grid doubles from 2048 to 4096 blocks. The B matrix (K=64, N=4) is tiny and fits in registers regardless of BLOCK_M.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.619e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.174e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.209e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_num_warps_mio_latency_hiding",
+    "iteration": 2,
+    "speedup": 1.5472,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "increase_num_warps_to_hide_mio_latency",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 52.51,
+        "Scheduler Statistics.No Eligible": 86.53,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.18,
+        "Scheduler Statistics.Active Warps Per Scheduler": 5.49,
+        "Occupancy.Achieved Occupancy": 34.11,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 40.76,
+        "Memory Workload Analysis.Memory Throughput": 1340.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 51.17,
+        "Scheduler Statistics.No Eligible": 85.94,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.18,
+        "Scheduler Statistics.Active Warps Per Scheduler": 5.67,
+        "Occupancy.Achieved Occupancy": 34.23,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 40.31,
+        "Memory Workload Analysis.Memory Throughput": 1380.0
+      }
+    },
+    "strategy_title": "Increase num_warps to hide MIO/shared-memory latency",
+    "strategy_description": "When the CPIStall rule identifies high MIO stall cycles per warp (23 cycles, 56.5% of total stall time) from shared memory operations, and the scheduler shows >85% no-eligible cycles with very few active warps per scheduler (~5.5), increasing num_warps at the Triton launch site can provide more in-flight warps to hide the latency. However, in this case the improvement was marginal (52.51us\u219251.17us, ~2.6% wall-clock reduction despite 1.55x reported speedup), because the dominant bottleneck remained the 10-way shared memory bank conflicts (80% of shared load wavefronts) which num_warps alone cannot fix \u2014 more warps in flight still stall on the same conflicted banks. The strategy is most effective when MIO stalls are caused by latency rather than contention; when bank conflicts are the root cause, fixing the access pattern is necessary first.",
+    "slow_pseudocode": "# Launch with default num_warps=4, no pipelining\ntriton_kernel[grid](arg_0, arg_1, arg_2, arg_3)\n# Results in ~5.5 active warps/scheduler, 86.5% no-eligible cycles",
+    "fast_pseudocode": "# Launch with num_warps=8, num_stages=2\ntriton_kernel[grid](\n    arg_0, arg_1, arg_2, arg_3,\n    num_warps=8,\n    num_stages=2,\n)\n# Results in ~5.7 active warps/scheduler, 85.9% no-eligible cycles\n# Marginal improvement \u2014 bank conflicts still dominate",
+    "applicable_when": "CPIStall rule fires with MIO stall cycles >15 per warp representing >40% of total stall cycles; scheduler No Eligible >80%; active warps per scheduler <8; block_limit_shared_mem > block_limit_registers (shared memory is not the binding occupancy constraint); the MIO stalls are latency-driven (not bank-conflict-driven)",
+    "do_not_apply_when": "SharedMemoryConflicts rule also fires with >5-way bank conflicts \u2014 in that case, bank conflicts are the root cause of MIO stalls and adding more warps only queues more conflicting requests; the block is already limited by shared memory capacity (block_limit_shared_mem is the binding constraint and doubling warps would reduce block count); registers_per_thread is already high and doubling warps would spill to local memory",
+    "framework_notes": "In Triton, num_warps and num_stages are passed as keyword arguments to the kernel launch: kernel[grid](*args, num_warps=8, num_stages=2). num_warps must be a power of 2. num_stages enables software pipelining of the main loop. In CUDA, the equivalent is choosing a larger block size or using cooperative groups to increase warp-level parallelism per SM."
+  },
+  {
+    "item_id": "exp_002_preload_b_into_registers_to_eliminate_loop_reload",
+    "iteration": 2,
+    "speedup": 1.5337,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "preload_small_matrix_into_registers_before_k_loop",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 52.51,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 75.32,
+        "GPU Speed Of Light Throughput.Memory Throughput": 64.44,
+        "Memory Workload Analysis.Memory Throughput": 1340.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 40.76,
+        "Scheduler Statistics.No Eligible": 86.53,
+        "Occupancy.Achieved Occupancy": 34.11,
+        "Instruction Statistics.Executed Instructions": 4726784.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 51.62,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 77.97,
+        "GPU Speed Of Light Throughput.Memory Throughput": 66.34,
+        "Memory Workload Analysis.Memory Throughput": 1370.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.22,
+        "Scheduler Statistics.No Eligible": 85.84,
+        "Occupancy.Achieved Occupancy": 34.59,
+        "Instruction Statistics.Executed Instructions": 4726784.0
+      }
+    },
+    "strategy_title": "Preload Small Reused Matrix Into Registers Before K-Loop",
+    "strategy_description": "When a matrix (e.g., B with shape [K, N]) is small enough to fit entirely in registers and is reused across all K-loop iterations, loading it once before the loop eliminates repeated global memory fetches and shared memory bank conflicts inside the loop. In this case, B (64\u00d74 = 256 floats = 1 KB) was loaded once as a [BLOCK_K, BLOCK_N] register tile before the k_idx loop, replacing the per-iteration strided global gather that caused 10-way shared memory bank conflicts (80% of shared load wavefronts). The speedup is modest (1.53x) because the dominant bottleneck (SharedMemoryConflicts, CPIStall MIO stalls) persists \u2014 the bank conflicts in shared loads were not fully eliminated since the dot product still uses shared memory internally \u2014 but the global load traffic inside the loop was removed.",
+    "slow_pseudocode": "# B reloaded every k_idx iteration with strided global gather\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A + xindex_a)  # [BLOCK_M, BLOCK_K]\n    # Strided B load: B[k, n] at B + (k + 64*n), causes 10-way bank conflicts\n    b = tl.load(B + (idx_m + 64 * idx_n))  # [BLOCK_K, BLOCK_N]\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "# Preload entire B once before loop into register tile\nb_k_coords = tl.arange(0, BLOCK_K)[:, None]   # [BLOCK_K, 1]\nb_n_coords = offs_b_n[None, :]                  # [1, BLOCK_N]\nb_preloaded = tl.load(B + (b_k_coords + 64 * b_n_coords))  # [BLOCK_K, BLOCK_N], loaded once\n\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A + xindex_a)  # [BLOCK_M, BLOCK_K]\n    b = b_preloaded             # reuse register tile, no global load\n    acc += tl.dot(a, b)",
+    "applicable_when": "A matrix operand is small enough to fit in registers (e.g., <4 KB), is reused across all K-loop iterations without change (i.e., the same tile covers the full K dimension), and the per-iteration load causes shared memory bank conflicts or strided global accesses. SharedMemoryConflicts NCU rule fires with high bank conflict way-count (>5x) on shared loads inside the K-loop.",
+    "do_not_apply_when": "The matrix is too large to fit in registers (causes register spilling and occupancy collapse); the K-loop iterates over different tiles of B (i.e., BLOCK_K < K, so different k_idx values need different B slices \u2014 this optimization only works when BLOCK_K == K or there is only one k_idx iteration); register pressure is already high (>64 regs/thread) and adding a register-resident tile would reduce occupancy.",
+    "framework_notes": "In Triton, loading a 2D tile with tl.load(ptr + (row_idx + stride * col_idx)) where row_idx and col_idx are broadcast index arrays produces a register-resident tensor. This avoids shared memory entirely for the preloaded tile. The optimization is only correct when BLOCK_K equals the full K dimension (single k_idx iteration). For multi-iteration K-loops, a slice selection mechanism (e.g., dynamic_slice) would be needed, which Triton does not support efficiently \u2014 in that case, consider shared memory staging with padding instead."
+  },
+  {
+    "item_id": "34d46b09",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "static_range_column_wise_accumulation_to_bypass_tl_dot_shared_memory",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "static_range_column_wise_accumulation_to_bypass_tl_dot_shared_memory \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'static_range_column_wise_accumulation_to_bypass_tl_dot_shared_memory' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, m",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The dominant bottleneck is 10-way shared memory bank conflicts on loads (60% speedup potential) caused by tl.dot staging its operands through shared memory with a strided layout. B has shape [K=64, N=4] with stride_bn=64 (column-major), so when tl.dot stages B into shared memory, consecutive threads access elements 4 apart in the N dimension, hitting the same bank repeatedly. The 3D expand-and-sum approach (item neg_002) failed due to register spill (128*64*4=32768 elements). The correct fix is tl.static_range over N=4 columns: for each column n, load b_col = B[:,n] as a [BLOCK_K] vector, then compute acc[:,n] += tl.sum(a * b_col[None,:], axis=1). This avoids shared memory entirely (no tl.dot staging), avoids the 3D intermediate (no register spill), and the 4-iteration static loop is fully unrolled by the compiler. With BLOCK_K=64=K, B is loaded once before the k-loop. The shared memory allocation drops to near zero, freeing the Block_Limit_Shared_Mem constraint and potentially allowing more blocks/SM.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/",
+    "framework_notes": null
+  },
+  {
+    "item_id": "5d047e99",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reorder_a_load_to_coalesced_k_innermost_and_reduce_block_m_for_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reorder_a_load_to_coalesced_k_innermost_and_reduce_block_m_for_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reorder_a_load_to_coalesced_k_innermost_and_reduce_block_m_for_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.619e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.174e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.209e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a tall-thin GEMM: M=262144, N=4, K=64. tl.dot(a, b) with a=[128,64] and b=[64,4] stages both operands into shared memory. Matrix A is loaded with stride_am=64 (row-major: A[m,k] at A + k + 64*m), so consecutive threads in a warp (varying over the M-tile) access A elements separated by stride 64 floats = 256 bytes. In shared memory, bank = (byte_offset/4) % 32, so stride-64 maps all 32 threads to bank 0 \u2014 a 32-way bank conflict. The fix is to transpose the A load: load A as [BLOCK_K, BLOCK_M] so threads vary over K (stride_ak=1, contiguous), then apply tl.trans before tl.dot. Additionally, reduce BLOCK_M from 128 to 64 to halve shared memory per block, raising Block Limit Shared Mem from 6 to 12 and theoretical occupancy from 37.5% toward 75%.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.619e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.174e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.209e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_003_revert_tl_dot_from_register_spill",
+    "iteration": 3,
+    "speedup": 1.5328,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "replace_tl_dot_with_register_accumulation_to_eliminate_smem_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 101.54,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.06,
+        "Instruction Statistics.Executed Instructions": 15327232.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.55
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 51.65,
+        "Launch Statistics.Registers Per Thread": 39.0,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Occupancy.Achieved Occupancy": 34.33,
+        "Instruction Statistics.Executed Instructions": 4726784.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.87
+      }
+    },
+    "strategy_title": "Revert 3D Expand-Sum to tl.dot to Fix Register Spill",
+    "strategy_description": "When a kernel has been modified to replace tl.dot with a 3D expand-and-sum pattern that causes register spilling (registers/thread at hardware max of 255, theoretical occupancy collapsed to 12.5%, instruction count 3x higher), reverting to tl.dot restores correct register usage (39/thread), occupancy (37.5%), and instruction count (4.7M), cutting duration by ~50%. The only code change needed is replacing the 3D intermediate accumulation with tl.dot(a, b, allow_tf32=False, out_dtype=ACC_TYPE); the surrounding load logic and epilogue remain unchanged. This is a corrective revert, not a new optimization \u2014 the negative experience (neg_002) documents the anti-pattern and this positive confirms the fix.",
+    "slow_pseudocode": "# 3D expand-and-sum: creates [BLOCK_M=128, BLOCK_K=64, BLOCK_N=4] intermediate -> spills to local mem\na_3d = tl.expand_dims(a.to(ACC_TYPE), 2)   # [128, 64, 1]\nb_3d = tl.expand_dims(b.to(ACC_TYPE), 0)   # [1, 64, 4]\nacc = acc + tl.sum(a_3d * b_3d, axis=1)    # [128, 64, 4] -> [128, 4]  SPILLS",
+    "fast_pseudocode": "# tl.dot uses shared memory, avoids register spill\nacc += tl.dot(a, b, allow_tf32=False, out_dtype=ACC_TYPE)  # [BLOCK_M, BLOCK_N]",
+    "applicable_when": "Kernel shows registers_per_thread at or near hardware maximum (255), theoretical occupancy collapsed to <=12.5%, instruction count 3x+ higher than expected, and UncoalescedSharedAccess/local memory NCU rules firing \u2014 all symptoms of a prior 3D expand-and-sum replacement of tl.dot having caused register spill.",
+    "do_not_apply_when": "The kernel is already using tl.dot correctly (registers/thread ~39, occupancy ~37.5%); or when the 3D intermediate tensor is small enough to fit in registers (BLOCK_M * BLOCK_K * BLOCK_N < ~4K elements).",
+    "framework_notes": "In Triton, tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32) is the correct way to perform matrix multiplication using shared memory without register spill. The allow_tf32=False flag is critical for FP32 precision. The 3D expand-and-sum anti-pattern (tl.expand_dims + broadcast multiply + tl.sum) materializes a full [BLOCK_M, BLOCK_K, BLOCK_N] tensor that exceeds register file capacity for typical tile sizes."
+  }
+]

@@ -1,0 +1,73 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 128},  num_warps=4),
+        triton.Config({'XBLOCK': 256},  num_warps=4),
+        triton.Config({'XBLOCK': 512},  num_warps=4),
+        triton.Config({'XBLOCK': 1024}, num_warps=8),
+    ],
+    key=['xnumel'],
+)
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_relu_216(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 815360
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = xindex < xnumel
+    x2 = xindex
+    x0 = (xindex % 1664)
+    # Load channel-indexed BN params first (small, L1-cached) so rsqrt latency
+    # is overlapped with the subsequent streaming x-load
+    tmp_mean   = tl.load(in_ptr1 + x0, xmask, eviction_policy='evict_last')
+    tmp_var    = tl.load(in_ptr2 + x0, xmask, eviction_policy='evict_last')
+    tmp_weight = tl.load(in_ptr3 + x0, xmask, eviction_policy='evict_last')
+    tmp_bias   = tl.load(in_ptr4 + x0, xmask, eviction_policy='evict_last')
+    # Precompute scale and shift (rsqrt latency now overlapped with x-load below)
+    tmp_eps   = tl.full([1], 1e-05, tl.float32)
+    tmp_scale = tmp_weight * libdevice.rsqrt(tmp_var + tmp_eps)  # weight/sqrt(var+eps)
+    tmp_shift = tmp_bias - tmp_mean * tmp_scale                  # bias - mean*scale (FMA)
+    # Load streaming input x AFTER issuing rsqrt (decouples latencies)
+    tmp_x   = tl.load(in_ptr0 + x2, xmask)
+    # 2-op FMA hot path: scale*x + shift = weight*(x-mean)*rsqrt(var+eps) + bias
+    tmp_bn  = tmp_scale * tmp_x + tmp_shift
+    tmp_out = tl.maximum(tl.full([1], 0, tl.int32), tmp_bn)
+    tl.store(out_ptr0 + x2, tmp_out, xmask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    arg_5 = inputs[5]
+    xnumel = 815360
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_relu_216[grid](arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, 815360)
+    return arg_5
+
+def get_inputs():
+    arg_0 = rand_strided((10, 1664, 7, 7), (81536, 1, 11648, 1664), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((1664,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((1664,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((1664,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((1664,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_5 = rand_strided((10, 1664, 7, 7), (81536, 1, 11648, 1664), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4, arg_5]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

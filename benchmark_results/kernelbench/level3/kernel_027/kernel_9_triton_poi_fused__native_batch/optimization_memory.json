@@ -1,0 +1,218 @@
+[
+  {
+    "item_id": "885f4a70",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_grid_launch_mismatch_and_improve_coalescing_with_correct_autotune",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + LaunchConfiguration + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_grid_launch_mismatch_and_improve_coalescing_with_correct_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_grid_launch_mismatch_and_improve_coalescing_with_correct_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has a critical structural bug: the @triton.autotune decorator defines configs with XBLOCK=1 and YBLOCK up to 1024, but kernel_function() launches with a hardcoded static grid of (cdiv(9,128), cdiv(32768,8)) = (1,4096) completely ignoring the autotune-selected META values. Furthermore, the persistent tile loop inside the kernel uses tl.num_programs(0) (1D) but the grid is 2D, so num_sms = grid_x = 1 and the while loop iterates all 4096 tiles sequentially on a single SM. This explains the 944M instruction count for a trivial copy. Additionally, the load index x2 + 9*y3 strides by 9 floats between consecutive x-threads, causing severe uncoalescing (4/32 bytes used per sector). The fix must: (1) correct the grid lambda to use META['XBLOCK'] and META['YBLOCK'], (2) remove the broken persistent loop and switch to a standard 2D non-persistent grid, and (3) keep XBLOCK=1 so consecutive y-threads access contiguous memory.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_003_persistent_kernel_autotune_config_reduction_regression",
+    "iteration": 3,
+    "speedup": 0.0032,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.42,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6608.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 12.66,
+        "GPU Speed Of Light Throughput.Memory Throughput": 5.46,
+        "Occupancy.Achieved Occupancy": 28.36,
+        "Scheduler Statistics.No Eligible": 62.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.28,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.92,
+        "Instruction Statistics.Executed Instructions": 429056.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 20.32,
+        "Launch Statistics.Waves Per SM": 1.94
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 1620000.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2427901.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 76.74,
+        "GPU Speed Of Light Throughput.Memory Throughput": 68.9,
+        "Occupancy.Achieved Occupancy": 79.94,
+        "Scheduler Statistics.No Eligible": 24.77,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.19,
+        "Scheduler Statistics.Active Warps Per Scheduler": 12.98,
+        "Instruction Statistics.Executed Instructions": 943996928.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 81.61,
+        "Memory Workload Analysis.L2 Hit Rate": 99.15,
+        "Launch Statistics.Waves Per SM": 1.94
+      }
+    },
+    "strategy_title": "Persistent Kernel Loop Causes Catastrophic Instruction Explosion",
+    "strategy_description": "Converting a short-lived 2D grid kernel into a persistent 1D grid with an inner while-loop caused a catastrophic regression: executed instructions exploded from 429K to 944M (~2200x), and duration increased from 4.42\u00b5s to 1.62ms (~366x slower). Although occupancy improved (28.4% \u2192 79.9%) and L1/L2 hit rates rose dramatically (L2: 20% \u2192 99%), these gains were completely overwhelmed by the instruction count explosion. The root cause is that the persistent while-loop forces each SM to iterate through many tiles sequentially, and the per-iteration arithmetic (modulo, integer division for tile decomposition) generates enormous instruction overhead that dwarfs the actual memory work. This iteration also removed 4 of the 8 autotune configs (YBLOCK=2048, 4096 and XBLOCK=16 variants), further limiting the search space. For extremely short kernels (duration < 10\u00b5s, total work < 1M instructions), persistent scheduling adds more overhead than it saves from eliminating partial waves.",
+    "slow_pseudocode": "# Persistent 1D grid: 132 CTAs, each loops over ~17-18 tiles\n# Also removed YBLOCK=2048, 4096 and XBLOCK=16 configs from autotune\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 128,  'XBLOCK': 1}, num_warps=4),\n        triton.Config({'YBLOCK': 256,  'XBLOCK': 1}, num_warps=4),\n        triton.Config({'YBLOCK': 512,  'XBLOCK': 1}, num_warps=8),\n        triton.Config({'YBLOCK': 1024, 'XBLOCK': 1}, num_warps=8),\n        # YBLOCK=2048, 4096, XBLOCK=16 configs REMOVED\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    x_tiles = tl.cdiv(xnumel, XBLOCK)\n    y_tiles = tl.cdiv(ynumel, YBLOCK)\n    total_tiles = x_tiles * y_tiles\n    num_sms = tl.num_programs(0)\n    tile_id = tl.program_id(0)\n    while tile_id < total_tiles:  # each SM loops ~17-18 times\n        x_tile_id = tile_id % x_tiles   # expensive modulo per iteration\n        y_tile_id = tile_id // x_tiles  # expensive division per iteration\n        xoffset = x_tile_id * XBLOCK\n        yoffset = y_tile_id * YBLOCK\n        # ... load/store ...\n        tile_id += num_sms\ngrid = (132,)  # 1D persistent grid, ignores autotune META",
+    "fast_pseudocode": "# Standard 2D grid: one CTA per tile, no loop overhead\n# Keep all autotune configs including YBLOCK=2048, 4096\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 128,  'XBLOCK': 1}, num_warps=4),\n        triton.Config({'YBLOCK': 256,  'XBLOCK': 1}, num_warps=4),\n        triton.Config({'YBLOCK': 512,  'XBLOCK': 1}, num_warps=8),\n        triton.Config({'YBLOCK': 1024, 'XBLOCK': 1}, num_warps=8),\n        triton.Config({'YBLOCK': 2048, 'XBLOCK': 1}, num_warps=8),\n        triton.Config({'YBLOCK': 4096, 'XBLOCK': 1}, num_warps=16),\n        triton.Config({'YBLOCK': 256,  'XBLOCK': 16}, num_warps=4),\n        triton.Config({'YBLOCK': 128,  'XBLOCK': 16}, num_warps=4),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = tl.program_id(1) * YBLOCK\n    yindex  = yoffset + tl.arange(0, YBLOCK)[:, None]\n    ymask   = yindex < ynumel\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex  = xoffset + tl.arange(0, XBLOCK)[None, :]\n    xmask   = xindex < xnumel\n    tmp0 = tl.load(in_ptr0 + (xindex + 9*yindex), xmask & ymask)\n    tl.store(out_ptr0 + (y0 + 128*xindex + 1152*y1), tmp0, xmask & ymask)\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "applicable_when": "Never applicable for kernels with very low total instruction counts (<1M instructions, duration <10\u00b5s). The while-loop overhead (modulo, integer division, multiply for tile decomposition + loop branch) generates more instructions than the actual memory work being done per tile.",
+    "do_not_apply_when": "Any kernel where the total work per CTA is very small (e.g., a simple layout permutation with 128 elements per block). Persistent scheduling is only beneficial when each tile does substantial compute (e.g., matmul tiles, large reductions) where the loop overhead is negligible relative to the tile work. Never combine persistent scheduling with autotune config reduction \u2014 both changes compound the regression.",
+    "framework_notes": "In Triton, tl.num_programs(0) returns the grid size in dimension 0, which is correct for persistent kernels. However, the integer arithmetic inside the while-loop (tile_id % x_tiles, tile_id // x_tiles) is not free \u2014 on GPU these are full 32-bit integer divide/modulo operations that are expensive relative to simple memory loads/stores. For tiny kernels, this overhead dominates. CUDA persistent kernels have the same issue. Additionally, this iteration also removed 4 autotune configs (YBLOCK=2048, 4096, XBLOCK=16 variants) which further degraded the search space."
+  },
+  {
+    "item_id": "exp_003_grid_lambda_fix_autotune_configs",
+    "iteration": 3,
+    "speedup": 1.131,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_grid_lambda_to_honor_autotune_meta_block_sizes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + LaunchConfiguration + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.42,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6608.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 12.66,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 11.02,
+        "Occupancy.Achieved Occupancy": 28.36,
+        "Scheduler Statistics.No Eligible": 62.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.28,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.92,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.05,
+        "Memory Workload Analysis.L2 Hit Rate": 20.32,
+        "Instruction Statistics.Executed Instructions": 429056.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.58,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6783.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 15.78,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 16.43,
+        "Occupancy.Achieved Occupancy": 30.74,
+        "Scheduler Statistics.No Eligible": 54.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.67,
+        "Scheduler Statistics.Active Warps Per Scheduler": 5.09,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.13,
+        "Memory Workload Analysis.L2 Hit Rate": 36.64,
+        "Instruction Statistics.Executed Instructions": 542208.0
+      }
+    },
+    "strategy_title": "Trim Autotune Config Set to Avoid Instruction Count Regression",
+    "strategy_description": "Changing the autotune config set (removing some XBLOCK=1 large-YBLOCK configs and adding XBLOCK=16 variants with num_stages=1) alongside a grid lambda that reads META['XBLOCK'] and META['YBLOCK'] produced a modest 1.13x speedup. However, the winning config increased executed instructions (429K \u2192 542K) and elapsed cycles (6608 \u2192 6783), while improving scheduler eligible warps (1.28 \u2192 1.67), reducing warp cycles per issued instruction (13.05 \u2192 11.13), and improving L2 hit rate (20.32% \u2192 36.64%). The net speedup is real but smaller than predicted, suggesting the autotune selected an XBLOCK=16 config that trades instruction efficiency for better cache reuse. When the grid lambda is already correct and the bottleneck is scheduler idle cycles, trimming the config set to only XBLOCK=1 variants with large YBLOCK is safer than introducing XBLOCK=16 configs that increase instruction count.",
+    "slow_pseudocode": "# Before: 8 configs including YBLOCK=2048/4096 XBLOCK=1 and XBLOCK=16 variants\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 128,  'XBLOCK': 1},  num_warps=4),\n        triton.Config({'YBLOCK': 256,  'XBLOCK': 1},  num_warps=4),\n        triton.Config({'YBLOCK': 512,  'XBLOCK': 1},  num_warps=8),\n        triton.Config({'YBLOCK': 1024, 'XBLOCK': 1},  num_warps=8),\n        triton.Config({'YBLOCK': 2048, 'XBLOCK': 1},  num_warps=8),\n        triton.Config({'YBLOCK': 4096, 'XBLOCK': 1},  num_warps=16),\n        triton.Config({'YBLOCK': 256,  'XBLOCK': 16}, num_warps=4),\n        triton.Config({'YBLOCK': 128,  'XBLOCK': 16}, num_warps=4),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    ymask = (yoffset + tl.arange(0, YBLOCK)[:, None]) < ynumel\n    ...\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "fast_pseudocode": "# After: 7 configs, all with num_stages=1, XBLOCK=16 variants added, YBLOCK=128/2048/4096 XBLOCK=1 removed\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 256},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 512},  num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 1024}, num_warps=16, num_stages=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 64},   num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 128},  num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 256},  num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 512},  num_warps=16, num_stages=1),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    ymask = yindex < ynumel  # simplified mask expression\n    ...\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))",
+    "applicable_when": "Triton kernel where the grid lambda already correctly reads META['XBLOCK'] and META['YBLOCK'], scheduler No Eligible is high (>50%), eligible warps per scheduler is low (<1.5), and L2 hit rate is low (<25%). Adding XBLOCK=16 configs with num_stages=1 can improve cache reuse and scheduler utilization when xnumel allows XBLOCK=16 without excessive masking.",
+    "do_not_apply_when": "The grid is still a static tuple (fix the grid lambda first). The autotune already includes XBLOCK=16 configs. Executed instruction count is already low and the bottleneck is memory bandwidth rather than scheduler idle cycles. xnumel is very small (e.g., 9) and XBLOCK=16 would still mask 7/16 threads, wasting ~44% of x-threads.",
+    "framework_notes": "Triton-specific: num_stages=1 disables software pipelining for pointwise kernels where there is no benefit from prefetching. The ymask simplification (yindex < ynumel instead of (yoffset + tl.arange(0, YBLOCK)[:, None]) < ynumel) is semantically equivalent since yindex is already defined as yoffset + tl.arange(0, YBLOCK)[:, None]."
+  },
+  {
+    "item_id": "626d5557",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "rewrite_as_flat_1d_linearized_copy_with_correct_autotune_grid",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + LaunchConfiguration + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "rewrite_as_flat_1d_linearized_copy_with_correct_autotune_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'rewrite_as_flat_1d_linearized_copy_with_correct_autotune_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.604e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a pure layout-permutation copy over a (32768, 9) = 294912-element space. kernel_function launches with a HARDCODED static grid (cdiv(9,128), cdiv(32768,8)) = (1, 4096), completely ignoring the @triton.autotune META values. With grid_x=1 and XBLOCK=128, a single CTA covers all 9 x-elements but allocates 128 threads in x \u2014 119/128 (93%) are masked and do zero work. The load stride is 9 floats between consecutive x-threads causing 78% excessive sectors. Previous attempts to fix the 2D grid lambda caused correctness failures (max_diff ~6.7) because the 2D index decomposition y0=(yindex%128), y1=(yindex//128) was mismatched with the new grid shape. The safe fix is to collapse the 2D (ynumel, xnumel) space into a single flat 1D numel=294912, use a 1D XBLOCK-only autotune, and reconstruct x2 and y3 from the flat index. This eliminates the 2D grid/index mismatch entirely and enables coalesced loads.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.604e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "ae3a4bbd",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "restrict_autotune_to_xblock1_and_fix_grid_lambda",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + LaunchConfiguration + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "restrict_autotune_to_xblock1_and_fix_grid_lambda \u2014 correctness failure",
+    "strategy_description": "Plan 'restrict_autotune_to_xblock1_and_fix_grid_lambda' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a pure layout permutation over a (32768, 9) logical 2D space. The launch grid in kernel_function is HARDCODED as (cdiv(9,128), cdiv(32768,8)) = (1, 4096), completely ignoring the autotune META values. This means the effective tile is always XBLOCK=128 (1 block covers all 9 x-elements), wasting 119/128 x-threads (~93%). The autotune configs include XBLOCK=16 variants, but xnumel=9 means XBLOCK=16 still wastes 7/16 threads (44%) and the autotuner picks these configs because the grid is wrong. Memory item exp_003 confirms the current state is the after of a prior fix that achieved 1.13x but still has the hardcoded grid. The correct fix: (1) change the grid to a lambda using META['XBLOCK'] and META['YBLOCK'], (2) restrict configs to XBLOCK=1 only (since xnumel=9, XBLOCK=1 is the only value that avoids x-thread waste), and (3) keep all kernel index arithmetic IDENTICAL to avoid correctness failures seen in prior attempts.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "8901b92d",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "remove_broken_persistent_loop_use_standard_2d_grid",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + LaunchConfiguration + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "remove_broken_persistent_loop_use_standard_2d_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'remove_broken_persistent_loop_use_standard_2d_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has a persistent tile loop that calls tl.num_programs(0) to get the SM count. However, kernel_function launches a 2D grid (1, 4096). tl.num_programs(0) returns the x-dimension size = 1, so the while loop iterates all 4096 tiles sequentially on a SINGLE SM instead of distributing them across 132 SMs. This explains the 944M instruction count (4096x serialization overhead). Additionally, XBLOCK=128 with xnumel=9 wastes 119/128 threads and causes stride-9 uncoalesced loads (78% excessive sectors, only 4/32 bytes used per sector). Previous fix attempts changed the grid lambda but kept the persistent loop, causing correctness failures. The correct fix is to REMOVE the persistent loop entirely and use standard 2D program_id indexing paired with a proper META-based grid lambda.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "86eb98bf",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "remove_broken_persistent_loop_and_use_standard_2d_grid",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "remove_broken_persistent_loop_and_use_standard_2d_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'remove_broken_persistent_loop_and_use_standard_2d_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has TWO compounding bugs causing ~944M instructions for a 295K-element copy. (1) The persistent tile loop uses tl.num_programs(0) which reads the X-dimension of the 2D launch grid. The grid is hardcoded as (cdiv(9,128), cdiv(32768,8)) = (1, 4096), so num_sms = grid_x = 1. The while loop then iterates ALL 4096 tiles sequentially on a SINGLE SM, serializing the entire kernel. (2) The grid ignores META['XBLOCK'] and META['YBLOCK'] from the autotune decorator, so the autotuner's configs are never exercised. The fix is to REMOVE the persistent while loop entirely and replace it with a standard 2D program_id dispatch (program_id(0) for x, program_id(1) for y), then fix the grid to lambda META: (triton.cdiv(xnumel, META['XBLOCK']), triton.cdiv(ynumel, META['YBLOCK'])). Prior attempts that kept the persistent loop or changed only the grid failed correctness. Memory item exp_001 confirms 1.164x speedup is achievable with this approach.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.152e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.700e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "77dcbb42",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + LaunchConfiguration + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_triton_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'add_triton_autotune' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 710, in run\n    bound_args, specialization, options = binder(*args, **kwargs)\n                                          ^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: dynamic_func() missing 1",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a pure layout-permutation copy over a (32768, 9) = 294912-element space. kernel_function launches with a HARDCODED static grid (cdiv(9,128), cdiv(32768,8)) = (1, 4096), completely ignoring the @triton.autotune META values. With grid_x=1 and XBLOCK=128, a single CTA covers all 9 x-elements but allocates 128 threads in x \u2014 119/128 (93%) are masked and do zero work. The load stride is 9 floats between consecutive x-threads causing 78% excessive sectors. Previous attempts to fix the 2D grid lambda caused correctness failures (max_diff ~6.7) because the 2D index decomposition y0=(yindex%128), y1=(yindex//128) was mismatched with the new grid shape. The safe fix is to collapse the 2D (ynumel, xnumel) space into a single flat 1D numel=294912, use a 1D XBLOCK-only autotune, and reconstruct x2 and y3 from the flat index. This eliminates the 2D grid/index mismatch entirely and enables coalesced loads.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 710, in run\n    bound_args, specialization, options = binder(*args, **kwargs)\n ",
+    "framework_notes": null
+  }
+]

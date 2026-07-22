@@ -1,0 +1,168 @@
+[
+  {
+    "item_id": "59108784",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "shared_memory_transpose_for_coalesced_stores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "shared_memory_transpose_for_coalesced_stores \u2014 correctness failure",
+    "strategy_description": "Plan 'shared_memory_transpose_for_coalesced_stores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.339e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.684e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a transpose: reads in_ptr0[x2 + 512*y3] (x is fast dimension, loads are coalesced) and writes to out_ptr0[y0 + 1024*x2 + 524288*y1] where x2 has stride 1024 in the output. With XBLOCK=128, each store touches 128 different cache lines (one per thread), causing massive store non-coalescing. This explains the near-zero L1 hit rate (0.04%), the 26.8-cycle L1TEX stall, and 77.54% no-eligible-warp cycles. The fix is a register-tile transpose using tl.trans(): load a square tile contiguously, transpose it, then store so that the output fast dimension (y0, stride 1) is warp-contiguous.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.339e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.684e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_evict_first_streaming_transpose",
+    "iteration": 1,
+    "speedup": 2.1304,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_and_evict_first_for_streaming_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + CPIStall (L1TEX)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 10.78,
+        "GPU Speed Of Light Throughput.Memory Throughput": 65.43,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.68,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 75.01,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 53.71,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.72,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.04,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.1
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.06,
+        "GPU Speed Of Light Throughput.Memory Throughput": 17.48,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.62,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 24.35,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.98,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.44,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.05
+      }
+    },
+    "strategy_title": "Autotune Tiles + evict_first for Streaming Transpose Kernels",
+    "strategy_description": "For streaming kernels (L1 hit rate ~0%) with a partial-wave grid and high L1TEX stall cycles (>40% of all cycles), combining @triton.autotune over (XBLOCK, YBLOCK, num_warps) with eviction_policy='evict_first' on loads yields large speedups. Autotuning finds tile shapes that reduce the partial-wave tail (LaunchConfiguration rule flagging up to 50% waste) while also reducing register pressure (28\u219218 registers/thread) and shared memory usage. Switching from evict_last to evict_first on streaming loads that have zero L1 reuse eliminates unnecessary cache pollution, reducing Warp Cycles Per Issued Instruction from 53.7 to 15.0 and cutting duration by ~53%.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # ... index computation ...\n    tmp0 = tl.load(in_ptr + offset, mask, eviction_policy='evict_last')  # zero reuse\n    tl.store(out_ptr + permuted_offset, tmp0, mask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # hardcoded, creates partial wave\nkernel[grid](arg0, arg1, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 16}, num_warps=4),\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 64}, num_warps=4),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 64}, num_warps=8),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 64}, num_warps=8),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=8),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8},  num_warps=4),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 8},  num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # ... index computation ...\n    tmp0 = tl.load(in_ptr + offset, mask, eviction_policy='evict_first')  # streaming, no reuse\n    tl.store(out_ptr + permuted_offset, tmp0, mask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](arg0, arg1, ynumel, xnumel)  # XBLOCK/YBLOCK from autotune",
+    "applicable_when": "Triton 2D-tiled streaming kernels (transpose, permute, copy) where: (1) L1/TEX Hit Rate < 1% confirming zero data reuse, (2) LaunchConfiguration NCU rule fires with partial-wave fraction >= 30%, (3) CPIStall rule attributes >40% of cycles to L1TEX scoreboard stalls, (4) eviction_policy is set to 'evict_last' on loads, (5) tile sizes are hardcoded rather than autotuned.",
+    "do_not_apply_when": "Kernels with meaningful L1 reuse (L1 hit rate > 10%) \u2014 evict_first will hurt cache effectiveness. Also avoid if the grid is already wave-aligned (no partial wave) and register pressure is already low, as autotune overhead may not pay off for very short-lived kernels.",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter. The lambda grid `lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))` is required when tile sizes are determined at autotune time. eviction_policy='evict_first' is a Triton tl.load argument; equivalent in CUDA is __ldcs (streaming cache hint) or using __builtin_nontemporal loads."
+  },
+  {
+    "item_id": "exp_autotune_tile_size_partial_wave_001",
+    "iteration": 1,
+    "speedup": 2.1179,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_eliminate_partial_wave",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 10.78,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 16.68,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 70.01,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput (%)": 75.01,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 0.04,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 53.6,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 53.71,
+        "Occupancy.Achieved Occupancy (%)": 74.94,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Launch Statistics.Registers Per Thread": 28.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 5.09,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 26.78,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 39.86,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput (%)": 24.14,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 57.04,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.97,
+        "Occupancy.Achieved Occupancy (%)": 58.44,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Launch Statistics.Registers Per Thread": 18.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Reduce Memory Stall Cycles",
+    "strategy_description": "When a kernel shows very high L1/TEX cache throughput (>65%) with near-zero L1 hit rate (<0.1%) and high warp stall cycles on L1TEX scoreboard waits (>25 cycles/instruction, >40% of total stall), the tile sizes are too small to amortize memory latency. Adding @triton.autotune over XBLOCK/YBLOCK configurations allows the runtime to select larger tiles that reduce per-block memory traffic and lower warp stall cycles \u2014 here from 53.7 to 14.97 cycles/instruction \u2014 yielding a 2.1x speedup. Register pressure also dropped (28\u219218 registers/thread) as a side effect of the winning config, further improving scheduling.",
+    "slow_pseudocode": "# Hardcoded small tile: XBLOCK=128, YBLOCK=8\n# grid = (cdiv(512, 128), cdiv(8192, 8)) = (4, 1024) = 4096 blocks\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = tl.program_id(1) * YBLOCK\n    xoffset = tl.program_id(0) * XBLOCK\n    # load/store with small tile\n    ...\n\nkernel[grid](arg0, arg1, 8192, 512, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile: runtime selects best XBLOCK/YBLOCK from configs\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 16}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 64}, num_warps=8),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=8),\n        triton.Config({'XBLOCK': 64, 'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # identical body\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](arg0, arg1, 8192, 512)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel with hardcoded small tile sizes (XBLOCK, YBLOCK constants); NCU LaunchConfiguration rule fires with >=30% estimated waste from partial wave; L1/TEX cache throughput >60% but L1 hit rate <1%; Warp Cycles Per Issued Instruction >30 with CPIStall rule attributing >40% of stalls to L1TEX scoreboard waits; kernel body is correct for any tile size (uses masks).",
+    "do_not_apply_when": "Kernel body has tile-size-dependent logic that is not guarded by masks (correctness risk); kernel is already autotuned; the bottleneck is compute-bound (Compute SM Throughput >60%); grid size is already a clean multiple of SM count with no partial wave; autotune overhead is unacceptable (e.g., single-use kernels in latency-critical paths).",
+    "framework_notes": "Triton-specific: use @triton.autotune with configs=[] and key=[...] above @triton.jit. The grid lambda must use meta['XBLOCK'] and meta['YBLOCK'] instead of hardcoded values. Remove explicit XBLOCK/YBLOCK keyword args from the kernel call site. In CUDA/other frameworks, the equivalent is a template parameter sweep or runtime config selection."
+  },
+  {
+    "item_id": "f32e93eb",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_swap_inner_dimension_for_store",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_swap_inner_dimension_for_store \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_swap_inner_dimension_for_store' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.314e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.232e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "This is a transpose kernel: loads from in_ptr0[x2 + 512*y3] (x is fast in input -> loads are coalesced) and stores to out_ptr0[y0 + 1024*x2 + 524288*y1]. The output fast dimension is y0 (stride 1), but y0 = yindex % 1024 comes from the Y tile. With the current 2D tiling, consecutive threads in the X-warp direction write to addresses separated by stride 1024 (4096 bytes), each hitting a different cache line -- classic store non-coalescing. The fix is to make the Y dimension the warp-contiguous (innermost) dimension in the thread layout, so consecutive threads differ in y0 (stride 1 in output) rather than x2 (stride 1024 in output). This makes stores coalesced. The L2 hit rate of 56.6% means the now-strided loads will still be partially served from L2, making the store coalescing gain the dominant effect.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.314e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.232e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f2bf2524",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_via_loop_dimension_swap",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + WorkloadImbalance",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_via_loop_dimension_swap \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_via_loop_dimension_swap' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.314e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.232e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a transpose: input is read with x2 as the fast dimension (stride 1 in in_ptr0, coalesced loads), but output is written with y0 as the fast dimension (stride 1) while x2 has stride 1024. With XBLOCK threads spanning x2, each store goes to a different cache line \u2014 classic non-coalesced scatter. The current autotune configs all keep XBLOCK as the program_id(0) dimension (spanning x2), so none of them fix the store coalescing problem. The fix is to swap the program_id assignment: make program_id(0) iterate over Y (so YBLOCK threads span y0, which has stride 1 in the output), and program_id(1) iterate over X. This makes stores coalesced (consecutive threads write consecutive y0 addresses). Loads become slightly less coalesced but L2 already absorbs load traffic at 57% hit rate. The autotune configs are expanded to favor large YBLOCK shapes.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.314e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.232e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "ae22e21e",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_swap_warp_contiguous_dimension",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_swap_warp_contiguous_dimension \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_swap_warp_contiguous_dimension' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.314e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.845e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a tensor permute: loads from in_ptr0[x2 + 512*y3] (coalesced, x is fast) and stores to out_ptr0[y0 + 1024*x2 + 524288*y1]. The output fast dimension is y0 (stride 1). Currently XBLOCK is the warp-contiguous dimension (pid(0)), so threads within a warp differ in x2, producing stores with stride 1024 \u2014 one cache line per thread, 128 cache lines per warp. This causes massive L2 replay traffic (L2 throughput 75% vs DRAM 34%). The fix is to make YBLOCK the warp-contiguous dimension by assigning pid(0) to Y and pid(1) to X, so consecutive threads differ in y0 (stride 1) -> fully coalesced stores. Combined with evict_first on the streaming load (L1 hit rate 0.07% confirms zero reuse) and a fresh autotune config set that explores large YBLOCK values, this directly addresses the memory_coalescing bottleneck.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.314e+00 > atol=0.001\nseed=42 output[0]: max_diff=7.229e+00 > atol=0.001\nseed=1337 output[0]: max_diff=7.845e+00 > atol=0.001",
+    "framework_notes": null
+  }
+]

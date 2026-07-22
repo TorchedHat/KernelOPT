@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "cc1a03f4",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.086e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.072e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.084e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel runs on an H200 SXM5 with peak FP32 Tensor Core (TF32) throughput of 989 TFLOPS vs 67 TFLOPS for scalar FP32 FFMA \u2014 a ~14.7x hardware advantage. Currently ALLOW_TF32 = False is hardcoded, forcing tl.dot to use scalar FFMA and completely bypassing Tensor Cores. This explains the dismal 7.93% Compute SOL. Enabling allow_tf32=True in tl.dot will route the 32\u00d732 matrix multiply through the H200's Tensor Core units. K=960 is large, so TF32 mantissa truncation (23\u219210 bits) may introduce small numerical error, but the diversity instruction explicitly targets this strategy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.086e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.072e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.084e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_tile_size_change_regression",
+    "iteration": 1,
+    "speedup": 0.5347,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "change_tile_sizes_without_autotune_to_fix_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 55.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 83815.0,
+        "Instruction Statistics.Executed Instructions": 3531480.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.35,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 94.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Compute Workload Analysis.Issue Slots Busy": 13.61,
+        "Compute Workload Analysis.Executed Ipc Active": 0.54
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 104.61,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 156845.0,
+        "Instruction Statistics.Executed Instructions": 11507772.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.24,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Compute Workload Analysis.Issue Slots Busy": 23.61,
+        "Compute Workload Analysis.Executed Ipc Active": 0.94
+      }
+    },
+    "strategy_title": "Manual Tile Resize Without Autotune Causes Regression",
+    "strategy_description": "Manually changing BLOCK_M/BLOCK_N from 32 to 64 and BLOCK_K from 128 to 32 without autotuning caused a 1.87x slowdown despite reducing shared memory bank conflicts (12-way conflicts persisted) and improving IPC. The instruction count exploded from 3.5M to 11.5M (3.26x increase) because the smaller BLOCK_K means more K-loop iterations, and register pressure increased from 94 to 128 registers/thread (hitting the 128 register cap), while achieved occupancy remained stuck at 6.25% \u2014 the same as before. The net effect was far more total work with no occupancy benefit, causing the kernel to run nearly 2x longer.",
+    "slow_pseudocode": "# Before: BLOCK_M=32, BLOCK_N=32, BLOCK_K=128\n# grid = (80, 1, 1)\nBLOCK_M : tl.constexpr = 32\nBLOCK_N : tl.constexpr = 32\nBLOCK_K : tl.constexpr = 128\n# K-loop iterates K/BLOCK_K = 960/128 = 7.5 times\n# Executed instructions: 3.5M, registers: 94/thread",
+    "fast_pseudocode": "# After (regressed): BLOCK_M=64, BLOCK_N=64, BLOCK_K=32\n# grid = (80, 1, 1) \u2014 unchanged!\nBLOCK_M : tl.constexpr = 64\nBLOCK_N : tl.constexpr = 64\nBLOCK_K : tl.constexpr = 32\n# K-loop iterates K/BLOCK_K = 960/32 = 30 times\n# Executed instructions: 11.5M, registers: 128/thread (capped)\n# Grid unchanged \u2014 no occupancy improvement",
+    "applicable_when": "Never apply this pattern. Manual tile size changes without updating the grid and without autotuning are an anti-pattern.",
+    "do_not_apply_when": "Always avoid manually hardcoding new tile sizes without: (1) updating the launch grid to match new tile dimensions, (2) verifying register pressure does not increase to the hardware cap (128 regs/thread on H100/H200), (3) using @triton.autotune to search the configuration space. When BLOCK_K is reduced, the K-loop iteration count increases proportionally, multiplying total instruction count \u2014 this dominates if occupancy does not improve.",
+    "framework_notes": "In Triton, reducing BLOCK_K from 128 to 32 increases K-loop iterations by 4x (960/32=30 vs 960/128=7.5), causing instruction count to multiply. Simultaneously, larger BLOCK_M/BLOCK_N tiles increase register usage per thread. If the grid size is not updated to reflect the new tile dimensions (e.g., grid should be (cdiv(M,BLOCK_M)*cdiv(N,BLOCK_N), 1, 1) not a fixed (80,1,1)), the number of output tiles computed per block increases, further multiplying work. The plan called for @triton.autotune but the implementation only changed constexpr values \u2014 the autotune decorator was never added, and the grid was not updated."
+  }
+]

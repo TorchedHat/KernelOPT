@@ -1,0 +1,83 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,27 @@
+ 
+ 
+ # Fused GEMM + bias + ReLU kernel
++
+ @triton.autotune(
+     configs=[
++        # smem = 3*(128*32+32*128)*4 = 98,304 bytes - exactly at 2-block threshold
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=3, num_warps=4),
++        # smem = 3*(128*32+32*64)*4 = 49,152 bytes - allows 4 blocks/SM
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N':  64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M':  64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        # smem = 2*(128*64+64*128)*4 = 65,536 bytes - safe, allows 3 blocks/SM
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 4}, num_stages=2, num_warps=4),
++        # smem = 3*(64*32+32*64)*4 = 24,576 bytes - high occupancy fallback
++        triton.Config({'BLOCK_M':  64, 'BLOCK_N':  64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        # NEW: BLOCK_N=256, num_warps=8, num_stages=2 -- smem=2*(128*32+32*256)*4=98304 bytes (safe)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=2, num_warps=8),
++        # NEW: BLOCK_N=256, BLOCK_M=64, num_warps=8 -- smem=2*(64*32+32*256)*4=81920 bytes (safe)
++        triton.Config({'BLOCK_M':  64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
++        # NEW: BLOCK_N=128, num_warps=8, num_stages=3 -- smem=3*(128*32+32*128)*4=98304 bytes (safe)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -46,15 +59,28 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
++    # Hoist row/col boundary masks - computed once, not per K-iteration
++    m_mask = offs_m < M   # shape (BLOCK_M,)
++    n_mask = offs_n < N   # shape (BLOCK_N,)
++
++    # Peeled tail: split into branch-free main loop + optional tail block
++    num_full_k_blocks = K // BLOCK_K  # Python integer division, resolved at trace time
++
++    # Main loop: only full blocks, no K-mask -> compiler emits FMAs
++    for k in range(0, num_full_k_blocks):
++        a = tl.load(A_ptrs, mask=m_mask[:, None], other=0.0)
++        b = tl.load(B_ptrs, mask=n_mask[None, :], other=0.0)
+         acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+         A_ptrs += BLOCK_K * stride_ak
+         B_ptrs += BLOCK_K * stride_bk
++
++    # Tail block: only when K is not a multiple of BLOCK_K
++    if K % BLOCK_K != 0:
++        k_remaining = K - num_full_k_blocks * BLOCK_K
++        k_mask = offs_k < k_remaining
++        a = tl.load(A_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++        b = tl.load(B_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
++        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+ 
+     if APPLY_BIAS:
+         bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+@@ -63,10 +89,10 @@
+     if APPLY_RELU:
+         acc = tl.maximum(acc, 0.0)
+ 
+-    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    # Store with hoisted mask
++    out_mask = m_mask[:, None] & n_mask[None, :]
+     C_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     tl.store(C_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def run_gemm_bias_relu(A, B, bias, apply_relu=True):
+     """

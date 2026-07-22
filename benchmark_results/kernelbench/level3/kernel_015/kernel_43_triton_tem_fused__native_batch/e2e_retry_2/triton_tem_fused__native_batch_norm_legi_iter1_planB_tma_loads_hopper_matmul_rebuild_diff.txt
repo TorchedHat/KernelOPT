@@ -1,0 +1,69 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_relu_43(arg_A, arg_B, out_ptr0):
+@@ -12,7 +13,7 @@
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 64
+     BLOCK_N : tl.constexpr = 128
+-    BLOCK_K : tl.constexpr = 32
++    BLOCK_K : tl.constexpr = 64
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+@@ -57,24 +58,28 @@
+     offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # Create TMA descriptor for A once before the k-loop
++    # A is row-major: shape [M=7840, K=512], strides [512, 1] — last-dim stride=1, TMA compatible
++    desc_a = tl.make_tensor_descriptor(
++        arg_A,
++        shape=[7840, 512],
++        strides=[512, 1],
++        block_shape=[BLOCK_M, BLOCK_K],
++    )
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
++        # TMA bulk async load for A (bank-conflict-free, offloads address generation)
++        a = tl.load_tensor_descriptor(desc_a, [pid_m * BLOCK_M, k_idx * BLOCK_K])
++
++        # Scalar pointer load for B (column-major: stride_bk=1, stride_bn=512)
++        # B stored as [256, 512] with strides [512, 1], viewed as [K=512, N=256]
++        # last-dim stride would be 512 — not TMA compatible, keep scalar loads
+         b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 512*idx_m
+-        a = tl.load(A + (xindex))
+-
+         idx_m = b_k_idx_vals
+         idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 256*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++        b = tl.load(B + (tl.broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N])))
+ 
+-        
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -86,8 +91,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 256*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

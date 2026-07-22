@@ -1,0 +1,38 @@
+[
+  {
+    "item_id": "exp_002_autotune_xblock_grid_lambda_still_broken",
+    "iteration": 2,
+    "speedup": 0.5007,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_tile_size",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization + UncoalescedGlobalAccess + FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 21.73,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 71.9,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 35.25,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 42.63,
+        "Occupancy.Achieved Occupancy": 83.47,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Instruction Statistics.Executed Instructions": 12136320.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 41.98,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 79.74,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 18.25,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 64.73,
+        "Occupancy.Achieved Occupancy": 90.57,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 26295360.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK increase with hardcoded grid causes 2x regression again",
+    "strategy_description": "Despite the plan explicitly targeting the grid/XBLOCK mismatch, the applied diff did NOT fix the grid lambda \u2014 the launch site still used a hardcoded `triton.cdiv(xnumel, 128)` grid rather than `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. As a result, the autotuner selected XBLOCK=512+ while the grid remained sized for XBLOCK=128, causing executed instructions to more than double (12.1M \u2192 26.3M), registers per thread to jump from 18 to 32, and duration to nearly double (21.73us \u2192 41.98us). The index decomposition and autotune config changes were cosmetic and did not compensate for the fundamental grid mismatch. This is the same failure mode as exp_001: any autotune XBLOCK expansion without a corresponding grid lambda update will produce instruction count inflation proportional to new_XBLOCK/old_XBLOCK.",
+    "slow_pseudocode": "# BROKEN pattern (applied in this iteration)\n@triton.autotune(configs=[Config({'XBLOCK': 512}, ...), Config({'XBLOCK': 2048}, ...)], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # index decomposition (cosmetic, no perf benefit)\n    x1_mod56 = x1 % 56\n    ...\n    tl.load(ptr + ..., mask=xmask)\n    tl.store(ptr + ..., val, mask=xmask)\n\n# BUG: grid still hardcoded to XBLOCK=128 despite autotune selecting 512+\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](args, xnumel=3010560)",
+    "fast_pseudocode": "# CORRECT pattern (never actually applied across iterations 1 or 2)\n@triton.autotune(configs=[Config({'XBLOCK': 512}, ...), ...], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tl.load(ptr + ..., mask=xmask)\n    tl.store(ptr + ..., val, mask=xmask)\n\n# REQUIRED: grid must adapt to autotuned XBLOCK\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](args, xnumel=3010560)  # no XBLOCK kwarg",
+    "applicable_when": "Never apply autotune XBLOCK expansion without simultaneously updating the grid to use meta['XBLOCK']. This pattern is a confirmed anti-pattern across two iterations.",
+    "do_not_apply_when": "Do not add @triton.autotune with variable XBLOCK configs if the launch grid is not simultaneously updated to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. Do not apply index decomposition as a standalone optimization when the kernel is already compute-bound with ALU saturation \u2014 it does not reduce instruction count meaningfully. Do not increase XBLOCK when registers per thread are already \u226518 and the kernel is not memory-bound, as larger tiles will trigger register pressure increases that reduce occupancy.",
+    "framework_notes": "In Triton, @triton.autotune with variable XBLOCK REQUIRES the grid to be `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. A hardcoded grid based on the original XBLOCK causes the autotuner to select larger configs while launching with too many CTAs, producing instruction count inflation of exactly new_XBLOCK/old_XBLOCK. This has now caused regressions in two consecutive iterations (iter 1: 0.13x, iter 2: 0.50x). The index decomposition change (naming intermediate variables) had no measurable positive effect on ALU pressure."
+  }
+]

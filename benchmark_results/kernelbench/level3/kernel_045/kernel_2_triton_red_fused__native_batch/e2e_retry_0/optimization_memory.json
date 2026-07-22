@@ -1,0 +1,86 @@
+[
+  {
+    "item_id": "exp_001_online_softmax_register_cache_single_pass",
+    "iteration": 1,
+    "speedup": 21.4397,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "online_softmax_register_cache_single_pass",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall (L1TEX scoreboard 90.7% of stall cycles before \u2192 33.5% after)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 1370.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2057240.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 8.76,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 41.12,
+        "Occupancy.Achieved Occupancy_%": 12.09,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.84,
+        "Scheduler Statistics.One or More Eligible_%": 4.88,
+        "Memory Workload Analysis.L2 Hit Rate_%": 54.74,
+        "Memory Workload Analysis.L1/TEX Hit Rate_%": 12.96,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 48260757.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 63.9,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 95448.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 16.11,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 21.71,
+        "Occupancy.Achieved Occupancy_%": 11.41,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.58,
+        "Scheduler Statistics.One or More Eligible_%": 18.41,
+        "Memory Workload Analysis.L2 Hit Rate_%": 79.16,
+        "Memory Workload Analysis.L1/TEX Hit Rate_%": 38.8,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 2463001.0
+      }
+    },
+    "strategy_title": "Eliminate Second Global Pass via Register-Tile Cache",
+    "strategy_description": "When a reduction kernel makes two sequential passes over the same global memory tensor (pass 1: compute + store intermediates; pass 2: reload intermediates + finalize), the second global read can be eliminated by caching intermediate values in a register tile (tl.zeros([XBLOCK, R0_BLOCK], tl.float32)) during the first pass and reading from it in the second pass. This pattern is especially effective when the CPIStall rule reports >80% of warp stall cycles as L1TEX scoreboard waits and the kernel is severely underutilized (waves/SM < 0.2). In this case, elapsed cycles dropped from 2.06M to 95K (21.4x), L2 input sectors fell from 48M to 2.5M (~20x), and warp cycles per issued instruction improved from 39.8 to 10.6.",
+    "slow_pseudocode": "# Pass 1: compute BN-norm, accumulate online softmax stats, store intermediates to global\nfor r in range(0, R, R_BLOCK):\n    x = load(global_buf[r])          # global read\n    bn_x = batch_norm(x, ...)\n    max_acc, sum_acc = online_softmax_update(max_acc, sum_acc, bn_x)\n    store(global_buf[r], bn_x)        # global write (intermediate)\n\nmax_final, sum_final = reduce(max_acc, sum_acc)\n\n# Pass 2: reload intermediates, apply final softmax, store output\nfor r in range(0, R, R_BLOCK):\n    bn_x = load(global_buf[r])        # second global read (redundant!)\n    out = exp(bn_x - max_final) / sum_final\n    store(global_buf[r], out)         # global write (final)",
+    "fast_pseudocode": "# Allocate register tile to cache intermediates\nreg_cache = zeros([XBLOCK, R_BLOCK], float32)\n\n# Pass 1: compute BN-norm, accumulate online softmax stats, cache in registers\nfor r in range(0, R, R_BLOCK):\n    x = load(global_buf[r])           # global read (kept)\n    bn_x = batch_norm(x, ...)\n    max_acc, sum_acc = online_softmax_update(max_acc, sum_acc, bn_x)\n    reg_cache = where(r_mask, bn_x, reg_cache)  # register write (no global store)\n\nmax_final, sum_final = reduce(max_acc, sum_acc)\n\n# Pass 2: read from register cache, apply final softmax, store output\nfor r in range(0, R, R_BLOCK):\n    bn_x = reg_cache                  # register read (eliminates global load)\n    out = exp(bn_x - max_final) / sum_final\n    store(global_buf[r], out)         # global write (final, kept)",
+    "applicable_when": "Kernel has two sequential loops over the same global tensor where the first loop writes intermediates and the second loop reloads them. CPIStall rule reports >70% of stall cycles as L1TEX scoreboard waits. Waves/SM < 0.3 (severely underutilized). R_BLOCK * XBLOCK * 4 bytes fits in the register file / L1 (e.g., \u226464 KB for XBLOCK=32, R_BLOCK=512). The reduction dimension is fully covered in a single loop iteration (R_BLOCK == r_numel) or the cache is large enough to hold all tiles.",
+    "do_not_apply_when": "Register tile size (XBLOCK * R_BLOCK * dtype_bytes) exceeds available register file, causing excessive spilling that negates the benefit. The second pass reads from a different address pattern than the first (cache would be incorrect). The kernel is already compute-bound rather than memory-latency bound. R_BLOCK << r_numel requiring many loop iterations where the cache would need to be partitioned across iterations.",
+    "framework_notes": "In Triton, the register cache is declared as tl.zeros([XBLOCK, R0_BLOCK], tl.float32) before the first loop and updated with tl.where(r0_mask, value, cache) inside the loop. Adding @triton.autotune with multiple XBLOCK configs (32, 64, 128) alongside this change improved waves/SM from 0.12 to 0.97 by allowing the autotuner to select smaller XBLOCK values that increase grid size. The xmask must be applied to all scalar loads when XBLOCK is no longer guaranteed to divide xnumel evenly."
+  },
+  {
+    "item_id": "exp_001_xblock_alignment_coalescing",
+    "iteration": 1,
+    "speedup": 2.1066,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "xblock_alignment_to_eliminate_uncoalesced_shared_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 1370.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 2057240.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 12.96,
+        "Memory Workload Analysis.L2 Hit Rate": 54.74,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 39.84,
+        "Source Counters.Avg. Divergent Branches": 1.94,
+        "Instruction Statistics.Executed Instructions": 51741696.0,
+        "UncoalescedSharedAccess.excessive_wavefronts": 245760.0,
+        "UncoalescedSharedAccess.speedup_pct": 79.27
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 650.34,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 975422.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 25.39,
+        "Memory Workload Analysis.L2 Hit Rate": 64.24,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 33.67,
+        "Source Counters.Avg. Divergent Branches": 7.76,
+        "Instruction Statistics.Executed Instructions": 28755968.0,
+        "UncoalescedSharedAccess.excessive_wavefronts": 114688.0,
+        "UncoalescedSharedAccess.speedup_pct": 80.02
+      }
+    },
+    "strategy_title": "Align XBLOCK to inner dimension to coalesce memory access",
+    "strategy_description": "When a Triton kernel decomposes xindex into a fast (stride-1) inner dimension of size N and a slow outer dimension, setting XBLOCK > N causes warps to span both dimensions, introducing a large stride discontinuity at the boundary and triggering UncoalescedSharedAccess. Setting XBLOCK = N (or a divisor of N) ensures all threads in a block access only stride-1 elements, eliminating the discontinuity. This reduced elapsed cycles by ~53% (2.06M \u2192 0.97M), improved L1/TEX hit rate from 13% to 25%, L2 hit rate from 55% to 64%, and halved total executed instructions.",
+    "slow_pseudocode": "# XBLOCK=128 > inner_dim=64: warp spans x0 and x1 boundary\nxoffset = pid * 128\nxindex = xoffset + arange(0, 128)[:, None]\nx0 = xindex % 64   # fast dim, stride-1\nx1 = xindex // 64  # slow dim, stride-32768\n# threads 0..63 access stride-1, threads 64..127 jump by 32768 elements\nload(ptr + x0 + 64*r + 32768*x1)  # catastrophic stride at x0 wrap",
+    "fast_pseudocode": "# XBLOCK=64 == inner_dim=64: warp stays within x0 only\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 64, 'R0_BLOCK': 512}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 64, 'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 32, 'R0_BLOCK': 512}, num_warps=4, num_stages=1),\n], key=['xnumel', 'r0_numel'])\nxoffset = pid * 64\nxindex = xoffset + arange(0, 64)[:, None]\nx0 = xindex % 64   # fast dim, stride-1\nx1 = xindex // 64  # slow dim (constant within block)\n# all threads access stride-1 elements, fully coalesced\nxmask = xindex < xnumel\nload(ptr + x0 + 64*r + 32768*x1, xmask & r_mask)",
+    "applicable_when": "UncoalescedSharedAccess or MemoryCacheAccessPattern NCU rules are triggered; xindex is decomposed as xindex%N (stride-1) and xindex//N (large stride); XBLOCK > N causing warps to span the stride boundary; excessive_wavefronts > 50% of total wavefronts; L1/TEX hit rate < 20%",
+    "do_not_apply_when": "XBLOCK is already <= inner dimension N; the tensor layout is row-major with no stride discontinuity within a block; increasing grid size would cause occupancy to drop below a critical threshold; the kernel is already compute-bound rather than memory-latency-bound",
+    "framework_notes": "Triton-specific: use @triton.autotune to explore XBLOCK values that are divisors of the inner dimension. The xmask must be updated from tl.full([XBLOCK], True, tl.int1)[:, None] to xindex < xnumel when XBLOCK no longer evenly tiles xnumel. All load/store masks must be updated to xmask & r_mask. In CUDA, the equivalent is ensuring threadIdx.x maps to the contiguous dimension with no stride jump within a warp."
+  }
+]

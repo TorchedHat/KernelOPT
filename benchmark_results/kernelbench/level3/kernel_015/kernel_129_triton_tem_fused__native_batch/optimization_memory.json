@@ -1,0 +1,296 @@
+[
+  {
+    "item_id": "76d294ca",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_kernel_k_slice_round_robin",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_kernel_k_slice_round_robin \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_kernel_k_slice_round_robin' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.268e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.902e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.363e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "M=10, N=10 with BLOCK_M=16, BLOCK_N=16 produces exactly 1 output tile (ceil(10/16)=1 in each dim), so the grid is always (1,1,1) regardless of M/N tile size. Prior attempts to fix this via smaller tiles (autotune) and split-K both failed correctness due to the non-standard B-matrix broadcast indexing. This plan partitions the K-reduction dimension across SPLIT_K=32 blocks (one per K-tile since K//BLOCK_K=32), uses tl.atomic_add for partial sums into a workspace, and applies the bias in a separate epilogue kernel. With K=1024 and BLOCK_K=32, there are exactly 32 K-tiles; distributing these across 32 blocks gives a 32x improvement in SM utilization.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.268e+01 > atol=0.001\nseed=42 output[0]: max_diff=8.902e+01 > atol=0.001\nseed=1337 output[0]: max_diff=8.363e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_reduce_block_k_shared_mem_pressure_v2",
+    "iteration": 2,
+    "speedup": 1.0773,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_block_k_to_cut_shared_memory_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + CPIStall",
+      "key_metric_before": {
+        "Launch.dynamic_smem_per_block_bytes": 8192.0,
+        "Occupancy.Block_Limit_Shared_Mem": 14.0,
+        "Occupancy.Theoretical_Occupancy_pct": 62.5,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 10.3,
+        "GPU_SOL.Duration_us": 29.98,
+        "Memory_Workload.L2_Hit_Rate_pct": 53.56,
+        "SharedMemoryConflicts.speedup_pct": 69.25,
+        "CPIStall.MIO_stall_cycles": 7.6
+      },
+      "key_metric_after": {
+        "Launch.dynamic_smem_per_block_bytes": 8192.0,
+        "Occupancy.Block_Limit_Shared_Mem": 14.0,
+        "Occupancy.Theoretical_Occupancy_pct": 62.5,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 10.31,
+        "GPU_SOL.Duration_us": 29.76,
+        "Memory_Workload.L2_Hit_Rate_pct": 94.47,
+        "SharedMemoryConflicts.speedup_pct": 68.93,
+        "CPIStall.MIO_stall_cycles": 7.6
+      }
+    },
+    "strategy_title": "Add autotune configs to improve num_warps/num_stages selection",
+    "strategy_description": "Adding a @triton.autotune decorator with multiple (num_warps, num_stages) configurations to a small GEMM kernel that already has BLOCK_K reduced yielded a modest 7.7% speedup. The primary observable metric change was L2 Hit Rate improving dramatically from 53.56% to 94.47%, suggesting the autotuner selected a configuration with more pipeline stages that better prefetches data into L2. The shared memory and occupancy metrics remained unchanged (BLOCK_K was already reduced in the prior iteration), confirming the gain came from better warp/stage scheduling rather than tile size changes.",
+    "slow_pseudocode": "# No autotune \u2014 fixed num_warps, num_stages\n@triton.jit\ndef kernel(...):\n    BLOCK_K: tl.constexpr = 32\n    for k in range(0, K, BLOCK_K):\n        a = tl.load(...)\n        b = tl.load(...)\n        acc += tl.dot(a, b)",
+    "fast_pseudocode": "# Autotune over num_warps and num_stages\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_K: tl.constexpr = 32\n    for k in range(0, K, BLOCK_K):\n        a = tl.load(...)\n        b = tl.load(...)\n        acc += tl.dot(a, b)",
+    "applicable_when": "Triton GEMM kernel where tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) are already fixed/optimized but num_warps and num_stages are not autotuned. Particularly effective when L2 Hit Rate is low (<60%) suggesting poor prefetch behavior, and when the kernel has a non-trivial K-loop (K >= 256) where pipeline depth (num_stages) can hide memory latency.",
+    "do_not_apply_when": "Kernel already has @triton.autotune with a comprehensive config space. Avoid when the kernel is so small (grid=1, tiny K) that autotuning overhead dominates. Do not apply when the primary bottleneck is shared memory bank conflicts or occupancy \u2014 fix those structural issues first before autotuning scheduling parameters.",
+    "framework_notes": "Triton: num_stages controls the software pipelining depth for async memory operations; num_warps controls the number of warps per block. The autotune key should include shape-determining variables (e.g., xnumel, K) so the autotuner re-selects configs for different problem sizes. Equivalent concept in CUDA: pipeline stages map to cp.async pipeline depth; num_warps maps to blockDim.x/32."
+  },
+  {
+    "item_id": "a7f3c1d9",
+    "iteration": 2,
+    "speedup": 1.0705,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_b_matrix_strided_load_to_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 29.98,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 89.06,
+        "Memory Workload Analysis.L2 Hit Rate": 53.56,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.3,
+        "Scheduler Statistics.No Eligible": 90.34,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "CPIStall.MIO_scoreboard_cycles": 7.6,
+        "CPIStall.pct_of_total_stall": 73.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 29.95,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 89.18,
+        "Memory Workload Analysis.L2 Hit Rate": 41.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.31,
+        "Scheduler Statistics.No Eligible": 90.3,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "CPIStall.MIO_scoreboard_cycles": 7.6,
+        "CPIStall.pct_of_total_stall": 73.4
+      }
+    },
+    "strategy_title": "Fix Incorrect Matrix Load Index to Eliminate Bank Conflicts",
+    "strategy_description": "When a matrix load uses an incorrect stride (e.g., output stride instead of the source matrix's actual stride), the resulting transposed or scrambled shared memory access pattern causes severe bank conflicts. In this case, replacing a buggy broadcast_to indirection that used stride 10 (output row stride) with a direct coalesced index using the correct stride_bn=1024 yielded a 1.07x speedup. However, the SharedMemoryConflicts metrics (12-way conflicts, 77.76% excessive wavefronts) and CPIStall MIO scoreboard cycles (7.6) remained essentially unchanged after the fix, suggesting the compiler may have re-routed the load through a different path or the bank conflict source was not fully eliminated by this index change alone.",
+    "slow_pseudocode": "# Buggy B load: uses output stride (10) and broadcast_to indirection\nidx_m = b_k_idx_vals          # [BLOCK_K, 1]\nidx_n = offs_b_n[None, :]     # [1, BLOCK_N]\nxindex = idx_n + 10 * idx_m   # wrong stride\nb = tl.load(B + tl.broadcast_to(idx_m + 1024 * idx_n, [BLOCK_K, BLOCK_N]))",
+    "fast_pseudocode": "# Fixed B load: direct coalesced index matching stride_bk=1, stride_bn=1024\nb_ptrs = b_k_idx_vals + 1024 * offs_b_n[None, :]  # [BLOCK_K, BLOCK_N]\nb = tl.load(B + b_ptrs)",
+    "applicable_when": "A matrix load in a Triton GEMM kernel uses an incorrect stride (e.g., output matrix stride instead of the source matrix's actual stride), combined with a broadcast_to indirection that obscures the true access pattern. NCU reports SharedMemoryConflicts with high bank-conflict-way (>=8) and excessive wavefronts (>70%), and CPIStall shows MIO scoreboard stalls >7 cycles representing >70% of total stall cycles.",
+    "do_not_apply_when": "The load index is already correct and coalesced. If the bank conflicts persist after the fix (as seen here where metrics barely changed), the root cause may be elsewhere (e.g., a different shared memory operation, or the compiler staging the corrected load through shared memory in a conflicting layout). Do not expect large speedups from index correction alone when the kernel is severely underutilized (grid_size=1, waves_per_sm=0.0) \u2014 the dominant bottleneck is launch configuration, not memory access pattern.",
+    "framework_notes": "In Triton, using tl.broadcast_to with a transposed index can cause the compiler to stage data through shared memory in a non-coalesced layout. Replacing broadcast_to with a direct 2D index expression (e.g., row_offsets[:, None] + col_stride * col_offsets[None, :]) gives the compiler a cleaner access pattern to optimize."
+  },
+  {
+    "item_id": "b3e2f7a1",
+    "iteration": 3,
+    "speedup": 0.725,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "expand_autotune_configs_and_fix_bias_broadcast_load",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 29.76,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 88.65,
+        "Launch.block_size": 128.0,
+        "Launch.registers_per_thread": 42.0,
+        "Launch.dynamic_smem_per_block_bytes": 8192.0,
+        "Memory Workload Analysis.L2 Hit Rate": 94.47,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.31,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "CPIStall.MIO_scoreboard_cycles_pct": 73.46,
+        "Instruction Statistics.Executed Instructions": 16370.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 44.22,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 57.89,
+        "Launch.block_size": 64.0,
+        "Launch.registers_per_thread": 51.0,
+        "Launch.dynamic_smem_per_block_bytes": 4096.0,
+        "Memory Workload Analysis.L2 Hit Rate": 62.96,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.32,
+        "SharedMemoryConflicts.bank_conflict_way": 18.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 83.32,
+        "CPIStall.MIO_scoreboard_cycles_pct": 50.56,
+        "CPIStall.L1TEX_scoreboard_cycles_pct": 31.81,
+        "Instruction Statistics.Executed Instructions": 12440.0
+      }
+    },
+    "strategy_title": "Expanding Autotune Config Space Regresses Small GEMM Kernel",
+    "strategy_description": "Expanding the @triton.autotune config space (adding num_warps=2/4/8 \u00d7 num_stages=2/3/4 combinations) while simultaneously fixing the bias broadcast load caused a 27.5% regression (29.76 \u00b5s \u2192 44.22 \u00b5s). The autotuner selected a 64-thread block (num_warps=2) instead of the prior 128-thread block, which increased registers per thread from 42 to 51, reduced achieved occupancy from 6.23% to 3.12%, worsened L2 hit rate from 94.47% to 62.96%, and increased shared memory bank conflicts from 12-way to 18-way. Changing the autotune key from key=['xnumel'] to key=[] may have caused the autotuner to select a suboptimal cached config, and the expanded config space included lower-warp configurations that are strictly worse for this kernel's shared memory access pattern.",
+    "slow_pseudocode": "# Expanded autotune with key=[] \u2014 autotuner picks num_warps=2 (64 threads)\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=4),\n    ],\n    key=[],  # changed from key=['xnumel']\n)\n@triton.jit\ndef kernel(...):\n    # block_size=64, registers=51, achieved_occ=3.12%",
+    "fast_pseudocode": "# Smaller autotune space with key=['xnumel'] \u2014 autotuner picks num_warps=4 (128 threads)\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    # block_size=128, registers=42, achieved_occ=6.23%",
+    "applicable_when": "Never \u2014 this is a negative result. Do not expand autotune configs to include very low num_warps (num_warps=2) for kernels with shared memory bank conflicts, as lower warp counts increase bank conflict severity.",
+    "do_not_apply_when": "Always avoid: (1) changing autotune key from a meaningful dispatch key (e.g., key=['xnumel']) to key=[] for kernels where the autotuner may select a cached suboptimal config; (2) including num_warps=2 configs in the sweep when the kernel already has 12-way shared memory bank conflicts \u2014 fewer warps per block means fewer threads per bank access, which worsens conflict multiplicity (observed: 12-way \u2192 18-way); (3) simultaneously changing multiple things (autotune key, config space, and bias load) making it impossible to isolate the regression source.",
+    "framework_notes": "Triton: changing key=[] removes the dispatch dimension, potentially causing the autotuner to reuse a stale or suboptimal config. The autotune key should always include at least one shape-determining variable. When num_warps is reduced (e.g., from 4 to 2), the block size halves (128\u219264 threads), which increases register pressure per thread (42\u219251 registers) and reduces achieved occupancy, compounding the existing underutilization problem on a grid_size=1 kernel."
+  },
+  {
+    "item_id": "b3e2f7a1",
+    "iteration": 3,
+    "speedup": 1.0658,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_num_warps_num_stages_for_small_gemm",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 29.76,
+        "Memory Workload Analysis.L2 Hit Rate": 94.47,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.31,
+        "Scheduler Statistics.No Eligible": 90.39,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "CPIStall.MIO_scoreboard_cycles": 7.6
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 30.08,
+        "Memory Workload Analysis.L2 Hit Rate": 45.13,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.31,
+        "Scheduler Statistics.No Eligible": 90.41,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "CPIStall.MIO_scoreboard_cycles": 7.6
+      }
+    },
+    "strategy_title": "Autotune num_warps/num_stages Without Changing Tile Sizes",
+    "strategy_description": "Expanding the @triton.autotune config space with additional (num_warps, num_stages) combinations (adding num_stages=1 configs and num_warps=16) on a kernel that already had a 6-config autotune sweep yielded a 6.58% speedup. Profiling metrics before and after are nearly identical \u2014 occupancy, warp cycles, bank conflicts, and instruction counts are all unchanged \u2014 confirming the gain is purely from the autotuner selecting a marginally better scheduling configuration. Notably, L2 Hit Rate dropped from 94.47% to 45.13%, suggesting the winning config uses fewer pipeline stages (less prefetching) but reduces some other overhead.",
+    "slow_pseudocode": "# 6-config autotune sweep\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_K: tl.constexpr = 32\n    # ... matmul body ...",
+    "fast_pseudocode": "# Expanded 11-config autotune sweep including num_stages=1 and num_warps=16\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=1),\n        triton.Config({}, num_warps=8, num_stages=1),\n        triton.Config({}, num_warps=8, num_stages=4),\n        triton.Config({}, num_warps=16, num_stages=2),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_K: tl.constexpr = 32\n    # ... matmul body unchanged ...",
+    "applicable_when": "Triton kernel already has @triton.autotune with a limited num_warps/num_stages sweep but the config space has not been exhaustively explored. Kernel is small (grid_size=1, waves_per_sm~0), compute and memory throughput are both very low (<1%), and the dominant bottleneck is scheduler inefficiency (No Eligible >90%). Tile sizes cannot be safely changed.",
+    "do_not_apply_when": "Kernel already has a comprehensive autotune sweep covering num_stages=1 through 4 and num_warps=2 through 16. Kernel is large enough to saturate SMs (waves_per_sm >= 1). Tile size changes are safe and would yield larger gains \u2014 in that case, include tile sizes in the autotune sweep instead.",
+    "framework_notes": "Triton-specific: adding num_stages=1 configs (no software pipelining) can outperform higher num_stages for very small kernels where prefetch overhead exceeds latency hiding benefit. num_warps=16 is valid on H100/H200 (max 64 warps/SM). The autotune key must match the existing launch wrapper's dispatch key."
+  },
+  {
+    "item_id": "7c285303",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "elementwise_fma_loop_to_expand_grid_from_1_to_100_blocks",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "elementwise_fma_loop_to_expand_grid_from_1_to_100_blocks \u2014 correctness failure",
+    "strategy_description": "Plan 'elementwise_fma_loop_to_expand_grid_from_1_to_100_blocks' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): 024,1,...) -> A[m,k] = arg_A + m*1024 + k\n    # B: shape (10,1024), strides (1024,1) -> B[n,k] = arg_B + n*1024 + k\n    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)\n    for k_base in tl.static_range(0, K, BLOCK_K):\n    ^\nAssertionError('int32[] used as tl.stat",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel computes a 10x10 matmul (M=10, N=10, K=1024). With BLOCK_M=16 and BLOCK_N=16, ceil(10/16)xceil(10/16)=1x1=1 output tile, so the grid is always (1,1,1). This leaves 131 of 132 SMs completely idle. Prior attempts to fix this via smaller tiles (BLOCK_M=8, BLOCK_N=8) failed correctness because tl.dot requires minimum 16x16 MMA tiles. Split-K and persistent-K approaches also failed correctness. The unexplored direction: replace tl.dot with an explicit scalar FMA reduction loop, allowing BLOCK_M=1, BLOCK_N=1 tiles. This gives ceil(10/1)xceil(10/1)=100 output tiles -> grid=(100,1,1), spreading work across 100 SMs. Each thread computes one output element via a K-length dot product loop. This also eliminates shared memory entirely (no tl.dot staging), removing the 12-way bank conflicts and 7.6-cycle MIO stalls.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): 024,1,...) -> A[m,k] = arg_A + m*1024 + k\n    # B: shape (10,1024), strides (1024,1) -> B[n,k] = arg_B + n*1024 + k\n    acc = tl.zeros((BLOCK_K,), dtype=tl.floa",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c9f4a2e8",
+    "iteration": 4,
+    "speedup": 0.7244,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "prune_low_warp_autotune_configs_and_restore_dispatch_key",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 30.02,
+        "Launch.block_size": 128.0,
+        "Launch.registers_per_thread": 42.0,
+        "Launch.dynamic_smem_per_block_bytes": 8192.0,
+        "Memory Workload Analysis.L2 Hit Rate": 55.08,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.38,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "Instruction Statistics.Executed Instructions": 16370.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 44.26,
+        "Launch.block_size": 128.0,
+        "Launch.registers_per_thread": 34.0,
+        "Launch.dynamic_smem_per_block_bytes": 4096.0,
+        "Memory Workload Analysis.L2 Hit Rate": 49.92,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.38,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.77,
+        "Instruction Statistics.Executed Instructions": 14648.0,
+        "CPIStall.L1TEX_scoreboard_cycles_pct": 33.28
+      }
+    },
+    "strategy_title": "Pruning num_warps=2 Configs and Changing Autotune Key Regresses Kernel",
+    "strategy_description": "Removing num_warps=2 configs from the autotune sweep and changing the dispatch key from key=['xnumel'] to key=['BLOCK_M','BLOCK_N','BLOCK_K'] caused a 27.6% regression (30.02 \u00b5s \u2192 44.26 \u00b5s). Despite the block size remaining at 128 threads, registers per thread dropped from 42 to 34 and dynamic shared memory halved from 8 KB to 4 KB, indicating the autotuner selected a different config that restructured the kernel's memory layout. Warp cycles per issued instruction worsened dramatically from 10.38 to 17.38, and a new L1TEX scoreboard stall appeared (33.3% of stall cycles), suggesting the changed bias load pattern (1D load + register broadcast replacing 2D shared memory load) introduced additional L1TEX latency that the prior shared memory path did not have. Changing the autotune key to constexpr values (BLOCK_M, BLOCK_N, BLOCK_K) that are fixed at compile time effectively makes the key meaningless, causing unpredictable config selection.",
+    "slow_pseudocode": "# Pruned configs + constexpr key + 1D bias load\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=4),\n    ],\n    key=['BLOCK_M', 'BLOCK_N', 'BLOCK_K'],  # constexpr values \u2014 meaningless key\n)\n@triton.jit\ndef kernel(...):\n    # bias load changed to 1D + register broadcast\n    bias_mask = (rn < N)\n    tmp0 = tl.load(in_ptr0 + rn, bias_mask)  # [BLOCK_N]\n    tmp1 = acc + tmp0[None, :]  # register broadcast",
+    "fast_pseudocode": "# Original configs + meaningful runtime key + 2D bias load\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel'],  # runtime shape variable\n)\n@triton.jit\ndef kernel(...):\n    # original 2D bias load\n    tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask)\n    tmp1 = acc + tmp0",
+    "applicable_when": "Never \u2014 this is a negative result. Do not use constexpr tl.constexpr values as autotune keys, and do not simultaneously change both the autotune config space and the bias/epilogue load pattern.",
+    "do_not_apply_when": "Always avoid: (1) using tl.constexpr kernel arguments (BLOCK_M, BLOCK_N, BLOCK_K) as autotune dispatch keys \u2014 these are compile-time constants and do not vary across calls, making the key degenerate and causing unpredictable config selection; (2) simultaneously pruning autotune configs AND changing the epilogue load pattern, as the two changes interact and make regression attribution impossible; (3) replacing a 2D shared memory bias load with a 1D register broadcast when the kernel already has L1TEX stall pressure \u2014 the 1D load adds a new L1TEX scoreboard dependency (33.3% of stall cycles) that did not exist before.",
+    "framework_notes": "Triton: tl.constexpr values (BLOCK_M, BLOCK_N, BLOCK_K) are baked into the compiled kernel and do not vary at runtime, so using them as autotune keys is equivalent to key=[] \u2014 the autotuner sees the same key for every call and may select a stale or suboptimal cached config. Always use runtime Python-level arguments (e.g., xnumel, M, N, K) as autotune keys. The 1D bias load (tl.load(ptr + rn)) followed by tmp0[None, :] broadcast appears to introduce an L1TEX scoreboard stall not present with the original 2D broadcast_to load pattern."
+  },
+  {
+    "item_id": "c4f1a8e3",
+    "iteration": 4,
+    "speedup": 1.0715,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_bias_broadcast_load_1d_to_avoid_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 30.02,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput_pct": 89.26,
+        "Memory Workload Analysis.L2 Hit Rate_pct": 55.08,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 766.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.38,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.76,
+        "CPIStall.MIO_scoreboard_cycles_pct": 72.94,
+        "Instruction Statistics.Executed Instructions": 16370.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 29.92,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput_pct": 88.93,
+        "Memory Workload Analysis.L2 Hit Rate_pct": 52.5,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 639.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.43,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.excessive_wavefronts_pct": 77.77,
+        "CPIStall.MIO_scoreboard_cycles_pct": 72.49,
+        "Instruction Statistics.Executed Instructions": 16372.0
+      }
+    },
+    "strategy_title": "Load Bias 1D Then Register-Broadcast to Avoid Bank Conflicts",
+    "strategy_description": "When a bias epilogue load uses a 2D broadcast index (e.g., tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), Triton may stage the load through shared memory, causing all BLOCK_M rows to access the same BLOCK_N column addresses simultaneously and producing high-way bank conflicts. Replacing the 2D broadcast load with a 1D masked load of shape [BLOCK_N] followed by a register-level reshape ([None, :]) eliminates the shared memory staging path. In this case the speedup was modest (1.07x) and the NCU-reported bank conflict metrics (12-way, 77.77% excessive wavefronts) did not visibly improve, suggesting the compiler may have partially re-routed the load or the dominant conflict source lies elsewhere; however, L2 Compression Input Sectors decreased from 766 to 639, indicating slightly fewer cache line accesses.",
+    "slow_pseudocode": "# 2D broadcast load \u2014 may stage through shared memory causing bank conflicts\nidx_n = rn[None, :]  # shape [1, BLOCK_N]\ntmp0 = tl.load(in_ptr0 + tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N]), mask, eviction_policy='evict_last')\ntmp1 = acc + tmp0",
+    "fast_pseudocode": "# 1D load + register broadcast \u2014 avoids shared memory staging\nbias_mask = rn < N  # shape [BLOCK_N]\ntmp0_1d = tl.load(in_ptr0 + rn, bias_mask, eviction_policy='evict_last', other=0.0)\ntmp0 = tmp0_1d[None, :]  # shape [1, BLOCK_N] broadcasts to [BLOCK_M, BLOCK_N] in registers\ntmp1 = acc + tmp0",
+    "applicable_when": "Triton GEMM epilogue loads a 1D bias vector using a 2D broadcast index (tl.broadcast_to over the M dimension). NCU reports SharedMemoryConflicts with high bank-conflict-way (>=8) and excessive wavefronts (>70%), and CPIStall shows MIO scoreboard stalls >7 cycles representing >70% of total stall cycles. The bias tensor has shape [N] with stride 1.",
+    "do_not_apply_when": "The bank conflict metrics do not improve after the fix (as partially observed here \u2014 12-way conflicts persisted), suggesting the compiler re-routes the load through shared memory regardless. Do not expect large speedups when the kernel is severely underutilized (grid_size=1, waves_per_sm=0.0) \u2014 the dominant bottleneck is launch configuration. Do not apply when the bias load is already 1D or when the mask logic is complex and other=0.0 fill would corrupt accumulator values.",
+    "framework_notes": "Triton: tl.broadcast_to with a 2D shape can cause the compiler to stage data through shared memory in a conflicting layout. Using a 1D tl.load followed by [None, :] reshape keeps the broadcast in registers. The other=0.0 fill for out-of-bounds lanes is safe when the corresponding tl.store uses the same boundary mask. This pattern is equivalent to loading a bias row vector once per warp and broadcasting in registers in CUDA."
+  }
+]

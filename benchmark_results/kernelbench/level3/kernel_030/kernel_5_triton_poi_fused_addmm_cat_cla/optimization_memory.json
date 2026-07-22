@@ -1,0 +1,208 @@
+[
+  {
+    "item_id": "9313e38b",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_uncoalesced_stores_via_autotune_tile_swap",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (stores) + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_uncoalesced_stores_via_autotune_tile_swap \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_uncoalesced_stores_via_autotune_tile_swap' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.542e+12 > atol=0.001\nseed=42 output[0]: max_diff=5.256e+12 > atol=0.001\nseed=1337 output[0]: max_diff=4.942e+12 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The store address is `out_ptr0 + (y0 + 49*x5 + 4704*y1)`. With XBLOCK=128 and YBLOCK=8, consecutive threads in the X-warp write to addresses separated by stride 49 (49*x5), which is non-contiguous. This causes 50% sector utilization (16/32 bytes used) and 27% excessive sectors. The contiguous dimension in the output is y0 (stride=1), but y0 is in the YBLOCK dimension (only 8 threads). Swapping so that the y-dimension (stride-1 in output) is covered by YBLOCK>=32 aligns consecutive warp threads to consecutive output addresses, enabling coalesced 128-bit vectorized stores. Additionally, XBLOCK=128 with xnumel=96 wastes 32 threads per block and inflates register pressure.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.542e+12 > atol=0.001\nseed=42 output[0]: max_diff=5.256e+12 > atol=0.001\nseed=1337 output[0]: max_diff=4.942e+12 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_tile_coalesced_stores",
+    "iteration": 1,
+    "speedup": 1.3092,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_coalesce_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (stores) + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 15.58,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 63.91,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 16.65,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 19.16,
+        "Memory Workload Analysis.Memory Throughput": 817.23,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.27,
+        "Compute Workload Analysis.Issue Slots Busy": 73.41,
+        "Source Counters.Avg. Divergent Branches": 176.68
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.9,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 21.31,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 7.54,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 55.71,
+        "Memory Workload Analysis.Memory Throughput": 369.63,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.02,
+        "Compute Workload Analysis.Issue Slots Busy": 83.12,
+        "Source Counters.Avg. Divergent Branches": 59.39
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Fix Uncoalesced Stores",
+    "strategy_description": "When NCU reports uncoalesced global stores (e.g., only 16/32 bytes per sector utilized) caused by the fast thread dimension mapping to a strided output axis, wrapping the kernel with @triton.autotune and exploring configurations with larger YBLOCK (the stride-1 output dimension) as the fast thread axis dramatically reduces L2 traffic and improves store coalescing. In this case, L2 Cache Throughput dropped from 63.9% to 21.3%, memory throughput halved from 817 GB/s to 370 GB/s, L1 hit rate tripled from 19% to 56%, and divergent branches fell from 177 to 59, collectively reducing kernel duration by ~24% (15.58 \u00b5s \u2192 11.9 \u00b5s). Autotune also incidentally found a configuration using fewer registers per thread (40 \u2192 34), slightly improving occupancy.",
+    "slow_pseudocode": "# XBLOCK=128 (fast dim) maps to stride-49 in output; YBLOCK=8 (slow dim) maps to stride-1\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    y0 = yindex % 49   # stride-1 in output\n    x5 = xindex        # stride-49 in output\n    tl.store(out_ptr + (y0 + 49*x5 + 4704*y1), val, mask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune explores configs with larger YBLOCK so stride-1 dim is fast thread dim\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 32, 'YBLOCK': 64}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 32, 'YBLOCK': 16}, num_warps=2, num_stages=2),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 32, 'YBLOCK': 128}, num_warps=8, num_stages=2),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # same body; autotune selects config where YBLOCK >= 32 makes y0 (stride-1) fast\n    tl.store(out_ptr + (y0 + 49*x5 + 4704*y1), val, mask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](..., ynumel, xnumel)  # XBLOCK/YBLOCK injected by autotune",
+    "applicable_when": "NCU reports MemoryCacheAccessPattern OPT for global stores with <20 bytes/sector utilized; UncoalescedGlobalAccess rule fires; the store index has a stride-1 dimension that is NOT the fast (XBLOCK) thread dimension; the kernel uses hardcoded tile sizes rather than autotuning.",
+    "do_not_apply_when": "Stores are already coalesced (bytes/sector close to 32); the kernel is already autotuned; the output tensor has no stride-1 dimension accessible by the slow thread axis; kernel correctness depends on a specific tile shape (e.g., warp-level reductions).",
+    "framework_notes": "Triton-specific: use @triton.autotune above @triton.jit with a configs list of triton.Config dicts. The grid must become a lambda referencing META['XBLOCK'] and META['YBLOCK'] so it adapts to the selected config. XBLOCK and YBLOCK must remain tl.constexpr in the kernel signature. In CUDA, the equivalent is launching with different block dimensions and using __launch_bounds__ or occupancy APIs to select the best configuration."
+  },
+  {
+    "item_id": "exp_003_triton_autotune_num_stages_software_pipelining",
+    "iteration": 3,
+    "speedup": 1.3049,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "add_num_stages_software_pipelining_to_autotune_configs",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + TheoreticalOccupancy + FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.94,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 67.35,
+        "Occupancy.Achieved Occupancy": 62.65,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Scheduler Statistics.No Eligible": 16.86,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.06,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 55.7,
+        "Memory Workload Analysis.L2 Hit Rate": 58.6
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.94,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 67.49,
+        "Occupancy.Achieved Occupancy": 62.73,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Scheduler Statistics.No Eligible": 16.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.05,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 55.72,
+        "Memory Workload Analysis.L2 Hit Rate": 58.64
+      }
+    },
+    "strategy_title": "Add num_stages to Autotune Configs for Software Pipelining",
+    "strategy_description": "Expanding the autotune search space to include num_stages={1,2,3} alongside existing tile configurations allows Triton's autotuner to select a configuration with software pipelining enabled. However, for pointwise kernels (no tl.dot, no inner reduction loop), the NCU profiling metrics show virtually no change in key signals (Duration, No-Eligible stall %, Eligible Warps/Scheduler, L1/L2 hit rates) between before and after \u2014 the 1.30x speedup is likely attributable to the autotuner selecting a marginally better tile shape from the expanded config space rather than software pipelining itself. In pointwise kernels, num_stages has limited effect because there is no multi-iteration loop body for the compiler to pipeline across; the benefit is primarily seen in kernels with inner loops (reductions, GEMMs, convolutions).",
+    "slow_pseudocode": "# Autotune configs all missing num_stages (defaults to 1)\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4),  # num_stages=1 implicit\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 16},  num_warps=4),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=4),\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 64},  num_warps=8),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 32},  num_warps=8),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 16},  num_warps=4),\n    triton.Config({'XBLOCK': 32,  'YBLOCK':  8},  num_warps=2),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 32},  num_warps=4),\n], key=['ynumel', 'xnumel'])",
+    "fast_pseudocode": "# Autotune configs with explicit num_stages={1,2,3}\n@triton.autotune(configs=[\n    # num_stages=1\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 16},  num_warps=4, num_stages=1),\n    # num_stages=2\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 16},  num_warps=4, num_stages=2),\n    # num_stages=3\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 16},  num_warps=4, num_stages=3),\n], key=['ynumel', 'xnumel'])",
+    "applicable_when": "Kernel has an inner loop (reduction, GEMM, convolution) with multiple global load instructions per iteration; NCU shows No-Eligible warp stall >15% and Eligible Warps/Scheduler <4; existing autotune configs all lack explicit num_stages; kernel is memory-latency bound at the warp scheduler level.",
+    "do_not_apply_when": "Kernel is purely pointwise (no inner loop, single pass over data) \u2014 in this case num_stages has negligible effect on NCU metrics (Duration, stall %, hit rates all unchanged); the speedup from expanding the config space is marginal and comes from tile shape selection, not pipelining. Do not expect >5% improvement from num_stages alone on pointwise kernels.",
+    "framework_notes": "Triton-specific: num_stages in triton.Config controls the software pipeline depth for the kernel's main loop. For kernels with no tl.dot and no explicit for-loop over tiles, num_stages=1 vs 2 vs 3 produces identical PTX because there is no loop to pipeline. The equivalent in CUDA would be __pipeline_memcpy_async with cp.async instructions, which also requires a loop body to be effective."
+  },
+  {
+    "item_id": "5a169c54",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_maxnreg_to_autotune_configs_to_break_register_occupancy_ceiling",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_maxnreg_to_autotune_configs_to_break_register_occupancy_ceiling \u2014 correctness failure",
+    "strategy_description": "Plan 'add_maxnreg_to_autotune_configs_to_break_register_occupancy_ceiling' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.542e+12 > atol=0.001\nseed=42 output[0]: max_diff=5.256e+12 > atol=0.001\nseed=1337 output[0]: max_diff=4.942e+12 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has @triton.autotune with 15 configs, but kernel_function uses a hardcoded grid=(cdiv(xnumel,128), cdiv(ynumel,8)) so autotune's selected XBLOCK/YBLOCK are NEVER reflected in the grid. The grid always launches as if XBLOCK=128, YBLOCK=8. This is the primary implementation flaw. Additionally, at 34 registers/thread, Block Limit Registers=12 blocks/SM caps theoretical occupancy at 75% (12*4warps/16max = 75%). By adding maxnreg=32 to autotune configs, the compiler is forced to spill to 32 regs/thread, allowing 16 blocks/SM -> 100% theoretical occupancy. Combined with fixing the grid lambda, this breaks both the register ceiling and the tail-wave problem simultaneously. The 33.3% tail-wave speedup opportunity is the largest single gain available.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.542e+12 > atol=0.001\nseed=42 output[0]: max_diff=5.256e+12 > atol=0.001\nseed=1337 output[0]: max_diff=4.942e+12 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_005_triton_rsqrt_multiply_fused_fp32_plus_register_reduction",
+    "iteration": 5,
+    "speedup": 1.8954,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_fp32_instructions_via_rsqrt_multiply_and_reduce_registers",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions + TheoreticalOccupancy + LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.9,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 67.79,
+        "Occupancy.Achieved Occupancy": 62.73,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Instruction Statistics.Executed Instructions": 6326880.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.04,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 30.41,
+        "Memory Workload Analysis.Memory Throughput": 369.76,
+        "Source Counters.Avg. Divergent Branches": 59.39
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 8.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 48.13,
+        "Occupancy.Achieved Occupancy": 81.4,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 3159520.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.41,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0,
+        "Memory Workload Analysis.Memory Throughput": 535.04,
+        "Source Counters.Avg. Divergent Branches": 0.0
+      }
+    },
+    "strategy_title": "Replace sqrt+divide with rsqrt+multiply to Reduce Registers and Boost Occupancy",
+    "strategy_description": "Replacing a sqrt-clamp-divide sequence (tl.sqrt_rn + tl.maximum + division) with rsqrt-clamp-multiply (libdevice.rsqrt + tl.minimum + multiplication) reduces register pressure from 34 to 32 registers/thread, which breaks the register-limited occupancy ceiling and raises theoretical occupancy from 75% to 100% and achieved occupancy from 62.7% to 81.4%. The instruction count halved (6.3M \u2192 3.2M executed instructions) and divergent branches dropped to zero, collectively reducing kernel duration by 31% (11.9 \u00b5s \u2192 8.22 \u00b5s). The causal chain is: fewer registers per thread \u2192 higher Block Limit Registers \u2192 more warps schedulable per SM \u2192 better latency hiding \u2192 lower duration; the clamp direction must flip (maximum(sqrt(x), eps) \u2192 minimum(rsqrt(x), 1/eps)) because reciprocal reverses the inequality.",
+    "slow_pseudocode": "# sqrt + clamp + divide: 34 registers/thread, 75% theoretical occupancy\ntmp22 = tl.sqrt_rn(tmp21)                          # FSQRT (multi-cycle)\ntmp23 = tl.full([1, 1], 1e-12, tl.float32)\ntmp24 = tl.maximum(tmp22, tmp23)                    # clamp from below\ntmp25 = tmp20 / tmp24                               # FDIV (multi-cycle)",
+    "fast_pseudocode": "# rsqrt + clamp + multiply: 32 registers/thread, 100% theoretical occupancy\n# NOTE: clamp direction flips because reciprocal reverses inequality\ntmp22_rsqrt = libdevice.rsqrt(tmp21)                # MUFU.RSQRT (single-cycle)\ntmp23_inv   = tl.full([1, 1], 1.0 / 1e-12, tl.float32)  # = 1e12\ntmp24_inv   = tl.minimum(tmp22_rsqrt, tmp23_inv)   # clamp from above\ntmp25       = tmp20 * tmp24_inv                     # FFMA-fusible multiply",
+    "applicable_when": "NCU FPInstructions rule fires with a high ratio of non-fused to fused FP32 instructions (>80% non-fused); kernel contains a vector-norm normalization pattern (sqrt + clamp + divide); registers/thread is at a value that limits Block Limit Registers below the hardware maximum (e.g., 34 regs \u2192 12 blocks/SM cap on H100/H200); TheoreticalOccupancy is below 100% and register-limited; the squared input to sqrt is guaranteed non-negative.",
+    "do_not_apply_when": "The input to sqrt may be negative (rsqrt of negative is NaN/undefined); numerical precision requirements are strict and rsqrt's ~1 ULP approximation is unacceptable; the clamp epsilon is not a simple scalar constant (making the reciprocal transformation non-trivial); registers/thread is already at or below the threshold for 100% theoretical occupancy.",
+    "framework_notes": "Triton-specific: use `from triton.language.extra import libdevice` and call `libdevice.rsqrt(x)` which maps to MUFU.RSQRT on NVIDIA GPUs. The clamp direction MUST flip: `tl.maximum(sqrt(x), eps)` becomes `tl.minimum(rsqrt(x), 1/eps)`. In CUDA C++, the equivalent is `__frsqrt_rn(x)` or `rsqrtf(x)` followed by `fminf(rsqrt_val, 1.0f/eps)`. The 2-register reduction (34\u219232) is the key occupancy unlock on H200 where Block Limit Registers = floor(max_regs_per_sm / (regs_per_thread * warp_size))."
+  },
+  {
+    "item_id": "exp_005_autotune_config_pruning_large_yblock",
+    "iteration": 5,
+    "speedup": 1.3159,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_eliminate_masked_thread_waste",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + TheoreticalOccupancy + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.9,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 67.79,
+        "Occupancy.Achieved Occupancy": 62.73,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 55.72,
+        "Memory Workload Analysis.L2 Hit Rate": 59.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.04,
+        "Scheduler Statistics.No Eligible": 16.88
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.84,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 67.63,
+        "Occupancy.Achieved Occupancy": 62.7,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 55.72,
+        "Memory Workload Analysis.L2 Hit Rate": 59.02,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.05,
+        "Scheduler Statistics.No Eligible": 17.76
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Eliminate Masked Thread Waste",
+    "strategy_description": "Replacing a large set of autotune configs (including many num_stages variants) with a focused set of large-YBLOCK and large-XBLOCK configs produced a marginal 0.6 \u00b5s reduction in kernel duration (11.9 \u2192 11.84 \u00b5s). The NCU metrics are nearly identical before and after \u2014 same registers/thread (34), same achieved occupancy (~62.7%), same L1 hit rate (55.72%), same warp cycles per instruction (~12.05) \u2014 indicating the speedup comes from the autotuner selecting a slightly better tile shape from the new config space rather than any structural improvement. This is consistent with the prior iteration's finding that this kernel is already near its optimum for the current launch configuration.",
+    "slow_pseudocode": "# Many configs including num_stages variants and YBLOCK=128/256 with num_stages=1,2\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1,  'YBLOCK': 128}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 2,  'YBLOCK': 128}, num_warps=4, num_stages=1),\n    # ... 20+ configs with num_stages=1,2\n    triton.Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=16, num_stages=2),\n], key=['ynumel', 'xnumel'])",
+    "fast_pseudocode": "# Focused configs: large YBLOCK and large XBLOCK, no num_stages specified\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 8,   'YBLOCK': 128}, num_warps=4),\n    triton.Config({'XBLOCK': 8,   'YBLOCK': 256}, num_warps=8),\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 128}, num_warps=8),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8},   num_warps=4),\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 4},   num_warps=4),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 2},   num_warps=8),\n    triton.Config({'XBLOCK': 1024,'YBLOCK': 1},   num_warps=8),\n], key=['ynumel', 'xnumel'])",
+    "applicable_when": "Kernel already has @triton.autotune with many configs including num_stages variants; NCU metrics are stable (registers/thread, occupancy, L1 hit rate all near-optimal); marginal gains may come from pruning the config space to focus on tile shapes that better match the problem dimensions.",
+    "do_not_apply_when": "Kernel metrics show clear bottlenecks (low L1 hit rate, high register pressure, large divergent branch count) that require structural changes rather than config pruning; the existing autotune config space already covers the optimal tile shapes.",
+    "framework_notes": "Triton-specific: removing explicit num_stages from triton.Config lets Triton use its default (typically 1 for pointwise kernels). For pointwise kernels with no inner loop, num_stages has negligible effect on performance as confirmed by near-identical NCU metrics across iterations 3, 4, and 5."
+  }
+]

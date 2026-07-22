@@ -1,0 +1,86 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused_addmm_clone_permute_t_view_2(arg_A, arg_B, out_ptr0):
+@@ -44,37 +45,39 @@
+     tl.assume(pid_m >= 0)
+     tl.assume(pid_n >= 0)
+ 
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    if ((stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1)) and (M >= BLOCK_M and K > 1):
+-        offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    else:
+-        offs_a_m = rm % M
+-    if ((stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1)) and (N >= BLOCK_N and K > 1):
+-        offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-    else:
+-        offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # A is stored as [M=31360, K=96] row-major: A[m,k] = A_ptr + m*96 + k
++    # shape=(M, K), strides=(stride_am=96, stride_ak=1), block_shape=(BLOCK_M, BLOCK_K)
++    # order=(1, 0): dim-1 (K, stride=1) is fast-varying (contiguous)
++    a_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0)
++    )
++
++    # B is stored as [N=288, K=96] row-major: B[n,k] = B_ptr + n*96 + k
++    # View as shape=(K, N) with strides=(stride_bk=1, stride_bn=96)
++    # This gives a [BLOCK_K, BLOCK_N] tile for tl.dot(A[BLOCK_M,BLOCK_K], B[BLOCK_K,BLOCK_N])
++    # order=(0, 1): dim-0 (K, stride=1) is fast-varying (contiguous)
++    b_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1)
++    )
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 96*idx_m
+-        a = tl.load(A + (xindex))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 288*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 96*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-        
++        a = tl.load(a_block_ptr, boundary_check=(0, 1))
++        b = tl.load(b_block_ptr, boundary_check=(0, 1))
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
++        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
++        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -86,8 +89,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 288*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

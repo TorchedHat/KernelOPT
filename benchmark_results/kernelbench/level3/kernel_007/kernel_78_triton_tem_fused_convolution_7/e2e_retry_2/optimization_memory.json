@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "e06331dc",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.067e-01 > atol=0.001\nseed=42 output[0]: max_diff=9.332e-02 > atol=0.001\nseed=1337 output[0]: max_diff=1.039e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a GEMM (M=490, N=160, K=832) with ALLOW_TF32=False, meaning tl.dot uses FP32 FFMA instead of Tensor Cores. On H200, peak FP32 FFMA is 67 TFLOPS while TF32 Tensor Core peak is 989 TFLOPS \u2014 roughly 14.8x higher. The kernel achieves only 7.93% compute SOL and 6.25% occupancy. Enabling TF32 (allow_tf32=True) routes tl.dot through the Tensor Core MMA pipeline, dramatically increasing compute throughput. Additionally, the current tile sizes (BLOCK_M=32, BLOCK_N=32, BLOCK_K=128) cause severe 12-way shared memory bank conflicts (71% speedup potential) and produce only 80 blocks for 132 SMs. Adding @triton.autotune with larger tile configurations will both reduce bank conflicts and improve SM utilization. K=832 is moderate enough that TF32 mantissa reduction stays within typical atol=1e-2 tolerance.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.067e-01 > atol=0.001\nseed=42 output[0]: max_diff=9.332e-02 > atol=0.001\nseed=1337 output[0]: max_diff=1.039e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_smem_bank_conflict_tile_resize_negative",
+    "iteration": 1,
+    "speedup": 0.542,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_block_k_to_eliminate_smem_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 49.6,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 74316.0,
+        "Instruction Statistics.Executed Instructions": 3121880.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.34,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 94.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Memory Workload Analysis.Memory Throughput": 44.3,
+        "Compute Workload Analysis.Executed Ipc Active": 0.54
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 91.52,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 137237.0,
+        "Instruction Statistics.Executed Instructions": 10018088.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.26,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Memory Workload Analysis.Memory Throughput": 23.96,
+        "Compute Workload Analysis.Executed Ipc Active": 0.94
+      }
+    },
+    "strategy_title": "Reducing BLOCK_K Alone Cannot Fix Smem Bank Conflicts",
+    "strategy_description": "Reducing BLOCK_K from 128 to 32 (and increasing BLOCK_M/BLOCK_N from 32 to 64) partially reduced per-instruction MIO stall cycles (7.34\u21924.26 cycles/instruction) and reduced shared memory per block (65\u219233 KB), but the total executed instruction count exploded 3.2x (3.1M\u219210.0M instructions), causing overall kernel duration to nearly double (49.6\u219291.5 \u00b5s). The bank conflict rate remained at ~12-way on 77-78% of shared load wavefronts, meaning the access pattern conflict was not resolved by the tile size change alone. The register pressure also increased significantly (94\u2192128 registers/thread), further limiting occupancy. When the dominant bottleneck is shared memory bank conflicts, simply changing tile dimensions without fixing the underlying strided access pattern (e.g., adding padding to shared memory arrays or transposing the load layout) will not eliminate conflicts and may dramatically increase instruction count.",
+    "slow_pseudocode": "# BLOCK_M=32, BLOCK_N=32, BLOCK_K=128 (hardcoded)\n# 12-way smem bank conflicts on 77.78% of shared loads\n# Duration: 49.6 us, 3.1M instructions\nfor k in range(0, K, BLOCK_K=128):\n    a_tile = load_A(BLOCK_M=32, BLOCK_K=128)  # smem\n    b_tile = load_B(BLOCK_K=128, BLOCK_N=32)  # smem, strided access -> 12-way conflict\n    acc += dot(a_tile, b_tile)",
+    "fast_pseudocode": "# BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 (changed)\n# Still 12-way smem bank conflicts on 77.71% of shared loads\n# Duration: 91.5 us, 10.0M instructions (3.2x more work!)\nfor k in range(0, K, BLOCK_K=32):  # 26 iterations instead of 6.5\n    a_tile = load_A(BLOCK_M=64, BLOCK_K=32)  # smem\n    b_tile = load_B(BLOCK_K=32, BLOCK_N=64)  # smem, still conflicted\n    acc += dot(a_tile, b_tile)  # more iterations = more total instructions",
+    "applicable_when": "Never: this specific approach (reducing BLOCK_K without fixing the access pattern) is always harmful when bank conflicts persist.",
+    "do_not_apply_when": "When shared memory bank conflicts are caused by strided access patterns (e.g., column-major loads into row-major shared memory), reducing BLOCK_K alone does not change the conflict structure and causes a multiplicative increase in loop iterations and total instruction count. Do not apply tile size reduction as the sole fix for bank conflicts without also padding shared memory arrays or transposing the load layout to achieve conflict-free access.",
+    "framework_notes": "In Triton, shared memory bank conflicts arise from the access stride pattern within tl.load into shared memory. Padding the shared memory tile dimension by 1 element (e.g., BLOCK_K+1 instead of BLOCK_K for the inner dimension) is the canonical fix. Tile size changes alone do not alter the bank conflict structure if the stride pattern remains the same."
+  }
+]

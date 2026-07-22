@@ -1,0 +1,68 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,18 @@
+ 
+ 
+ # Fused GEMM + bias + ReLU kernel
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        # Primary: large BLOCK_K to maximize K-loop arithmetic intensity
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=3, num_warps=8),
++        # Secondary: large output tiles with num_stages=2 to cap register pressure
++        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=2, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_M': 8}, num_stages=2, num_warps=4),
++        # Fallback: proven baseline config (was 198 regs, 654us before regression)
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,  'GROUP_M': 8}, num_stages=3, num_warps=4),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -46,12 +50,22 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    for k in range(0, tl.cdiv(K, BLOCK_K)):
++    # Hoist row/col boundary masks - computed once, not per K-iteration
++    m_mask = offs_m < M   # shape (BLOCK_M,)
++    n_mask = offs_n < N   # shape (BLOCK_N,)
++    num_k_blocks = tl.cdiv(K, BLOCK_K)
++
++    for k in range(0, num_k_blocks):
+         k_remaining = K - k * BLOCK_K
+-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+-        a = tl.load(A_ptrs, mask=a_mask, other=0.0)
+-        b = tl.load(B_ptrs, mask=b_mask, other=0.0)
++        if k_remaining < BLOCK_K:
++            # Last partial block: apply K-dimension mask
++            k_mask = offs_k < k_remaining
++            a = tl.load(A_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++            b = tl.load(B_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
++        else:
++            # Full block: no K-mask - enables vectorized 128-bit LDG.E.128 loads
++            a = tl.load(A_ptrs, mask=m_mask[:, None], other=0.0)
++            b = tl.load(B_ptrs, mask=n_mask[None, :], other=0.0)
+         acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+         A_ptrs += BLOCK_K * stride_ak
+         B_ptrs += BLOCK_K * stride_bk
+@@ -63,10 +77,10 @@
+     if APPLY_RELU:
+         acc = tl.maximum(acc, 0.0)
+ 
+-    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    # Store with hoisted mask
++    out_mask = m_mask[:, None] & n_mask[None, :]
+     C_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     tl.store(C_ptrs, acc.to(tl.float32), mask=out_mask)
+-
+ 
+ def run_gemm_bias_relu(A, B, bias, apply_relu=True):
+     """

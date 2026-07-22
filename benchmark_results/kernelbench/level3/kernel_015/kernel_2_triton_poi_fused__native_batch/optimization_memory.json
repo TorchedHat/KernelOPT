@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "exp_001_autotune_block_size_regression",
+    "iteration": 1,
+    "speedup": 0.3222,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_and_num_warps_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 21.79,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 35.52,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 15.04,
+        "Occupancy.Achieved Occupancy": 40.52,
+        "Scheduler Statistics.No Eligible": 61.71,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.59,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.97,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 14.85,
+        "Instruction Statistics.Executed Instructions": 5770240.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 67.62,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 79.04,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 4.84,
+        "Occupancy.Achieved Occupancy": 76.96,
+        "Scheduler Statistics.No Eligible": 18.4,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 6.78,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.9,
+        "Launch Statistics.Block Size": 512.0,
+        "Launch Statistics.Waves Per SM": 59.39,
+        "Instruction Statistics.Executed Instructions": 42210560.0
+      }
+    },
+    "strategy_title": "Large Block Size Causes Instruction Explosion in Pointwise Kernels",
+    "strategy_description": "Increasing block size (XBLOCK) from 128 to 512 via autotune improved occupancy (40.5%\u219277%) and scheduler utilization (eligible warps 0.59\u21926.78), but caused a 7.3x explosion in executed instructions (5.77M\u219242.2M) and a 3.1x increase in kernel duration (21.8\u219267.6 \u00b5s). The autotune selected a large block config that dramatically increased waves_per_sm (14.85\u219259.39), meaning each SM processed far more work per launch with redundant computation. For small pointwise kernels where the original grid already provides sufficient parallelism (waves_per_sm ~15), increasing block size multiplies total work without proportional throughput gains, resulting in severe regression despite improved scheduler metrics.",
+    "slow_pseudocode": "# Block size 128, grid=cdiv(N,128), waves_per_sm=14.85\n# Executed instructions: 5.77M, Duration: 21.8us\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):  # XBLOCK=128 hardcoded\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    # load, compute BN+ReLU, store\n    ...\ngrid = (cdiv(N, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# Autotune selected XBLOCK=512, waves_per_sm=59.39\n# Executed instructions: 42.2M, Duration: 67.6us \u2014 REGRESSION\n@triton.autotune(configs=[Config({'XBLOCK':512}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel  # mask added unnecessarily\n    # load with mask, compute BN+ReLU, store with mask\n    ...\ngrid = lambda meta: (cdiv(N, meta['XBLOCK']),)\nkernel[grid](...)",
+    "applicable_when": "Never \u2014 this specific combination of autotune + mask introduction caused regression. The strategy of increasing block size to hide L1TEX latency is theoretically sound but failed here due to instruction count explosion and unnecessary mask overhead.",
+    "do_not_apply_when": "Do not apply large XBLOCK autotune to pointwise kernels where: (1) the original grid already provides ~15+ waves_per_sm, (2) xnumel is exactly divisible by the original XBLOCK (making masks unnecessary overhead), and (3) the kernel body is simple (BN+ReLU) with low arithmetic intensity. Adding xmask to loads/stores that were previously mask-free introduces predication overhead that compounds with the instruction explosion from larger blocks.",
+    "framework_notes": "In Triton, adding xmask=xindex<xnumel to previously mask-free loads/stores introduces predicated memory instructions even when the original XBLOCK divided xnumel exactly. The autotune framework selected a config (XBLOCK=512) that increased waves_per_sm from 14.85 to 59.39, meaning 4x more total thread-blocks executed, each doing the same work \u2014 this is a correctness bug in the grid lambda not accounting for the fixed grid size. The grid was not updated to use the lambda form properly, so the fixed grid=(cdiv(N,128),) was used with the autotuned kernel, causing 4x more blocks than needed."
+  },
+  {
+    "item_id": "af69bf12",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_autotune_grid_lambda_and_remove_mask_overhead",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_autotune_grid_lambda_and_remove_mask_overhead \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'fix_autotune_grid_lambda_and_remove_mask_overhead' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has a critical implementation flaw: the launch grid is hardcoded to (triton.cdiv(xnumel, 128),) = 31,360 blocks, but @triton.autotune selected XBLOCK=512. This means 31,360 blocks each process 512 elements, but only 7,840 blocks are needed \u2014 the GPU launches 4x too many CTAs, each doing redundant/overlapping work. This caused a 7.3x instruction explosion (5.77M to 42.2M) and a 3.1x duration regression (21.8us to 67.6us). Additionally, the autotune added xmask = xindex < xnumel to all loads/stores, introducing predication overhead that is unnecessary since xnumel=4,014,080 is exactly divisible by all XBLOCK values in the config list. The fix is: (1) change the grid to a lambda so it scales with the chosen XBLOCK, and (2) remove the xmask predication from all loads/stores.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  }
+]

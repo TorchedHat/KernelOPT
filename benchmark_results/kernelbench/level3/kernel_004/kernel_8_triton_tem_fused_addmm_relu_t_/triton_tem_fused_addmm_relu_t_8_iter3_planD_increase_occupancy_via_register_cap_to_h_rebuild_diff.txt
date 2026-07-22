@@ -1,0 +1,69 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,26 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=2, maxnreg=48),
++        triton.Config({}, num_warps=4, num_stages=3, maxnreg=48),
++        triton.Config({}, num_warps=8, num_stages=2, maxnreg=48),
++        triton.Config({}, num_warps=8, num_stages=3, maxnreg=48),
++        triton.Config({}, num_warps=2, num_stages=2, maxnreg=48),
++        triton.Config({}, num_warps=2, num_stages=3, maxnreg=48),
++        triton.Config({}, num_warps=4, num_stages=2, maxnreg=40),
++        triton.Config({}, num_warps=4, num_stages=3, maxnreg=40),
++        triton.Config({}, num_warps=8, num_stages=2, maxnreg=40),
++        triton.Config({}, num_warps=8, num_stages=3, maxnreg=40),
++        triton.Config({}, num_warps=2, num_stages=2, maxnreg=40),
++        triton.Config({}, num_warps=2, num_stages=3, maxnreg=40),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_addmm_relu_t_8(in_ptr0, arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = False
+@@ -60,24 +80,23 @@
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+         a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+-        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+ 
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 84*idx_m
+         a = tl.load(A + (xindex), mask=a_mask, other=0.0)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 20*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 84*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)), mask=b_mask, other=0.0)
+-
++        # Transposed B load: threads stride along K (stride-1) instead of N (stride-84)
++        # This eliminates the 13.3-way bank conflict from stride-84 N-dimension access
++        n_off = offs_b_n[:, None]                              # [BLOCK_N, 1]
++        k_off_t = offs_k[None, :] + k_idx * BLOCK_K           # [1, BLOCK_K]
++        b_mask_t = k_off_t < K                                 # [1, BLOCK_K] broadcast to [BLOCK_N, BLOCK_K]
++        b_T = tl.load(B + (k_off_t + 84 * n_off), mask=b_mask_t, other=0.0)  # [BLOCK_N, BLOCK_K]
++        b = tl.trans(b_T)  # [BLOCK_K, BLOCK_N] - layout transpose for tl.dot
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -91,7 +110,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

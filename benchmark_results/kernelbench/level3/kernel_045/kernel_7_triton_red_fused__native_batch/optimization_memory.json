@@ -1,0 +1,248 @@
+[
+  {
+    "item_id": "exp_001_autotune_xblock_reduction_tile_fix",
+    "iteration": 1,
+    "speedup": 236.0911,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_increase_grid_waves_and_fix_oversized_reduction_tile",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.12,
+        "Occupancy.Achieved Occupancy": 11.92,
+        "Scheduler Statistics.No Eligible": 92.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.3,
+        "GPU Speed Of Light Throughput.Duration_us": 906.59,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 1359819.0,
+        "Instruction Statistics.Executed Instructions": 55388160.0,
+        "Launch.Stack Size": 12288.0,
+        "Launch.Grid Size": 256.0,
+        "Launch.R0_BLOCK_effective": 512.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.12,
+        "Occupancy.Achieved Occupancy": 11.69,
+        "Scheduler Statistics.No Eligible": 80.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.77,
+        "GPU Speed Of Light Throughput.Duration_us": 3.84,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5668.0,
+        "Instruction Statistics.Executed Instructions": 309248.0,
+        "Launch.Stack Size": 1024.0,
+        "Launch.Grid Size": 256.0,
+        "Launch.R0_BLOCK_effective": 256.0
+      }
+    },
+    "strategy_title": "Fix Oversized Reduction Tile and Autotune XBLOCK",
+    "strategy_description": "When R0_BLOCK is set larger than r0_numel (e.g., R0_BLOCK=512 with r0_numel=256), half the reduction tile threads are masked out every iteration, wasting registers, stack space (12288 bytes vs 1024 bytes after fix), and executing ~179x more instructions than necessary. Adding @triton.autotune with R0_BLOCK clamped to the actual reduction dimension size eliminates this waste. The dominant effect here was the over-allocated reduction tile causing massive instruction bloat (55M vs 309K executed instructions), not the grid wave count \u2014 duration dropped from 906us to 3.84us (236x) primarily by eliminating wasted masked-out computation.",
+    "slow_pseudocode": "# R0_BLOCK=512 but r0_numel=256 \u2014 half the tile is always masked\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    for r0_offset in range(0, R0_BLOCK, RBLOCK_STEP):  # iterates 512 elements\n        r0_mask = r0_index < r0_numel  # masks out upper 256\n        data = tl.load(..., mask=xmask & r0_mask)  # half loads are no-ops\n        ...\n\ngrid = (triton.cdiv(xnumel, 128),)  # = 256 blocks\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# R0_BLOCK=256 == r0_numel \u2014 no wasted masked iterations\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,  'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 2,  'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 4,  'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 8,  'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 16, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 32, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    for r0_offset in range(0, R0_BLOCK, RBLOCK_STEP):  # iterates exactly 256 elements\n        r0_mask = r0_index < r0_numel  # all in-bounds, no wasted work\n        ...\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](..., xnumel=xnumel, r0_numel=r0_numel)  # no explicit XBLOCK/R0_BLOCK",
+    "applicable_when": "Triton reduction kernel where R0_BLOCK (or RBLOCK) is set to a power-of-2 value larger than the actual r0_numel; profiling shows very high executed instruction count relative to problem size, large stack size per thread (>4KB), and CPIStall on L1TEX with high warp cycles per issued instruction (>20). The ratio of R0_BLOCK/r0_numel > 1 is the key signal.",
+    "do_not_apply_when": "R0_BLOCK is already equal to or smaller than r0_numel; when the reduction dimension is not a power-of-2 and rounding up is intentional for vectorization; when the kernel is already achieving high SM utilization (waves_per_sm > 1).",
+    "framework_notes": "Triton-specific: @triton.autotune must be placed above @triton.jit. The grid lambda `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` is required when XBLOCK is autotuned. The autotune key should include all dimension variables that affect the optimal config (e.g., ['xnumel', 'r0_numel']). Stack size reduction from 12288 to 1024 bytes is a side effect of fewer live registers when R0_BLOCK is corrected."
+  },
+  {
+    "item_id": "exp_001_online_softmax_register_buffer_eliminate_intermediate_global_rw",
+    "iteration": 1,
+    "speedup": 224.9603,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "online_softmax_register_buffer_eliminate_intermediate_global_rw",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 906.59,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 39.35,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 11.51,
+        "Occupancy.Achieved Occupancy": 11.92,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.3,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 27.05,
+        "Instruction Statistics.Executed Instructions": 55388160.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.03,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 0.73,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 7.27,
+        "Occupancy.Achieved Occupancy": 5.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.7,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 63.62,
+        "Instruction Statistics.Executed Instructions": 239616.0
+      }
+    },
+    "strategy_title": "Eliminate Intermediate Global Write/Read in Two-Pass Softmax",
+    "strategy_description": "When a two-pass softmax kernel writes intermediate batch-norm results to global memory after pass 1 and re-reads them in pass 2, and the entire reduction fits within a single tile (R0_BLOCK >= r0_numel), the intermediate global store and load are completely unnecessary. Replacing the intermediate global write with a register-resident buffer (tl.where accumulation into a local tensor) and reading from that buffer in pass 2 eliminates the redundant global memory round-trip. This directly resolves MemoryCacheAccessPattern violations (1/32 bytes utilized per sector on local loads/stores) and CPIStall from L1TEX dependency chains, reducing warp cycles per instruction from 24.3 to 6.7 and executed instructions by 230x.",
+    "slow_pseudocode": "# Pass 1: compute BN, accumulate softmax stats, WRITE intermediate to global\nfor r0_offset in range(0, r0_numel, R0_BLOCK):\n    tmp17 = batch_norm(load(in_out_ptr0, ...))\n    _max, _sum = online_softmax_combine(_max, _sum, tmp17)\n    store(in_out_ptr0, tmp17)  # <-- unnecessary intermediate write\n\nmax_val, sum_val = online_softmax_reduce(_max, _sum)\n\n# Pass 2: RE-READ from global (expensive), apply normalization\nfor r0_offset in range(0, r0_numel, R0_BLOCK):\n    tmp21 = load(in_out_ptr0, ...)  # <-- unnecessary re-read\n    store(in_out_ptr0, exp(tmp21 - max_val) / sum_val)",
+    "fast_pseudocode": "# Pass 1: compute BN, accumulate softmax stats, keep intermediate in REGISTERS\ntmp17_buf = zeros([XBLOCK, R0_BLOCK])  # register buffer\nfor r0_offset in range(0, r0_numel, R0_BLOCK):\n    tmp17 = batch_norm(load(in_out_ptr0, ...))\n    _max, _sum = online_softmax_combine(_max, _sum, tmp17)\n    tmp17_buf = where(r0_mask, tmp17, tmp17_buf)  # accumulate in registers, NO global store\n\nmax_val, sum_val = online_softmax_reduce(_max, _sum)\n\n# Pass 2: read from REGISTER buffer, NO global re-read\nfor r0_offset in range(0, r0_numel, R0_BLOCK):\n    tmp21 = tmp17_buf  # register read, not global load\n    store(in_out_ptr0, exp(tmp21 - max_val) / sum_val)",
+    "applicable_when": "Kernel implements a two-pass softmax (or similar reduction+normalize pattern) where: (1) intermediate results are written to global memory after pass 1 and re-read in pass 2; (2) the entire reduction fits in a single tile (R0_BLOCK >= r0_numel so the loop executes exactly once); (3) MemoryCacheAccessPattern rule fires with ~1/32 bytes utilized per sector on local loads/stores; (4) CPIStall shows high L1TEX stall cycles (>15 avg cycles, >70% of total stall); (5) DRAM throughput is significant (>20%) relative to compute throughput.",
+    "do_not_apply_when": "The reduction does NOT fit in a single tile (R0_BLOCK < r0_numel, loop executes multiple times) \u2014 in that case the register buffer would need to span multiple iterations and may not hold all intermediate values simultaneously, causing register spill. Also avoid if register pressure is already near the hardware limit (>200 registers/thread), as adding an [XBLOCK, R0_BLOCK] register buffer will cause spilling to local memory.",
+    "framework_notes": "In Triton, the register buffer is created with tl.zeros([XBLOCK, R0_BLOCK], tl.float32) and accumulated with tl.where(r0_mask, tmp17, tmp17_buf). The autotune decorator with multiple XBLOCK configs (1, 4, 8, 16, 32, 64, 128) allows the compiler to find the best balance between grid size (SM utilization) and register pressure. Stack size dropped from 12288 to 1024 bytes after the optimization, confirming elimination of local memory spill from the intermediate global store pattern."
+  },
+  {
+    "item_id": "exp_001_autotune_grid_underutilization",
+    "iteration": 1,
+    "speedup": 97.0653,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_fix_grid_underutilization",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.12,
+        "Occupancy.Achieved Occupancy": 11.92,
+        "Scheduler Statistics.No Eligible": 92.08,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.3,
+        "GPU Speed Of Light Throughput.Duration_us": 906.59,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 11.51,
+        "Compute Workload Analysis.Executed Ipc Active": 0.31,
+        "Launch.grid_size": 256.0,
+        "Launch.Registers Per Thread": 32.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.97,
+        "Occupancy.Achieved Occupancy": 11.95,
+        "Scheduler Statistics.No Eligible": 51.62,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.72,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.87,
+        "GPU Speed Of Light Throughput.Duration_us": 9.34,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 37.15,
+        "Compute Workload Analysis.Executed Ipc Active": 1.94,
+        "Launch.grid_size": 256.0,
+        "Launch.Registers Per Thread": 255.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Fix Grid Underutilization",
+    "strategy_description": "When a Triton reduction kernel launches far fewer CTAs than available SMs (waves_per_sm << 1), the scheduler starves: eligible warps per scheduler drop near zero and 'No Eligible' cycles exceed 90%, causing massive L1TEX scoreboard stalls. Adding @triton.autotune with smaller XBLOCK configs (e.g. 16, 32, 64 instead of 128) multiplies the grid size, giving the scheduler more warps to hide memory latency. In this case, reducing XBLOCK from 128 to the autotuned optimum cut Warp Cycles Per Issued Instruction from 24.3 to 3.87 and raised Compute SM Throughput from 11.5% to 37.2%, yielding a 97x wall-time reduction. Also cap R0_BLOCK at the actual r0_numel to eliminate wasted masked iterations.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # reduction over r0_numel=256 elements\n    ...\n\n# Fixed launch: 256 blocks on 132-SM GPU = 0.12 waves\ngrid = (cdiv(xnumel, 128),)  # XBLOCK=128 hardcoded\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)  # R0_BLOCK > r0_numel",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16, 'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 16, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 32, 'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 32, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 64, 'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 64, 'R0_BLOCK': 128}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=3),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    ...\n\n# Dynamic grid; XBLOCK/R0_BLOCK chosen by autotuner\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # no hardcoded XBLOCK/R0_BLOCK kwargs",
+    "applicable_when": "waves_per_sm < 0.5, No Eligible scheduler cycles > 70%, Eligible Warps Per Scheduler < 0.2, CPIStall dominated by L1TEX scoreboard stalls, and the kernel uses a fixed large XBLOCK that results in a grid smaller than ~2x the SM count. Also applicable when R0_BLOCK is set larger than the actual r0_numel.",
+    "do_not_apply_when": "The kernel is already compute-bound (Compute SM Throughput > 70%) or waves_per_sm > 2. Also avoid if reducing XBLOCK would break algorithmic correctness (e.g. reductions that require all elements in one block). Note: autotuning with 255 registers/thread limits theoretical occupancy to 12.5%; if register pressure is the primary bottleneck, a different approach is needed.",
+    "framework_notes": "Triton-specific: use @triton.autotune above @triton.jit, pass configs as list of triton.Config dicts, set key to the shape dimensions that determine optimal tile size. Replace hardcoded grid tuple with a lambda that reads meta['XBLOCK']. Remove explicit XBLOCK/R0_BLOCK kwargs from the kernel call site. In CUDA, the equivalent is launching more thread blocks with smaller block dimensions or using cooperative groups."
+  },
+  {
+    "item_id": "exp_001_coalesced_dim_swap_reduction",
+    "iteration": 1,
+    "speedup": 11.8586,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "coalesced_dim_swap_reduction_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 906.59,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 11.51,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 39.35,
+        "Scheduler Statistics.No Eligible": 92.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 24.3,
+        "Occupancy.Achieved Occupancy": 11.92,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 27.05,
+        "Memory Workload Analysis.L2 Hit Rate": 64.72
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 76.45,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 46.41,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 19.45,
+        "Scheduler Statistics.No Eligible": 42.71,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.13,
+        "Occupancy.Achieved Occupancy": 11.03,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 71.72,
+        "Memory Workload Analysis.L2 Hit Rate": 79.06
+      }
+    },
+    "strategy_title": "Swap X-tile Dimension to Coalesce Global Memory Accesses",
+    "strategy_description": "When the x-index decomposition maps consecutive threads to a strided memory dimension (e.g., stride-128 floats), NCU reports only 1.0/32 bytes utilized per sector and CPIStall shows ~83% of warp cycles stalled on L1TEX. Swapping the x-tile to cover the unit-stride dimension (e.g., channel with stride=1) and moving the formerly-x dimension into the reduction loop eliminates the 32x memory amplification, raising L1 hit rate from 27% to 72% and reducing warp stall cycles from 24.3 to 3.1 cycles/instruction. As a secondary benefit, loop-invariant parameter loads (e.g., batch-norm scale/bias) can be hoisted outside the reduction loop, eliminating redundant loads per iteration.",
+    "slow_pseudocode": "# Uncoalesced: consecutive threads differ by stride-S in memory\nx_strided = xindex % W          # stride-S dimension (e.g. width, stride=128 floats)\nx_h = (xindex // W) % H\nx_b = xindex // (W * H)\nfor r0_offset in range(0, R, R_BLOCK):\n    r0_unit = r0_offset + arange(R_BLOCK)  # unit-stride dim in reduction\n    addr = r0_unit + S * x_strided + ...   # consecutive threads: delta=S -> UNCOALESCED\n    param = load(in_ptr + r0_unit)         # param re-loaded every iteration\n    val = load(data + addr)\n    ...",
+    "fast_pseudocode": "# Coalesced: consecutive threads differ by stride-1 in memory\nx_unit = xindex % C             # unit-stride dimension (e.g. channel, stride=1)\nx_h = (xindex // C) % H\nx_b = xindex // (C * H)\n# Hoist loop-invariant param loads outside reduction loop\nparam = load(in_ptr + x_unit)   # loaded once per block, not per iteration\nfor r0_offset in range(0, W, R_BLOCK):\n    r0_strided = r0_offset + arange(R_BLOCK)  # formerly-x strided dim\n    addr = x_unit + S * r0_strided + ...      # consecutive threads: delta=1 -> COALESCED\n    val = load(data + addr)\n    ...",
+    "applicable_when": "NCU MemoryCacheAccessPattern rule fires with bytes_utilized_per_sector ~1.0/32 for global loads/stores; CPIStall shows >50% of warp cycles stalled on L1TEX; the x-index decomposition maps consecutive threads to a non-unit-stride memory dimension while a unit-stride dimension exists elsewhere (e.g., in the reduction axis); waves_per_sm < 0.5 indicating under-utilization.",
+    "do_not_apply_when": "The reduction dimension is semantically different from the strided x-dimension (verify mathematical correctness of the swap before applying); when the tensor layout does not have a unit-stride dimension available to move into x-tile; when occupancy is already register-limited and adding autotune configs with large XBLOCK would further reduce theoretical occupancy below acceptable levels.",
+    "framework_notes": "Triton-specific: use @triton.autotune with multiple XBLOCK/R0_BLOCK configs and key=['xnumel','r0_numel'] to let the autotuner find the best tile shape after the dimension swap. The grid launch must be updated to triton.cdiv(xnumel, XBLOCK) and XBLOCK/R0_BLOCK removed from the explicit call so autotune controls them. In CUDA, the equivalent is choosing thread block dimensions so threadIdx.x indexes the unit-stride memory dimension."
+  },
+  {
+    "item_id": "exp_003_pid_swizzle_for_l2_locality_with_fixed_autotune_grid",
+    "iteration": 3,
+    "speedup": 219.5133,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "pid_swizzle_for_l2_locality_with_fixed_autotune_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + AchievedOccupancy + WorkloadImbalance",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 4.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5944.0,
+        "Launch.waves_per_sm": 0.08,
+        "Occupancy.Achieved Occupancy": 6.02,
+        "Scheduler Statistics.No Eligible": 85.19,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.15,
+        "Memory Workload Analysis.L2 Hit Rate": 70.87,
+        "GPU and Memory Workload Distribution.Average L2 Active Cycles": 1482.3,
+        "Instruction Statistics.Executed Instructions": 230400.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 4.13,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6123.0,
+        "Launch.waves_per_sm": 0.08,
+        "Occupancy.Achieved Occupancy": 6.01,
+        "Scheduler Statistics.No Eligible": 85.66,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.14,
+        "Memory Workload Analysis.L2 Hit Rate": 72.8,
+        "GPU and Memory Workload Distribution.Average L2 Active Cycles": 1678.04,
+        "Instruction Statistics.Executed Instructions": 248832.0
+      }
+    },
+    "strategy_title": "PID Swizzle for L2 Locality When Grid Already Undersized",
+    "strategy_description": "Adding a program-ID swizzle (grouping spatially-adjacent CTAs into the same L2 slice) to a kernel that already has a severely undersized grid (waves_per_sm=0.08, 256 blocks on 132 SMs) provides negligible benefit and may slightly increase overhead. The profiling shows nearly identical metrics before and after: No Eligible cycles stayed at ~85%, achieved occupancy stayed at ~6%, and duration actually increased slightly from 4.0us to 4.13us. The PID swizzle adds extra arithmetic instructions (pid // GROUP_SIZE, tl.minimum, pid % group_size_adj) that increase executed instruction count from 230K to 249K without meaningfully improving L2 hit rate (70.87% \u2192 72.8%) or reducing L2 workload imbalance. The 219x reported speedup reflects the cumulative improvement from prior iterations (fixing R0_BLOCK and adding register buffer), not this specific change.",
+    "slow_pseudocode": "# Direct pid-to-xoffset mapping\nxoffset = tl.program_id(0) * XBLOCK\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]\nxmask = xindex < xnumel",
+    "fast_pseudocode": "# PID swizzle for L2 locality\npid = tl.program_id(0)\nnum_pid = tl.num_programs(0)\nGROUP_SIZE: tl.constexpr = 8\ngroup_id = pid // GROUP_SIZE\nfirst_pid = group_id * GROUP_SIZE\ngroup_size_adj = tl.minimum(num_pid - first_pid, GROUP_SIZE)\npid_swizzled = first_pid + (pid % group_size_adj)\nxoffset = pid_swizzled * XBLOCK\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]\nxmask = xindex < xnumel",
+    "applicable_when": "Grid is large enough to have multiple CTAs per SM (waves_per_sm >= 1) AND L2 WorkloadImbalance rule fires with >20% deviation AND L2 hit rate is below 60%. PID swizzle is most effective when spatially-adjacent CTAs access overlapping data regions and the grid is large enough that reordering CTAs meaningfully changes which L2 slice they hit.",
+    "do_not_apply_when": "Grid is severely undersized (waves_per_sm << 1, e.g. 0.08) \u2014 in this regime there are too few CTAs to benefit from reordering, and the extra arithmetic instructions add overhead without improving cache reuse. Also avoid when the primary bottleneck is scheduler starvation (No Eligible > 80%) rather than L2 imbalance, as swizzling does not increase the number of eligible warps.",
+    "framework_notes": "Triton-specific: GROUP_SIZE must be declared as tl.constexpr for compile-time constant folding. The swizzle formula first_pid + (pid % group_size_adj) with group_size_adj = tl.minimum(num_pid - first_pid, GROUP_SIZE) is a bijection over [0, num_pid). In CUDA, the equivalent is a 2D grid launch with blockIdx.x and blockIdx.y swapped, or a manual pid remapping in the kernel body. The technique is most impactful for matrix-multiply-like kernels with large grids (thousands of CTAs) where L2 slice assignment matters."
+  },
+  {
+    "item_id": "exp_003_remove_maxnreg_cap_eliminate_register_spill",
+    "iteration": 3,
+    "speedup": 12.5081,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "remove_maxnreg_cap_to_eliminate_register_spill_to_local_memory",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + UncoalescedSharedAccess + SharedMemoryConflicts + TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 128.0,
+        "Launch.waves_per_sm": 0.08,
+        "Occupancy.Achieved Occupancy": 6.02,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Block Limit Registers": 24.0,
+        "Scheduler Statistics.No Eligible": 85.19,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.15,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.84,
+        "GPU Speed Of Light Throughput.Duration_us": 4.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 7.19,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 0.74,
+        "Instruction Statistics.Executed Instructions": 230400.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 255.0,
+        "Launch.waves_per_sm": 0.97,
+        "Occupancy.Achieved Occupancy": 11.08,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Scheduler Statistics.No Eligible": 42.64,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.76,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.16,
+        "GPU Speed Of Light Throughput.Duration_us": 72.48,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.89,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 20.51,
+        "Instruction Statistics.Executed Instructions": 27413504.0
+      }
+    },
+    "strategy_title": "Remove maxnreg Cap to Eliminate Register Spill",
+    "strategy_description": "When a Triton kernel has a maxnreg cap that forces register spill to local (stack) memory, removing the cap allows the compiler to allocate registers naturally, eliminating the spill. However, if the kernel body has been restructured (e.g., loop-invariant loads hoisted, intermediate buffers added, dimension swaps applied) such that the natural register demand is very high (e.g., 255 registers/thread), removing maxnreg trades spill-induced instruction bloat (29M instructions) for a register-limited occupancy regime (Block Limit Registers=2, 12.5% theoretical occupancy) while still achieving better scheduler utilization (No Eligible drops from 85% to 43%) and higher compute throughput (7% to 48%). The net result is a 12.5x speedup over the spilling baseline (4us\u219272us is a regression vs the 3.84us pre-spill state, but 12.5x better than the 139us maxnreg-spill state), confirming that eliminating spill is correct even when it reduces theoretical occupancy.",
+    "slow_pseudocode": "# WITH maxnreg cap: compiler spills to local memory\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 256}, num_warps=2,  num_stages=1, maxnreg=128),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 256}, num_warps=8,  num_stages=1, maxnreg=128),\n        # ... all configs carry maxnreg=128 or maxnreg=64\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    # maxnreg forces spill: 29M executed instructions, 1/32 bytes/sector on local loads/stores\n    # Duration: ~139us (spill-dominated)",
+    "fast_pseudocode": "# WITHOUT maxnreg: compiler allocates 255 registers/thread naturally, no spill\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 32},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 256}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 8,   'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 256}, num_warps=4, num_stages=2),\n        # ... no maxnreg in any config\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    # No spill: 27M instructions (from actual work), 72us duration\n    # Block Limit Registers=2, Theoretical Occupancy=12.5%, Achieved=11.1%\n    # Compute SM Throughput=47.9% (vs 7.2% with spill)",
+    "applicable_when": "Triton autotune configs carry maxnreg keyword arguments AND profiling shows MemoryCacheAccessPattern firing with ~1/32 bytes utilized per sector on local loads AND stores (definitive register spill signature), AND executed instructions are dramatically inflated (10x-100x above expected for the problem size), AND the kernel body has been restructured with hoisted loads or register buffers that increase natural register demand. Removing maxnreg eliminates spill even if it reduces theoretical occupancy.",
+    "do_not_apply_when": "The kernel's natural register count without the cap is low (e.g., <64 registers/thread) \u2014 the cap has no effect and removing it changes nothing. Also do not apply if MemoryCacheAccessPattern is NOT firing (no spill present) and the maxnreg cap is actually helping occupancy without causing spill. If the kernel body is simple enough that the cap does not cause spill, removing it may reduce occupancy without benefit.",
+    "framework_notes": "Triton-specific: maxnreg is a keyword argument to triton.Config() (supported since Triton 2.1+). Removing it from all configs lets the compiler choose register allocation freely. When the kernel has many simultaneously live values (hoisted loop-invariant loads, register-resident intermediate buffers, dimension-swap patterns), the natural register demand can reach 255/thread, limiting Block Limit Registers to 2 and theoretical occupancy to 12.5% on H200. Despite low theoretical occupancy, the elimination of spill-induced instruction bloat (29M\u219227M actual work instructions vs 29M spill-dominated) and improved scheduler utilization (No Eligible 85%\u219243%) yields a 12.5x net speedup. In CUDA, the equivalent is removing __launch_bounds__ or maxrregcount constraints."
+  }
+]

@@ -1,0 +1,272 @@
+[
+  {
+    "item_id": "exp_002_autotune_kernel_body_rewrite_inflates_instructions",
+    "iteration": 2,
+    "speedup": 0.7916,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_tile_size_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.94,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.02,
+        "Occupancy.Achieved Occupancy": 43.33,
+        "Instruction Statistics.Executed Instructions": 1705200.0,
+        "Launch Statistics.Registers Per Thread": 24.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.99
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 9.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.32,
+        "Occupancy.Achieved Occupancy": 80.86,
+        "Instruction Statistics.Executed Instructions": 4582725.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.72
+      }
+    },
+    "strategy_title": "Kernel Body Rewrite + Autotune Inflates Instructions 2.7x",
+    "strategy_description": "Replacing tl.rsqrt() with a manual sqrt_rn + integer division sequence, combined with adding @triton.autotune with larger XBLOCK configs (512\u20132048), increased registers per thread from 24 to 32 and inflated executed instructions from 1.7M to 4.6M (2.7x), extending kernel duration from 6.94\u00b5s to 9.02\u00b5s despite occupancy improving from 43.3% to 80.9%. The kernel body rewrite introduced redundant integer/float type conversions and replaced a single high-throughput intrinsic (tl.rsqrt) with a multi-step sequence, causing the compiler to allocate more registers and emit far more instructions. Additionally, the grid was not updated to a lambda reading meta['XBLOCK'], so the fixed grid at cdiv(xnumel, 128) caused each CTA to process more elements than intended under larger XBLOCK configs, further inflating instruction count. Both the kernel body change and the grid mismatch contributed to the regression.",
+    "slow_pseudocode": "# BEFORE: single intrinsic, 24 registers, 6.94\u00b5s\ntmp10 = tl.rsqrt(tmp5)  # single instruction\ntmp16 = tl.full([1], 0, tl.float32)\ntmp17 = tl.maximum(tmp16, tmp15)\n\ngrid = (triton.cdiv(xnumel, 128),)  # fixed grid",
+    "fast_pseudocode": "# AFTER (regressed): manual multi-step, 32 registers, 9.02\u00b5s\ntmp6 = tl.sqrt_rn(tmp5)\ntmp7 = tl.full([1], 1, tl.int32)\ntmp8 = (tmp7 / tmp6)   # int/float mixed division\ntmp9 = tl.full([1], 1.0, tl.float32)\ntmp10 = tmp8 * tmp9    # redundant cast\ntmp16 = tl.full([1], 0, tl.int32)  # wrong dtype for maximum\ntmp17 = tl.maximum(tmp16, tmp15)\n\n# Grid still fixed (not updated to lambda)\ngrid = (triton.cdiv(xnumel, 128),)",
+    "applicable_when": "Kernel uses tl.rsqrt() and has low register count; temptation to replace with manual sqrt+reciprocal for precision or compatibility reasons.",
+    "do_not_apply_when": "Always avoid replacing tl.rsqrt() with manual sqrt_rn + integer division \u2014 this is strictly worse: it increases register pressure, introduces type conversion overhead, and inflates instruction count. Never mix int32 and float32 in arithmetic sequences that feed into tl.maximum() with float tensors. Do not apply autotune XBLOCK changes without simultaneously updating the grid to a lambda.",
+    "framework_notes": "In Triton, tl.rsqrt() is a single high-throughput intrinsic that maps directly to hardware rsqrt. Replacing it with tl.sqrt_rn() + manual division introduces multiple instructions and increases live register count. Also, tl.full([1], 0, tl.int32) passed to tl.maximum() against a float32 tensor causes implicit type conversion overhead. The grid must always be updated to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` when autotune is added."
+  },
+  {
+    "item_id": "exp_003_rsqrt_intrinsic_with_fixed_xblock_autotune_positive",
+    "iteration": 3,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "collapse_redundant_reciprocal_sqrt_to_tl_rsqrt_intrinsic",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.57,
+        "Occupancy.Achieved Occupancy": 48.85,
+        "Instruction Statistics.Executed Instructions": 1506260.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.9,
+        "Memory Workload Analysis.Memory Throughput": 533.54
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 6.85,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.12,
+        "Occupancy.Achieved Occupancy": 49.42,
+        "Instruction Statistics.Executed Instructions": 1506260.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.91,
+        "Memory Workload Analysis.Memory Throughput": 536.04
+      }
+    },
+    "strategy_title": "Fix XBLOCK, Vary num_stages/num_warps in Autotune Configs",
+    "strategy_description": "When a pointwise kernel is latency-bound (CPIStall ~53%, low DRAM utilization ~11%) and register pressure is already near the block-limit boundary (20 registers/thread, Block Limit Registers = 21 blocks/SM), locking XBLOCK to the known-good value (128) while sweeping only num_stages and num_warps in the autotune configs avoids register inflation and instruction count explosion. The actual causal change in this diff was replacing the 5-instruction manual reciprocal-sqrt chain (sqrt_rn + int32 constant + division + float constant + multiply) with tl.rsqrt() AND simultaneously constraining autotune to XBLOCK=128-only configs with varying num_stages (2/3/4) and num_warps (4/8). Duration dropped marginally (6.88\u21926.85 \u00b5s) with no change in executed instruction count or registers per thread, suggesting the speedup came primarily from the autotune finding a better num_stages/num_warps combination rather than the arithmetic simplification alone. The key insight is: when prior iterations showed XBLOCK increases cause register spill, fix XBLOCK and only tune pipeline depth (num_stages) and warp count.",
+    "slow_pseudocode": "# BEFORE: autotune with varying XBLOCK (128/256/512), fixed arithmetic\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 256}, num_warps=4),\n        triton.Config({'XBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 512}, num_warps=8),\n        triton.Config({'XBLOCK': 512}, num_warps=16),\n    ],\n    key=['xnumel'],\n)\ntmp6 = tl.sqrt_rn(tmp5)\ntmp7 = tl.full([1], 1, tl.int32)\ntmp8 = (tmp7 / tmp6)\ntmp9 = tl.full([1], 1.0, tl.float32)\ntmp10 = tmp8 * tmp9\ntmp16 = tl.full([1], 0, tl.float32)\ntmp17 = tl.maximum(tmp16, tmp15)",
+    "fast_pseudocode": "# AFTER: autotune with fixed XBLOCK=128, varying num_stages/num_warps\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=4),\n    ],\n    key=['xnumel'],\n)\ntmp10 = tl.rsqrt(tmp5)  # single MUFU.RSQ instruction\ntmp16 = tl.full([1], 0, tl.int32)\ntmp17 = tl.maximum(tmp16, tmp15)",
+    "applicable_when": "Kernel is latency-bound (CPIStall >50%, low DRAM throughput <15%), registers per thread is near the Block Limit Registers boundary, and prior autotune experiments with larger XBLOCK caused register inflation and instruction count explosion. The kernel contains a manual reciprocal-sqrt sequence (sqrt_rn + int division + float multiply) that can be collapsed to tl.rsqrt().",
+    "do_not_apply_when": "Kernel is memory-bandwidth-bound (DRAM throughput >60%) where larger XBLOCK would improve coalescing. Do not apply when registers per thread is well below the block limit (e.g., <16 registers with limit at 32+), as there is headroom to increase XBLOCK safely. Do not apply when the kernel duration is dominated by compute throughput rather than L1TEX scoreboard stalls.",
+    "framework_notes": "In Triton, num_stages controls software pipelining depth for async memory operations. For latency-bound pointwise kernels with no shared memory, num_stages has limited effect but can still influence instruction scheduling. Fixing XBLOCK in autotune configs while sweeping num_stages (2/3/4) and num_warps (4/8) is a safe exploration strategy when larger XBLOCK is known to cause register pressure. tl.rsqrt() maps to MUFU.RSQ PTX instruction; tl.full([1], 0, tl.int32) passed to tl.maximum() against float32 is valid in Triton (implicit cast)."
+  },
+  {
+    "item_id": "exp_003_pin_xblock_128_removes_large_autotune_configs",
+    "iteration": 3,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "pin_xblock_128_only_to_prevent_register_inflation",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.57,
+        "Occupancy.Achieved Occupancy": 48.85,
+        "Instruction Statistics.Executed Instructions": 1506260.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 3.36,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.9,
+        "Memory Workload Analysis.Memory Throughput": 533.54,
+        "Memory Workload Analysis.L2 Hit Rate": 62.26
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 6.85,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.08,
+        "Occupancy.Achieved Occupancy": 49.47,
+        "Instruction Statistics.Executed Instructions": 1506260.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 3.36,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.03,
+        "Memory Workload Analysis.Memory Throughput": 536.04,
+        "Memory Workload Analysis.L2 Hit Rate": 62.67
+      }
+    },
+    "strategy_title": "Pin Autotune to Single Small XBLOCK Prevents Register Inflation",
+    "strategy_description": "Removing all large-XBLOCK autotune configs (256, 512, 1024) and leaving only XBLOCK=128/num_warps=4 prevented the autotuner from selecting a larger tile that would inflate registers per thread and executed instruction count. The profiling metrics are nearly identical before and after (same block size, same register count, same instruction count), confirming the kernel was already running at XBLOCK=128 in the 'before' state \u2014 the speedup of 1.04x reflects elimination of autotune overhead and/or minor timing variance rather than a structural kernel change. The key lesson is that when a kernel is already at its optimal XBLOCK, removing larger configs from the autotune list locks in that optimum and prevents future autotuner regressions without changing kernel behavior.",
+    "slow_pseudocode": "# BEFORE: autotune list includes large XBLOCK configs\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 256}, num_warps=4),\n        triton.Config({'XBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 512}, num_warps=8),\n        triton.Config({'XBLOCK': 512}, num_warps=16),\n    ],\n    key=['xnumel'],\n)\ndef kernel(...): ...",
+    "fast_pseudocode": "# AFTER: single config, autotuner cannot select larger XBLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 128}, num_warps=4),\n    ],\n    key=['xnumel'],\n)\ndef kernel(...): ...",
+    "applicable_when": "A pointwise Triton kernel has a known-optimal XBLOCK (e.g., 128) that keeps registers per thread low (<24), and the autotune config list includes larger XBLOCK values that have historically caused the autotuner to select a regressed config with higher register count and inflated instruction count. Profiling shows CPIStall or L1TEX scoreboard stalls as the primary bottleneck.",
+    "do_not_apply_when": "The kernel has not been profiled at multiple XBLOCK values and the optimal tile size is unknown \u2014 removing configs prematurely forecloses potentially better configurations. Also do not apply when the kernel is compute-bound rather than memory-latency-bound, as larger XBLOCK may genuinely improve throughput in that regime.",
+    "framework_notes": "In Triton, @triton.autotune benchmarks all configs and selects the fastest. However, the compiler generates different PTX for each XBLOCK constexpr value, and larger XBLOCK can increase register pressure even for simple pointwise kernels. Pinning to a single config effectively disables autotuning and locks the kernel to a known-good configuration. This is appropriate when prior profiling has established the optimal config and the autotune search space only introduces risk of regression. The grid must remain consistent with the pinned XBLOCK (e.g., triton.cdiv(xnumel, 128))."
+  },
+  {
+    "item_id": "exp_005_evict_first_streaming_load_store_improves_l2_reuse",
+    "iteration": 5,
+    "speedup": 1.0469,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_on_streaming_tensor_to_free_l2_for_reused_params",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.07,
+        "Occupancy.Achieved Occupancy": 48.89,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.11,
+        "Scheduler Statistics.No Eligible": 56.11,
+        "Memory Workload Analysis.L2 Hit Rate": 62.46,
+        "Instruction Statistics.Executed Instructions": 1506260.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 6.82,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.74,
+        "Occupancy.Achieved Occupancy": 50.84,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.88,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.31,
+        "Scheduler Statistics.No Eligible": 52.55,
+        "Memory Workload Analysis.L2 Hit Rate": 62.66,
+        "Instruction Statistics.Executed Instructions": 1619940.0
+      }
+    },
+    "strategy_title": "evict_first on Large Streaming Load Frees L2 for Small Params",
+    "strategy_description": "When a kernel loads a large streaming tensor (too large to fit in L2) alongside small repeatedly-reused parameter vectors (e.g., batch norm channel params ~29KB), adding eviction_policy='evict_first' to the large tensor's tl.load() and the corresponding tl.store() frees L2 lines immediately after use, leaving more L2 capacity for the small reused tensors. This reduced Warp Cycles Per Issued Instruction from 18.15 to 16.88 cycles (7% reduction) and increased Eligible Warps Per Scheduler from 1.11 to 1.31, directly addressing CPIStall from L1TEX scoreboard stalls. The L2 Hit Rate showed only marginal improvement (62.46% \u2192 62.66%), suggesting the primary benefit came from reduced L2 contention rather than a large hit-rate shift, but the scheduling improvement was sufficient for a 1.047x speedup.",
+    "slow_pseudocode": "# Large streaming tensor: default eviction (competes with small params for L2)\ntmp0 = tl.load(in_ptr0 + (x2), xmask)  # ~3.6MB streaming tensor\ntmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')  # ~7KB param\n# ... compute ...\ntl.store(out_ptr0 + (x2), tmp17, xmask)  # default eviction",
+    "fast_pseudocode": "# Large streaming tensor: evict_first frees L2 for small reused params\ntmp0 = tl.load(in_ptr0 + (x2), xmask, eviction_policy='evict_first')  # ~3.6MB streaming\ntmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')  # ~7KB param retained\n# ... compute ...\ntl.store(out_ptr0 + (x2), tmp17, xmask, eviction_policy='evict_first')  # streaming write\n# Also: fix tl.full([1], 0, tl.int32) -> tl.full([1], 0, tl.float32) for tl.maximum()",
+    "applicable_when": "Kernel is CPIStall-bound (L1TEX scoreboard stalls >50% of CPI), loads a large streaming tensor (>>L2 size) alongside small repeatedly-reused parameter vectors that fit in L2, and the large tensor uses the default eviction policy. Eligible warps per scheduler is low (<1.5) indicating warp stalls from memory latency.",
+    "do_not_apply_when": "All tensors are similarly sized or all fit in L2 (evict_first provides no benefit when there is no L2 pressure from competing tensors). Do not apply when the kernel is compute-bound rather than memory-latency-bound. Do not apply evict_first to small reused tensors (e.g., channel params) \u2014 those should retain evict_last.",
+    "framework_notes": "In Triton, eviction_policy='evict_first' and 'evict_last' are passed directly to tl.load() and tl.store(). evict_first maps to NVIDIA's streaming cache hint (equivalent to __ldcs in CUDA), telling the L2 to prioritize evicting these lines. evict_last maps to __ldcg (retain in L2). This is a zero-register-pressure change. Also note: tl.full([1], 0, tl.int32) passed to tl.maximum() against a float32 tensor should be tl.full([1], 0, tl.float32) to avoid implicit type conversion overhead."
+  },
+  {
+    "item_id": "exp_005_evict_first_streaming_load_protects_broadcast_cache",
+    "iteration": 5,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "evict_first_on_streaming_load_to_protect_broadcast_cache",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.07,
+        "Occupancy.Achieved Occupancy": 48.89,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.11,
+        "Scheduler Statistics.No Eligible": 56.11,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.15,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 48.97,
+        "Compute Workload Analysis.Executed Ipc Active": 1.73,
+        "Compute Workload Analysis.Issue Slots Busy": 43.27
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 6.85,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.55,
+        "Occupancy.Achieved Occupancy": 51.54,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.32,
+        "Scheduler Statistics.No Eligible": 51.98,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.73,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 49.03,
+        "Compute Workload Analysis.Executed Ipc Active": 1.9,
+        "Compute Workload Analysis.Issue Slots Busy": 47.55
+      }
+    },
+    "strategy_title": "evict_first on Streaming Load Protects Broadcast Cache Lines",
+    "strategy_description": "When a kernel loads a large streaming tensor (no reuse) alongside several small broadcast tensors marked evict_last, adding eviction_policy='evict_first' to the streaming load reduces L1 cache pollution from the streaming data, freeing cache lines for the broadcast tensors. In this case, warp cycles per issued instruction dropped from 18.15 to 16.73 (\u22127.8%), eligible warps per scheduler rose from 1.11 to 1.32 (+19%), and achieved occupancy improved from 48.9% to 51.5%, yielding a 4.2% speedup despite L1/TEX hit rate remaining nearly flat (48.97% \u2192 49.03%), suggesting the benefit came from improved scheduling efficiency rather than a measurable L1 hit rate change. The strategy is most effective when CPIStall (L1TEX scoreboard) is the dominant bottleneck and broadcast tensors are already marked evict_last.",
+    "slow_pseudocode": "# Streaming load with default eviction policy competes with broadcast data\ntmp0 = tl.load(in_ptr0 + (x2), xmask)  # 909K elements, no reuse\ntmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')  # broadcast\ntmp3 = tl.load(in_ptr2 + (x0), xmask, eviction_policy='evict_last')  # broadcast\ntmp12 = tl.load(in_ptr3 + (x0), xmask, eviction_policy='evict_last')  # broadcast\ntmp14 = tl.load(in_ptr4 + (x0), xmask, eviction_policy='evict_last')  # broadcast",
+    "fast_pseudocode": "# Streaming load marked evict_first to protect broadcast cache lines\ntmp0 = tl.load(in_ptr0 + (x2), xmask, eviction_policy='evict_first')  # streaming, no reuse\ntmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')  # broadcast, unchanged\ntmp3 = tl.load(in_ptr2 + (x0), xmask, eviction_policy='evict_last')  # broadcast, unchanged\ntmp12 = tl.load(in_ptr3 + (x0), xmask, eviction_policy='evict_last')  # broadcast, unchanged\ntmp14 = tl.load(in_ptr4 + (x0), xmask, eviction_policy='evict_last')  # broadcast, unchanged",
+    "applicable_when": "Kernel mixes a large streaming tensor (accessed once, no reuse) with small broadcast tensors (accessed repeatedly across tiles, marked evict_last). CPIStall (L1TEX scoreboard) is the dominant bottleneck (>50% of warp cycles). Eligible warps per scheduler is low (<1.5). The streaming tensor is much larger than the broadcast tensors combined.",
+    "do_not_apply_when": "All loads are streaming with no reuse (no broadcast tensors to protect). Kernel is memory-bandwidth-bound rather than latency-bound (DRAM throughput >60%). The broadcast tensors are too large to fit in L1 cache even without streaming pollution. Do not apply evict_first to broadcast tensors or to tensors with temporal reuse within a tile.",
+    "framework_notes": "In Triton, eviction_policy='evict_first' maps to the EVICT_FIRST cache operator in PTX (lowest-priority for L1 eviction), equivalent to CUDA's __ldg with streaming hint or cudaAccessPropertyStreaming. eviction_policy='evict_last' maps to EVICT_LAST (highest-priority, equivalent to cudaAccessPropertyPersisting). These are cache hints only and do not affect correctness. On Hopper/Ampere, L1 cache per SM is 192KB; small broadcast tensors (e.g., 4\u00d71856 floats = ~29KB) fit comfortably and benefit from evict_last protection when streaming loads are marked evict_first."
+  },
+  {
+    "item_id": "exp_005_evict_first_streaming_load_to_preserve_l1_for_channel_params",
+    "iteration": 5,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "streaming_eviction_policy_for_main_tensor_to_improve_l1_hit_rate_for_channel_params",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.07,
+        "Occupancy.Achieved Occupancy": 48.89,
+        "Instruction Statistics.Executed Instructions": 1506260.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.15,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 48.97,
+        "Memory Workload Analysis.L2 Hit Rate": 62.46,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.11,
+        "Scheduler Statistics.No Eligible": 56.11
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 6.85,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.21,
+        "Occupancy.Achieved Occupancy": 49.17,
+        "Instruction Statistics.Executed Instructions": 1648360.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.44,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 49.1,
+        "Memory Workload Analysis.L2 Hit Rate": 60.94,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.21,
+        "Scheduler Statistics.No Eligible": 55.34
+      }
+    },
+    "strategy_title": "evict_first on Streaming Load Preserves L1 for Reused Params",
+    "strategy_description": "When a kernel loads a large streaming tensor (read-once, no reuse) alongside small channel-parameter tensors that are reused across spatial positions, marking the streaming load with eviction_policy='evict_first' (maps to CUDA .cs cache hint) reduces L1 cache pollution and preserves capacity for the reused tensors. In this case, Warp Cycles Per Issued Instruction dropped from 18.15 to 16.44 cycles and eligible warps per scheduler improved from 1.11 to 1.21, indicating reduced L1TEX scoreboard stall pressure. The change is zero-cost in terms of registers and instruction count (no arithmetic change), making it a safe micro-optimization for latency-bound kernels dominated by CPIStall from L1TEX dependencies. Note: the L2 hit rate slightly decreased (62.46\u219260.94%) and executed instructions increased (1.51M\u21921.65M), suggesting the compiler may have reordered or expanded some instructions; the net effect was a modest 1.04x speedup.",
+    "slow_pseudocode": "# Large streaming tensor: no eviction hint (defaults to evict_last / .ca)\ntmp0 = tl.load(in_ptr0 + (x2), xmask)\n# Small reused channel params\ntmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')\ntmp3 = tl.load(in_ptr2 + (x0), xmask, eviction_policy='evict_last')\ntmp12 = tl.load(in_ptr3 + (x0), xmask, eviction_policy='evict_last')\ntmp14 = tl.load(in_ptr4 + (x0), xmask, eviction_policy='evict_last')",
+    "fast_pseudocode": "# Large streaming tensor: evict_first (.cs) to free L1 for reused params\ntmp0 = tl.load(in_ptr0 + (x2), xmask, eviction_policy='evict_first')\n# Small reused channel params: evict_last (.ca) unchanged\ntmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')\ntmp3 = tl.load(in_ptr2 + (x0), xmask, eviction_policy='evict_last')\ntmp12 = tl.load(in_ptr3 + (x0), xmask, eviction_policy='evict_last')\ntmp14 = tl.load(in_ptr4 + (x0), xmask, eviction_policy='evict_last')",
+    "applicable_when": "Kernel loads a large streaming tensor (read-once, much larger than L1 cache) alongside small tensors that are reused across spatial positions or waves. CPIStall rule is triggered with L1TEX scoreboard stalls >50% of warp cycles. L1/TEX hit rate is ~50% or below. The kernel is latency-bound (low DRAM throughput <15%, low compute throughput <40%).",
+    "do_not_apply_when": "All tensors are similarly sized and accessed with similar reuse patterns \u2014 evict_first on one tensor will not selectively benefit others. Do not apply when the kernel is DRAM bandwidth-bound (DRAM throughput >60%), as cache eviction policy changes have negligible effect in that regime. Do not apply when the 'streaming' tensor actually has intra-CTA reuse (e.g., accessed multiple times per thread block).",
+    "framework_notes": "In Triton, eviction_policy='evict_first' maps to the PTX .cs (cache streaming) load modifier, which marks cache lines as low-priority for L1 retention. eviction_policy='evict_last' maps to .ca (cache all), which is the default high-priority hint. This is a Triton-specific API; in CUDA C++ the equivalent is __ldcs() for streaming loads vs. __ldca() or regular loads for cached access. The change has zero impact on register count, instruction semantics, or output correctness."
+  },
+  {
+    "item_id": "exp_005_fma_fusion_bn_relu_reduces_registers",
+    "iteration": 5,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_fp32_multiply_add_chains_to_fma_instructions",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.07,
+        "Occupancy.Achieved Occupancy": 48.89,
+        "Instruction Statistics.Executed Instructions": 1506260.0,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.15,
+        "Memory Workload Analysis.Memory Throughput": 533.54
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 6.85,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.86,
+        "Occupancy.Achieved Occupancy": 49.34,
+        "Instruction Statistics.Executed Instructions": 1534680.0,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.62,
+        "Memory Workload Analysis.Memory Throughput": 536.04
+      }
+    },
+    "strategy_title": "libdevice.fma() Reduces Registers, Marginally Cuts Latency",
+    "strategy_description": "Replacing a 4-step BN arithmetic chain (sub\u2192mul\u2192mul\u2192add) with two explicit libdevice.fma() calls reduced registers per thread from 20 to 18, slightly improved achieved occupancy (48.9%\u219249.3%), and cut Warp Cycles Per Issued Instruction from 18.15 to 17.62. Notably, executed instruction count did not decrease (it actually rose slightly from 1,506,260 to 1,534,680), indicating the compiler was already partially fusing the arithmetic \u2014 the benefit came from reduced register pressure rather than instruction count reduction. The speedup of ~1.04x is modest and mirrors prior iterations, suggesting this kernel is fundamentally latency-bound by L1TEX scoreboard stalls that are not addressable through arithmetic rewriting alone.",
+    "slow_pseudocode": "# BEFORE: explicit sub + mul + mul + add, 20 registers/thread\ntmp2 = tmp0 - tmp1\ntmp10 = tl.rsqrt(tmp5)\ntmp11 = tmp2 * tmp10\ntmp13 = tmp11 * tmp12\ntmp15 = tmp13 + tmp14\ntmp16 = tl.full([1], 0, tl.int32)\ntmp17 = tl.maximum(tmp16, tmp15)",
+    "fast_pseudocode": "# AFTER: libdevice.fma() fusion, 18 registers/thread\ntmp6 = tl.rsqrt(tmp5)\ntmp_neg_mean_inv_std = -tmp1 * tmp6\ntmp_normed = libdevice.fma(tmp0, tmp6, tmp_neg_mean_inv_std)  # x*inv_std + (-mean*inv_std)\ntmp_out = libdevice.fma(tmp_normed, tmp12, tmp14)             # normed*weight + bias\ntmp_zero = tl.full([1], 0, tl.float32)\ntmp17 = tl.maximum(tmp_zero, tmp_out)",
+    "applicable_when": "Kernel has a multi-step FP32 arithmetic chain (e.g., BN normalization: sub\u2192mul\u2192mul\u2192add) and registers per thread are near the Block Limit Registers boundary. FPInstructions NCU rule reports a high ratio of non-fused to fused FP32 instructions (>3:1). Warp Cycles Per Issued Instruction is elevated (>15) due to L1TEX scoreboard stalls.",
+    "do_not_apply_when": "Kernel is already at low register count (well below block limit boundary) and the primary bottleneck is DRAM bandwidth rather than L1TEX stalls. Do not expect large instruction count reductions \u2014 the Triton compiler may already fuse arithmetic internally, so the main benefit is register pressure reduction (2 registers saved in this case). Do not apply if the arithmetic chain cannot be safely rewritten as FMA without changing numerical semantics.",
+    "framework_notes": "In Triton, libdevice.fma(a, b, c) computes a*b+c and maps to FFMA PTX. Import via 'from triton.language.extra import libdevice'. The compiler does not always auto-fuse sub\u2192mul\u2192mul\u2192add chains into FFMA even when mathematically equivalent, so explicit libdevice.fma() calls can reduce live temporaries and register pressure. However, instruction count may not decrease if the compiler was already partially fusing \u2014 the primary observable benefit is reduced registers per thread. Also note: simultaneously removing multi-config autotune (replacing 6 configs with 1 fixed config) was part of this diff, which may have contributed to the speedup independently of the FMA rewrite."
+  }
+]

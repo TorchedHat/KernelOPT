@@ -1,0 +1,91 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 1024}, num_warps=8, num_stages=1),
+        triton.Config({'XBLOCK': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 512},  num_warps=8, num_stages=1),
+        triton.Config({'XBLOCK': 512},  num_warps=4, num_stages=2),
+        triton.Config({'XBLOCK': 256},  num_warps=8, num_stages=1),
+        triton.Config({'XBLOCK': 256},  num_warps=4, num_stages=1),
+        triton.Config({'XBLOCK': 128},  num_warps=4, num_stages=1),
+        triton.Config({'XBLOCK': 128},  num_warps=4, num_stages=2),
+    ],
+    key=['xnumel'],
+)
+@triton.jit
+def triton_poi_fused__unsafe_view_clone_constant_pad_nd_convolution_native_layer_norm_permute_transpose_view_23(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 2352000
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = xindex < xnumel
+    x1 = ((xindex // 32) % 294)
+    x2 = xindex // 9408
+    x0 = (xindex % 32)
+    x3 = xindex
+    tmp0 = (-4) + 7*(((x2 // 5) % 5)) + (((x1 % 49)) // 7)
+    tmp1 = tl.full([1], 0, tl.int64)
+    tmp2 = tmp0 >= tmp1
+    tmp3 = tl.full([1], 28, tl.int64)
+    tmp4 = tmp0 < tmp3
+    tmp5 = (-4) + 7*((x2 % 5)) + ((((x1 % 49)) % 7))
+    tmp6 = tmp5 >= tmp1
+    tmp7 = tmp5 < tmp3
+    tmp8 = tmp2 & tmp4
+    tmp9 = tmp8 & tmp6
+    tmp10 = tmp9 & tmp7
+    tmp11 = tl.load(in_ptr0 + ((-22272) + x0 + 32*(x1 // 49) + 192*((((x1 % 49)) % 7)) + 1344*((x2 % 5)) + 5376*(((x1 % 49)) // 7) + 37632*(((x2 // 5) % 5)) + 150528*(x2 // 25)), mask=tmp10 & xmask, other=0.0)
+    tmp12 = tl.load(in_ptr1 + ((-116) + 7*((x2 % 5)) + 28*(((x1 % 49)) // 7) + 196*(((x2 // 5) % 5)) + 784*(x2 // 25) + ((((x1 % 49)) % 7))), mask=tmp10 & xmask, eviction_policy='evict_last', other=0.0)
+    tmp13 = tmp11 - tmp12
+    tmp14 = tl.load(in_ptr2 + ((-116) + 7*((x2 % 5)) + 28*(((x1 % 49)) // 7) + 196*(((x2 // 5) % 5)) + 784*(x2 // 25) + ((((x1 % 49)) % 7))), mask=tmp10 & xmask, eviction_policy='evict_last', other=0.0)
+    tmp15 = tl.full([1], 192.0, tl.float32)
+    tmp16 = (tmp14 / tmp15)
+    tmp17 = tl.full([1], 1e-05, tl.float32)
+    tmp18 = tmp16 + tmp17
+    tmp19 = libdevice.rsqrt(tmp18)
+    tmp20 = tmp13 * tmp19
+    tmp21 = tl.load(in_ptr3 + (x0 + 32*(x1 // 49)), mask=tmp10 & xmask, eviction_policy='evict_last', other=0.0)
+    tmp22 = tmp20 * tmp21
+    tmp23 = tl.load(in_ptr4 + (x0 + 32*(x1 // 49)), mask=tmp10 & xmask, eviction_policy='evict_last', other=0.0)
+    tmp24 = tmp22 + tmp23
+    tmp25 = tl.full(tmp24.shape, 0.0, tmp24.dtype)
+    tmp26 = tl.where(tmp10, tmp24, tmp25)
+    tl.store(out_ptr0 + (x3), tmp26, mask=xmask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    arg_5 = inputs[5]
+    xnumel = 2352000
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__unsafe_view_clone_constant_pad_nd_convolution_native_layer_norm_permute_transpose_view_23[grid](arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, 2352000)
+    return arg_5
+
+def get_inputs():
+    arg_0 = rand_strided((10, 784, 192), (150528, 192, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((10, 784, 1), (784, 1, 7840), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((10, 784, 1), (784, 1, 7840), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((192,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((192,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_5 = rand_strided((250, 294, 32), (9408, 32, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4, arg_5]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

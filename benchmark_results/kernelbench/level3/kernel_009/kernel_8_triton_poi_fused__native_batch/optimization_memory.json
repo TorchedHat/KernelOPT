@@ -1,0 +1,175 @@
+[
+  {
+    "item_id": "7552069e",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_tile_size",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_xblock_increase_tile_size \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_xblock_increase_tile_size' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 1,568 CTAs (XBLOCK=128, xnumel=200,704) on a 132-SM H200, yielding just 0.74 waves/SM. Over half of all scheduler cycles (53.5%) have no eligible warp, primarily due to L1TEX stalls (34.9% of cycles). Increasing XBLOCK to 512-2048 reduces the grid to 98-392 CTAs, giving each CTA 4-16x more work and proportionally more reuse of the 128-element broadcast arrays (mean/var/weight/bias). More warps per block also hide L1TEX latency. Adding @triton.autotune lets the runtime select the optimal XBLOCK and num_warps combination.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.4802,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_work_per_cta",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.52,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.34,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Launch Statistics.Registers Per Thread": 17.0,
+        "Scheduler Statistics.No Eligible": 53.51,
+        "Occupancy.Achieved Occupancy": 57.18,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Block Limit Registers": 21.0,
+        "Instruction Statistics.Executed Instructions": 457856.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 7.33,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 60.3,
+        "Launch Statistics.Waves Per SM": 2.38,
+        "Launch Statistics.Registers Per Thread": 48.0,
+        "Scheduler Statistics.No Eligible": 16.03,
+        "Occupancy.Achieved Occupancy": 50.74,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Instruction Statistics.Executed Instructions": 3422944.0
+      }
+    },
+    "strategy_title": "Autotune larger XBLOCK caused register spill and instruction explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20132048) selected a larger tile (XBLOCK=256) that caused registers-per-thread to jump from 17 to 48, reducing Block Limit Registers from 21 to 5 and capping theoretical occupancy at 62.5% instead of 100%. Simultaneously, executed instructions exploded 7.5x (from 457K to 3.4M), indicating the larger tile introduced redundant or unrolled computation far exceeding the original work. The net effect was a 2x increase in kernel duration (3.52 \u00b5s \u2192 7.33 \u00b5s) despite the scheduler idle rate improving from 53.5% to 16%, because the register pressure and instruction count increase dominated. When a kernel already has low register usage (\u226420 registers/thread) and the grid is small due to a genuinely small problem size rather than a tuning artifact, increasing XBLOCK via autotune risks register pressure blowup that more than offsets any latency-hiding benefit.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = tl.full([XBLOCK], True, tl.int1)[:]\n    # loads, BN+ReLU compute, store\n    # registers_per_thread=17, waves=0.74, duration=3.52us",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[Config({'XBLOCK': 2048}, num_warps=8), ..., Config({'XBLOCK': 128}, num_warps=4)],\n    key=['xnumel'],\n    restore_value=['in_out_ptr0'],\n)\n@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # autotune selected XBLOCK=256\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # same BN+ReLU compute\n    # registers_per_thread=48, waves=2.38, duration=7.33us (SLOWER)",
+    "applicable_when": "Never use this specific pattern when registers_per_thread is already low (\u226420) and the kernel body is simple (no shared memory, no reductions); the autotune overhead and register pressure from larger tiles will dominate.",
+    "do_not_apply_when": "Do not apply autotune with large XBLOCK configs when: (1) the kernel has very low register usage (\u226420 reg/thread) indicating the compiler is already tightly optimized; (2) the total problem size is small (xnumel \u2264 200K) so even the baseline grid is not severely underutilized in absolute terms; (3) the kernel uses in-place writes (restore_value adds overhead); or (4) the instruction count is already minimal \u2014 larger tiles may cause the compiler to unroll loops and explode instruction count.",
+    "framework_notes": "Triton-specific: @triton.autotune with restore_value=['in_out_ptr0'] adds correctness overhead for in-place kernels during autotuning warmup. The register blowup (17\u219248 reg/thread) is a Triton compiler artifact when XBLOCK is increased \u2014 larger constexpr tile sizes cause more aggressive unrolling. In CUDA, the equivalent would be increasing thread block size or loop unroll factor, with the same register pressure risk."
+  },
+  {
+    "item_id": "exp_002_rsqrt_fma_fusion",
+    "iteration": 2,
+    "speedup": 1.1,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "replace_int_reciprocal_with_rsqrt_for_fma_fusion",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.74,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.63,
+        "Instruction Statistics.Executed Instructions": 1011360.0,
+        "Source Counters.Branch Instructions": 95648.0,
+        "Source Counters.Avg. Divergent Branches": 11.88,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 29.95,
+        "Warp State Statistics.Avg. Not Predicated Off Threads Per Warp": 26.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 18.81,
+        "Instruction Statistics.Executed Instructions": 479808.0,
+        "Source Counters.Branch Instructions": 7840.0,
+        "Source Counters.Avg. Divergent Branches": 0.0,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0,
+        "Warp State Statistics.Avg. Not Predicated Off Threads Per Warp": 30.33
+      }
+    },
+    "strategy_title": "Replace int-reciprocal chain with rsqrt for FMA fusion",
+    "strategy_description": "When a batch-norm normalization sequence uses an integer constant (tl.full([1], 1, tl.int32)) divided by a float sqrt result, the mixed int/float types block the compiler's FMA fusion pass, producing a high ratio of non-fused FP32 instructions (NCU FPInstructions rule). Replacing the sqrt + integer-reciprocal + redundant float multiply chain with a single libdevice.rsqrt() call eliminates the type mismatch, allows the compiler to fuse (x-mean)*inv_std*weight+bias into FFMA chains, and halves total executed instructions (1,011K \u2192 480K) yielding a ~15% duration reduction (3.74 \u00b5s \u2192 3.20 \u00b5s). Branch divergence also drops to zero as predicated-off threads are eliminated by the cleaner compute path.",
+    "slow_pseudocode": "# 6-instruction non-fusable chain (mixed int32/float32 blocks FMA)\ntmp6  = tl.sqrt_rn(tmp5)               # sqrt(var + eps)\ntmp7  = tl.full([1], 1, tl.int32)      # integer 1 \u2014 blocks FMA fusion\ntmp8  = (tmp7 / tmp6)                  # int/float division\ntmp9  = tl.full([1], 1.0, tl.float32) # redundant 1.0\ntmp10 = tmp8 * tmp9                    # no-op multiply\ntmp11 = tmp2 * tmp10                   # (x - mean) * inv_std\ntmp13 = tmp11 * tmp12                  # * weight\ntmp15 = tmp13 + tmp14                  # + bias",
+    "fast_pseudocode": "# 3-instruction FMA-fusable chain (all float32)\ntmp6  = libdevice.rsqrt(tmp5)  # 1/sqrt(var+eps) via MUFU.RSQ\ntmp11 = tmp2 * tmp6            # (x - mean) * inv_std  -> FMA candidate\ntmp13 = tmp11 * tmp12          # * weight               -> FMA candidate\ntmp15 = tmp13 + tmp14          # + bias                 -> FMA candidate",
+    "applicable_when": "NCU FPInstructions rule fires with a high ratio of non-fused to fused FP32 instructions (e.g., >3:1 non-fused:fused). The kernel contains a reciprocal-sqrt pattern implemented via integer constant division (tl.full([1], 1, tl.int32) / sqrt_result) or a redundant multiply-by-1.0. The compute chain is a multiply-add sequence (BN normalization: (x-mean)*inv_std*weight+bias) that would benefit from FFMA fusion.",
+    "do_not_apply_when": "The kernel is already using libdevice.rsqrt() or pure float32 reciprocal. The bottleneck is memory bandwidth rather than instruction throughput (DRAM Throughput near 100%). The kernel is so short that the overhead of libdevice function call exceeds savings.",
+    "framework_notes": "Triton-specific: use `from triton.language import libdevice; libdevice.rsqrt(x)` which maps to the PTX MUFU.RSQ instruction. In CUDA C++, the equivalent is `__frsqrt_rn(x)` or `rsqrtf(x)`. The key insight is that tl.full([1], 1, tl.int32) / float_val creates a mixed-type expression that prevents the Triton/LLVM compiler from emitting FFMA instructions for the surrounding multiply-add chain."
+  },
+  {
+    "item_id": "exp_003_arithmetic_simplification_register_reduction",
+    "iteration": 2,
+    "speedup": 1.0476,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_arithmetic_simplification",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.74,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.63,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Occupancy.Achieved Occupancy": 53.09,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Instruction Statistics.Executed Instructions": 1011360.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.25,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 29.95
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.36,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 12.29,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Occupancy.Achieved Occupancy": 53.56,
+        "Occupancy.Block Limit Registers": 21.0,
+        "Instruction Statistics.Executed Instructions": 326144.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.42,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0
+      }
+    },
+    "strategy_title": "Simplify redundant FP arithmetic to cut register pressure",
+    "strategy_description": "Replacing redundant arithmetic patterns (integer-divide-by-float, multiply-by-1.0 no-ops, tl.sqrt_rn+divide instead of tl.rsqrt, int32 zero for ReLU) with clean equivalents (tl.rsqrt, float literal 0.0) reduced registers-per-thread from 32 to 18 and executed instructions by ~3.1x (1.01M to 326K). This lowered Block Limit Registers from 16 to 21 blocks/SM and improved average active threads per warp from 29.95 to 32.0 (eliminating predicated-off threads from type-cast divergence), yielding a 10.7% duration reduction (3.74 \u00b5s \u2192 3.36 \u00b5s). When NCU reports FPInstructions with non-fused FP32 instructions and Avg. Active Threads Per Warp below 32, inspecting the kernel body for redundant type-conversion arithmetic (int/float ops, multiply-by-one, int-zero ReLU) and replacing with native float ops is a reliable low-risk optimization.",
+    "slow_pseudocode": "# Redundant arithmetic pattern in BN+ReLU kernel\ntmp4 = tl.full([1], 1e-05, tl.float32)\ntmp5 = tmp3 + tmp4\ntmp6 = tl.sqrt_rn(tmp5)          # sqrt then divide\ntmp7 = tl.full([1], 1, tl.int32) # int32 constant\ntmp8 = (tmp7 / tmp6)              # int/float division\ntmp9 = tl.full([1], 1.0, tl.float32)\ntmp10 = tmp8 * tmp9               # multiply by 1.0 (no-op)\ntmp11 = tmp2 * tmp10\ntmp13 = tmp11 * tmp12\ntmp15 = tmp13 + tmp14\ntmp16 = tl.full([1], 0, tl.int32) # int32 zero for ReLU\ntmp17 = tl.maximum(tmp16, tmp15)   # forces int->float cast\ntl.store(out + x2, tmp17, xmask)",
+    "fast_pseudocode": "# Simplified equivalent: 4 ops, all float, no type conversions\ninv_std = tl.rsqrt(tmp3 + 1e-5)   # replaces sqrt+int_divide+mul_one\nnormalized = tmp2 * inv_std\nscaled = normalized * tmp12 + tmp14\nresult = tl.maximum(0.0, scaled)   # float literal avoids int->float cast\ntl.store(out + x2, result, xmask)",
+    "applicable_when": "NCU FPInstructions rule fires with significant non-fused FP32 instructions; Avg. Active Threads Per Warp is below 32 (indicating predicated-off threads from type-cast divergence); registers-per-thread is elevated relative to the logical complexity of the kernel; the kernel body contains tl.full([1], 1, tl.int32) or tl.full([1], 0, tl.int32) used in arithmetic with float tensors, or tl.sqrt_rn followed by division.",
+    "do_not_apply_when": "The arithmetic differences are intentional (e.g., integer division semantics differ from float rsqrt for non-positive inputs); the kernel already uses native float ops and tl.rsqrt; register pressure is not a bottleneck (Block Limit Registers is not the binding occupancy constraint).",
+    "framework_notes": "Triton-specific: tl.rsqrt(x) is a single instruction equivalent to 1/sqrt(x) for x>0 (variance+eps is always positive). tl.full([1], 0, tl.int32) used in tl.maximum forces an implicit int32\u2192float32 cast that the Triton compiler may not eliminate, causing both extra instructions and thread predication divergence. Using float literal 0.0 directly avoids this. Removing @triton.autotune and fixing XBLOCK=128 was also part of this change, locking in the config that avoids the register blowup documented in exp_001_autotune_xblock_regression."
+  },
+  {
+    "item_id": "exp_004_autotune_removal_minor_fma_cleanup",
+    "iteration": 4,
+    "speedup": 1.0571,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "remove_autotune_and_fix_xblock_for_small_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.39,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 12.63,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 27.22,
+        "Scheduler Statistics.No Eligible": 65.22,
+        "Occupancy.Achieved Occupancy": 50.47,
+        "Instruction Statistics.Executed Instructions": 332416.0,
+        "Launch Statistics.Registers Per Thread": 18.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.33,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 11.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.33,
+        "Scheduler Statistics.No Eligible": 62.48,
+        "Occupancy.Achieved Occupancy": 48.52,
+        "Instruction Statistics.Executed Instructions": 326144.0,
+        "Launch Statistics.Registers Per Thread": 18.0
+      }
+    },
+    "strategy_title": "Remove autotune and fix XBLOCK to reduce scheduling overhead",
+    "strategy_description": "Removing @triton.autotune and hardcoding XBLOCK=128 (with xnumel as a compile-time constant) reduced warp cycles per issued instruction from 27.22 to 23.33 (~14% reduction) and executed instructions from 332K to 326K, yielding a modest 5.7% duration improvement. The key causal change was eliminating the autotuning dispatch overhead and allowing the compiler to treat xnumel as a constexpr, reducing branch/predication overhead. This is a complementary gain on top of prior FMA fusion fixes \u2014 when the arithmetic chain is already clean (float32 throughout, rsqrt used), the remaining gain comes from removing runtime dispatch overhead. The speedup is small because the kernel is already near-optimal for its problem size; the dominant bottleneck (SOLBottleneck: only 0.74 waves/SM) cannot be addressed without restructuring the grid.",
+    "slow_pseudocode": "@triton.autotune(\n    configs=[Config({'XBLOCK': 128}, num_warps=4), Config({'XBLOCK': 512}, ...), ...],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel  # runtime xnumel check\n    ...\n    tmp16 = tl.full([1], 0.0, tl.float32)\n    tmp17 = tl.maximum(tmp16, tmp15)\n    tl.store(out + x2, tmp17, xmask)\n# grid: triton.cdiv(xnumel, 128) \u2014 XBLOCK resolved at runtime",
+    "fast_pseudocode": "@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xnumel = 200704  # compile-time constant\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    ...\n    tmp17 = tl.maximum(0.0, tmp15)  # float literal, no tl.full\n    tl.store(out + x2, tmp17, xmask)\n# caller: kernel[grid](args, 200704, XBLOCK=128)  \u2014 XBLOCK fixed at callsite",
+    "applicable_when": "The kernel has a fixed, known problem size (xnumel is constant across all calls). Autotune is present but the optimal config is already known (e.g., from prior profiling). The kernel is small (< 1M elements) and register pressure is already low (\u226420 reg/thread), making larger XBLOCK configs risky. Warp cycles per issued instruction is elevated (>20) suggesting scheduling overhead.",
+    "do_not_apply_when": "The problem size varies across calls (xnumel is dynamic) \u2014 removing autotune would lock in a suboptimal config. The kernel is large enough that different XBLOCK values genuinely trade off latency hiding vs. register pressure. The dominant bottleneck is memory bandwidth (DRAM Throughput near 100%) rather than scheduling overhead.",
+    "framework_notes": "Triton-specific: passing XBLOCK as a keyword argument at the callsite (kernel[grid](args, XBLOCK=128)) bypasses autotune dispatch. Setting xnumel as a Python-level constant inside the kernel body (xnumel = 200704) allows the compiler to treat the mask predicate as a compile-time known bound, potentially eliminating some predication overhead. In CUDA, the equivalent is using template parameters or #define for block/grid dimensions instead of runtime variables."
+  }
+]

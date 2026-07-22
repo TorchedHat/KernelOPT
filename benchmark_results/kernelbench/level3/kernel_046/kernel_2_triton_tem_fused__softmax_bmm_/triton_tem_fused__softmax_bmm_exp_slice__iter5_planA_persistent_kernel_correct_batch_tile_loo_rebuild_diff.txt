@@ -1,0 +1,128 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused__softmax_bmm_exp_slice_sub_transpose_view_2(arg_A, arg_B, out_ptr0):
+@@ -16,8 +17,6 @@
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+-    A = arg_A
+-    B = arg_B
+ 
+     M = 32
+     N = 512
+@@ -31,62 +30,61 @@
+     stride_bk = 512
+     stride_bn = 1
+ 
+-    # based on triton.ops.matmul
+-    pid = tl.program_id(0).to(INDEX_DTYPE)
+-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
++    grid_m = (M + BLOCK_M - 1) // BLOCK_M  # = 1
++    grid_n = (N + BLOCK_N - 1) // BLOCK_N  # = 4
++    tiles_per_batch = grid_m * grid_n       # = 4
++    total_tiles = 2048 * tiles_per_batch    # = 8192
+ 
+-    # re-order program ID for better L2 performance
+-    width = GROUP_M * grid_n
+-    group_id = pid // width
+-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+-    pid_m = group_id * GROUP_M + (pid % group_size)
+-    pid_n = (pid % width) // (group_size)
+-    tl.assume(pid_m >= 0)
+-    tl.assume(pid_n >= 0)
++    start_tile = tl.program_id(0).to(INDEX_DTYPE)
++    grid_size = tl.num_programs(0).to(INDEX_DTYPE)
+ 
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    if (stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1):
+-        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    else:
++    tile_id = start_tile
++    while tile_id < total_tiles:
++        # Decode batch index and tile within batch
++        idx_q = tile_id // tiles_per_batch
++        tile_within_batch = tile_id % tiles_per_batch
++
++        # GROUP_M swizzle (grid_m=1, so group_size=1, pid_m=0, pid_n=tile_within_batch)
++        width = GROUP_M * grid_n  # 8*4=32
++        group_id = tile_within_batch // width
++        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)  # min(1,8)=1
++        pid_m = group_id * GROUP_M + (tile_within_batch % group_size)  # =0
++        pid_n = (tile_within_batch % width) // group_size  # =tile_within_batch
++
++        tl.assume(pid_m >= 0)
++        tl.assume(pid_n >= 0)
++
++        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++        rk = tl.arange(0, BLOCK_K)
++
++        # stride_am==1, stride_ak==48 (not M=32), so use else branch for ram
++        # stride_bk==512 (==N), stride_bn==1, so use max_contiguous for rbn
+         ram = rm % M
+-    if (stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1):
+         rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-    else:
+-        rbn = rn % N
+ 
+-    rk = tl.arange(0, BLOCK_K)
++        # CRITICAL FIX 1: recompute from original base pointers each iteration
++        A_ptr = arg_A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q * stride_aq)
++        B_ptr = arg_B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q * stride_bq)
+ 
+-    idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q*stride_aq)
+-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q*stride_bq)
++        # CRITICAL FIX 2: zero accumulator inside the loop for each tile
++        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+-    for k in range(K, 0, -BLOCK_K):
+-        if EVEN_K:
+-            a = tl.load(A)
+-            b = tl.load(B)
+-        else:
+-            a = tl.load(A, mask=rk[None, :] < k, other=0.)
+-            b = tl.load(B, mask=rk[:, None] < k, other=0.)
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+-        A += BLOCK_K * stride_ak
+-        B += BLOCK_K * stride_bk
++        for k in range(K, 0, -BLOCK_K):
++            a = tl.load(A_ptr, mask=rk[None, :] < k, other=0.)
++            b = tl.load(B_ptr, mask=rk[:, None] < k, other=0.)
++            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
++            A_ptr += BLOCK_K * stride_ak
++            B_ptr += BLOCK_K * stride_bk
+ 
+-    # rematerialize rm and rn to save registers
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+-    idx_m = rm[:, None]
+-    idx_n = rn[None, :]
+-    mask = (idx_m < M) & (idx_n < N)
++        # Store result
++        idx_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None]
++        idx_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :]
++        mask = (idx_m < M) & (idx_n < N)
++        xindex = idx_n + 512 * idx_m + 16384 * idx_q
++        tl.store(out_ptr0 + tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N]), acc, mask)
+ 
+-    # inductor generates a suffix
+-    xindex = idx_n + 512*idx_m + 16384*idx_q
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
++        tile_id += grid_size  # advance by grid stride
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

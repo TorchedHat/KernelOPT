@@ -1,0 +1,38 @@
+[
+  {
+    "item_id": "exp_001_xblock_waste_autotune",
+    "iteration": 1,
+    "speedup": 1.0451,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_xblock_thread_waste_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.block_size": 128.0,
+        "Launch.waves_per_sm": 0.48,
+        "Occupancy.Achieved Occupancy": 40.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.77,
+        "Scheduler Statistics.No Eligible": 59.43,
+        "GPU Speed Of Light Throughput.Duration": 3.01,
+        "Launch.registers_per_thread": 27.0
+      },
+      "key_metric_after": {
+        "Launch.block_size": 64.0,
+        "Launch.waves_per_sm": 0.24,
+        "Occupancy.Achieved Occupancy": 14.48,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.24,
+        "Scheduler Statistics.No Eligible": 81.96,
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "Launch.registers_per_thread": 16.0
+      }
+    },
+    "strategy_title": "Fix XBLOCK/YBLOCK Mismatch via Autotune for Transpose Kernels",
+    "strategy_description": "When a Triton kernel's XBLOCK is set much larger than xnumel (e.g., XBLOCK=128 for xnumel=4), the vast majority of x-threads are masked out and do no useful work, wasting register pressure and reducing effective occupancy. Setting XBLOCK to match xnumel exactly and autotuning YBLOCK across a range (32\u2013512) eliminates this thread waste and reduces register usage per thread (27\u219216), yielding a modest but real latency reduction. The speedup is limited (~4.5%) because the kernel remains wave-count-limited (grid too small to fill the GPU), but per-CTA efficiency improves as evidenced by lower warp cycles per issued instruction (15.77\u219211.24).",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=4: 97% of x-threads masked out\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)  # XBLOCK=128, xnumel=4\n    xmask = xindex < xnumel  # 124/128 threads masked\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)  # YBLOCK=8\n    ymask = tl.full([YBLOCK], True, tl.int1)  # no boundary guard\n    tmp = tl.load(in_ptr + (x + stride*y), xmask)\n    tl.store(out_ptr + (y0 + stride*x + ...), tmp, xmask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # (1, 1024)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=4 == xnumel=4: all x-threads active; autotune YBLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 32},  num_warps=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 64},  num_warps=4),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 512}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)  # XBLOCK=4\n    xmask = xindex < xnumel\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)\n    ymask = yindex < ynumel  # proper boundary guard\n    tmp = tl.load(in_ptr + (x + stride*y), xmask & ymask)\n    tl.store(out_ptr + (y0 + stride*x + ...), tmp, xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton kernel has XBLOCK >> xnumel (e.g., XBLOCK=128 but xnumel=4), causing most x-threads to be masked; AchievedOccupancy is well below theoretical; IssueSlotUtilization shows high 'No Eligible' warp percentage (>50%); registers_per_thread is elevated due to unused thread slots; kernel is a layout permutation / transpose operation.",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (no thread waste); kernel is already wave-saturated (waves_per_sm >= 1.0); the grid is already large enough to fill the GPU \u2014 in that case, reducing block size further will hurt occupancy more than it helps; when the speedup from fixing thread waste is outweighed by increased launch overhead from more CTAs.",
+    "framework_notes": "Triton-specific: use @triton.autotune with configs specifying XBLOCK and YBLOCK as tl.constexpr parameters. The grid must be a lambda using META['XBLOCK'] and META['YBLOCK'] when autotuning. In CUDA, the equivalent is choosing blockDim.x to match the actual work dimension rather than a power-of-2 default. Note: even with correct XBLOCK, if the total grid is still < 1 wave (grid_size < sm_count), occupancy will remain low \u2014 this fix is necessary but may not be sufficient for wave-limited kernels."
+  }
+]

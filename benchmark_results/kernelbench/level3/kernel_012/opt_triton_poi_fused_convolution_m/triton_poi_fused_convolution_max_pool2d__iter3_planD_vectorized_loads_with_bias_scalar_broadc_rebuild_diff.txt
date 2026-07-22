@@ -1,0 +1,88 @@
+--- baseline
++++ rebuilt
+@@ -3,12 +3,22 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=3),
+     ],
+     key=['n_elements'],
+ )
+@@ -23,28 +33,47 @@
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
++    # Alignment hints enable 128-bit vectorized loads (LDG.128)
+     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    offsets = tl.max_contiguous(tl.multiple_of(offsets, BLOCK_SIZE), BLOCK_SIZE)
+     mask = offsets < n_elements
+-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+-    # Determine channel index for bias
+-    # For NCHW layout: channel = (offset / channel_stride) % n_channels
+-    chan = (offsets // channel_stride) % n_channels
+-    bias = tl.load(bias_ptr + chan, mask=mask, other=0.0)
+-    result = x + bias
++    x = tl.load(x_ptr + offsets, mask=mask, other=0.0, eviction_policy='evict_first')
++    # Scalar bias broadcast: when channel_stride >= BLOCK_SIZE, all threads in
++    # this block share the same channel -- hoist the bias load out of the gather
++    block_start = pid * BLOCK_SIZE
++    block_chan = (block_start // channel_stride) % n_channels
++    block_end_chan = ((block_start + BLOCK_SIZE - 1) // channel_stride) % n_channels
++    if block_chan == block_end_chan:  # single-channel block: scalar broadcast
++        bias_val = tl.load(bias_ptr + block_chan, mask=block_chan < n_channels, other=0.0)
++        result = x + bias_val
++    else:  # block spans channel boundary: per-thread gather (rare)
++        chan = (offsets // channel_stride) % n_channels
++        bias = tl.load(bias_ptr + chan, mask=mask, other=0.0)
++        result = x + bias
+     result = tl.maximum(result, 0.0)
+-    tl.store(out_ptr + offsets, result, mask=mask)
++    tl.store(out_ptr + offsets, result, mask=mask, eviction_policy='evict_first')
+ 
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4, num_stages=1),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=3),
+     ],
+     key=['n_elements'],
+ )
+ @triton.jit
++
+ def bias_relu_nhwc_kernel(
+     x_ptr,
+     bias_ptr,

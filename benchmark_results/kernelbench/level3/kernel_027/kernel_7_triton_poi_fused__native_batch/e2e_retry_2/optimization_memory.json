@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "13b75901",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_xblock_overallocation_with_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_xblock_overallocation_with_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_xblock_overallocation_with_autotune' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has xnumel=9 (only 9 elements in the X dimension) but XBLOCK=128. This means 119 out of every 128 X-threads are masked out and do zero useful work \u2014 only 7% of X-threads are active. This directly causes the 41.8% idle issue slots and the 34.75% occupancy gap. The grid collapses to (1, 2048) \u2014 a single CTA column \u2014 producing barely 0.97 waves/SM. The MemoryCacheAccessPattern rule (11.45% speedup) further confirms sparse sector utilization (only 18/32 bytes used per sector). The fix is to shrink XBLOCK to a value <= 16 and increase YBLOCK, expanding the grid for better SM coverage. @triton.autotune will find the optimal balance.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_reduce_xblock_to_match_xnumel_persistent_loop",
+    "iteration": 1,
+    "speedup": 1.2325,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_xblock_to_match_xnumel_with_persistent_loop",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.87,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5770.0,
+        "Occupancy.Achieved Occupancy": 65.25,
+        "Scheduler Statistics.No Eligible": 41.8,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.73,
+        "Scheduler Statistics.Active Warps Per Scheduler": 11.61,
+        "Memory Workload Analysis.Memory Throughput": 153.39,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.95,
+        "Instruction Statistics.Executed Instructions": 819200.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4616.0,
+        "Occupancy.Achieved Occupancy": 22.58,
+        "Scheduler Statistics.No Eligible": 80.87,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.31,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.96,
+        "Memory Workload Analysis.Memory Throughput": 189.71,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.47,
+        "Instruction Statistics.Executed Instructions": 203776.0
+      }
+    },
+    "strategy_title": "Match XBLOCK to xnumel to eliminate masked-thread waste",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=9), the vast majority of x-threads are masked out on every CTA, wasting compute slots and causing uncoalesced memory access patterns (low bytes-utilized-per-sector). Reducing XBLOCK to match or slightly exceed xnumel eliminates this waste, reduces total executed instructions by ~75%, and improves memory throughput. Adding a persistent loop over the y-dimension with autotune over YBLOCK configurations compensates for the reduced grid coverage and allows the best tile shape to be selected automatically.",
+    "slow_pseudocode": "# XBLOCK=128, xnumel=9 \u2192 93% of x-threads masked every CTA\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = tl.program_id(1) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel  # 119/128 threads masked!\n    tmp0 = tl.load(in_ptr0 + (x + stride*y), xmask)\n    tl.store(out_ptr0 + (y0 + stride_x*x + stride_y*y1), tmp0, xmask)\ngrid = (cdiv(9, 128), cdiv(16384, 8))  # = (1, 2048)",
+    "fast_pseudocode": "# XBLOCK=16 (autotune), xnumel=9 \u2192 only 7/16 threads masked\n@triton.autotune(configs=[\n    Config({'XBLOCK': 16, 'YBLOCK': 64},  num_warps=4),\n    Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=4),\n    Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=8),\n    Config({'XBLOCK': 16, 'YBLOCK': 512}, num_warps=8),\n    Config({'XBLOCK': 16, 'YBLOCK': 32},  num_warps=4),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    pid_y = tl.program_id(1)\n    num_pid_y = tl.num_programs(1)\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    yoffset = pid_y * YBLOCK\n    while yoffset < ynumel:  # persistent loop\n        yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n        ymask = yindex < ynumel\n        tmp0 = tl.load(in_ptr0 + (x + stride*y), xmask & ymask)\n        tl.store(out_ptr0 + (y0 + stride_x*x + stride_y*y1), tmp0, xmask & ymask)\n        yoffset += num_pid_y * YBLOCK\ngrid = (cdiv(xnumel, XBLOCK), cdiv(ynumel, YBLOCK))  # autotune selects best",
+    "applicable_when": "xnumel is much smaller than XBLOCK (e.g., xnumel <= XBLOCK/4), causing >50% of x-threads to be masked; IssueSlotUtilization rule fires with high 'No Eligible' warp cycles (>30%); MemoryCacheAccessPattern rule fires with low bytes-utilized-per-sector (<20 of 32); kernel has a large ynumel dimension that can absorb a persistent loop",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (masking overhead is minimal); the kernel is already compute-bound rather than latency-bound; reducing XBLOCK would drop occupancy below the minimum needed to hide memory latency; the grid is already many waves (waves_per_sm >> 2)",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] to select best XBLOCK/YBLOCK/num_warps. The persistent loop uses tl.num_programs(1) as the stride. In CUDA, the equivalent is choosing blockDim.x to match the actual x-dimension size and using a grid-stride loop over the y-dimension."
+  }
+]

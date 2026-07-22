@@ -1,0 +1,65 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused_convolution_15(in_ptr0, arg_A, arg_B, out_ptr0):
+@@ -14,7 +15,7 @@
+     BLOCK_N : tl.constexpr = 32
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+-    ALLOW_TF32 : tl.constexpr = False
++    ALLOW_TF32 : tl.constexpr = True
+     INDEX_DTYPE : tl.constexpr = tl.int32
+     A = arg_A
+     B = arg_B
+@@ -55,26 +56,25 @@
+         block_shape=(BLOCK_M, BLOCK_K),
+         order=(1, 0),
+     )
+-    # B transposed: shape=[N, K]=[32, 192], strides=[stride_bn, stride_bk]=[192, 1]
+-    # order=(1, 0) means K is innermost (contiguous) in SMEM — N-contiguous layout
+-    # This eliminates bank conflicts: N-row accesses hit consecutive banks
+-    b_T_block_ptr = tl.make_block_ptr(
++    # B K-major layout: shape=[K, N]=[192, 32], strides=[stride_bk, stride_bn]=[1, 192]
++    # order=(0, 1) means K is innermost (contiguous) — eliminates tl.trans() and SMEM bank conflicts
++    b_block_ptr = tl.make_block_ptr(
+         base=B,
+-        shape=(N, K),
+-        strides=(stride_bn, stride_bk),
+-        offsets=(pid_n * BLOCK_N, 0),
+-        block_shape=(BLOCK_N, BLOCK_K),
+-        order=(1, 0),
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1),
+     )
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+         a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')
+-        b_T = tl.load(b_T_block_ptr, boundary_check=(0, 1), padding_option='zero')  # [BLOCK_N, BLOCK_K]
+-        acc += tl.dot(a, tl.trans(b_T), allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)  # a:[M,K] x b_T^T:[K,N]
++        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')  # [BLOCK_K, BLOCK_N]
++        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)  # a:[M,K] x b:[K,N]
+         a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+-        b_T_block_ptr = tl.advance(b_T_block_ptr, (0, BLOCK_K))  # advance K axis (axis=1)
++        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))  # advance K axis (axis=0)
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -88,7 +88,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

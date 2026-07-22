@@ -1,0 +1,76 @@
+[
+  {
+    "item_id": "exp_triton_autotune_regression_fixed_grid_001",
+    "iteration": 1,
+    "speedup": 0.8082,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_with_fixed_grid_ignoring_xblock",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + CPIStall + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 10.11,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 15046.0,
+        "Occupancy.Achieved Occupancy": 23.78,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.83,
+        "Instruction Statistics.Executed Instructions": 770048.0,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Block Size": 128.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 12.51,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 18659.0,
+        "Occupancy.Achieved Occupancy": 14.83,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.99,
+        "Instruction Statistics.Executed Instructions": 1849344.0,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Block Size": 128.0
+      }
+    },
+    "strategy_title": "Autotune with Mismatched Fixed Grid Causes Regression",
+    "strategy_description": "Adding @triton.autotune to vary XBLOCK while keeping the launch grid hardcoded to cdiv(xnumel, 128) causes a mismatch: the grid does not scale with the autotuned XBLOCK, so larger XBLOCK configs process the same data multiple times or incorrectly. This caused executed instructions to balloon from 770K to 1.85M (+140%) and duration to increase from 10.11 \u00b5s to 12.51 \u00b5s despite warp cycles per instruction improving (31.8 \u2192 10.0), indicating the kernel ran more work, not less. The grid lambda must be updated to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` whenever XBLOCK is autotuned.",
+    "slow_pseudocode": "@triton.autotune(configs=[Config({'XBLOCK': 256, 'R0_BLOCK': 128}, ...), ...], key=[...])\n@triton.jit\ndef kernel(...):\n    ...\n\n# BUG: grid is hardcoded to old XBLOCK=128, not updated for autotune\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](arg_0, arg_1, xnumel, r0_numel)",
+    "fast_pseudocode": "@triton.autotune(configs=[Config({'XBLOCK': 256, 'R0_BLOCK': 128}, ...), ...], key=[...])\n@triton.jit\ndef kernel(...):\n    ...\n\n# CORRECT: grid uses meta to pick up the autotuned XBLOCK\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](arg_0, arg_1, xnumel, r0_numel)",
+    "applicable_when": "Any Triton kernel where @triton.autotune varies XBLOCK (or any block-size tl.constexpr that determines how many elements each program_id processes) and the launch grid is a fixed tuple rather than a lambda.",
+    "do_not_apply_when": "The grid is already a lambda that reads meta['XBLOCK']; or XBLOCK is not being autotuned and remains a fixed constant.",
+    "framework_notes": "Triton-specific: when using @triton.autotune, the grid must be a callable `lambda meta: (...)` that references `meta['XBLOCK']` (or whichever constexpr drives the grid dimension). A hardcoded integer grid tuple does not update when the autotuner selects a different config, causing incorrect execution counts and always a regression."
+  },
+  {
+    "item_id": "exp_triton_excessive_registers_kills_occupancy_001",
+    "iteration": 2,
+    "speedup": 0.8226,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "triton_vectorized_load_hints_with_list_arguments_cause_register_explosion",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 12.51,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 14.83,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.99,
+        "Instruction Statistics.Executed Instructions": 1849344.0,
+        "Launch Statistics.Waves Per SM": 0.24
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 15.21,
+        "Launch Statistics.Registers Per Thread": 192.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 11.95,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.6,
+        "Instruction Statistics.Executed Instructions": 4058112.0,
+        "Launch Statistics.Waves Per SM": 1.94
+      }
+    },
+    "strategy_title": "List Arguments to tl.max_contiguous/tl.multiple_of Explode Register Count",
+    "strategy_description": "Passing list arguments (e.g., `[1, 32]`, `[32, 1]`) to `tl.max_contiguous` and `tl.multiple_of` instead of scalar integers caused the Triton compiler to generate a kernel with 192 registers per thread (up from 32), a 6x increase. This collapsed theoretical occupancy from 100% to 12.5% (Block Limit Registers dropped from 16 to 2 blocks per SM) and caused executed instructions to balloon from 1.85M to 4.06M (+119%), resulting in a 0.82x regression. The correct API usage requires scalar integer arguments matching the contiguous run length and alignment of the access pattern, not per-dimension lists.",
+    "slow_pseudocode": "# WRONG: list arguments cause register explosion\n_offset = tl.max_contiguous(\n    tl.multiple_of(x0 + 32*r0_2 + 3200*x1, [1, 32]),\n    [32, 1]\n)\ntmp0 = tl.load(in_ptr0 + _offset, mask, ...)",
+    "fast_pseudocode": "# CORRECT: scalar integer arguments\n_offset = tl.max_contiguous(\n    tl.multiple_of(x0 + 32*r0_2 + 3200*x1, 32),\n    32\n)\ntmp0 = tl.load(in_ptr0 + _offset, mask, ...)",
+    "applicable_when": "Any Triton kernel where tl.max_contiguous or tl.multiple_of is used to provide vectorization hints for memory loads; registers per thread jumps dramatically after adding these hints.",
+    "do_not_apply_when": "The hints are already using scalar integer arguments and registers per thread is not elevated; or the access pattern is genuinely multi-dimensional and list arguments are intentionally used with full understanding of the register cost.",
+    "framework_notes": "Triton-specific: `tl.max_contiguous(ptr, N)` and `tl.multiple_of(ptr, N)` expect scalar integer N. Passing a Python list (e.g., `[32, 1]`) is syntactically accepted but causes the compiler to treat the offset as a multi-dimensional tensor, dramatically increasing register pressure. Always use scalar integers. The equivalent in CUDA would be `__builtin_assume_aligned` or `__ldg` with no such pitfall."
+  }
+]

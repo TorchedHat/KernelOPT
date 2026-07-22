@@ -1,0 +1,91 @@
+--- baseline
++++ rebuilt
+@@ -5,58 +5,44 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_per_fused__softmax_add_clamp_clone_exp_index_log_mul_permute_prepare_softmax_online_sigmoid_sub_unsqueeze_view_10(in_ptr0, in_ptr1, in_ptr2, in_ptr3, out_ptr2, xnumel, r0_numel, XBLOCK : tl.constexpr):
+     xnumel = 94080
+     r0_numel = 49
+-    R0_BLOCK: tl.constexpr = 64
+-    rnumel = r0_numel
+-    RBLOCK: tl.constexpr = R0_BLOCK
+     xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
++    xindex = xoffset + tl.arange(0, XBLOCK)  # [XBLOCK] -- 1D
+     xmask = xindex < xnumel
+-    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+-    r0_offset = 0
+-    r0_mask = r0_index < r0_numel
+-    roffset = r0_offset
+-    rindex = r0_index
+-    r0_3 = r0_index
+-    x4 = xindex
+-    x1 = ((xindex // 49) % 3)
+-    x0 = (xindex % 49)
+-    x5 = xindex // 49
+-    tmp0 = tl.load(in_ptr0 + (r0_3 + 49*x4), r0_mask & xmask, other=0.0)
+-    tmp1 = tl.load(in_ptr1 + (x1), xmask, eviction_policy='evict_last')
+-    tmp6 = tl.load(in_ptr2 + (r0_3 + 49*x0), r0_mask & xmask, eviction_policy='evict_last', other=0.0)
+-    tmp2 = tl.full([1, 1], 4.605170249938965, tl.float32)
+-    tmp3 = tl.minimum(tmp1, tmp2)
+-    tmp4 = tl.exp(tmp3)
+-    tmp5 = tmp0 * tmp4
+-    tmp7 = tl.full([1, 1], 169, tl.int32)
+-    tmp8 = tmp6 + tmp7
+-    tmp9 = tmp6 < 0
+-    tmp10 = tl.where(tmp9, tmp8, tmp6)
+-    tl.device_assert(((0 <= tmp10) & (tmp10 < 169)) | ~(r0_mask & xmask), "index out of bounds: 0 <= tmp10 < 169")
+-    tmp12 = tl.load(in_ptr3 + (x1 + 3*tmp10), r0_mask & xmask, eviction_policy='evict_last')
+-    tmp13 = tl.sigmoid(tmp12)
+-    tmp14 = tl.full([1, 1], 16.0, tl.float32)
+-    tmp15 = tmp13 * tmp14
+-    tmp16 = tmp5 + tmp15
+-    tmp17 = tl.broadcast_to(tmp16, [XBLOCK, R0_BLOCK])
+-    tmp19 = tl.broadcast_to(tmp17, [XBLOCK, R0_BLOCK])
+-    tmp21 = tl.where(r0_mask & xmask, tmp19, float("-inf"))
+-    tmp22 = triton_helpers.max2(tmp21, 1)[:, None].to(tl.float32)
+-    tmp23 = tmp17 - tmp22
+-    tmp24 = tl.exp(tmp23)
+-    tmp25 = tl.broadcast_to(tmp24, [XBLOCK, R0_BLOCK])
+-    tmp27 = tl.where(r0_mask & xmask, tmp25, 0)
+-    tmp28 = tl.sum(tmp27, 1)[:, None].to(tl.float32)
+-    tmp29 = tmp16 - tmp22
+-    tmp30 = tl.exp(tmp29)
+-    tmp31 = (tmp30 / tmp28)
+-    tl.store(out_ptr2 + (r0_3 + 49*x0 + 2432*x5), tmp31, r0_mask & xmask)
++    x1 = ((xindex // 49) % 3)   # [XBLOCK]
++    x0 = (xindex % 49)           # [XBLOCK]
++    x5 = xindex // 49            # [XBLOCK]
+ 
++    # Load per-x scale (broadcast scalar per x)
++    scale = tl.load(in_ptr1 + x1, xmask, eviction_policy='evict_last')  # [XBLOCK]
++    scale_exp = tl.exp(tl.minimum(scale, 4.605170249938965))             # [XBLOCK]
+ 
++    # Online softmax pass 1: compute running max m_i and normalizer d_i
++    m_i = tl.full([XBLOCK], float('-inf'), dtype=tl.float32)
++    d_i = tl.zeros([XBLOCK], dtype=tl.float32)
++    for r0 in tl.static_range(49):
++        score = tl.load(in_ptr0 + (r0 + 49*xindex), xmask, other=0.0)   # [XBLOCK]
++        idx_raw = tl.load(in_ptr2 + (r0 + 49*x0), xmask, other=0)        # [XBLOCK]
++        idx = tl.where(idx_raw < 0, idx_raw + 169, idx_raw)               # [XBLOCK]
++        bias = tl.load(in_ptr3 + (x1 + 3*idx), xmask, eviction_policy='evict_last')  # [XBLOCK]
++        logit = score * scale_exp + tl.sigmoid(bias) * 16.0               # [XBLOCK]
++        m_new = tl.maximum(m_i, logit)
++        d_i = d_i * tl.exp(m_i - m_new) + tl.exp(logit - m_new)
++        m_i = m_new
++
++    # Online softmax pass 2: normalize and store
++    for r0 in tl.static_range(49):
++        score = tl.load(in_ptr0 + (r0 + 49*xindex), xmask, other=0.0)
++        idx_raw = tl.load(in_ptr2 + (r0 + 49*x0), xmask, other=0)
++        idx = tl.where(idx_raw < 0, idx_raw + 169, idx_raw)
++        bias = tl.load(in_ptr3 + (x1 + 3*idx), xmask, eviction_policy='evict_last')
++        logit = score * scale_exp + tl.sigmoid(bias) * 16.0
++        softmax_val = tl.exp(logit - m_i) / d_i                           # [XBLOCK]
++        tl.store(out_ptr2 + (r0 + 49*x0 + 2432*x5), softmax_val, xmask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

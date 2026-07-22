@@ -1,0 +1,44 @@
+[
+  {
+    "item_id": "exp_001_fix_xblock_wasted_threads_autotune",
+    "iteration": 1,
+    "speedup": 1.0766,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_oversized_xblock_with_autotune_for_small_dimension",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 4096.0,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Launch Statistics.Registers Per Thread": 27.0,
+        "Occupancy.Achieved Occupancy": 69.73,
+        "Scheduler Statistics.No Eligible": 46.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.56,
+        "GPU Speed Of Light Throughput.Duration": 5.06,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.02,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 33.34
+      },
+      "key_metric_after": {
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 4096.0,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Occupancy.Achieved Occupancy": 45.34,
+        "Scheduler Statistics.No Eligible": 41.67,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.32,
+        "GPU Speed Of Light Throughput.Duration": 4.7,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 13.59,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      }
+    },
+    "strategy_title": "Match XBLOCK to actual dimension size via autotune",
+    "strategy_description": "When a Triton kernel's XBLOCK is set much larger than the actual X-dimension (e.g., XBLOCK=128 for xnumel=4), nearly all threads in the X direction are masked out and do no useful work, wasting thread slots and inflating the grid size. Adding @triton.autotune with XBLOCK values that match the true dimension size (e.g., XBLOCK=4) eliminates this waste, reduces register pressure (27\u219216 registers/thread), and cuts warp cycles per issued instruction (19.56\u219216.32). The speedup is modest (~7.7%) because the grid size remained at 4096 blocks (autotune selected a smaller YBLOCK than optimal), but register pressure and instruction count dropped significantly (1.36M\u2192494K executed instructions).",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=4: 96.9% of X threads are masked\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xnumel = 4  # only 4 valid X elements\n    yoffset = tl.program_id(1) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # 128 threads, 124 wasted\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + (x2 + 4*y3), xmask)\n    tl.store(out_ptr + (y0 + 128*x2 + 512*y1), tmp0, xmask)\n\ngrid = (cdiv(4, 128), cdiv(32768, 8))  # = (1, 4096)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=4 == xnumel=4: zero wasted X threads\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 32,  'XBLOCK': 4}, num_warps=2),\n        triton.Config({'YBLOCK': 64,  'XBLOCK': 4}, num_warps=4),\n        triton.Config({'YBLOCK': 128, 'XBLOCK': 4}, num_warps=4),\n        triton.Config({'YBLOCK': 256, 'XBLOCK': 4}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xnumel = 4\n    yoffset = tl.program_id(1) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=4\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # 4 threads, 0 wasted\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + (x2 + 4*y3), xmask & ymask)\n    tl.store(out_ptr + (...), tmp0, xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)  # autotune selects best config",
+    "applicable_when": "XBLOCK (or YBLOCK) is set much larger than the actual dimension size (e.g., XBLOCK=128 for xnumel=4), causing >50% of threads to be masked; NCU LaunchConfiguration rule fires with high speedup_pct (\u226550%); registers_per_thread is elevated; executed instruction count is high relative to useful work",
+    "do_not_apply_when": "XBLOCK already matches or is close to the actual dimension size; the dimension is large enough that oversizing causes no significant waste; autotune overhead exceeds the per-call savings (very short-lived kernels called once)",
+    "framework_notes": "Triton-specific: use @triton.autotune with configs that set XBLOCK equal to the true xnumel (or its next power-of-2 if constexpr requires it). Update the grid lambda to use META['XBLOCK'] and META['YBLOCK']. Also add ymask guard when YBLOCK may not evenly divide ynumel. In CUDA, the equivalent is choosing blockDim.x to match the actual work width."
+  }
+]

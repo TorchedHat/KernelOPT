@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "1b94410c",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_swap_tile_dimensions",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_swap_tile_dimensions \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_swap_tile_dimensions' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): ynumel=125440 (batch*spatial)\n    xnumel = 192\n    ynumel = 125440\n    # x covers channels (stride-1 dimension \u2192 coalesced)\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]   # shape [1, XBLOCK]\n                     ",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The input tensor in_ptr0 has shape (125440, 192) with strides (192, 1) \u2014 channel-last / NHWC-like. The current kernel assigns XBLOCK=128 to the spatial dimension (x2) and YBLOCK=8 to the channel+batch dimension. The load address is `y0 + 192*x2 + 2408448*y1`: consecutive threads in the x-warp step along x2 with a stride of 192 floats (768 bytes), causing 128 separate cache-line transactions per warp instead of 1. This is the root cause of the 88% L2 throughput, 4.88% L1 hit rate, and 30.8-cycle L1TEX stalls. Swapping so that the channel dimension (stride=1 in in_ptr0) becomes the fast-varying XBLOCK dimension makes the input load fully coalesced.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): ynumel=125440 (batch*spatial)\n    xnumel = 192\n    ynumel = 125440\n    # x covers channels (stride-1 dimension \u2192 coalesced)\n    xoffset = tl.program_id(0) * XBL",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_software_pipeline_001",
+    "iteration": 1,
+    "speedup": 1.1898,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "software_pipelining_via_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall (L1TEX scoreboard, 30.8 cycles avg, 56.8% of CPI)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 66.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.15,
+        "GPU Speed Of Light Throughput.Memory Throughput": 62.86,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 88.02,
+        "Scheduler Statistics.No Eligible": 72.89,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.57,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 54.22,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 4.88,
+        "Launch Statistics.Waves Per SM": 11.14,
+        "Launch Statistics.Registers Per Thread": 32.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 55.65,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 36.0,
+        "GPU Speed Of Light Throughput.Memory Throughput": 84.62,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 68.87,
+        "Scheduler Statistics.No Eligible": 61.83,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.19,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 7.17,
+        "Launch Statistics.Waves Per SM": 14.85,
+        "Launch Statistics.Registers Per Thread": 40.0
+      }
+    },
+    "strategy_title": "Autotune num_stages to Enable Async Prefetch in Triton",
+    "strategy_description": "When a Triton kernel shows >70% no-eligible-warp cycles and a dominant L1TEX scoreboard stall (>50% of CPI), the hardware cannot hide memory latency with the available active warps. Adding @triton.autotune with configs that sweep num_stages (2\u20134) alongside XBLOCK/YBLOCK/num_warps enables the Triton compiler to emit async prefetch instructions, overlapping the next tile's data fetch with current-tile compute. In this case, warp cycles per issued instruction dropped from 54.2 to 29.2 and eligible warps per scheduler rose from 0.57 to 1.0, yielding a 1.19x speedup (66.2 \u00b5s \u2192 55.7 \u00b5s); the trade-off is higher register pressure (32\u219240 registers/thread) which reduced theoretical occupancy from 100% to 75%.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr0, ..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # body unchanged\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)  # fixed config, num_stages=1",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 4},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8},  num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=4),\n        # ... more configs ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, ..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # body unchanged\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)  # no explicit XBLOCK/YBLOCK/num_stages; autotune selects best",
+    "applicable_when": "Triton pointwise/elementwise kernel with: (1) no-eligible-warp cycles >60%, (2) dominant L1TEX scoreboard stall >40% of CPI, (3) L1 hit rate <10%, (4) current num_stages=1 (single-stage pipeline), (5) kernel body is simple (few loads, one FMA, one store) making it amenable to Triton's pipeline lowering.",
+    "do_not_apply_when": "Kernel is already register-bound (registers/thread near hardware max); increasing num_stages raises register pressure and may reduce occupancy enough to hurt performance. Also avoid when the kernel has complex control flow or data-dependent branches that prevent static prefetch scheduling. Not applicable when the bottleneck is compute-bound (SM throughput >80%) rather than memory-latency-bound.",
+    "framework_notes": "Triton-specific: num_stages in triton.Config controls the software pipeline depth emitted by the Triton compiler (async prefetch). Equivalent concept in CUDA is __pipeline_memcpy_async / cp.async with pipeline stages. The grid must be changed from a static tuple to a lambda meta: (...) so autotune can inject the selected XBLOCK/YBLOCK. The kernel call site must drop explicit XBLOCK/YBLOCK kwargs."
+  }
+]

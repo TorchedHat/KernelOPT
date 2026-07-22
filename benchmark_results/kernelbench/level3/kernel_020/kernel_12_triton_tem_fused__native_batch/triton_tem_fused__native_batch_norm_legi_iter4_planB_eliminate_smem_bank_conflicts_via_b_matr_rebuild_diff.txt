@@ -1,0 +1,62 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_12(arg_A, arg_B, out_ptr0):
+@@ -58,26 +59,29 @@
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
++
+         a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+-        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+-        
++
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 144*idx_m
+-        a = tl.load(A + (xindex), mask=a_mask, other=0.0)
++        a = tl.load(A + (xindex), mask=a_mask, other=0.0, eviction_policy='evict_first')
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 24*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 144*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)), mask=b_mask, other=0.0)
++        # Load B transposed: [BLOCK_N, BLOCK_K] from global memory
++        # B[k, n] = B + k*stride_bk + n*stride_bn = B + k*1 + n*144
++        # Loading as [n, k] means consecutive threads access consecutive k (stride=1), eliminating bank conflicts
++        k_start = k_idx * BLOCK_K
++        b_n_idx = rn[:, None]                          # shape [BLOCK_N=32, 1]
++        b_k_idx = k_start + offs_k[None, :]            # shape [1, BLOCK_K=32]
++        b_mask = (b_n_idx < N) & (b_k_idx < K)         # N=24, K=144
++        b_transposed = tl.load(B + b_k_idx * stride_bk + b_n_idx * stride_bn,
++                                mask=b_mask, other=0.0, eviction_policy='evict_last')
++        # b_transposed is [BLOCK_N=32, BLOCK_K=32]; transpose to [BLOCK_K, BLOCK_N] for tl.dot
++        b = tl.trans(b_transposed)                     # shape [BLOCK_K=32, BLOCK_N=32]
+ 
+-        
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -88,9 +92,7 @@
+ 
+     # inductor generates a suffix
+     xindex = idx_n + 24*idx_m
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
++    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask, eviction_policy='evict_first')
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

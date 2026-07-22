@@ -1,0 +1,54 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_convolution_relu_225(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
+    # numel = 57344 * 9 = 516096
+    # in_ptr0 layout: shape (32,1792,3,3), stride (16128,9,3,1)
+    # flat index = x2 + 9*y3 where x2 in [0..8], y3 in [0..57343]
+    # => loading in_ptr0 + flat is stride-1 coalesced
+    numel = 516096
+    pid = tl.program_id(0)
+    offsets = pid * XBLOCK + tl.arange(0, XBLOCK)
+    mask = offsets < numel
+    # Coalesced load: flat index matches contiguous memory layout of in_ptr0
+    tmp0 = tl.load(in_ptr0 + offsets, mask=mask)
+    # Reconstruct 2D indices from flat offset
+    x2 = offsets % 9          # spatial index h*3+w in [0..8]
+    y3 = offsets // 9         # combined batch+channel index in [0..57343]
+    y0 = y3 % 1792            # channel index c in [0..1791]
+    y1 = y3 // 1792           # batch index b in [0..31]
+    # Output address: out_ptr0 stride (16128,1,5376,1792)
+    # = b*16128 + c*1 + (h*3+w)*1792 = y1*16128 + y0 + x2*1792
+    out_idx = y0 + 1792 * x2 + 16128 * y1
+    tl.store(out_ptr0 + out_idx, tmp0, mask=mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 57344
+    xnumel = 9
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused__native_batch_norm_legit_no_training_convolution_relu_225[grid](arg_0, arg_1, 57344, 9, YBLOCK=8, XBLOCK=128)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((32, 1792, 3, 3), (16128, 9, 3, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((32, 1792, 3, 3), (16128, 1, 5376, 1792), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

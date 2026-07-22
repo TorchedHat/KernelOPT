@@ -1,0 +1,114 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=4),
+    ],
+    key=[],
+)
+@triton.jit
+def triton_tem_fused_addmm_native_layer_norm_t_view_1(arg_A, arg_B, out_ptr0):
+    BLOCK_M : tl.constexpr = 128
+    BLOCK_N : tl.constexpr = 128
+    BLOCK_K : tl.constexpr = 64
+    GROUP_M : tl.constexpr = 8
+
+    M = 65536
+    N = 2304
+    K = 768
+
+    if M * N == 0:
+        return
+
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    # re-order program ID for better L2 performance
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    # TMA block pointers: address generation offloaded to hardware unit
+    # A has shape (M=65536, K=768), strides (768, 1) — row-major
+    A_ptr = tl.make_block_ptr(
+        base=arg_A,
+        shape=(M, K),
+        strides=(K, 1),
+        offsets=(pid_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0),
+    )
+    # B has shape (2304, 768), strides (768, 1)
+    # Viewed as (K=768, N=2304): element [k, n] = B[n, k] => strides=(1, K=768)
+    B_ptr = tl.make_block_ptr(
+        base=arg_B,
+        shape=(K, N),
+        strides=(1, K),
+        offsets=(0, pid_n * BLOCK_N),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(0, 1),
+    )
+    # Output block pointer
+    out_block_ptr = tl.make_block_ptr(
+        base=out_ptr0,
+        shape=(M, N),
+        strides=(N, 1),
+        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0),
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for _ in range(tl.cdiv(K, BLOCK_K)):
+        a = tl.load(A_ptr, boundary_check=(0, 1), eviction_policy='evict_first')
+        b = tl.load(B_ptr, boundary_check=(0, 1), eviction_policy='evict_first')
+        acc = tl.dot(a, b, acc, allow_tf32=False, out_dtype=tl.float32)
+        A_ptr = tl.advance(A_ptr, (0, BLOCK_K))
+        B_ptr = tl.advance(B_ptr, (BLOCK_K, 0))
+
+    tl.store(out_block_ptr, acc, boundary_check=(0, 1), eviction_policy='evict_first')
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    grid = (9216, 1, 1)
+    triton_tem_fused_addmm_native_layer_norm_t_view_1[grid](arg_0, arg_1, arg_2)
+    return arg_2
+
+def get_inputs():
+    arg_0 = rand_strided((128, 512, 768), (393216, 768, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((2304, 768), (768, 1), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((65536, 2304), (2304, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

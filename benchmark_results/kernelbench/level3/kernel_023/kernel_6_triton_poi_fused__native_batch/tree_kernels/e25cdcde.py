@@ -1,0 +1,68 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 128}, num_warps=4),
+        triton.Config({'XBLOCK': 128}, num_warps=8),
+    ],
+    key=['xnumel'],
+)
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_convolution_hardtanh_6(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 2304000
+    sm_id = tl.program_id(0)
+    num_sms = tl.num_programs(0)
+    total_tiles = tl.cdiv(xnumel, XBLOCK)
+    for tile_idx in tl.range(sm_id, total_tiles, num_sms):
+        xoffset = tile_idx * XBLOCK
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = xindex < xnumel
+        x2 = xindex
+        x0 = (xindex % 16)
+        tmp0 = tl.load(in_out_ptr0 + (x2), xmask, eviction_policy='evict_first')
+        tmp1 = tl.load(in_ptr0 + (x0), xmask, eviction_policy='evict_last')
+        tmp3 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')
+        tmp12 = tl.load(in_ptr2 + (x0), xmask, eviction_policy='evict_last')
+        tmp14 = tl.load(in_ptr3 + (x0), xmask, eviction_policy='evict_last')
+        tmp_rstd = libdevice.rsqrt(tmp3 + 1e-5)
+        tmp_xr = tmp0 * tmp_rstd
+        tmp_normed = tl.math.fma(-tmp1, tmp_rstd, tmp_xr)   # (x - mean) * rstd via FMA
+        tmp_out = tl.math.fma(tmp_normed, tmp12, tmp14)      # normed * weight + bias via FMA
+        tmp_clamped = tl.maximum(tl.minimum(tmp_out, 1.0), -1.0)  # hardtanh [-1, 1]
+        tl.store(in_out_ptr0 + (x2), tmp_clamped, xmask, eviction_policy='evict_first')
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    xnumel = 2304000
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_convolution_hardtanh_6[grid](arg_0, arg_1, arg_2, arg_3, arg_4, 2304000)
+    return arg_4
+
+def get_inputs():
+    arg_0 = rand_strided((10, 16, 120, 120), (230400, 1, 1920, 16), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

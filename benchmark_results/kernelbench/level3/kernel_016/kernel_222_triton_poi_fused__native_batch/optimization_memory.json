@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "99cb60fe",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "restructure_to_2d_grid_eliminate_modulo_and_balance_workload",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + WorkloadImbalance + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "restructure_to_2d_grid_eliminate_modulo_and_balance_workload \u2014 correctness failure",
+    "strategy_description": "Plan 'restructure_to_2d_grid_eliminate_modulo_and_balance_workload' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.668e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.071e+02 > atol=0.001\nseed=1337 output[0]: max_diff=2.113e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel computes x0 = xindex % 1760 to index into 4 per-channel tensors (mean, var, weight, bias). With a 1D XBLOCK=128 layout, each warp processes 128 consecutive flat indices that span multiple channel groups, making the modulo expensive and causing irregular L1TEX access patterns confirmed by the CPIStall rule (36.1% of cycles stalled on L1TEX scoreboard, 5.3 cycles/warp). Switching to a 2D grid with CBLOCK covering the channel dimension and SBLOCK covering the spatial dimension eliminates the runtime modulo: the channel index becomes pid_c directly, making per-channel loads a single broadcast per block. This also restructures the grid from 6738 blocks (3 full waves + 402-block partial wave) into a shape tunable to be divisible by 132 SMs, addressing the LaunchConfiguration and WorkloadImbalance rules. Prior autotune attempts failed because the call-site grid was hardcoded to cdiv(xnumel, 128) instead of using a lambda \u2014 this plan uses a proper 2D lambda grid from the start.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.668e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.071e+02 > atol=0.001\nseed=1337 output[0]: max_diff=2.113e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a3f7c291",
+    "iteration": 5,
+    "speedup": 0.4769,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_to_reduce_partial_wave_and_improve_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + LaunchConfiguration + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.75,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.69,
+        "Occupancy.Achieved Occupancy": 50.44,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 19.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 3.19,
+        "Instruction Statistics.Executed Instructions": 1374548.0,
+        "Scheduler Statistics.No Eligible": 59.2,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.07
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 14.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.9,
+        "Occupancy.Achieved Occupancy": 62.43,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 38.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Waves Per SM": 8.51,
+        "Instruction Statistics.Executed Instructions": 7283776.0,
+        "Scheduler Statistics.No Eligible": 24.05,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.81
+      }
+    },
+    "strategy_title": "Larger XBLOCK Doubles Register Use, Explodes Instruction Count",
+    "strategy_description": "Increasing XBLOCK from 128 to 256 (via autotune config changes) caused registers per thread to jump from 19 to 38, which halved theoretical occupancy from 100% to 75% and more than doubled the total executed instruction count (1.37M \u2192 7.28M). Despite improving scheduler eligibility (No Eligible: 59.2% \u2192 24.0%) and compute throughput (33.7% \u2192 64.9%), the kernel duration more than doubled (6.75\u00b5s \u2192 14.3\u00b5s) because the instruction explosion overwhelmed any latency-hiding benefit. When a kernel's register count is already near the per-thread limit, increasing block size causes register spilling or register-pressure-induced occupancy collapse, making the kernel slower even if individual warp stalls decrease.",
+    "slow_pseudocode": "# XBLOCK=256, num_warps=8/16\n# registers_per_thread=38, theoretical_occupancy=75%\n# executed_instructions=7.28M\n@triton.autotune(configs=[Config({'XBLOCK': 2048}, num_warps=8), Config({'XBLOCK': 1024}, num_warps=8), ...], key=['xnumel'])\ndef kernel(...):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)\n    # ... BN + ReLU ops ...",
+    "fast_pseudocode": "# XBLOCK=128, num_warps=4\n# registers_per_thread=19, theoretical_occupancy=100%\n# executed_instructions=1.37M\n@triton.autotune(configs=[Config({'XBLOCK': 128}, num_warps=4), Config({'XBLOCK': 256}, num_warps=4), ...], key=['xnumel'])\ndef kernel(...):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)\n    # ... BN + ReLU ops ...",
+    "applicable_when": "Never: this specific change (replacing small XBLOCK configs with large XBLOCK configs in autotune) caused a 2x regression when the kernel already had low register count (19/thread) and 100% theoretical occupancy.",
+    "do_not_apply_when": "When the kernel already achieves 100% theoretical occupancy with small block sizes and low register counts (\u226420 registers/thread). Increasing XBLOCK in autotune configs for such kernels causes register pressure to spike (doubling register count), collapsing theoretical occupancy and massively inflating instruction count, resulting in severe slowdown even if per-warp stall metrics improve.",
+    "framework_notes": "In Triton, autotune configs with larger XBLOCK values cause the JIT compiler to allocate more registers per thread to hold the larger tile. On H200/SM90, Block Limit Registers dropped from 21 blocks/SM to 6 blocks/SM when registers/thread went from 19 to 38, directly capping theoretical occupancy at 75% and waves_per_sm jumped from 3.19 to 8.51 (more serialization). The instruction count explosion (5.3x) suggests the larger tile also triggered more predicated/masked operations."
+  }
+]

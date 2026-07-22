@@ -1,0 +1,74 @@
+[
+  {
+    "item_id": "exp_001_autotune_tile_sizes_low_wave_kernel",
+    "iteration": 1,
+    "speedup": 1.2558,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_low_wave_small_xnumel_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Waves Per SM": 0.79,
+        "Occupancy.Achieved Occupancy": 55.44,
+        "Scheduler Statistics.No Eligible": 50.6,
+        "GPU Speed Of Light Throughput.Duration": 3.78,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4096.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Waves Per SM": 1.58,
+        "Occupancy.Achieved Occupancy": 60.16,
+        "Scheduler Statistics.No Eligible": 45.09,
+        "GPU Speed Of Light Throughput.Duration": 3.01,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 0.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes When X-Dimension Collapses Grid",
+    "strategy_description": "When a 2D Triton kernel has a very small X-dimension (e.g., xnumel=9) but a large XBLOCK (e.g., 128), the X grid collapses to a single CTA column, severely limiting total grid size and causing sub-1.0 waves/SM. Adding @triton.autotune with configs that shrink XBLOCK to match the actual X-dimension and increase YBLOCK allows the runtime to find tile shapes that maximize waves/SM and reduce per-thread register pressure. This directly addresses SOLBottleneck (grid too small), IssueSlotUtilization (idle scheduler cycles), and AchievedOccupancy gaps by doubling waves/SM and halving register usage.",
+    "slow_pseudocode": "# Fixed tile sizes, XBLOCK >> xnumel\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # xnumel=9, XBLOCK=128 \u2192 cdiv(9,128)=1 CTA in X\n    # ynumel=13312, YBLOCK=8 \u2192 1664 CTAs in Y\n    # total grid = 1664 CTAs, waves = 1664/132 = 0.79\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + (xindex + xnumel*yindex), xmask)\n    tl.store(out_ptr + (...), tmp0, xmask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile sizes, XBLOCK matches xnumel\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 512}, num_warps=8),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 256}, num_warps=4),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 64},  num_warps=2),\n        triton.Config({'XBLOCK': 4,  'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 4,  'YBLOCK': 64},  num_warps=4),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 64},  num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 32},  num_warps=4),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    ymask = yindex < ynumel  # re-enable ymask for non-power-of-2 ynumel\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + (xindex + xnumel*yindex), xmask & ymask)\n    tl.store(out_ptr + (...), tmp0, xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no XBLOCK/YBLOCK kwargs",
+    "applicable_when": "Triton 2D kernel where one dimension (xnumel) is much smaller than XBLOCK, causing cdiv(xnumel, XBLOCK)=1 and total grid << sm_count; waves/SM < 1.0; SOLBottleneck rule fires; IssueSlotUtilization shows >40% idle scheduler cycles; AchievedOccupancy significantly below theoretical.",
+    "do_not_apply_when": "Both dimensions are large enough that the grid already produces >2 waves/SM with the current tile sizes; kernel is already autotuned; xnumel is a large value that benefits from large XBLOCK for vectorization.",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] and a grid lambda reading META['XBLOCK']/META['YBLOCK']. Also re-enable ymask (yindex < ynumel) when YBLOCK configs may not evenly divide ynumel. Removing dynamic shared memory allocation (from 4KB to 0) was a side effect of the tile size change and contributed to reduced register pressure (28\u219216 registers/thread)."
+  },
+  {
+    "item_id": "exp_001_rightsize_xblock_persistent_yloop",
+    "iteration": 1,
+    "speedup": 1.2313,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "rightsize_xblock_persistent_yloop_for_small_xnumel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {
+        "Launch.block_size": 128.0,
+        "Launch.waves_per_sm": 0.79,
+        "Occupancy.Achieved Occupancy": 55.44,
+        "Scheduler Statistics.No Eligible": 50.6,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.47,
+        "GPU Speed Of Light Throughput.Duration": 3.78,
+        "Instruction Statistics.Executed Instructions": 685568.0
+      },
+      "key_metric_after": {
+        "Launch.block_size": 64.0,
+        "Launch.waves_per_sm": 0.39,
+        "Occupancy.Achieved Occupancy": 14.4,
+        "Scheduler Statistics.No Eligible": 81.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.23,
+        "GPU Speed Of Light Throughput.Duration": 3.07,
+        "Instruction Statistics.Executed Instructions": 145600.0
+      }
+    },
+    "strategy_title": "Right-size XBLOCK and add persistent Y-loop for small xnumel",
+    "strategy_description": "When a Triton pointwise kernel has a very small x-dimension (e.g., xnumel=9) but a large XBLOCK (e.g., 128), the vast majority of threads per CTA are masked out, wasting compute and inflating instruction counts. Reducing XBLOCK to the smallest power-of-2 that covers xnumel (e.g., 16 for xnumel=9) eliminates wasted masked threads and dramatically reduces executed instructions (685K \u2192 146K here). Adding a persistent y-loop inside the kernel body\u2014where each CTA strides over multiple y-tiles\u2014reduces the grid size while keeping SMs busy, cutting warp cycles per issued instruction (16.47 \u2192 11.23) and overall kernel duration (3.78 \u2192 3.07 \u00b5s).",
+    "slow_pseudocode": "# XBLOCK=128 for xnumel=9: 119/128 threads masked on x-dim\n# grid = (cdiv(9, 128), cdiv(13312, 8)) = (1, 1664), waves=0.79\n@triton.jit\ndef kernel(...):\n    yoffset = pid_y * YBLOCK  # YBLOCK=8\n    yindex = yoffset + arange(0, YBLOCK)[:, None]\n    xoffset = pid_x * XBLOCK  # XBLOCK=128\n    xindex = xoffset + arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel  # 119 of 128 threads masked!\n    tmp = load(ptr + x + stride*y, xmask)\n    store(out_ptr + ..., tmp, xmask)",
+    "fast_pseudocode": "# XBLOCK=16 for xnumel=9: only 7/16 threads masked on x-dim\n# Persistent y-loop: grid y-dim capped, each CTA processes multiple tiles\n@triton.autotune(configs=[Config({'XBLOCK':16,'YBLOCK':B}) for B in [32,64,128,256,512]], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(...):\n    xoffset = pid_x * XBLOCK  # XBLOCK=16\n    xindex = xoffset + arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel  # only 7 masked\n    pid_y = tl.program_id(1)\n    num_pid_y = tl.num_programs(1)\n    for yoffset in tl.range(pid_y * YBLOCK, ynumel, num_pid_y * YBLOCK):\n        yindex = yoffset + arange(0, YBLOCK)[:, None]\n        ymask = yindex < ynumel\n        tmp = load(ptr + x + stride*y, xmask & ymask)\n        store(out_ptr + ..., tmp, xmask & ymask)",
+    "applicable_when": "Triton pointwise kernel where xnumel << XBLOCK (e.g., xnumel < XBLOCK/4), causing most threads to be masked on the x-dimension; SOLBottleneck rule fires (waves_per_sm < 1.0); IssueSlotUtilization shows >40% no-eligible-warp cycles; AchievedOccupancy significantly below theoretical.",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (masking overhead is minimal); kernel is already memory-bandwidth bound at high utilization (DRAM throughput >50%); grid is already large enough to fill all SMs (waves_per_sm > 2.0); persistent loop would cause L2 thrashing due to large working set per CTA.",
+    "framework_notes": "Uses tl.range() for the persistent loop (Triton-specific). The autotune key must include both ynumel and xnumel to avoid incorrect config reuse. In CUDA, the equivalent is a grid-stride loop over the y-dimension with a manually tuned block size."
+  }
+]

@@ -1,0 +1,50 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,20 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_convolution_32(in_ptr0, arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -66,12 +80,13 @@
+         xindex = idx_n + 480*idx_m
+         a = tl.load(A + (xindex))
+ 
+-        # Direct [BLOCK_K, BLOCK_N] load — no tl.trans, no shared memory bank conflicts
++        # COALESCED B load: load [BLOCK_N, BLOCK_K] so K (stride=1) is innermost
+         k_base = k_idx * BLOCK_K
+-        b_idx_k = (k_base + tl.arange(0, BLOCK_K))[:, None]  # [BLOCK_K, 1]
+-        b_idx_n = offs_b_n[None, :]                           # [1, BLOCK_N]
+-        b_ptrs = B + b_idx_k * 1 + b_idx_n * 480             # [BLOCK_K, BLOCK_N]
+-        b = tl.load(b_ptrs)                                   # shape [BLOCK_K, BLOCK_N], no tl.trans
++        b_idx_n = offs_b_n[:, None]                           # [BLOCK_N, 1]
++        b_idx_k = (k_base + tl.arange(0, BLOCK_K))[None, :]  # [1, BLOCK_K]
++        b_ptrs = B + b_idx_n * 480 + b_idx_k * 1             # [BLOCK_N, BLOCK_K], K innermost
++        b = tl.load(b_ptrs)                                   # coalesced: consecutive threads read consecutive K
++        b = tl.trans(b)                                       # -> [BLOCK_K, BLOCK_N] for tl.dot
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+@@ -88,7 +103,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

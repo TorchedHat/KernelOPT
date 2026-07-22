@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "172b0a68",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedGlobalAccess + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_autotune \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_autotune' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a layout-permutation (NCHW to NHWC-like reformat): load is contiguous (stride-1 in x2) but the store writes with stride 3 in the innermost dimension (y0 + 3*x2), causing 23% excessive sectors and only 20/32 bytes utilized per sector. L1TEX stalls account for 49.5% of all stall cycles (avg 14.7 cycles/warp), indicating the compiler is emitting scalar loads instead of 128-bit vectorized loads for the contiguous input. Adding tl.max_contiguous + tl.multiple_of hints on the load pointer tells the compiler the access is 128-bit aligned and contiguous, enabling 4-element float32 (128-bit) vectorized loads. Simultaneously, @triton.autotune explores larger XBLOCK values (256, 512) to increase per-CTA work, improve L2 reuse, and better hide L1TEX latency, addressing the 0.74 waves/SM underutilization.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n ",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_tile_evict_first",
+    "iteration": 1,
+    "speedup": 1.5366,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_with_evict_first_for_streaming_layout_permutation",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall (L1TEX) + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.74,
+        "Occupancy.Achieved Occupancy": 54.45,
+        "Scheduler Statistics.No Eligible": 72.21,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.93,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 29.67,
+        "GPU Speed Of Light Throughput.Duration": 6.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.12,
+        "Memory Workload Analysis.L2 Hit Rate": 60.22,
+        "Source Counters.UncoalescedGlobalAccess excess sectors pct": 23.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 1.48,
+        "Occupancy.Achieved Occupancy": 67.66,
+        "Scheduler Statistics.No Eligible": 36.96,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.01,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.83,
+        "GPU Speed Of Light Throughput.Duration": 4.1,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 25.76,
+        "Memory Workload Analysis.L2 Hit Rate": 77.12,
+        "Source Counters.UncoalescedGlobalAccess excess sectors pct": 50.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes + evict_first for Streaming Permutation Kernels",
+    "strategy_description": "When a Triton kernel has fewer than ~1 wave per SM (waves_per_sm < 1.0), scheduler idle rate above 70% (No Eligible > 70%), and L1TEX stall cycles dominating (CPIStall L1TEX ~50%), adding @triton.autotune with a range of XBLOCK/YBLOCK configs allows the runtime to find a tile shape that increases per-block work and better hides memory latency. Changing the load eviction policy from 'evict_last' to 'evict_first' on large streaming inputs prevents L1 cache pollution, improving L2 hit rate (60% \u2192 77%) and reducing effective memory pressure. Together these changes doubled waves_per_sm (0.74 \u2192 1.48), cut scheduler idle time nearly in half (72% \u2192 37%), and reduced kernel duration by ~35% (6.3 \u00b5s \u2192 4.1 \u00b5s).",
+    "slow_pseudocode": "# Fixed tile, evict_last, no autotune\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    tmp0 = tl.load(in_ptr + offset, mask, eviction_policy='evict_last')\n    tl.store(out_ptr + strided_offset, tmp0, mask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile, evict_first, runtime selects best config\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 4}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 8}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 8}, num_warps=4, num_stages=1),\n        # ... more configs\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    tmp0 = tl.load(in_ptr + offset, mask, eviction_policy='evict_first')\n    tl.store(out_ptr + strided_offset, tmp0, mask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "waves_per_sm < 1.0; scheduler No Eligible > 60%; CPIStall L1TEX stall fraction > 40%; kernel is a layout permutation or streaming memory copy with large input tensors; fixed tile sizes are suboptimal (block_size=128 or similar small default)",
+    "do_not_apply_when": "Kernel is already well-tuned (waves_per_sm > 2, achieved occupancy > 80%); input tensors are small enough to fit in L1/L2 cache (evict_first may hurt reuse); kernel has complex control flow where tile size changes break correctness; autotune overhead is unacceptable in latency-sensitive single-run scenarios",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter. The key=['ynumel','xnumel'] ensures re-tuning when problem dimensions change. num_stages=1 is appropriate for pointwise/permutation kernels with no software pipelining benefit. eviction_policy='evict_first' is a Triton load hint; equivalent in CUDA is __ldcs (streaming cache hint). Grid must be a lambda meta: (...) when using autotune so it reads the selected XBLOCK/YBLOCK from meta dict."
+  }
+]

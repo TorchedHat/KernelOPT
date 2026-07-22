@@ -1,0 +1,42 @@
+[
+  {
+    "item_id": "exp_001_autotune_xblock_register_spill_regression",
+    "iteration": 1,
+    "speedup": 0.6152,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_tile_size_for_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + AchievedOccupancy (register-limited)",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 18.0,
+        "Launch.waves_per_sm": 0.37,
+        "Occupancy.achieved_occupancy_pct": 31.29,
+        "Occupancy.theoretical_occupancy_pct": 100.0,
+        "Occupancy.block_limit_registers": 21.0,
+        "Scheduler.no_eligible_pct": 69.8,
+        "GPU_SOL.duration_us": 3.07,
+        "GPU_SOL.compute_sm_throughput_pct": 10.45,
+        "Instruction.executed_instructions": 269696.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 48.0,
+        "Launch.waves_per_sm": 1.19,
+        "Occupancy.achieved_occupancy_pct": 46.31,
+        "Occupancy.theoretical_occupancy_pct": 62.5,
+        "Occupancy.block_limit_registers": 5.0,
+        "Scheduler.no_eligible_pct": 24.37,
+        "GPU_SOL.duration_us": 4.99,
+        "GPU_SOL.compute_sm_throughput_pct": 44.83,
+        "Instruction.executed_instructions": 1711472.0
+      }
+    },
+    "strategy_title": "Larger XBLOCK Causes Register Spill, Kills Occupancy",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20132048) caused the compiler to allocate 48 registers/thread (up from 18), collapsing Block Limit Registers from 21 to 5 and capping theoretical occupancy at 62.5% instead of 100%. Although waves_per_sm improved from 0.37 to 1.19 and scheduler idle dropped from 69.8% to 24.37%, the 6.3x increase in executed instructions (269K \u2192 1.71M) from unrolled loop bodies at larger tile sizes dominated, causing a 1.63x slowdown. When a pointwise kernel already has low register pressure at the baseline tile size, increasing XBLOCK via autotune can trigger aggressive loop unrolling that spills registers and inflates instruction count far beyond the occupancy benefit.",
+    "slow_pseudocode": "# BEFORE: fixed small tile, low register pressure\n@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # pointwise BN+ReLU ops\n    tl.store(in_out_ptr0 + x2, result, xmask)\n\ngrid = (triton.cdiv(xnumel, 128),)  # 784 CTAs\nkernel[grid](..., XBLOCK=128)       # 18 regs/thread",
+    "fast_pseudocode": "# AFTER (regressed): autotune with large tiles, register spill\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 512},  num_warps=8),\n        triton.Config({'XBLOCK': 256},  num_warps=4),\n        triton.Config({'XBLOCK': 128},  num_warps=4),\n    ],\n    key=['xnumel'],\n    restore_value=['in_out_ptr0'],\n)\n@triton.jit\ndef kernel(in_out_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    # same body \u2014 but compiler unrolls at XBLOCK=256 \u2192 48 regs/thread\n    ...\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # selected XBLOCK=256, 48 regs/thread, Block Limit Regs=5",
+    "applicable_when": "Kernel has low waves_per_sm (<0.5) and low achieved occupancy due to small grid, with low register pressure at baseline (\u226420 regs/thread) and low compute throughput (<15%).",
+    "do_not_apply_when": "The kernel body contains enough arithmetic that the compiler will aggressively unroll at larger XBLOCK, causing register count to jump significantly (e.g., 18\u219248 regs/thread). Check that Block Limit Registers stays above ~10 at the new tile size before committing. Also avoid when restore_value is set in autotune on an in-place pointer, as this adds overhead. Do not apply when the kernel is already instruction-throughput bound rather than latency-bound.",
+    "framework_notes": "In Triton, larger XBLOCK values cause tl.arange(0, XBLOCK) to expand at compile time, which the compiler may fully unroll, dramatically increasing register usage. The restore_value=['in_out_ptr0'] parameter in @triton.autotune adds correctness overhead for in-place kernels during the autotuning search. Always verify registers_per_thread and Block Limit Registers in NCU after changing XBLOCK."
+  }
+]

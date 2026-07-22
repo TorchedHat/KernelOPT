@@ -1,0 +1,126 @@
+[
+  {
+    "item_id": "99ce2458",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.890e-02 > atol=0.001\nseed=42 output[0]: max_diff=7.777e-02 > atol=0.001\nseed=1337 output[0]: max_diff=7.727e-02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a GEMM (M=1960, N=192, K=480) with ALLOW_TF32=False, forcing all tl.dot accumulation through FP32 FFMA units at 67 TFLOPS peak. The H200 has 989 TFLOPS FP32 Tensor Core throughput \u2014 nearly 15x higher. With only 6.25% achieved occupancy (1 active warp/scheduler), the scheduler is idle 77% of cycles. Enabling TF32 routes tl.dot through Tensor Cores, which have much higher throughput and shorter latency, directly attacking the HighPipeUtilization bottleneck. K=480 is below the 512 threshold where TF32 mantissa truncation causes accumulated error exceeding atol=1e-3, so precision is safe. Adding @triton.autotune explores tile sizes and num_warps to improve the 0.18 waves/SM utilization.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.890e-02 > atol=0.001\nseed=42 output[0]: max_diff=7.777e-02 > atol=0.001\nseed=1337 output[0]: max_diff=7.727e-02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_iter1_autotune_num_warps_stages_only",
+    "iteration": 1,
+    "speedup": 0.8057,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_stages_without_tile_size_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 55.33,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 89.04,
+        "Occupancy.Achieved Occupancy (%)": 6.25,
+        "Occupancy.Theoretical Occupancy (%)": 25.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Waves Per SM": 0.18,
+        "Scheduler Statistics.No Eligible (%)": 77.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.35,
+        "Memory Workload Analysis.Mem Busy (%)": 59.9
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 68.67,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 42.6,
+        "Occupancy.Achieved Occupancy (%)": 3.12,
+        "Occupancy.Theoretical Occupancy (%)": 18.75,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Scheduler Statistics.No Eligible (%)": 62.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.63,
+        "Memory Workload Analysis.Mem Busy (%)": 27.05
+      }
+    },
+    "strategy_title": "Autotuning num_warps/num_stages without tile size changes regresses",
+    "strategy_description": "Adding @triton.autotune that only varies num_warps and num_stages while keeping tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) fixed caused a 24% regression (55 us \u2192 69 us). The winning config selected a smaller block size (64 threads vs 128), which increased registers per thread from 128 to 168, reduced theoretical occupancy from 25% to 18.75%, and cut waves/SM from 0.18 to 0.12 \u2014 the opposite of the intended effect. When the root bottleneck is insufficient grid coverage and low occupancy due to large tile sizes, autotuning only num_warps/num_stages cannot fix it and may make it worse by selecting configs that spill more registers.",
+    "slow_pseudocode": "# BEFORE: autotune only num_warps/num_stages, tile sizes fixed\n@triton.autotune(\n    configs=[Config({}, num_warps=w, num_stages=s) for w,s in [(2,3),(4,3),(2,2),(4,2),(8,2),(8,3),(4,4),(8,4)]],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64  # hardcoded\n    BLOCK_N: tl.constexpr = 64  # hardcoded\n    BLOCK_K: tl.constexpr = 32  # hardcoded\n    # grid = (93, 1, 1) \u2014 static, unchanged",
+    "fast_pseudocode": "# CORRECT approach: autotune must include tile sizes to fix grid coverage\n@triton.autotune(\n    configs=[\n        Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=3),\n        Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),\n        # ... smaller tiles \u2192 more blocks \u2192 more waves/SM\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(..., BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n    # grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), 1, 1)",
+    "applicable_when": "Kernel has very low waves/SM (<0.5) and low achieved occupancy (<10%) due to large fixed tile sizes; the plan calls for autotuning to increase grid coverage.",
+    "do_not_apply_when": "Tile sizes are already small or the bottleneck is not grid coverage; autotuning only num_warps/num_stages when tile sizes are the root cause of low occupancy will not help and may regress by selecting configs with higher register pressure.",
+    "framework_notes": "In Triton, @triton.autotune configs must include the tile-size constexprs (BLOCK_M, BLOCK_N, BLOCK_K) as dict keys if those are the parameters driving grid size and register pressure. Configs with empty dicts {} only vary num_warps/num_stages and cannot change the grid shape or register allocation driven by tile sizes."
+  },
+  {
+    "item_id": "f8b1dd4f",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_shared_memory_bank_conflicts_via_smem_swizzle",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_shared_memory_bank_conflicts_via_smem_swizzle \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_shared_memory_bank_conflicts_via_smem_swizzle' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.109e+02 > atol=0.001\nseed=42 output[0]: max_diff=9.907e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.032e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The dominant bottleneck is 12-way shared memory bank conflicts on shared loads, accounting for 77.63% of all shared load wavefronts and causing 64.5% of all scheduler stall cycles (CPIStall on MIO). The kernel uses tl.dot with BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 tiles. Triton stages A and B tiles through shared memory before feeding them to the MMA unit. With BLOCK_K=32 floats (128 bytes = 32 banks x 4 bytes), consecutive threads in a warp access the same bank when the shared memory stride is a multiple of 128 bytes. Changing BLOCK_K to 40 makes the shared memory row stride 160 bytes (160 mod 128 = 32), breaking the alignment and eliminating the 12-way conflict. TF32 was already tried and failed correctness (item 99ce2458). Autotuning num_warps/stages only also regressed (item exp_iter1_autotune_num_warps_stages_only). The fix must include tile sizes as autotune dict keys so the grid lambda can adapt.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.109e+02 > atol=0.001\nseed=42 output[0]: max_diff=9.907e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.032e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "0e35bac2",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_tiles",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + TheoreticalOccupancy + LaunchConfiguration + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_via_smaller_tiles \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_via_smaller_tiles' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.109e+02 > atol=0.001\nseed=42 output[0]: max_diff=9.907e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.032e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 0.12 waves/SM and 3.1% achieved occupancy. The primary cause is 168 registers/thread (up from 128 in the prior baseline), which limits blocks/SM to 6 and means the 93-block grid covers only 0.12 waves across 132 SMs. The current @triton.autotune only varies num_warps/num_stages with empty config dicts \u2014 it cannot change BLOCK_M/BLOCK_N/BLOCK_K, so it cannot reduce register pressure or increase grid coverage. The fix is to make BLOCK_M, BLOCK_N, BLOCK_K constexpr kernel arguments driven by autotune configs that include smaller tile sizes (e.g., 16x16, 32x32), which will: (1) reduce registers/thread by shrinking the accumulator tile, (2) increase grid size from 93 to up to 1470 blocks (for 16x16 tiles), giving 5.6 waves/SM, and (3) allow the scheduler to hide latency with more active warps. TF32 is explicitly excluded because it previously failed correctness (max_diff=0.079 >> atol=0.001). Autotune-only-num_warps was already tried and regressed 24% \u2014 tile sizes MUST be included in configs.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.109e+02 > atol=0.001\nseed=42 output[0]: max_diff=9.907e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.032e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "62a089d1",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_with_dynamic_grid",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + TheoreticalOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_with_dynamic_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_with_dynamic_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.109e+02 > atol=0.001\nseed=42 output[0]: max_diff=9.907e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.032e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 0.18 waves/SM and 6.25% achieved occupancy. The root cause is that BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 are hardcoded as tl.constexpr inside the kernel body, so the @triton.autotune configs (which only vary num_warps/num_stages via empty dicts {}) cannot change tile sizes, register pressure, or grid coverage. With 128 registers/thread and 32KB shared memory per block (64*64*4*2 bytes for A+B tiles), only 4 blocks fit per SM, and the 93-block grid covers only 0.7 SM-waves, leaving 39 SMs completely idle. The fix is to promote BLOCK_M, BLOCK_N, BLOCK_K to kernel parameters (tl.constexpr arguments) driven by autotune configs, AND update the grid lambda to compute cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N) dynamically. Smaller tiles (e.g., 32x32) reduce the accumulator from 64*64=4096 to 32*32=1024 floats, cutting register pressure and allowing more blocks/SM. A 32x32 tile grid would have ceil(1960/32)*ceil(192/32)=62*6=372 blocks, 4x more coverage. Prior attempts that changed tile sizes failed correctness (max_diff~100) because the grid remained static at (93,1,1) while tile sizes changed, causing wrong-tile accumulation. This plan fixes both simultaneously. TF32 is excluded (correctness failure). Autotune-num_warps-only is excluded (24% regression).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.109e+02 > atol=0.001\nseed=42 output[0]: max_diff=9.907e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.032e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

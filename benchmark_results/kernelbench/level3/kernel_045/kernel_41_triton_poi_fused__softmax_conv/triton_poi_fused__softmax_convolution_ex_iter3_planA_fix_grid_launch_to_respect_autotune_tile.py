@@ -1,0 +1,66 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 128, 'YBLOCK':  4}, num_warps=4),
+        triton.Config({'XBLOCK': 128, 'YBLOCK':  8}, num_warps=4),
+        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8),
+        triton.Config({'XBLOCK': 256, 'YBLOCK':  4}, num_warps=4),
+        triton.Config({'XBLOCK': 256, 'YBLOCK':  8}, num_warps=8),
+        triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=8),
+        triton.Config({'XBLOCK': 512, 'YBLOCK':  4}, num_warps=8),
+        triton.Config({'XBLOCK': 512, 'YBLOCK':  8}, num_warps=16),
+        triton.Config({'XBLOCK': 512, 'YBLOCK': 16}, num_warps=16),
+        triton.Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=8),
+        triton.Config({'XBLOCK': 256, 'YBLOCK': 32}, num_warps=16),
+    ],
+    key=['ynumel', 'xnumel'],
+)
+@triton.jit
+def triton_poi_fused__softmax_convolution_exp_sub_41(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+    ynumel = 32
+    xnumel = 32768
+    yoffset = tl.program_id(1) * YBLOCK
+    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+    ymask = yindex < ynumel
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+    xmask = tl.full([XBLOCK], True, tl.int1)[None, :]
+    x2 = xindex
+    y0 = (yindex % 4)
+    y1 = yindex // 4
+    y3 = yindex
+    tmp0 = tl.load(in_ptr0 + (y0 + 4*x2 + 131072*y1), xmask & ymask, eviction_policy='evict_first')
+    store_idx = tl.max_contiguous(tl.multiple_of(x2 + 32768*y3, [1, XBLOCK]), [1, XBLOCK])
+    tl.store(out_ptr0 + store_idx, tmp0, xmask & ymask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 32
+    xnumel = 32768
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused__softmax_convolution_exp_sub_41[grid](arg_0, arg_1, 32, 32768)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((262144, 4), (4, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((8, 4, 64, 512), (131072, 32768, 512, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

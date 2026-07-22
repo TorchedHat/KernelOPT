@@ -1,0 +1,50 @@
+--- baseline
++++ rebuilt
+@@ -5,25 +5,35 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_poi_fused__softmax_convolution_exp_sub_37(in_ptr0, in_ptr1, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+     ynumel = 512
+     xnumel = 32768
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = yindex < ynumel
++    # y1 is a scalar batch index (0..7), one per program_id(1)
++    y1 = tl.program_id(1).to(tl.int64)
++    # x tile: XBLOCK consecutive x2 values
+     xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = tl.full([XBLOCK], True, tl.int1)[None, :]
+-    x2 = xindex
+-    y0 = (yindex % 64)
+-    y1 = yindex // 64
+-    tmp0 = tl.load(in_ptr0 + (y0 + 64*x2 + 2097152*y1), ymask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), ymask, eviction_policy='evict_last')
+-    tmp2 = tmp0 + tmp1
+-    tl.store(out_ptr0 + (x2 + 32768*y0 + 4194304*y1), tmp2, ymask)
++    xindex = (xoffset + tl.arange(0, XBLOCK)).to(tl.int64)  # [XBLOCK], int64
++    xmask = xindex < xnumel
++    # y0 tile: all 64 channels (YBLOCK=64 covers exactly 0..63)
++    y0index = tl.arange(0, YBLOCK).to(tl.int64)  # [YBLOCK], int64, values 0..63
++    ymask = y0index < 64  # always True when YBLOCK=64, but needed for correctness
+ 
++    # Phase 1: COALESCED LOAD along y0 (stride-1 in in_ptr0)
++    # load_idx shape: [YBLOCK, XBLOCK]
++    # For fixed x2, consecutive y0 values are stride-1 in in_ptr0 -> coalesced!
++    load_idx = y0index[:, None] + 64 * xindex[None, :] + 2097152 * y1
++    data = tl.load(in_ptr0 + load_idx, mask=ymask[:, None] & xmask[None, :], other=0.0)
+ 
++    # Bias: in_ptr1[y0], shape [YBLOCK] -> broadcast over x
++    bias = tl.load(in_ptr1 + y0index, mask=ymask)  # [YBLOCK]
++    data = data + bias[:, None]  # [YBLOCK, XBLOCK]
++
++    # Phase 2: COALESCED STORE along x2 (stride-1 in out_ptr0)
++    # For fixed y0, consecutive x2 values are stride-1 in out_ptr0 -> coalesced!
++    store_idx = xindex[None, :] + 32768 * y0index[:, None] + 4194304 * y1
++    tl.store(out_ptr0 + store_idx, data, mask=ymask[:, None] & xmask[None, :])
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

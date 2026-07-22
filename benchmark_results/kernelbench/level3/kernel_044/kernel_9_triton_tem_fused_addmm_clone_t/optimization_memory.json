@@ -1,0 +1,193 @@
+[
+  {
+    "item_id": "exp_001_tma_block_ptr_regression",
+    "iteration": 1,
+    "speedup": 0.1652,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_loads_with_block_ptr_and_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 4.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 40.58,
+        "Occupancy.Theoretical Occupancy_%": 12.5,
+        "Occupancy.Achieved Occupancy_%": 12.38,
+        "Occupancy.Block Limit Registers_blocks": 2.0,
+        "Occupancy.Block Limit Shared Mem_blocks": 3.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 65.54,
+        "Scheduler Statistics.No Eligible_%": 58.37,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.97,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.74
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 25.54,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput_%": 8.2,
+        "Occupancy.Theoretical Occupancy_%": 6.25,
+        "Occupancy.Achieved Occupancy_%": 6.25,
+        "Occupancy.Block Limit Registers_blocks": 2.0,
+        "Occupancy.Block Limit Shared Mem_blocks": 1.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 131.07,
+        "Scheduler Statistics.No Eligible_%": 91.68,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.04
+      }
+    },
+    "strategy_title": "block_ptr TMA loads doubled shared memory, halved occupancy",
+    "strategy_description": "Replacing scalar pointer arithmetic with tl.make_block_ptr + tl.advance did NOT reduce register pressure (still 255 registers/thread) but doubled dynamic shared memory per block from 65 KB to 131 KB. This caused Block Limit Shared Mem to drop from 3 to 1 block/SM, cutting theoretical occupancy from 12.5% to 6.25% and worsening scheduler starvation (No Eligible cycles rose from 58% to 92%, Warp Cycles Per Issued Instruction from 4.74 to 12.04). The kernel ran 6x slower (4.22 ms \u2192 25.54 ms) because the shared memory increase was the binding occupancy constraint, not registers. When a kernel is already register-bound at 255 regs/thread, switching to block_ptr does not reduce register count in Triton \u2014 it may increase shared memory allocation, creating a new and worse occupancy bottleneck.",
+    "slow_pseudocode": "# Manual scalar arithmetic (before)\noffs_k = tl.arange(0, BLOCK_K)  # BLOCK_K=32\nfor k_idx in range(0, cdiv(K, BLOCK_K)):\n    xindex_a = offs_k[None,:] + k_idx*BLOCK_K + 768*offs_m[:,None]\n    a = tl.load(A + xindex_a)\n    xindex_b = offs_n[None,:] + 768*(offs_k[:,None] + k_idx*BLOCK_K)\n    b = tl.load(B + broadcast_to(xindex_b, ...))\n    acc += tl.dot(a, b, allow_tf32=False)\n# dynamic_smem=65KB, occupancy=12.5%, duration=4.22ms",
+    "fast_pseudocode": "# block_ptr / TMA path (after) \u2014 REGRESSION\nA_ptr = tl.make_block_ptr(arg_A, shape=(M,K), strides=(768,1),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1,0))\nB_ptr = tl.make_block_ptr(arg_B, shape=(K,N), strides=(1,768),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1,0))\nfor _ in range(0, cdiv(K, BLOCK_K)):  # BLOCK_K=64\n    a = tl.load(A_ptr, boundary_check=(0,1))\n    b = tl.load(B_ptr, boundary_check=(0,1))\n    acc += tl.dot(a, b, allow_tf32=False)\n    A_ptr = tl.advance(A_ptr, (0, BLOCK_K))\n    B_ptr = tl.advance(B_ptr, (BLOCK_K, 0))\ntl.store(C_ptr, acc, boundary_check=(0,1))\n# dynamic_smem=131KB, occupancy=6.25%, duration=25.54ms",
+    "applicable_when": "Never apply this specific pattern when the kernel is already at 255 registers/thread and shared memory is already near the per-SM limit; block_ptr does not reduce register count in Triton and may increase shared memory allocation.",
+    "do_not_apply_when": "Kernel is register-bound at max registers (255/thread) AND shared memory per block is already a binding occupancy constraint (Block Limit Shared Mem <= Block Limit Registers). Doubling BLOCK_K simultaneously with switching to block_ptr compounds the shared memory increase. Do not apply when the expected register reduction does not materialize \u2014 verify register count actually drops before deploying.",
+    "framework_notes": "In Triton, tl.make_block_ptr with boundary_check allocates additional shared memory for the TMA descriptor and staging buffers. On Hopper (compute capability 9.0), this can double dynamic shared memory per block compared to scalar loads, which is catastrophic when shared memory is already near the occupancy limit. The register count (255/thread) was unchanged by the block_ptr rewrite, disproving the hypothesis that manual index arithmetic was the primary source of register pressure."
+  },
+  {
+    "item_id": "57f68581",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_with_reduced_tile_sizes",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SOLFPRoofline + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores_with_reduced_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores_with_reduced_tile_sizes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-bound: 255 registers/thread (hardware maximum) limits occupancy to 12.5% (2 blocks/SM). With only 1.98 active warps/scheduler and 58.2% of cycles having no eligible warp, the GPU is latency-bound. The root cause is ALLOW_TF32=False, which forces tl.dot to use scalar FP32 FFMA instead of Tensor Core MMA instructions. FP32 FFMA requires the compiler to keep the full 128x128=16,384-element accumulator in registers, exhausting all 255 available registers. Enabling TF32 (allow_tf32=True) switches tl.dot to Tensor Core MMA, which keeps the accumulator in dedicated MMA registers rather than general-purpose registers, dramatically reducing register pressure. CRITICAL: The prior tf32_tensor_cores attempt failed correctness (max_diff~0.13) because it applied allow_tf32=True to the existing 128x128 tile where K=768 accumulated rounding errors exceed atol=1e-3. The fix is to SIMULTANEOUSLY reduce BLOCK_M and BLOCK_N from 128 to 64, which cuts the accumulator from 16,384 to 4,096 elements and reduces per-tile rounding error accumulation. The grid must be updated from 3072 to 12288 to cover the same output space.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "879dc87f",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_size_to_relieve_register_pressure_and_improve_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_size_to_relieve_register_pressure_and_improve_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_size_to_relieve_register_pressure_and_improve_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128 x BLOCK_N=128 accumulator tiles. With 128 threads per block, each thread owns 128x128/128 = 128 FP32 accumulator registers for acc alone. Combined with index arithmetic and loop variables, this saturates the 255-register hardware limit. Block Limit Registers = 2 blocks/SM -> only 8 warps/SM -> 12.5% theoretical occupancy. With 58% of cycles having no eligible warp, the GPU is severely latency-bound. TF32 was previously tried (item a836583b) but failed correctness (max_diff ~0.13 >> atol=0.001) because K=768 is large. The correct fix is to reduce tile dimensions: BLOCK_M=64, BLOCK_N=64 cuts the accumulator to 32 registers/thread, freeing ~96 registers and allowing 4+ blocks/SM (up to 50% occupancy). Smaller tiles also reduce shared memory bank conflicts (currently 5.3-way average).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "4efe0c2c",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "revert_block_ptr_reduce_tile_sizes_for_occupancy",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "revert_block_ptr_reduce_tile_sizes_for_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'revert_block_ptr_reduce_tile_sizes_for_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel is in a severely degraded state caused by a prior block_ptr rewrite that doubled dynamic shared memory from 65 KB to 131 KB per block. This made Block Limit Shared Mem = 1 block/SM (the binding constraint), cutting theoretical occupancy to 6.25% and leaving schedulers idle 91.68% of cycles. The fix is to revert to scalar pointer arithmetic (eliminating TMA descriptor overhead) AND reduce tile sizes (BLOCK_M=64, BLOCK_N=64, BLOCK_K=32) to cut shared memory ~4x to ~32 KB/block. This allows 4+ blocks/SM, improving occupancy from 6.25% to ~25%+. Note: allow_tf32=False is kept because TF32 was previously confirmed to fail correctness (max_diff=0.12 >> atol=0.001) for this K=768 accumulation workload.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "d2680342",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_small_block_k_for_precision",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SOLFPRoofline",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores_small_block_k_for_precision \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores_small_block_k_for_precision' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.235e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.302e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.278e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses ALLOW_TF32=False, forcing tl.dot to use scalar FP32 FFMA instructions. This causes the compiler to keep the full 128x128=16,384-element accumulator in general-purpose registers, exhausting all 255 available registers (hardware maximum). This limits occupancy to 12.5% (2 blocks/SM), leaving schedulers idle 58% of cycles. Enabling TF32 (allow_tf32=True) switches tl.dot to Tensor Core MMA instructions, which use dedicated MMA registers for the accumulator rather than general-purpose registers, dramatically reducing register pressure and enabling higher occupancy. Prior TF32 attempts failed: (1) 128x128 tiles -> max_diff=0.13 (genuine TF32 precision error from K=768 accumulation); (2) 64x64 tiles -> max_diff=163 (catastrophic implementation bug, not precision). The correct fix is to keep BLOCK_M=128, BLOCK_N=128 but reduce BLOCK_K from 32 to 16. Smaller BLOCK_K means each tl.dot accumulates fewer K-elements per call (16 instead of 32), and there are 48 calls instead of 24. Each individual tl.dot has less TF32 rounding error per call, and the FP32 accumulator (ACC_TYPE=tl.float32) sums these partial results in full FP32 precision. This halves per-tile TF32 error while keeping the large tile size that benefits from Tensor Core throughput.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.235e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.302e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.278e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "8045ca2c",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_accumulator_tile_size_with_correct_dynamic_grid",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_accumulator_tile_size_with_correct_dynamic_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_accumulator_tile_size_with_correct_dynamic_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "With BLOCK_M=128, BLOCK_N=128, BLOCK_K=32 and 128 threads/block, each thread owns 128x128/128=128 FP32 accumulator elements. Since ALLOW_TF32=False forces scalar FP32 FFMA (not Tensor Core MMA), the compiler must keep all 128 accumulator values in general-purpose registers, exhausting the 255-register hardware limit. This caps blocks/SM at 2 (Block Limit Registers=2), giving only 12.5% theoretical occupancy and 58% cycles with no eligible warp. Prior reduce_tile_size attempts (items 879dc87f, 4efe0c2c) failed correctness with max_diff~163 \u2014 far too large for FP32 rounding, indicating a grid size bug where the grid was left hardcoded at 3072 instead of being recomputed for the smaller tiles. With BLOCK_M=64, BLOCK_N=64: grid_m=ceil(65536/64)=1024, grid_n=ceil(768/64)=12, total tiles=12288. The accumulator shrinks to 64x64/128=32 elements/thread, freeing ~96 registers and allowing 4+ blocks/SM (~25-50% occupancy). ALLOW_TF32=False is preserved for correctness (K=768 accumulation). The grid lambda must be updated to compute tiles dynamically.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "3ce15275",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_size_fix_grid_for_register_pressure_and_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_size_fix_grid_for_register_pressure_and_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_size_fix_grid_for_register_pressure_and_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128 with 128 threads/block. Each thread owns 128x128/128=128 FP32 accumulator elements in acc, consuming ~128 registers just for the accumulator. Combined with index arithmetic, this saturates the 255-register hardware limit. Block Limit Registers=2 blocks/SM -> only 8 warps/SM -> 12.5% theoretical occupancy. With 58.2% of cycles having no eligible warp, the GPU is severely latency-bound. Prior attempts to reduce tiles (BLOCK_M=64, BLOCK_N=64) failed correctness with max_diff ~163 -- a catastrophic error indicating the grid was NOT updated from 3072 to 12288, causing tiles to write to wrong output locations. This is an implementation flaw, not an accuracy problem. allow_tf32=False is preserved to avoid the known TF32 accuracy failure (max_diff ~0.13 for K=768).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "9c7283a9",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_size_fix_grid_for_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + SharedMemoryConflicts + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_size_fix_grid_for_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_size_fix_grid_for_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128, BLOCK_K=32 with ALLOW_TF32=False. With 128 threads/block, the accumulator alone is 128x128/128 = 128 FP32 values per thread. Combined with index arithmetic and loop variables, this saturates the 255-register hardware limit, restricting Block Limit Registers to 2 blocks/SM and theoretical occupancy to 12.5%. With only 1.98 active warps/scheduler and 58.2% of cycles having no eligible warp, the GPU is severely latency-bound. Prior attempts to reduce tile sizes (items 879dc87f, 4efe0c2c, 57f68581) all failed correctness with max_diff=163 \u2014 a value far too large to be a numerical precision issue. This magnitude indicates an implementation bug: the grid was not updated to match the new tile sizes, causing output tiles to be skipped or overwritten. The fix is to reduce BLOCK_M=64, BLOCK_N=64 (cutting accumulator registers from 128 to 32 per thread, freeing ~96 registers) AND correctly recompute the grid as ceil(M/64)*ceil(N/64) = 1024*12 = 12288. This should allow 4+ blocks/SM (up to 50% occupancy), dramatically reducing scheduler starvation. ALLOW_TF32 must remain False (K=768 causes TF32 precision failures). The smaller tiles also reduce shared memory bank conflicts (5.3-way average currently).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.636e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.603e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.627e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

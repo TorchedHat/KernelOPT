@@ -1,0 +1,170 @@
+[
+  {
+    "item_id": "9d40deea",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLFPRoofline + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel explicitly sets ALLOW_TF32=False, forcing tl.dot to use FP32 FFMA (67 TFLOPS peak) instead of TF32 Tensor Cores (989 TFLOPS peak on H200 SXM5) \u2014 a ~14.7x theoretical gap. The kernel only achieves 27% of FP32 FFMA peak, meaning it is severely underutilizing compute. Enabling TF32 (allow_tf32=True) routes tl.dot through the MMA pipeline, which is ~8x faster than FFMA for this tile size. Additionally, 168 registers/thread crushes occupancy to 6.25% (1 active warp/scheduler), causing 69.5% scheduler idle cycles. Adding @triton.autotune with smaller BLOCK_K and fewer registers will improve occupancy. The 1024x1024x1024 problem size is a standard neural network GEMM where TF32 precision (10-bit mantissa) is well within acceptable accuracy bounds.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "3bf64cf5",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_autotune_reduce_register_pressure_fix_bank_conflicts",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_autotune_reduce_register_pressure_fix_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'add_autotune_reduce_register_pressure_fix_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.421e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.608e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.544e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=64, BLOCK_N=128, BLOCK_K=32 with 128 threads (4 warps). This produces 168 registers/thread \u2014 far above the ~64\u201396 sweet spot \u2014 limiting the SM to only 3 blocks and 6.25% occupancy. The 8-way shared memory bank conflicts (69.89% of wavefronts) are the primary L1/TEX bottleneck (68.57% SOL). The scheduler is idle 69.53% of cycles because only 1 active warp/scheduler exists to hide latency. With only 128 blocks for 132 SMs, the grid is also under-launched. Adding @triton.autotune with configs that use smaller tiles and more warps will: (1) reduce register pressure per thread, (2) increase occupancy to hide MIO stalls, (3) allow the autotuner to find bank-conflict-free tile shapes, and (4) fill all 132 SMs.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.421e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.608e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.544e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f816db3c",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_load_index_and_enable_tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_load_index_and_enable_tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_load_index_and_enable_tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B-matrix tile load uses a transposed index formula: tl.broadcast_to(idx_m + 1024*idx_n, [BLOCK_K, BLOCK_N]) where idx_m=offs_k[:,None] (shape [BLOCK_K,1]) and idx_n=offs_b_n[None,:] (shape [1,BLOCK_N]). This computes address as k*1024 + n instead of k*1 + n*1024 (correct for B stored row-major as [K,N] with stride_bk=1, stride_bn=1024). This transposed index is the root cause of the 8-way shared memory bank conflicts (69.89% of wavefronts) AND the large correctness errors (max_diff=0.12) seen in prior TF32 attempts. Fixing the B-load to use clean 2D pointers eliminates bank conflicts. Enabling ALLOW_TF32=True then routes tl.dot through Tensor Cores for ~8x compute throughput improvement over FP32 FFMA.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "0ea47127",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_load_indexing_and_enable_tf32_tensor_cores",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + SOLFPRoofline",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_load_indexing_and_enable_tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_load_indexing_and_enable_tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B-matrix load uses tl.trans(b_t) where b_t is loaded as [BLOCK_N, BLOCK_K]. In Triton, tl.trans() reinterprets the register tile layout but does NOT physically transpose data in shared memory. When tl.dot() receives this tile, it reads SMEM in the wrong stride pattern, causing (1) 8-way bank conflicts because consecutive threads access non-consecutive banks (69.89% of wavefronts are excessive), and (2) correctness errors of ~0.12 because the K-dimension accumulation reads wrong B values. The fix is to load B directly as [BLOCK_K, BLOCK_N] using offs_k[:,None] and offs_b_n[None,:] with address = offs_k[:,None]*1 + offs_b_n[None,:]*1024, matching stride_bk=1, stride_bn=1024. This is the canonical Triton GEMM B-load. Once the indexing is correct, ALLOW_TF32=True safely routes tl.dot through Tensor Cores (~8x throughput vs FP32 FFMA). The prior TF32 max_diff of 0.12 is far too large to be TF32 rounding error (which would be ~1e-3 for K=1024) \u2014 it is entirely caused by the indexing bug.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "4f99e37e",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_load_direct_block_k_n_and_enable_tf32",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLFPRoofline + SharedMemoryConflicts + UncoalescedSharedAccess + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_load_direct_block_k_n_and_enable_tf32 \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_load_direct_block_k_n_and_enable_tf32' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B-matrix load is fundamentally incorrect. The current code loads B as [BLOCK_N, BLOCK_K] using offs_b_n[:, None] * stride_bn + offs_k_cur[None, :] * stride_bk (stride_bn=1024, stride_bk=1), which reads B[n,k]. Then tl.trans(b_T) reinterprets the register layout as [BLOCK_K, BLOCK_N], but the VALUES are wrong: it treats B[n,k] as B[k,n]. This causes max_diff ~0.12 in all prior attempts. The correct load for B stored as [K,N] row-major (stride_bk=1, stride_bn=1024) is offs_k_cur[:, None] * stride_bk + offs_b_n[None, :] * stride_bn, which reads B[k,n] directly as [BLOCK_K, BLOCK_N] with no tl.trans() needed. Once correctness is restored, enabling ALLOW_TF32=True routes tl.dot through Tensor Cores (989 TFLOPS peak on H200 vs 67 TFLOPS FP32 FFMA), a ~14.7x theoretical improvement. The bank conflicts (8-way, 69.89% of wavefronts) are also caused by the wrong load pattern and will be eliminated.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c5ac0419",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "enable_tf32_tensor_cores_on_corrected_block_ptr_gemm",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLFPRoofline + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "enable_tf32_tensor_cores_on_corrected_block_ptr_gemm \u2014 correctness failure",
+    "strategy_description": "Plan 'enable_tf32_tensor_cores_on_corrected_block_ptr_gemm' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel achieves only 23% Compute SOL and 6.25% occupancy. 168 registers/thread limits the SM to 3 blocks (Block Limit Registers=3). The scheduler is idle 75.74% of cycles with only 1 active warp/scheduler. ALLOW_TF32=False forces tl.dot through FP32 FFMA (~67 TFLOPS peak) instead of TF32 Tensor Cores (~989 TFLOPS peak). Prior TF32 attempts failed correctness (max_diff~0.12) because the B-matrix was loaded with a transposed index formula. The CURRENT kernel has been migrated to tl.make_block_ptr with correct strides (stride_bk=1, stride_bn=1024, order=(1,0)), so the B-load is now correct. Enabling allow_tf32=True on this corrected kernel should route tl.dot through MMA hardware without the prior indexing-induced correctness error. Adding maxnreg=128 to autotune configs caps register usage to improve occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.243e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.363e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.253e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "b7f2a914",
+    "iteration": 4,
+    "speedup": 1.1389,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_num_stages_with_block_ptr_api",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 183.62,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 275264.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 63.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.59,
+        "Memory Workload Analysis.Mem Busy": 58.62,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Compute Workload Analysis.Executed Ipc Active": 1.11,
+        "Compute Workload Analysis.Issue Slots Busy": 27.8,
+        "Launch Statistics.Waves Per SM": 0.32,
+        "Launch Statistics.Registers Per Thread": 168.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 155.33,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 232938.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 72.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.05,
+        "Memory Workload Analysis.Mem Busy": 69.21,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Compute Workload Analysis.Executed Ipc Active": 1.31,
+        "Compute Workload Analysis.Issue Slots Busy": 32.77,
+        "Launch Statistics.Waves Per SM": 0.48,
+        "Launch Statistics.Registers Per Thread": 232.0
+      }
+    },
+    "strategy_title": "Expand num_stages in Autotune to Enable Async Pipelining",
+    "strategy_description": "Expanding the autotune config space to include num_stages=3,4,5 (from a max of 3) alongside the block pointer API and halved BLOCK_K (32\u219216) yielded a 13.9% speedup (183.6 \u00b5s \u2192 155.3 \u00b5s). The key causal change was the higher num_stages options enabling Triton's software pipeline to prefetch future K-tiles while computing tl.dot on the current tile, reducing warp cycles per issued instruction from 3.59 to 3.05 and improving IPC active from 1.11 to 1.31. Despite registers per thread increasing (168\u2192232, reducing theoretical occupancy from 18.75% to 12.5%), the pipelining benefit outweighed the occupancy cost, and waves_per_sm improved from 0.32 to 0.48 due to the autotuner selecting a more efficient config. Bank conflicts remained unresolved (identical conflict counts), so the gain is purely from latency hiding via deeper software pipelining.",
+    "slow_pseudocode": "# autotune with max num_stages=3\n@triton.autotune(configs=[\n    triton.Config({}, num_warps=4, num_stages=2),\n    triton.Config({}, num_warps=4, num_stages=3),\n    triton.Config({}, num_warps=8, num_stages=2),\n    triton.Config({}, num_warps=8, num_stages=3),\n], key=[])\n# BLOCK_K=32, manual pointer arithmetic in K-loop",
+    "fast_pseudocode": "# autotune with num_stages up to 5 + block_ptr API + BLOCK_K=16\n@triton.autotune(configs=[\n    triton.Config({}, num_warps=4, num_stages=3),\n    triton.Config({}, num_warps=4, num_stages=4),\n    triton.Config({}, num_warps=4, num_stages=5),\n    triton.Config({}, num_warps=8, num_stages=3),\n    triton.Config({}, num_warps=8, num_stages=4),\n    triton.Config({}, num_warps=8, num_stages=5),\n], key=[])\n# BLOCK_K=16, tl.make_block_ptr + tl.advance in K-loop\nfor _ in range(tl.cdiv(K, BLOCK_K)):\n    a = tl.load(a_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(b_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc += tl.dot(a, b, allow_tf32=False)\n    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))\n    b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))",
+    "applicable_when": "Triton GEMM kernel where IssueSlotUtilization is low (<35%), warp cycles per issued instruction >3.0, and the autotune config space is limited to num_stages<=3. The kernel is memory-latency bound (high Mem Busy, MIO stall CPIStall) with a K-loop that can be pipelined. Halving BLOCK_K increases loop trip count, giving the software pipeline more opportunities to prefetch ahead.",
+    "do_not_apply_when": "When register pressure is already very high (>200 registers/thread) and theoretical occupancy is already at or near the minimum (\u22642 warps/scheduler), adding more num_stages may further increase register spill or reduce occupancy below the point where pipelining helps. Also avoid when BLOCK_K is already at the minimum (e.g., 16) and further halving would create excessive loop overhead.",
+    "framework_notes": "In Triton, num_stages controls the depth of the software pipeline inserted by the compiler. Higher num_stages (4-5) causes the compiler to prefetch more K-tiles ahead, hiding HBM/L2 latency behind tl.dot compute. This increases register usage (168\u2192232 here) because more in-flight tiles must be buffered in registers. The autotuner selects the best config at runtime. BLOCK_K=16 with num_stages=5 means 5 tiles are prefetched, each 16 elements deep \u2014 equivalent to 80 elements of lookahead in the K dimension."
+  }
+]

@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "6ec4aa70",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.133e-01 > atol=0.001\nseed=42 output[0]: max_diff=5.455e-01 > atol=0.001\nseed=1337 output[0]: max_diff=5.057e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is bottlenecked by shared memory bank conflicts (8-way, 65% estimated speedup) caused by the scalar FP32 FFMA path taken when ALLOW_TF32=False. With K=16384 and BLOCK_K=32, the inner loop executes 512 iterations of tl.dot in scalar mode, generating massive shared memory traffic through the L1/TEX unit (87.48% throughput). Enabling allow_tf32=True routes tl.dot through Tensor Core MMA instructions, which operate on register tiles and bypass the shared-memory bank-conflict bottleneck entirely. TF32 Tensor Cores deliver ~8x the throughput of scalar FP32 FFMA. Additionally, increasing BLOCK_K from 32 to 64 reduces loop iterations by 2x and improves arithmetic intensity, while increasing BLOCK_N from 64 to 128 better saturates the Tensor Core pipeline.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.133e-01 > atol=0.001\nseed=42 output[0]: max_diff=5.455e-01 > atol=0.001\nseed=1337 output[0]: max_diff=5.057e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_smem_bank_conflict_regression",
+    "iteration": 1,
+    "speedup": 0.0287,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_stages_without_tile_size_changes_for_bank_conflict",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 4.03,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput_%": 87.48,
+        "Occupancy.Theoretical Occupancy_%": 18.75,
+        "Occupancy.Achieved Occupancy_%": 12.26,
+        "Occupancy.Block Limit Shared Mem_blocks": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 49.15,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.06,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Instruction Statistics.Executed Instructions": 1195972608.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 140.47,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput_%": 17.87,
+        "Occupancy.Theoretical Occupancy_%": 6.25,
+        "Occupancy.Achieved Occupancy_%": 6.25,
+        "Occupancy.Block Limit Shared Mem_blocks": 1.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 131.07,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.68,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.05,
+        "Instruction Statistics.Executed Instructions": 5541201920.0
+      }
+    },
+    "strategy_title": "Doubling BLOCK_N/BLOCK_K Explodes Shared Memory, Kills Occupancy",
+    "strategy_description": "Increasing BLOCK_N from 64\u2192128 and BLOCK_K from 32\u219264 quadrupled the shared memory per block (49 KB \u2192 131 KB), causing Block Limit Shared Mem to drop from 3 to 1 block per SM and theoretical occupancy to fall from 18.75% to 6.25%. This extreme occupancy collapse (combined with a 4.6\u00d7 instruction count increase from 1.2B to 5.5B) caused duration to balloon from 4 ms to 140 ms \u2014 a 35\u00d7 regression. The autotune decorator also failed to actually vary BLOCK_M/BLOCK_N/BLOCK_K (configs had empty dicts), so the larger hardcoded tile sizes were always used. When shared memory per block exceeds ~50 KB on a kernel already limited by smem occupancy, increasing tile sizes will worsen rather than improve performance.",
+    "slow_pseudocode": "# Before: BLOCK_N=64, BLOCK_K=32, smem=49KB, occupancy=18.75%\nBLOCK_M = 128; BLOCK_N = 64; BLOCK_K = 32\nfor k in range(0, K // BLOCK_K):\n    a = tl.load(A_tile)  # [128, 32]\n    b = tl.load(B_tile)  # [32, 64]\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "# After (REGRESSED): BLOCK_N=128, BLOCK_K=64, smem=131KB, occupancy=6.25%\n# autotune configs had empty dicts \u2014 tile sizes not actually autotuned\n@triton.autotune(configs=[triton.Config({}, num_warps=4, num_stages=3), ...], key=[])\nBLOCK_M = 128; BLOCK_N = 128; BLOCK_K = 64  # hardcoded, not autotuned\nfor k in tl.range(0, K // BLOCK_K, num_stages=3):\n    a = tl.load(A_tile)  # [128, 64]\n    b = tl.load(B_tile)  # [64, 128]\n    acc = tl.dot(a, b, acc)",
+    "applicable_when": "Never \u2014 this specific combination of empty autotune config dicts with hardcoded large tile sizes is always wrong.",
+    "do_not_apply_when": "When the kernel is already shared-memory occupancy limited (Block Limit Shared Mem \u2264 3 blocks). Do not increase BLOCK_N or BLOCK_K without verifying that the resulting shared memory per block stays within the occupancy budget. Do not use @triton.autotune with empty config dicts \u2014 tile sizes must be explicitly listed in each config dict. Do not add num_stages pipelining when occupancy is already critically low, as it increases smem pressure further.",
+    "framework_notes": "In Triton, @triton.autotune config dicts must explicitly include all tile-size parameters (BLOCK_M, BLOCK_N, BLOCK_K) as keys if those are meant to be autotuned. An empty dict {} means only num_warps/num_stages vary while hardcoded constexprs remain fixed. The key=[] argument also means no autotuning actually occurs across problem sizes. Additionally, tl.range(..., num_stages=N) increases shared memory allocation for software pipelining buffers, which can push smem per block over the occupancy threshold."
+  }
+]

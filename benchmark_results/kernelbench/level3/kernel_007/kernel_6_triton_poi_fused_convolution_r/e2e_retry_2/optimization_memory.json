@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "1b726ea9",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_tile_dimensions_for_small_xnumel",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_tile_dimensions_for_small_xnumel \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_tile_dimensions_for_small_xnumel' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.022e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.724e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.435e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "xnumel=9 but XBLOCK=128 \u2014 only 9 of 128 threads per block do real work in the X dimension (93% masked out). The grid is (cdiv(9,128)=1, cdiv(12288,8)=1536) = 1536 CTAs total. With 132 SMs this gives only 0.73 waves. Flipping the tile assignment so YBLOCK is large (e.g. 64 or 128) and XBLOCK=1 makes the large Y dimension drive parallelism, fills the grid properly, and eliminates the massive thread-mask waste. Additionally, the current XBLOCK=128 with xnumel=9 causes strided/uncoalesced stores to out_ptr0 (stride 64 in y0 dimension), which the MemoryCacheAccessPattern rule flags at 9% speedup.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.022e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.724e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.435e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_tile_xblock_mismatch_autotune",
+    "iteration": 1,
+    "speedup": 1.0655,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_xblock_mismatch_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "Compute Workload Analysis.Issue Slots Busy": 49.64,
+        "Occupancy.Achieved Occupancy": 51.06,
+        "Launch Statistics.Waves Per SM": 0.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.0,
+        "Scheduler Statistics.No Eligible": 46.69,
+        "GPU Speed Of Light Throughput.Duration": 3.58,
+        "Compute Workload Analysis.Executed Ipc Active": 1.92
+      },
+      "key_metric_after": {
+        "Compute Workload Analysis.Issue Slots Busy": 66.75,
+        "Occupancy.Achieved Occupancy": 49.95,
+        "Launch Statistics.Waves Per SM": 0.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.71,
+        "Scheduler Statistics.No Eligible": 36.75,
+        "GPU Speed Of Light Throughput.Duration": 3.36,
+        "Compute Workload Analysis.Executed Ipc Active": 2.6
+      }
+    },
+    "strategy_title": "Replace Oversized XBLOCK With Autotune When xnumel Is Small",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=9), the majority of threads in every CTA are masked out, wasting compute slots and inflating 'No Eligible' warp cycles. Replacing the static oversized tile with @triton.autotune over configs that match XBLOCK to xnumel (e.g., XBLOCK=16 or 1 for xnumel=9) eliminates thread waste and raises Issue Slots Busy from ~50% to ~67%, reducing Warp Cycles Per Issued Instruction from 16 to 11.7. The grid lambda must be updated to use meta['XBLOCK'] and meta['YBLOCK'] so the autotuner can vary both dimensions.",
+    "slow_pseudocode": "# XBLOCK >> xnumel: 93% of threads masked out per block\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # (1, 1536)\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK matched to xnumel via autotune\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  64}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK':  1, 'YBLOCK': 512}, num_warps=8),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 512}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr): ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # XBLOCK/YBLOCK from autotune",
+    "applicable_when": "XBLOCK is set to a power-of-2 default (e.g., 128) but xnumel is much smaller (e.g., single digits or tens); 'No Eligible' warp percentage is high (>40%); Issue Slots Busy is low (<55%); IssueSlotUtilization NCU rule fires; thread waste in X dimension exceeds 50%.",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (waste is minimal); the kernel is already autotuned; grid size is already large enough to saturate all SMs (waves_per_sm >> 1); occupancy is already near theoretical maximum.",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] and update the grid to a lambda using meta['XBLOCK'] and meta['YBLOCK']. In CUDA, the equivalent is choosing block dimensions that match the actual work dimensions rather than defaulting to 128 or 256 threads. Note: in this case waves_per_sm did not improve (stayed at 0.73) because the grid shape was not fully corrected by the autotune configs chosen, but IPC and issue slot utilization improved significantly due to reduced thread masking."
+  }
+]

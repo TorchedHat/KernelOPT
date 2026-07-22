@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "c81f9ce7",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "online_softmax_attention",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "online_softmax_attention \u2014 correctness failure",
+    "strategy_description": "Plan 'online_softmax_attention' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.718e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.542e+01 > atol=0.001\nseed=1337 output[0]: max_diff=9.623e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a batched attention BMM over 128 batches x 8 heads = 1024 slices, each slice being (512 seq_len x 96 head_dim). The grid is launched as (16, 1, 1): 16 tiles cover the M=512/N=96 output tile grid for a SINGLE batch slice, leaving 1023 batch slices completely unprocessed. This is the primary cause of 0.03 waves/SM and 6.25% occupancy. Beyond the grid bug, the kernel name reveals it is part of a multi-pass softmax attention pipeline (score -> softmax -> weighted sum), which materializes the full (512x512) attention score matrix to global memory between passes. The diversity instruction targets replacing this with an online softmax attention kernel that fuses the entire attention computation \u2014 QK^T, softmax with running max/normalizer, and weighted V sum \u2014 into a single streaming pass over the KV sequence, eliminating the intermediate attention matrix write-back and reducing global memory traffic by O(seq_len^2) floats.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.718e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.542e+01 > atol=0.001\nseed=1337 output[0]: max_diff=9.623e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_smem_regression_001",
+    "iteration": 1,
+    "speedup": 0.8196,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_num_stages_without_block_param_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Duration_us": 24.13,
+        "Launch.Elapsed_Cycles": 36120.0,
+        "Launch.Dynamic_Shared_Memory_Per_Block_Kbyte": 32.77,
+        "Launch.Registers_Per_Thread": 123.0,
+        "Occupancy.Theoretical_Occupancy_pct": 25.0,
+        "Occupancy.Block_Limit_Shared_Mem": 4.0,
+        "Compute.Issue_Slots_Busy_pct": 56.85,
+        "Warp.Warp_Cycles_Per_Issued_Instruction": 1.75
+      },
+      "key_metric_after": {
+        "Launch.Duration_us": 29.44,
+        "Launch.Elapsed_Cycles": 44109.0,
+        "Launch.Dynamic_Shared_Memory_Per_Block_Kbyte": 65.54,
+        "Launch.Registers_Per_Thread": 128.0,
+        "Occupancy.Theoretical_Occupancy_pct": 18.75,
+        "Occupancy.Block_Limit_Shared_Mem": 3.0,
+        "Compute.Issue_Slots_Busy_pct": 49.9,
+        "Warp.Warp_Cycles_Per_Issued_Instruction": 2.0
+      }
+    },
+    "strategy_title": "Autotune num_warps/num_stages Without Fixing Root Grid Bug",
+    "strategy_description": "Adding @triton.autotune varying only num_warps and num_stages while leaving the grid launch unchanged (16 blocks for 132 SMs) and doubling BLOCK_K from 32 to 64 caused a regression. The larger BLOCK_K doubled dynamic shared memory per block from ~33 KB to ~66 KB, reducing Block_Limit_Shared_Mem from 4 to 3 and theoretical occupancy from 25% to 18.75%. This increased Warp_Cycles_Per_Issued_Instruction from 1.75 to 2.0 and raised elapsed cycles by ~22%, resulting in 0.82x speedup. When the grid is already severely under-launched (waves_per_sm < 0.1), autotuning num_warps/num_stages without fixing the grid provides no benefit, and increasing BLOCK_K to reduce loop iterations is counterproductive if it inflates shared memory and cuts theoretical occupancy.",
+    "slow_pseudocode": "BLOCK_K = 32  # 128-byte loads, ~33 KB smem/block\ngrid = (16, 1, 1)  # only 16 blocks on 132-SM GPU\n@triton.jit\ndef kernel(A, B, out):\n    # matmul with BLOCK_M=64, BLOCK_N=64, BLOCK_K=32\n    ...",
+    "fast_pseudocode": "# WRONG APPROACH \u2014 do not do this:\nBLOCK_K = 64  # 256-byte loads, ~66 KB smem/block (doubles smem!)\ngrid = (16, 1, 1)  # grid still broken \u2014 root cause not fixed\n@triton.autotune(configs=[Config({}, num_warps=w, num_stages=s) for w,s in ...], key=[])\n@triton.jit\ndef kernel(A, B, out):\n    # matmul with BLOCK_M=64, BLOCK_N=64, BLOCK_K=64\n    # smem doubles \u2192 Block_Limit_Shared_Mem drops 4\u21923 \u2192 occupancy 25%\u219218.75%\n    ...",
+    "applicable_when": "Never \u2014 this is a negative example. Do not apply autotune of num_warps/num_stages alone when the grid is severely under-launched (waves_per_sm < 0.1) and the root cause is an incorrect grid dimension.",
+    "do_not_apply_when": "Always avoid increasing BLOCK_K (or any tile dimension that grows shared memory) when the kernel is already shared-memory limited (Block_Limit_Shared_Mem is the binding occupancy constraint). Do not add autotune without first fixing the grid launch bug when LaunchConfiguration NCU rule fires with speedup_pct > 80%.",
+    "framework_notes": "In Triton, @triton.autotune with configs that only vary num_warps and num_stages does not change tile sizes or grid shape. Increasing BLOCK_K as a constexpr inside the kernel body (not as a META parameter) still inflates shared memory allocation per block, reducing Block_Limit_Shared_Mem and theoretical occupancy. The grid lambda must be fixed independently of autotune."
+  }
+]

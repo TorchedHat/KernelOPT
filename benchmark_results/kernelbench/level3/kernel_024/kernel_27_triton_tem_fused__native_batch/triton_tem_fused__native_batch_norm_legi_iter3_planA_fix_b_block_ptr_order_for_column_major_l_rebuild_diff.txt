@@ -1,0 +1,74 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_mean_relu_sigmoid_27(arg_A, arg_B, in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr1):
+@@ -54,27 +55,37 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # Create TMA block pointers BEFORE the k-loop
++    # A is (M=2, K=288) row-major: strides=(stride_am=288, stride_ak=1)
++    a_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0)
++    )
++    # B is (K=288, N=1728) column-major: strides=(stride_bk=1, stride_bn=288)
++    # B[k, n] = B + k*1 + n*288 -- same formula as original idx_m + 288*idx_n
++    b_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(1, 0)
++    )
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 288*idx_m
+-        a = tl.load(A + (xindex))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 1728*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 288*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-
++        # TMA bulk async copy -- no scalar address generation, no bank conflicts
++        a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
++        # Advance block pointers along K dimension
++        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
++        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -103,8 +114,6 @@
+     tmp15 = tl.full([1], 0, tl.int32)
+     tmp16 = tl.maximum(tmp15, tmp14)
+     tl.store(out_ptr1 + (tl.broadcast_to(idx_n + 1728*idx_m, [BLOCK_M, BLOCK_N])), tmp16, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

@@ -1,0 +1,132 @@
+[
+  {
+    "item_id": "47ff9788",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_reduce_register_pressure_and_improve_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_to_reduce_register_pressure_and_improve_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_to_reduce_register_pressure_and_improve_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.791e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.824e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.986e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely occupancy-limited: 168 registers/thread with BLOCK_M=64, BLOCK_N=128, BLOCK_K=32 restricts the GPU to only 3 blocks/SM (18.75% theoretical, 11.89% achieved). With only 246 CTAs on 132 SMs (0.62 waves), the GPU is barely utilized. The scheduler sits idle 64% of cycles because so few warps are active to hide latency. Additionally, the current tile shape causes 7.9-way average shared memory bank conflicts (65% excessive wavefronts), which is the top NCU rule at 56.87% estimated speedup. Adding @triton.autotune with configurations that use smaller BLOCK_M/BLOCK_N (reducing register pressure) and varying BLOCK_K/num_warps/num_stages will allow the compiler to find a configuration that balances tile efficiency against occupancy. Smaller tiles also increase the grid size, improving SM utilization beyond the current 0.62 waves.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.791e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.824e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.986e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "b2e1c934",
+    "iteration": 2,
+    "speedup": 0.1082,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "cap_registers_with_maxnreg_to_improve_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Occupancy.Achieved Occupancy": 11.88,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Registers": 3.0,
+        "Launch.Registers Per Thread": 168.0,
+        "Launch.Waves Per SM": 0.62,
+        "Scheduler Statistics.No Eligible": 64.14,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.3,
+        "GPU Speed Of Light Throughput.Duration": 38.08,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 31.6,
+        "Memory Workload Analysis.Mem Busy": 71.79
+      },
+      "key_metric_after": {
+        "Occupancy.Achieved Occupancy": 5.74,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Launch.Registers Per Thread": 128.0,
+        "Launch.Waves Per SM": 0.23,
+        "Scheduler Statistics.No Eligible": 93.6,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.65,
+        "GPU Speed Of Light Throughput.Duration": 347.71,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 6.18,
+        "Memory Workload Analysis.Mem Busy": 10.8
+      }
+    },
+    "strategy_title": "maxnreg register cap causes severe register spill regression",
+    "strategy_description": "Adding maxnreg=128 to Triton autotune configs reduced registers/thread from 168 to 128 and raised theoretical occupancy from 18.75% to 25%, but achieved occupancy collapsed from 11.88% to 5.74% and duration increased 9x (38us \u2192 348us). The root cause is that forced register spilling to local memory introduced massive L1TEX stalls: warp cycles per issued instruction jumped from 5.3 to 15.65, idle scheduler cycles rose from 64% to 93.6%, and the CPIStall rule flagged L1TEX scoreboard stalls consuming 78.6% of cycles. The anti-pattern is applying maxnreg when the kernel already has low wave count (0.62 waves): halving the block size from 128 to 64 threads also halved the grid's effective parallelism (waves dropped from 0.62 to 0.23), compounding the spill penalty with even less occupancy to hide latency.",
+    "slow_pseudocode": "# AFTER (regressed)\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=2, maxnreg=128),\n        triton.Config({}, num_warps=4, num_stages=2, maxnreg=128),\n        triton.Config({}, num_warps=8, num_stages=2, maxnreg=128),\n        # ... all configs with maxnreg=128\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    # register spill to local memory due to maxnreg cap\n    # L1TEX stalls dominate: 78.6% of cycles\n    ...",
+    "fast_pseudocode": "# BEFORE (baseline)\n@triton.jit\ndef kernel(...):\n    # 168 registers/thread, no maxnreg cap\n    # shared memory bank conflicts present but manageable\n    # 38us duration, 31.6% SM throughput\n    ...",
+    "applicable_when": "Never: this strategy caused a 9x regression. Do not apply maxnreg capping when the kernel already has low wave count (<1.0 waves per SM) and the block size reduction would further reduce parallelism. Register spill latency to L1TEX/L2 is far more costly than the occupancy gain when there are insufficient waves to hide it.",
+    "do_not_apply_when": "Any kernel with waves_per_sm < 1.0 where the grid size is already small relative to SM count. Also avoid when the kernel's working set per thread is large (e.g., large accumulator tiles in GEMM), as forced spilling of accumulator registers to local memory creates uncoalesced L1TEX accesses (1 of 32 bytes utilized per sector, per NCU MemoryCacheAccessPattern rule). The combination of low occupancy + register spill is catastrophic: schedulers have no other warps to switch to while waiting on spill loads.",
+    "framework_notes": "In Triton, maxnreg=N in triton.Config() caps the compiler's register allocation per thread, forcing spills to local memory (mapped to L1TEX/L2). Unlike CUDA __launch_bounds__, Triton's maxnreg interacts with the autotuner's block_size selection. If the autotuner selects a smaller block_size (64 vs 128 threads) to fit more blocks, the grid's total parallelism may decrease if grid_size is fixed, worsening wave count."
+  },
+  {
+    "item_id": "c7a3f891",
+    "iteration": 3,
+    "speedup": 0.7123,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "remove_maxnreg_and_fix_b_matrix_index",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts + TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 37.89,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 31.5,
+        "Memory Workload Analysis.Mem Busy": 71.6,
+        "Occupancy.Achieved Occupancy": 11.89,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch.Registers Per Thread": 168.0,
+        "Launch.Waves Per SM": 0.62,
+        "Scheduler Statistics.No Eligible": 64.24,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.31,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 52.83,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 22.64,
+        "Memory Workload Analysis.Mem Busy": 34.22,
+        "Occupancy.Achieved Occupancy": 5.87,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Launch.Registers Per Thread": 255.0,
+        "Launch.Waves Per SM": 0.47,
+        "Scheduler Statistics.No Eligible": 72.01,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.58,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 41.96
+      }
+    },
+    "strategy_title": "Removing maxnreg and fixing B-index caused regression",
+    "strategy_description": "Removing maxnreg from autotune configs (intended to eliminate register spills) instead caused registers/thread to jump from 168 to 255, which further collapsed theoretical occupancy from 18.75% to 12.5% and achieved occupancy from 11.89% to 5.87%, increasing duration from 37.89us to 52.83us (0.71x speedup). The B-matrix index fix (changing xindex from `idx_n + 256*idx_m` to `idx_m + 128*idx_n`) partially reduced shared memory bank conflicts (7.9-way \u2192 5.3-way, excessive wavefronts 65% \u2192 52%) but the occupancy collapse from unconstrained register growth dominated. The anti-pattern is removing all register constraints when the kernel already has very low wave count (0.62 waves): without any cap, the compiler allocated even more registers (255 vs 168), reducing block limit registers from 3 to 4 but theoretical occupancy still dropped because block_size was halved (128\u219264 threads), cutting waves from 0.62 to 0.47 and leaving schedulers idle 72% of cycles.",
+    "slow_pseudocode": "# BEFORE (baseline, 37.89us)\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=4),\n    ], key=[],\n)\n# block_size=128, 168 regs/thread, waves=0.62\n# B index: xindex = idx_n + 256*idx_m (wrong stride)\na = tl.load(A + xindex, cache_modifier='.ca')\nb = tl.load(B + broadcast_to_xindex, cache_modifier='.ca')",
+    "fast_pseudocode": "# AFTER (regressed, 52.83us)\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n    ], key=[],\n)\n# block_size=64, 255 regs/thread, waves=0.47\n# B index: xindex = idx_m + 128*idx_n (corrected stride)\na = tl.load(A + xindex)  # no cache_modifier\nb = tl.load(B + xindex)  # no cache_modifier",
+    "applicable_when": "Never apply this combined change (removing maxnreg + reducing autotune config count + removing cache_modifier) when the kernel already has low wave count (<1.0 waves/SM) and block_size is already at 128 threads. The autotuner may select a smaller block_size (64 threads) from the new config set, further reducing waves and compounding the occupancy penalty from unconstrained register growth.",
+    "do_not_apply_when": "Any kernel where waves_per_sm < 1.0 and the autotune config set includes smaller block sizes that the autotuner might prefer. Removing cache_modifier='.ca' from global loads when L1 hit rate was already 0% (no benefit) is neutral, but the config set reduction that allows 64-thread blocks is harmful. Also avoid when the B-matrix index fix alone is the intended change \u2014 bundle it only with changes that do not reduce parallelism.",
+    "framework_notes": "In Triton, the autotuner selects the best config from the provided list. If the new config list includes smaller num_warps (e.g., num_warps=2 with block_size=64 threads), the autotuner may select it, reducing total threads and waves. The registers/thread can increase beyond the original 168 when maxnreg is absent and the compiler has more freedom, paradoxically worsening occupancy. The B-matrix index correction (stride 128 vs 256) is independently valid but insufficient to overcome the occupancy regression."
+  },
+  {
+    "item_id": "6a9b93d9",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_to_increase_grid_waves_and_lower_register_pressure",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + TheoreticalOccupancy + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_to_increase_grid_waves_and_lower_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_to_increase_grid_waves_and_lower_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.722e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.824e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.802e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has only 246 CTAs on 132 SMs (0.62 waves), leaving most SMs idle for the entire second wave. Occupancy is capped at 18.75% theoretical (3 blocks/SM) because 168 registers/thread x 128 threads/block = 21504 registers/block, and the H200 has 65536 registers/SM -> floor(65536/21504)=3 blocks. The accumulator tile acc[BLOCK_M=64, BLOCK_N=128] = 8192 float32 values is the primary driver of register pressure. Reducing BLOCK_N from 128->64 halves the accumulator to 4096 elements, cutting register pressure roughly in half (~84 regs/thread), which should raise block limit registers from 3->6 and theoretical occupancy from 18.75%->37.5%. Simultaneously, the grid doubles from 246->492 CTAs (3.7 waves), ensuring all 132 SMs are busy for multiple full waves. All prior attempts that failed either: (a) capped registers with maxnreg causing spills, (b) reduced block_size causing fewer waves, or (c) tried to fix smem bank conflicts without addressing the fundamental wave-count underutilization. This plan addresses the root cause - too few tiles for the available SMs - by a pure tile-shape change that increases parallelism.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.722e+01 > atol=0.001\nseed=42 output[0]: max_diff=5.824e+01 > atol=0.001\nseed=1337 output[0]: max_diff=5.802e+01 > atol=0.001",
+    "framework_notes": null
+  }
+]

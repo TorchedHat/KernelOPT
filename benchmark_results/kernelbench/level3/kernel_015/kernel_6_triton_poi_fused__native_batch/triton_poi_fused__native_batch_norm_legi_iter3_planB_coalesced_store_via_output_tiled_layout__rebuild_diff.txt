@@ -1,0 +1,80 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,53 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'YBLOCK': 32,  'XBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'YBLOCK': 64,  'XBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'YBLOCK': 128, 'XBLOCK': 1}, num_warps=8, num_stages=3),
++        triton.Config({'YBLOCK': 32,  'XBLOCK': 4}, num_warps=4, num_stages=3),
++        triton.Config({'YBLOCK': 64,  'XBLOCK': 4}, num_warps=8, num_stages=3),
++        triton.Config({'YBLOCK': 32,  'XBLOCK': 2}, num_warps=4, num_stages=3),
++    ],
++    key=['xnumel', 'ynumel'],
++)
+ @triton.jit
+-def triton_poi_fused__native_batch_norm_legit_no_training_cat_convolution_relu_6(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 3072
+-    xnumel = 9
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y3 = yindex
+-    y0 = (yindex % 96)
+-    y1 = yindex // 96
+-    tmp0 = tl.load(in_ptr0 + (x2 + 9*y3), xmask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (y0 + 96*x2 + 864*y1), tmp0, xmask)
++def triton_poi_fused__native_batch_norm_legit_no_training_cat_convolution_relu_6(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):
++    # Re-tile over output space:
++    # YBLOCK = Y0BLOCK (tiles y0 = y3%96, stride-1 in output => coalesced stores)
++    # XBLOCK = BXBLOCK (tiles combined (y1, x2) dimension [0, 288))
++    Y0 = 96   # y0 range: [0, 96)
++    Y1 = 32   # y1 range: [0, 32)
++    X2 = 9    # x2 range: [0, 9)
+ 
++    pid0 = tl.program_id(0)  # tiles over combined (y1, x2) dimension [0, 288)
++    pid1 = tl.program_id(1)  # tiles over y0 dimension [0, 96)
+ 
++    # bx_index covers the combined (y1, x2) dimension [0, 288)
++    bx_index = pid0 * XBLOCK + tl.arange(0, XBLOCK)  # shape [XBLOCK]
++    bx_mask = bx_index < Y1 * X2  # shape [XBLOCK]
++
++    # x2 is the remainder within each (y1, x2) pair
++    x2 = (bx_index % X2)[None, :]   # shape [1, XBLOCK]
++    y1 = (bx_index // X2)[None, :]  # shape [1, XBLOCK]
++
++    # y0 is the stride-1 output dimension (fast-varying for coalesced stores)
++    y0 = pid1 * YBLOCK + tl.arange(0, YBLOCK)[:, None]  # shape [YBLOCK, 1]
++    y0_mask = y0 < Y0  # shape [YBLOCK, 1]
++
++    # Reconstruct y3 from y1 and y0
++    y3 = y1 * Y0 + y0  # shape [YBLOCK, XBLOCK]
++
++    # Combined mask
++    mask = bx_mask[None, :] & y0_mask  # shape [YBLOCK, XBLOCK]
++
++    # Load: in_ptr0[x2 + 9*y3] — strided but cached via evict_last
++    tmp0 = tl.load(in_ptr0 + (x2 + X2 * y3), mask=mask, eviction_policy='evict_last')
++
++    # Store: out_ptr0[y0 + 96*x2 + 864*y1] — COALESCED (consecutive y0 = stride-1)
++    tl.store(out_ptr0 + (y0 + Y0 * x2 + 864 * y1), tmp0, mask=mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +59,7 @@
+     ynumel = 3072
+     xnumel = 9
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused__native_batch_norm_legit_no_training_cat_convolution_relu_6[grid](arg_0, arg_1, 3072, 9, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused__native_batch_norm_legit_no_training_cat_convolution_relu_6[grid](arg_0, arg_1, 3072, 9)
+     return arg_1
+ 
+ def get_inputs():

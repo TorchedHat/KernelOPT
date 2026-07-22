@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "c9d26b02",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_triton_autotune \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'add_triton_autotune' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 229, in benchmark\n    timings = {config: self._bench(*args, c",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has xnumel=9 but XBLOCK=128, meaning 119 out of 128 threads per block are masked/idle in the X dimension \u2014 a massive waste. The resulting grid is (1, 4096) = 4096 blocks across 132 SMs, producing 1 full wave + a partial wave of 1984 blocks. NCU's LaunchConfiguration rule estimates this tail effect costs up to 50% of total runtime. Additionally, the 2D tiling causes uncoalesced loads (only 18/32 bytes used per sector). Flattening to 1D and autotuning XBLOCK eliminates the partial wave and improves coalescing simultaneously.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packa",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_tile_eliminate_partial_wave",
+    "iteration": 1,
+    "speedup": 1.1562,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_eliminate_partial_wave",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Occupancy.Achieved Occupancy": 68.59,
+        "GPU Speed Of Light Throughput.Duration": 5.18,
+        "Scheduler Statistics.No Eligible": 29.63,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 28.0,
+        "Instruction Statistics.Executed Instructions": 1638400.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 4096.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Occupancy.Achieved Occupancy": 27.52,
+        "GPU Speed Of Light Throughput.Duration": 4.48,
+        "Scheduler Statistics.No Eligible": 65.51,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 47.06,
+        "Instruction Statistics.Executed Instructions": 248832.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 4096.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Eliminate Partial Wave Tail",
+    "strategy_description": "When NCU's LaunchConfiguration rule flags a partial wave accounting for ~50% of runtime, replacing fixed tile sizes with @triton.autotune over multiple (XBLOCK, YBLOCK, num_warps) configs allows the runtime to select a grid that fits cleanly into full waves. In this case, the kernel had xnumel=9 (tiny spatial dim) but XBLOCK=128, wasting 119/128 threads per block; switching to XBLOCK=1 and sweeping YBLOCK over {32,64,128,256} reduced executed instructions by 6.6x (1.64M\u2192249K) and duration from 5.18\u00b5s to 4.48\u00b5s. The L1 hit rate improved from 28% to 47% as a side effect of better tile alignment, though achieved occupancy dropped (from 68.6% to 27.5%) because the workload now fits in fewer waves.",
+    "slow_pseudocode": "# Fixed tile: XBLOCK=128, YBLOCK=8, grid=(cdiv(9,128), cdiv(32768,8))=(1,4096)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    yindex = pid(1)*YBLOCK + arange(0,YBLOCK)[:,None]\n    ymask = full([YBLOCK], True)  # no guard \u2014 wastes threads when ynumel not divisible\n    xindex = pid(0)*XBLOCK + arange(0,XBLOCK)[None,:]\n    xmask = xindex < xnumel      # xnumel=9, XBLOCK=128 \u2192 119/128 threads masked\n    load(in_ptr0 + x + 9*y, xmask)\n    store(out_ptr0 + ..., xmask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # (1, 4096) \u2192 1 full wave + 1984-block partial wave\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile: sweep YBLOCK, set XBLOCK small to match xnumel\n@triton.autotune(configs=[\n    Config({'YBLOCK': 32,  'XBLOCK': 1},  num_warps=2),\n    Config({'YBLOCK': 64,  'XBLOCK': 1},  num_warps=4),\n    Config({'YBLOCK': 128, 'XBLOCK': 1},  num_warps=4),\n    Config({'YBLOCK': 256, 'XBLOCK': 1},  num_warps=8),\n    Config({'YBLOCK': 32,  'XBLOCK': 16}, num_warps=2),\n    Config({'YBLOCK': 64,  'XBLOCK': 16}, num_warps=4),\n    Config({'YBLOCK': 128, 'XBLOCK': 16}, num_warps=4),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: constexpr, XBLOCK: constexpr):\n    yindex = pid(1)*YBLOCK + arange(0,YBLOCK)[:,None]\n    ymask = yindex < ynumel   # proper guard\n    xindex = pid(0)*XBLOCK + arange(0,XBLOCK)[None,:]\n    xmask = xindex < xnumel\n    load(in_ptr0 + x + 9*y, xmask & ymask)\n    store(out_ptr0 + ..., xmask & ymask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)  # autotune injects best XBLOCK/YBLOCK",
+    "applicable_when": "NCU LaunchConfiguration rule fires with partial wave overhead \u226530%; one tile dimension (XBLOCK or YBLOCK) is much larger than the corresponding numel (e.g., XBLOCK=128 but xnumel=9); kernel is a simple load/store or elementwise op with no shared memory dependency on tile size; grid produces 1\u20132 waves with significant tail.",
+    "do_not_apply_when": "Kernel uses shared memory sized proportionally to XBLOCK/YBLOCK (autotune would need smem configs too); kernel is already occupancy-bound and reducing block size would hurt latency hiding; grid is already a clean multiple of SM count with no partial wave; xnumel and ynumel are both large and well-matched to existing tile sizes.",
+    "framework_notes": "Triton-specific: @triton.autotune with key=['ynumel','xnumel'] triggers re-tuning when problem size changes. The grid must be a lambda consuming meta dict so XBLOCK/YBLOCK are injected at launch time. In CUDA, the equivalent is a hand-written autotuning loop over block dimensions before the kernel launch."
+  }
+]

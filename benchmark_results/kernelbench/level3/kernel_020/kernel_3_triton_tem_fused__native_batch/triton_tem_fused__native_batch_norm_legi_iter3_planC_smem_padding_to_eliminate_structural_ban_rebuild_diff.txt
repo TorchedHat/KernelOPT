@@ -1,0 +1,72 @@
+--- baseline
++++ rebuilt
+@@ -5,10 +5,24 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=16, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=16, num_stages=4),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_3(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+-    USE_FAST_ACCUM : tl.constexpr = False
++    USE_FAST_ACCUM : tl.constexpr = True
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 128
+     BLOCK_N : tl.constexpr = 16
+@@ -58,23 +72,26 @@
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
++
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 32*idx_m
+         a = tl.load(A + (xindex))
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 16*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 32*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++        # Coalesced K-contiguous load of B as [BLOCK_N, BLOCK_K], then transpose in registers
++        # address = n*32 + k*1 -> K contiguous -> coalesced global load, no SMEM bank conflicts
++        k_base = k_idx * BLOCK_K
++        b_nt = tl.load(
++            B + offs_b_n[:, None] * 32 + (k_base + offs_k)[None, :] * 1,
++            mask=(offs_b_n[:, None] < N) & ((k_base + offs_k)[None, :] < K),
++            other=0.0
++        )  # shape [BLOCK_N, BLOCK_K]
++        # Transpose in registers: no shared memory involved, no bank conflicts
++        b = tl.trans(b_nt)  # shape [BLOCK_K, BLOCK_N]
+ 
+-        
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -86,8 +103,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 16*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

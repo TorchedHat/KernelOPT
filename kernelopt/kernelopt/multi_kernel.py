@@ -195,6 +195,9 @@ def optimize_all_kernels(
         "api_key": state.config.api_key,
         "project_id": state.config.project_id,
         "region": state.config.region,
+        "provider": state.config.llm_provider,
+        "openai_base_url": state.config.openai_base_url,
+        "hf_inference_provider": state.config.hf_inference_provider,
     }
 
     model_source, fusion_results = run_fusion_phase(
@@ -292,6 +295,9 @@ def optimize_all_kernels(
             api_key=state.config.api_key,
             project_id=state.config.project_id,
             region=state.config.region,
+            llm_provider=state.config.llm_provider,
+            openai_base_url=state.config.openai_base_url,
+            hf_inference_provider=state.config.hf_inference_provider,
             planner_model=state.config.planner_model,
             executor_model=state.config.executor_model,
             profiler_model=state.config.profiler_model,
@@ -383,6 +389,9 @@ def optimize_all_kernels(
                                 T=1, N=2, K=2, TopK=_scfg.TopK,
                                 model=_scfg.model, api_key=_scfg.api_key,
                                 project_id=_scfg.project_id, region=_scfg.region,
+                                llm_provider=_scfg.llm_provider,
+                                openai_base_url=_scfg.openai_base_url,
+                                hf_inference_provider=_scfg.hf_inference_provider,
                                 planner_model=_scfg.planner_model,
                                 executor_model=_scfg.executor_model,
                                 profiler_model=_scfg.profiler_model,

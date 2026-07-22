@@ -1,0 +1,77 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,17 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=5),
++        triton.Config({}, num_warps=8, num_stages=5),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__softmax_bmm_exp_select_sub_transpose_view_7(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -60,17 +71,39 @@
+ 
+     idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+     A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q*stride_aq)
+-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q*stride_bq)
++    # Transposed B load: [BLOCK_N, BLOCK_K] with contiguous N-rows (stride_bn=1)
++    # to eliminate shared memory bank conflicts caused by stride_bk=256
++    B = B + (rbn[:, None] * stride_bn + rk[None, :] * stride_bk + idx_q*stride_bq)
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+     for k in range(K, 0, -BLOCK_K):
+         if EVEN_K:
+-            a = tl.load(A)
+-            b = tl.load(B)
++            a = tl.load(A, eviction_policy='evict_first')   # A is 8GB streaming, used once per tile
++            b_raw = tl.load(B, eviction_policy='evict_last')  # B is ~2MB, reused across 128 M-tiles
+         else:
+-            a = tl.load(A, mask=rk[None, :] < k, other=0.)
+-            b = tl.load(B, mask=rk[:, None] < k, other=0.)
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
++            a = tl.load(A, mask=rk[None, :] < k, other=0., eviction_policy='evict_first')
++            # rk is now the column (dim-1) index in the transposed [BLOCK_N, BLOCK_K] layout
++            b_raw = tl.load(B, mask=rk[None, :] < k, other=0., eviction_policy='evict_last')
++        # Pad b_raw to [BLOCK_N, BLOCK_K+BLOCK_K] = [32, 64] via tl.cat so smem stride = 64
++        # but only use the first BLOCK_K columns — this forces a non-power-of-2 effective stride
++        # Actually: pad to [BLOCK_N, BLOCK_K+1=33] by concatenating a single zero column.
++        # tl.cat requires power-of-2 sizes, so we cat with zeros of shape [BLOCK_N, BLOCK_K]
++        # to get [BLOCK_N, 2*BLOCK_K], then slice [:, :BLOCK_K].
++        # The smem layout will have stride 2*BLOCK_K=64 which is still power-of-2 — not ideal.
++        # Better: transpose b_raw to [BLOCK_K, BLOCK_N], cat a zero row to get [BLOCK_K+BLOCK_K, BLOCK_N],
++        # slice back. But this doesn't help either.
++        # Simplest correct approach: just use b_raw directly with tl.trans(b_raw).
++        # The padding via tl.cat along dim=1 with 1 zero: tl.cat needs power-of-2 second tensor.
++        # Use zeros of shape [BLOCK_N, BLOCK_N] (=32) and cat to get [BLOCK_N, BLOCK_K+BLOCK_N]=[32,64],
++        # then slice [:, :BLOCK_K] — stride in smem is 64 (still power-of-2, no help).
++        # The only working approach: transpose first, then pad rows.
++        # b_raw: [BLOCK_N=32, BLOCK_K=32]. tl.trans(b_raw): [BLOCK_K=32, BLOCK_N=32].
++        # Cat zeros [BLOCK_K, BLOCK_N] to get [2*BLOCK_K, BLOCK_N]=[64, BLOCK_N].
++        # Slice [:BLOCK_K, :] = [32, 32]. smem stride for rows = BLOCK_N=32 — same problem.
++        # Real fix: load b_raw as [BLOCK_K, BLOCK_N] (swap dims in pointer arithmetic),
++        # then use directly in tl.dot without tl.trans.
++        # tl.trans(b_raw) converts [BLOCK_N, BLOCK_K] -> [BLOCK_K, BLOCK_N] for correct matmul
++        acc += tl.dot(a, tl.trans(b_raw), allow_tf32=ALLOW_TF32)
+         A += BLOCK_K * stride_ak
+         B += BLOCK_K * stride_bk
+ 
+@@ -84,9 +117,7 @@
+ 
+     # inductor generates a suffix
+     xindex = idx_n + 32*idx_m + 524288*idx_q
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
++    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask, eviction_policy='evict_first')
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

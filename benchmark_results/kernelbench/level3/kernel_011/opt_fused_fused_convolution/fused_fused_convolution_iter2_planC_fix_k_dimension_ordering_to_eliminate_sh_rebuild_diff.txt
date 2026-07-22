@@ -1,0 +1,104 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,16 @@
+ 
+ # ─── Fused Conv2d (implicit GEMM) + bias + optional ReLU ───────────────────
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=3, num_warps=4),
++        # Focused configs for nested kh/kw/ic loop structure
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=1, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=1, num_warps=8),
+     ],
+     key=['BATCH', 'IN_C', 'IN_H', 'IN_W', 'OUT_C', 'OUT_H', 'OUT_W', 'KH', 'KW'],
+ )
+@@ -36,8 +38,6 @@
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+ 
+-    M = BATCH * OUT_H * OUT_W
+-
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+ 
+@@ -48,33 +48,34 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    TOTAL_K = IN_C * KH * KW
+-
+-    for k_start in range(0, TOTAL_K, BLOCK_K):
+-        k_offs = k_start + tl.arange(0, BLOCK_K)
+-        # decode k -> (ic, kh, kw)
+-        ic = k_offs % IN_C
+-        kw_idx = (k_offs // IN_C) % KW
+-        kh_idx = k_offs // (IN_C * KW)
+-
+-        ih = oh[:, None] * STR_H + kh_idx[None, :] - PAD_H
+-        iw = ow[:, None] * STR_W + kw_idx[None, :] - PAD_W
+-
+-        valid_x = (
+-            (n[:, None] < BATCH) &
+-            (ih >= 0) & (ih < IN_H) &
+-            (iw >= 0) & (iw < IN_W) &
+-            (k_offs[None, :] < TOTAL_K)
+-        )
+-
+-        x_ptrs = X_ptr + n[:, None] * sx_n + ih * sx_h + iw * sx_w + ic[None, :] * sx_c
+-        x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
+-
+-        valid_w = (k_offs[:, None] < TOTAL_K) & (offs_n[None, :] < OUT_C)
+-        w_ptrs = W_ptr + offs_n[None, :] * sw_o + kh_idx[:, None] * sw_h + kw_idx[:, None] * sw_w + ic[:, None] * sw_i
+-        w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
+-
+-        acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
++    # Nested loops: kh (outer), kw (middle), ic (inner, step BLOCK_K)
++    # Each innermost tile covers a contiguous ic range at fixed (kh_idx, kw_idx)
++    # This eliminates strided shared memory access and bank conflicts
++    for kh_idx in tl.static_range(KH):
++        # Hoist ih validity check outside ic loop
++        ih = oh[:, None] * STR_H + kh_idx - PAD_H   # (BLOCK_M, 1)
++        ih_valid = (ih >= 0) & (ih < IN_H)            # (BLOCK_M, 1)
++
++        for kw_idx in tl.static_range(KW):
++            # Hoist iw validity check outside ic loop
++            iw = ow[:, None] * STR_W + kw_idx - PAD_W  # (BLOCK_M, 1)
++            iw_valid = (iw >= 0) & (iw < IN_W)          # (BLOCK_M, 1)
++
++            for ic_start in range(0, IN_C, BLOCK_K):
++                ic_offs = ic_start + tl.arange(0, BLOCK_K)  # (BLOCK_K,) contiguous
++                ic_valid = ic_offs < IN_C                     # (BLOCK_K,) boundary mask
++
++                # X tile: (BLOCK_M, BLOCK_K) — ic_offs contiguous, sx_c=1 in NHWC
++                valid_x = (n[:, None] < BATCH) & ih_valid & iw_valid & ic_valid[None, :]
++                x_ptrs = X_ptr + n[:, None] * sx_n + ih * sx_h + iw * sx_w + ic_offs[None, :] * sx_c
++                x_tile = tl.load(x_ptrs, mask=valid_x, other=0.0)
++
++                # W tile: (BLOCK_K, BLOCK_N) — ic_offs contiguous, sw_i=1 in OKHWI
++                valid_w = ic_valid[:, None] & (offs_n[None, :] < OUT_C)
++                w_ptrs = W_ptr + offs_n[None, :] * sw_o + kh_idx * sw_h + kw_idx * sw_w + ic_offs[:, None] * sw_i
++                w_tile = tl.load(w_ptrs, mask=valid_w, other=0.0)
++
++                acc = tl.dot(x_tile, w_tile, acc, allow_tf32=False)
+ 
+     # Add bias
+     bias = tl.load(B_ptr + offs_n, mask=offs_n < OUT_C, other=0.0)
+@@ -92,7 +93,6 @@
+     )
+     y_ptrs = Y_ptr + n[:, None] * sy_n + oh[:, None] * sy_h + ow[:, None] * sy_w + offs_n[None, :] * sy_c
+     tl.store(y_ptrs, acc.to(tl.float32), mask=mask_out)
+-
+ 
+ def conv2d_bias_relu(x_nhwc, w_oihw, bias, pad=1, stride=1, do_relu=True):
+     """x_nhwc: (N,H,W,C), w_oihw: (OC,IC,KH,KW), returns (N,OH,OW,OC)"""

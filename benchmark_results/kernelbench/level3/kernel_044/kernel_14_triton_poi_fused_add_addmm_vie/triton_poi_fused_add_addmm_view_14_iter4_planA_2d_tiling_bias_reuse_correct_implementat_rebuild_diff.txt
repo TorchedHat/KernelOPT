@@ -1,0 +1,58 @@
+--- baseline
++++ rebuilt
+@@ -5,25 +5,38 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+-def triton_poi_fused_add_addmm_view_14(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, xnumel, XBLOCK : tl.constexpr):
+-    xnumel = 50331648
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK)[:], XBLOCK), XBLOCK)
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    x0 = (xindex % 768)
+-    tmp0 = tl.load(in_ptr0 + (x2), xmask)
+-    tmp1 = tl.load(in_ptr1 + (x0), xmask, eviction_policy='evict_last')
+-    tmp2 = tl.load(in_out_ptr0 + (x2), xmask)
+-    tmp5 = tl.load(in_ptr2 + (x0), xmask, eviction_policy='evict_last')
+-    tmp6 = tl.load(in_ptr3 + (x2), xmask)
+-    tmp3 = tmp1 + tmp2
+-    tmp4 = tmp0 + tmp3
+-    tmp7 = tmp5 + tmp6
+-    tmp8 = tmp4 + tmp7
+-    tl.store(in_out_ptr0 + (x2), tmp8, xmask)
++def triton_poi_fused_add_addmm_view_14(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, xnumel, XBLOCK: tl.constexpr):
++    # 2D tiling: each CTA processes YBLOCK=8 rows x 1024 columns (masked to 768)
++    # Bias vectors (in_ptr1, in_ptr2) loaded once per CTA and reused across all rows
++    HIDDEN: tl.constexpr = 768
++    YBLOCK: tl.constexpr = 8
++    XCOLS: tl.constexpr = 1024  # power-of-2 >= HIDDEN=768
+ 
++    pid_y = tl.program_id(0)  # row-tile index
++    row_start = pid_y * YBLOCK
++    num_rows = xnumel // HIDDEN  # = 65536
++
++    col_offs = tl.arange(0, XCOLS)   # [1024]
++    col_mask = col_offs < HIDDEN       # True for cols 0..767
++
++    # Load bias vectors ONCE per CTA - reused across all YBLOCK rows
++    bias1 = tl.load(in_ptr1 + col_offs, mask=col_mask, other=0.0)
++    bias2 = tl.load(in_ptr2 + col_offs, mask=col_mask, other=0.0)
++    bias_sum = bias1 + bias2  # stays in registers
++
++    # Process YBLOCK rows - statically unrolled loop
++    for i in tl.static_range(YBLOCK):
++        row = row_start + i
++        row_valid = row < num_rows
++        flat_offs = row * HIDDEN + col_offs  # [1024]
++        mask2d = col_mask & row_valid
++        v0 = tl.load(in_ptr0     + flat_offs, mask=mask2d, other=0.0)
++        v2 = tl.load(in_out_ptr0 + flat_offs, mask=mask2d, other=0.0)
++        v6 = tl.load(in_ptr3     + flat_offs, mask=mask2d, other=0.0)
++        result = v0 + v2 + v6 + bias_sum
++        tl.store(in_out_ptr0 + flat_offs, result, mask=mask2d)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

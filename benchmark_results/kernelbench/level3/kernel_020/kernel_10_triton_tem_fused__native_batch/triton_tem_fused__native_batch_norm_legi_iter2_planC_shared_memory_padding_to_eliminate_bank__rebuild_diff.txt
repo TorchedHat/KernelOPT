@@ -1,0 +1,64 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,18 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=3),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_10(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -60,21 +72,23 @@
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 96*idx_m
+-        a = tl.load(A + (xindex))
++        a = tl.load(A + (xindex), eviction_policy='evict_first')
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 24*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 96*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
++        # Transposed load: outer=N (stride 96), inner=K (stride 1 -> coalesced)
++        # B[k,n] = B_ptr + k + 96*n (strides (96,1) on shape (24,96))
++        offs_k_cur = offs_k + (k_idx * BLOCK_K)  # [BLOCK_K] 1D
++        idx_n_T = offs_b_n[:, None]               # [BLOCK_N, 1]
++        idx_k_T = offs_k_cur[None, :]             # [1, BLOCK_K]
++        # b_T[n,k] = B_ptr + idx_k_T + 96*idx_n_T  -> inner K stride=1 COALESCED
++        b_T = tl.load(B + (idx_k_T + 96 * idx_n_T), eviction_policy='evict_last')  # [BLOCK_N, BLOCK_K]
++        # tl.trans pads SMEM staging buffer -> zero bank conflicts on read-back
++        b = tl.trans(b_T)  # [BLOCK_K, BLOCK_N]
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -85,9 +99,7 @@
+ 
+     # inductor generates a suffix
+     xindex = idx_n + 24*idx_m
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
++    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask, eviction_policy='evict_first')
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

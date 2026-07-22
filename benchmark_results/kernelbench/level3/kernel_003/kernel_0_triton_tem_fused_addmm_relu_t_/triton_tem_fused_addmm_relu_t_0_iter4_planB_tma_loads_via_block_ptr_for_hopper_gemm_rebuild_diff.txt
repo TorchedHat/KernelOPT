@@ -1,0 +1,85 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,18 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_addmm_relu_t_0(arg_A, arg_B, in_ptr2, out_ptr1):
+     EVEN_K : tl.constexpr = True
+@@ -54,27 +66,39 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # Construct block pointers before the k-loop for TMA loads on Hopper
++    # A is row-major: shape=(M, K), strides=(stride_am=8192, stride_ak=1), order=(1, 0)
++    A_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    # B has stride_bk=1, stride_bn=8192: shape=(K, N), strides=(stride_bk=1, stride_bn=8192), order=(1, 0)
++    B_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(1, 0),
++    )
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 8192*idx_m
+-        a = tl.load(A + (xindex))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 1024*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 8192*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
++        # TMA loads via block pointers — hardware handles address generation on Hopper
++        a = tl.load(A_block_ptr, boundary_check=(0, 1))  # [BLOCK_M, BLOCK_K]
++        b = tl.load(B_block_ptr, boundary_check=(0, 1))  # [BLOCK_K, BLOCK_N]
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
++        # Advance block pointers to next K tile
++        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
++        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -90,8 +114,6 @@
+     tmp2 = tl.full([1], 0, tl.int32)
+     tmp3 = tl.maximum(tmp2, tmp1)
+     tl.store(out_ptr1 + (tl.broadcast_to(idx_n + 1024*idx_m, [BLOCK_M, BLOCK_N])), tmp3, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

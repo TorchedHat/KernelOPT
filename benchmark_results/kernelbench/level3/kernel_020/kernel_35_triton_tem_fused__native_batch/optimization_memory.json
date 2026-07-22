@@ -1,0 +1,189 @@
+[
+  {
+    "item_id": "61647a42",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.086e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.072e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.084e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 6.25% achieved occupancy, 0.2 waves/SM across 132 SMs, and 86.35% of scheduler cycles have no eligible warp. The compute pipeline is at 7.96% SM throughput \u2014 nearly idle. ALLOW_TF32=False forces tl.dot to use FP32 FFMA units instead of Tensor Cores, leaving the H200's 989 TFLOPS Tensor Core peak completely untapped (only 67 TFLOPS FP32 FFMA available). Enabling TF32 gives ~8x dot-product throughput. Additionally, 12-way shared memory bank conflicts (71.9% speedup potential) and shared-memory-limited occupancy (Block Limit Shared Mem=3) further throttle the kernel. The diversity instruction explicitly targets tf32_tensor_cores.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.086e-01 > atol=0.001\nseed=42 output[0]: max_diff=1.072e-01 > atol=0.001\nseed=1337 output[0]: max_diff=1.084e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_hardcoded_tile_size_increase_with_empty_autotune_configs",
+    "iteration": 2,
+    "speedup": 0.4208,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_stages_without_tile_size_change",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 54.37,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 81497.0,
+        "Instruction Statistics.Executed Instructions": 3450200.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.29,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Memory Workload Analysis.Memory Throughput": 46.14,
+        "Compute Workload Analysis.Issue Slots Busy": 13.7
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 132.77,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 199073.0,
+        "Instruction Statistics.Executed Instructions": 11193406.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.59,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Memory Workload Analysis.Memory Throughput": 19.18,
+        "Compute Workload Analysis.Issue Slots Busy": 19.32
+      }
+    },
+    "strategy_title": "Hardcoding larger tiles with empty autotune configs causes severe regression",
+    "strategy_description": "Increasing BLOCK_M and BLOCK_N from 32 to 64 (hardcoded inside the kernel body) while keeping autotune configs empty (only varying num_warps/num_stages) caused a 2.4x increase in elapsed cycles (81k\u2192199k) and a 3.2x increase in executed instructions (3.5M\u219211.2M). Registers per thread exploded from 64 to 168, collapsing theoretical occupancy from 50% to 18.75% and achieved occupancy from 6.25% to 3.12%, while memory throughput dropped from 46 to 19 GB/s. The SharedMemoryConflicts rule remained triggered (4.3M bank conflicts unchanged), confirming that simply enlarging tile sizes without promoting them to autotune parameters and without fixing the access pattern does not resolve bank conflicts \u2014 it only increases register pressure and instruction count.",
+    "slow_pseudocode": "# Before: BLOCK_M=32, BLOCK_N=32 hardcoded, 64 registers/thread\n@triton.autotune(configs=[triton.Config({}, num_warps=W, num_stages=S), ...], key=[])\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 32\n    BLOCK_N: tl.constexpr = 32\n    BLOCK_K: tl.constexpr = 32\n    # 12-way bank conflicts, 54us duration",
+    "fast_pseudocode": "# After: BLOCK_M=64, BLOCK_N=64 hardcoded, 168 registers/thread \u2014 WORSE\n@triton.autotune(configs=[triton.Config({}, num_warps=W, num_stages=S), ...], key=[])\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 64  # hardcoded \u2014 autotune cannot vary\n    BLOCK_N: tl.constexpr = 64  # hardcoded \u2014 autotune cannot vary\n    BLOCK_K: tl.constexpr = 32\n    # Bank conflicts unchanged, 3x more instructions, 133us duration",
+    "applicable_when": "Never \u2014 this is a negative result. Do not hardcode larger tile sizes inside the kernel body while keeping autotune configs empty when shared memory bank conflicts are the dominant bottleneck.",
+    "do_not_apply_when": "When SharedMemoryConflicts rule is triggered with >70% conflicted wavefronts: increasing BLOCK_M/BLOCK_N as hardcoded constexpr literals inside the kernel body (without promoting them to kernel parameters controlled by autotune) dramatically increases register pressure (64\u2192168 registers/thread), collapses occupancy (50%\u219218.75% theoretical), and multiplies instruction count (3x) without resolving the bank conflict pattern. The combination of larger tiles + empty autotune configs is strictly worse than the original.",
+    "framework_notes": "In Triton, tile sizes hardcoded as `BLOCK_M: tl.constexpr = 64` inside the kernel body are invisible to @triton.autotune even when autotune configs include BLOCK_M keys \u2014 the kernel body assignment overrides the parameter. To make tile sizes tunable, they must be declared as kernel function arguments (`def kernel(..., BLOCK_M: tl.constexpr, ...)`) and included in autotune Config dicts. Larger tiles with 168 registers/thread hit the H200 Block Limit Registers=6 and Block Limit Shared Mem=6 constraints simultaneously, further reducing theoretical occupancy."
+  },
+  {
+    "item_id": "b3f2c891",
+    "iteration": 2,
+    "speedup": 0.4608,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_tile_sizes_to_fix_smem_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 81497.0,
+        "GPU Speed Of Light Throughput.Duration": 54.37,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Instruction Statistics.Executed Instructions": 3450200.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.29,
+        "Memory Workload Analysis.Memory Throughput": 46.14
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 181764.0,
+        "GPU Speed Of Light Throughput.Duration": 121.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Instruction Statistics.Executed Instructions": 11403772.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.93,
+        "Memory Workload Analysis.Memory Throughput": 20.99
+      }
+    },
+    "strategy_title": "Larger Tile Sizes Cause Register/SMEM Pressure Regression",
+    "strategy_description": "Increasing BLOCK_M/BLOCK_N/BLOCK_K from 32 to 64 (hardcoded constexprs, not autotuned) doubled elapsed cycles from 54us to 121us (0.46x speedup). Although warp cycles per instruction improved slightly (7.29\u21924.93), registers per thread doubled (64\u2192128) and dynamic shared memory per block quadrupled (16\u219265 KB), crushing theoretical occupancy from 50% to 18.75% (Block Limit Shared Mem dropped from 9 to 3). The instruction count tripled (3.45M\u219211.4M), indicating the larger tiles did more redundant work without proportional throughput gain. Critically, the tile sizes were still hardcoded constexprs rather than true autotuned parameters, so the autotuner could not select the optimal configuration \u2014 the change was effectively a forced regression with no tuning escape hatch.",
+    "slow_pseudocode": "# BLOCK sizes hardcoded as constexprs \u2014 autotune configs are empty dicts\n@triton.autotune(configs=[triton.Config({}, num_warps=4, num_stages=3), ...], key=[])\n@triton.jit\ndef kernel(arg_A, arg_B, out_ptr0):\n    BLOCK_M: tl.constexpr = 64  # hardcoded, autotune cannot change\n    BLOCK_N: tl.constexpr = 64\n    BLOCK_K: tl.constexpr = 64\n    # registers_per_thread=128, dynamic_smem=65KB \u2192 occupancy crushed to 18.75%",
+    "fast_pseudocode": "# BLOCK sizes as kernel signature args \u2014 autotune configs include tile sizes\n@triton.autotune(\n    configs=[\n        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=3),\n        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=3),\n        # ... more configs\n    ],\n    key=[]\n)\n@triton.jit\ndef kernel(arg_A, arg_B, out_ptr0,\n           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n    # autotune selects best tile size; grid uses meta['BLOCK_M'], meta['BLOCK_N']\n    pass",
+    "applicable_when": "Never apply this pattern (hardcoded larger tile sizes without moving them to kernel signature). The anti-pattern is: increasing BLOCK_M/BLOCK_N/BLOCK_K as hardcoded constexprs when the autotune configs are empty dicts that cannot vary tile sizes.",
+    "do_not_apply_when": "Do not hardcode larger tile sizes as constexprs inside the kernel body when the @triton.autotune configs are empty dicts ({}). This prevents the autotuner from selecting smaller tiles if the larger ones cause register/shared-memory pressure. Specifically: when registers_per_thread would exceed 64 or dynamic_smem_per_block would exceed ~32KB, theoretical occupancy collapses and elapsed cycles increase despite lower warp stall cycles per instruction.",
+    "framework_notes": "In Triton, tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) must be moved to the kernel function signature as tl.constexpr parameters AND included in the autotune Config dicts for the autotuner to actually vary them. Hardcoding them inside the kernel body while using empty Config dicts ({}) means the autotuner only varies num_warps/num_stages \u2014 the tile sizes are fixed regardless of what the plan intends."
+  },
+  {
+    "item_id": "b2f3c891-4d7e-4a1b-9c2e-8f5d3e6a1b7c",
+    "iteration": 2,
+    "speedup": 0.5333,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_shared_memory_bank_conflicts_via_b_tile_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 54.37,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 81497.0,
+        "Instruction Statistics.Executed Instructions": 3450200.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.29,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Compute Workload Analysis.Executed Ipc Active": 0.55
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 104.77,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 157086.0,
+        "Instruction Statistics.Executed Instructions": 11507772.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.26,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Compute Workload Analysis.Executed Ipc Active": 0.94
+      }
+    },
+    "strategy_title": "B-tile transpose + larger blocks doubles register pressure, halves occupancy",
+    "strategy_description": "Applying tl.trans() on the B tile to fix shared memory bank conflicts was bundled with doubling BLOCK_M and BLOCK_N (32\u219264) and adding num_warps=16 configs. This caused registers_per_thread to double from 64 to 128 and dynamic shared memory per block to double from 16 to 33 KB, collapsing theoretical occupancy from 50% to 25% (Block Limit Registers dropped from 8 to 4 blocks/SM). Although per-instruction efficiency improved (IPC active 0.55\u21920.94, warp cycles/instruction 7.3\u21924.3), the 3.3x increase in total executed instructions (3.45M\u219211.5M) caused duration to nearly double (54\u2192105 \u00b5s). The bank conflict rate remained unchanged (~12-way, ~77% conflicted wavefronts), indicating the tl.trans() approach did not actually eliminate the shared memory bank conflicts. When a kernel is already register-limited (Block Limit Registers is the binding occupancy constraint), increasing tile sizes or adding large num_warps configs will further reduce occupancy and cause regression even if per-warp efficiency improves.",
+    "slow_pseudocode": "# BLOCK_M=32, BLOCK_N=32, BLOCK_K=32\n# registers_per_thread=64, smem=16KB/block\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = tl.load(A + xindex, mask=a_mask, eviction_policy='evict_first')  # [BLOCK_M, BLOCK_K]\n    b = tl.load(B + (idx_n + 160*idx_m), mask=b_mask, eviction_policy='evict_first')  # [BLOCK_K, BLOCK_N], strided\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# BLOCK_M=64, BLOCK_N=64, BLOCK_K=32  <-- doubled tile sizes\n# registers_per_thread=128, smem=33KB/block  <-- doubled resource usage\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = tl.load(A + xindex, mask=a_mask)  # [BLOCK_M, BLOCK_K]\n    offs_k_cur = offs_k + k_idx * BLOCK_K\n    b_tile = tl.load(B + (b_n_idx * 960 + b_k_idx), mask=b_mask_t)  # [BLOCK_N, BLOCK_K]\n    b = tl.trans(b_tile)  # [BLOCK_K, BLOCK_N]\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "applicable_when": "Never \u2014 this specific combination caused regression. The tl.trans() approach alone (without tile size increase) might be worth isolating, but as applied here it is harmful.",
+    "do_not_apply_when": "When the kernel is already register-limited (Block Limit Registers is the binding occupancy constraint, e.g. 8 blocks/SM at 64 registers/thread). Doubling tile sizes (BLOCK_M, BLOCK_N 32\u219264) in this regime doubles register pressure (64\u2192128 regs/thread), halves theoretical occupancy (50%\u219225%), and increases total instruction count by 3x, causing ~2x duration regression even though per-warp efficiency improves. Additionally, tl.trans() did not eliminate the 12-way shared memory bank conflicts in this case \u2014 the bank conflict rate remained ~77% of wavefronts after the change, suggesting the root cause was not purely the B load access pattern or that tl.trans() does not bypass shared memory for this tile size.",
+    "framework_notes": "In Triton, tl.trans() transposes a 2D tensor. When used to reorder a [BLOCK_N, BLOCK_K] load into [BLOCK_K, BLOCK_N] for tl.dot, it may still route through shared memory with the same bank conflict pattern depending on how the compiler lowers the transpose. The bank conflict fix requires padding shared memory (e.g., adding 1 element per row) rather than just reordering the load indices."
+  },
+  {
+    "item_id": "exp_003_reduce_block_k_to_halve_smem",
+    "iteration": 3,
+    "speedup": 0.4938,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_block_k_to_halve_smem_and_fix_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 104.77,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 157086.0,
+        "Instruction Statistics.Executed Instructions": 11507772.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.26,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32768.0,
+        "Compute Workload Analysis.Issue Slots Busy": 23.51,
+        "Memory Workload Analysis.Memory Throughput": 24.09
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 113.15,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 169661.0,
+        "Instruction Statistics.Executed Instructions": 11746172.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.53,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 7.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16384.0,
+        "Compute Workload Analysis.Issue Slots Busy": 22.08,
+        "Memory Workload Analysis.Memory Throughput": 22.21
+      }
+    },
+    "strategy_title": "Halving BLOCK_K to reduce SMEM fails when registers bind occupancy",
+    "strategy_description": "Reducing BLOCK_K from 32 to 16 halved dynamic shared memory per block (33KB\u219216KB), successfully raising Block Limit Shared Mem from 4 to 7 blocks/SM. However, theoretical and achieved occupancy remained unchanged at 25% and 6.25% respectively, because registers per thread (128) remained the binding constraint (Block Limit Registers=4). With occupancy unchanged, the doubled K-loop iteration count (30\u219260) added ~2% more instructions and worsened warp cycles per instruction (4.26\u21924.53), causing elapsed cycles to increase from 157k to 170k. The SharedMemoryConflicts rule remained triggered with the same 12-way average conflict degree and ~77% conflicted wavefronts, indicating that halving BLOCK_K did not materially change the bank conflict pattern for this access layout.",
+    "slow_pseudocode": "# BLOCK_K=32: smem=33KB/block, Block Limit Shared Mem=4, Block Limit Registers=4\n# 30 K-loop iterations, 157k elapsed cycles\nfor k_idx in range(cdiv(K, 32)):\n    a = tl.load(A_ptr, ...)  # [BLOCK_M=64, BLOCK_K=32]\n    b = tl.load(B_ptr, ...)  # [BLOCK_N=64, BLOCK_K=32] then tl.trans\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# BLOCK_K=16: smem=16KB/block, Block Limit Shared Mem=7, Block Limit Registers=4 (still binding)\n# 60 K-loop iterations, 170k elapsed cycles  <-- WORSE\nfor k_idx in range(cdiv(K, 16)):\n    a = tl.load(A_ptr, ...)  # [BLOCK_M=64, BLOCK_K=16]\n    b = tl.load(B_ptr, ...)  # [BLOCK_N=64, BLOCK_K=16] then tl.trans\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "applicable_when": "Never \u2014 this is a negative result. Reducing BLOCK_K to shrink shared memory footprint does not help when registers per thread are the binding occupancy constraint (Block Limit Registers < Block Limit Shared Mem).",
+    "do_not_apply_when": "When registers per thread are the binding occupancy limiter (Block Limit Registers \u2264 Block Limit Shared Mem): halving BLOCK_K reduces shared memory pressure but cannot increase occupancy beyond the register ceiling. The doubled loop iteration count then adds overhead (more instructions, worse warp cycles/instruction) without any compensating benefit. In this kernel, 128 registers/thread with BLOCK_M=64, BLOCK_N=64 fixes Block Limit Registers=4 regardless of BLOCK_K. The bank conflict degree also did not improve (still 12-way, ~77% conflicted wavefronts), suggesting the conflict pattern is driven by the BLOCK_M/BLOCK_N tile dimensions and the transposed access stride, not by BLOCK_K.",
+    "framework_notes": "In Triton, when a kernel has both high register pressure (128 regs/thread) and shared memory bank conflicts, reducing BLOCK_K alone cannot break the register-occupancy ceiling. The binding constraint must be identified first: if Block Limit Registers < Block Limit Shared Mem, shared memory reduction is wasted effort. Fixing the bank conflict pattern requires either padding shared memory allocations (add 1 element per row to avoid stride-32 aliasing in 32-bank SMEM) or restructuring the access pattern so consecutive threads access consecutive banks."
+  }
+]

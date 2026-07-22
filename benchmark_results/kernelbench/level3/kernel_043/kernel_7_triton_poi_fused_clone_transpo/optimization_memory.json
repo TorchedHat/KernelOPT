@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "87db3fac",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_with_autotuned_block_size",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_with_autotuned_block_size \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'vectorized_loads_with_autotuned_block_size' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a pointwise clone+transpose+view that reads from a strided input (stride-1 on x0/96-wide innermost dim, then large 49152-element stride on x1). L1 hit rate is 0% \u2014 every load goes to L2/DRAM. The innermost dimension x0 (stride-1, width 96) is contiguous, making it eligible for 128-bit (float4) vectorized loads via tl.max_contiguous + tl.multiple_of hints. The current XBLOCK=128 is too small to amortize launch overhead across 393,216 CTAs and leaves the scheduler starved (74.5% no-eligible cycles). Increasing XBLOCK to 512 or 1024 reduces grid size, increases ILP per CTA, and allows the compiler to emit wider memory transactions on the contiguous x0 axis. With 16 registers/thread and no shared memory, there is ample headroom to raise XBLOCK without hitting register or SMEM limits.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_grid_lambda_regression_004",
+    "iteration": 4,
+    "speedup": 0.5507,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_grid_lambda_to_match_autotuned_xblock",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 244.1,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 36.59,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 30.54,
+        "Occupancy.Achieved Occupancy": 43.11,
+        "Scheduler Statistics.No Eligible": 62.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.21,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 186.18,
+        "Instruction Statistics.Executed Instructions": 70778880.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 443.1,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 71.42,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 16.82,
+        "Occupancy.Achieved Occupancy": 61.82,
+        "Scheduler Statistics.No Eligible": 28.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.26,
+        "Launch Statistics.Block Size": 512.0,
+        "Launch Statistics.Waves Per SM": 744.73,
+        "Instruction Statistics.Executed Instructions": 248512512.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK Without Grid Lambda Inflates Work 4x",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (512+) while keeping the grid hardcoded to `cdiv(xnumel, 128)` caused a 3.5x inflation in executed instructions (70M \u2192 248M) and an 81% increase in duration (244 \u2192 443 us), despite superficially improving scheduler utilization metrics. The regression occurs because autotune selected XBLOCK=512 but the grid remained sized for XBLOCK=128, causing each block to process 4x more elements than the tensor contains. The grid MUST be `lambda meta: (cdiv(xnumel, meta['XBLOCK']),)` for autotune to work correctly \u2014 changing autotune configs alone without fixing the grid always causes this failure mode.",
+    "slow_pseudocode": "# BROKEN: autotune configs changed but grid still hardcoded to old divisor\n@triton.autotune(configs=[\n    Config({'XBLOCK': 2048}, num_warps=16),\n    Config({'XBLOCK': 1024}, num_warps=16),\n    Config({'XBLOCK': 512},  num_warps=8),\n], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, N, XBLOCK: tl.constexpr): ...\n\ngrid = (cdiv(xnumel, 128),)  # BUG: hardcoded 128, not meta['XBLOCK']\nkernel[grid](arg_0, arg_1, xnumel)",
+    "fast_pseudocode": "# CORRECT: grid must adapt to whichever XBLOCK autotune selects\n@triton.autotune(configs=[\n    Config({'XBLOCK': 2048}, num_warps=16),\n    Config({'XBLOCK': 1024}, num_warps=16),\n    Config({'XBLOCK': 512},  num_warps=8),\n], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, N, XBLOCK: tl.constexpr): ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)  # FIXED\nkernel[grid](arg_0, arg_1, xnumel)",
+    "applicable_when": "Any Triton kernel using @triton.autotune with variable XBLOCK where the call-site grid is a static tuple rather than a lambda reading meta['XBLOCK']. Symptom: executed instructions inflate by exactly XBLOCK_selected/XBLOCK_hardcoded ratio, waves/SM inflate proportionally, DRAM throughput drops while compute SM throughput rises spuriously.",
+    "do_not_apply_when": "Grid is already a lambda using meta['XBLOCK']; this is a pure implementation flaw diagnosis. Changing autotune configs alone without fixing the grid is always harmful and must never be attempted.",
+    "framework_notes": "Triton-specific: @triton.autotune selects XBLOCK at runtime, but the grid tuple is evaluated before the kernel launch. A static `grid = (cdiv(N, 128),)` does not adapt to the selected XBLOCK. The grid MUST be `lambda meta: (triton.cdiv(N, meta['XBLOCK']),)` for autotune to work correctly. Instruction count inflation is exactly proportional to XBLOCK_selected / XBLOCK_hardcoded. This iteration (4) reproduces the exact same failure as iteration 3 \u2014 the plan described the lambda fix but the diff only changed autotune configs, not the grid."
+  }
+]

@@ -1,0 +1,40 @@
+[
+  {
+    "item_id": "exp_persistent_tile_small_grid_regression_001",
+    "iteration": 1,
+    "speedup": 0.5418,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.53,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3768.0,
+        "Occupancy.Achieved Occupancy": 8.72,
+        "Scheduler Statistics.No Eligible": 88.74,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.7,
+        "Memory Workload Analysis.Memory Throughput": 62.48,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 12.69,
+        "Instruction Statistics.Executed Instructions": 79872.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.67,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6966.0,
+        "Occupancy.Achieved Occupancy": 7.14,
+        "Scheduler Statistics.No Eligible": 93.4,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.82,
+        "Memory Workload Analysis.Memory Throughput": 33.81,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 61.63,
+        "Instruction Statistics.Executed Instructions": 37536.0
+      }
+    },
+    "strategy_title": "Persistent Loop + Autotune Regresses Tiny Grid Kernels",
+    "strategy_description": "Adding a persistent while-loop with autotune to a small-grid kernel (192 CTAs, 0.09 waves/SM) caused a 1.85x slowdown despite the intent to improve occupancy. The after kernel shows elapsed cycles nearly doubling (3768\u21926966), achieved occupancy dropping further (8.72%\u21927.14%), and warp cycles per issued instruction worsening (12.7\u219217.82). The persistent loop introduced additional branch overhead and L1TEX stalls (CPIStall shifted from barrier-wait to L1TEX dependency, 31.6%\u219231.1%), while the autotune grid-capping logic left the launcher still using the old fixed grid (cdiv(25,128), cdiv(1536,8)) = (1,192), negating any persistent-loop benefit. For kernels this small (total work ~38K elements), the overhead of the while-loop control flow and autotune compilation cost exceeds any scheduling gain.",
+    "slow_pseudocode": "# BEFORE: single-tile, fixed XBLOCK=128/YBLOCK=8\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = pid_y * YBLOCK\n    xoffset = pid_x * XBLOCK\n    yindex = yoffset + arange(YBLOCK)[:, None]\n    xindex = xoffset + arange(XBLOCK)[None, :]\n    tmp = load(in_ptr + x + 25*y, mask)\n    store(out_ptr + (y%24) + 24*x + 600*(y//24), tmp, mask)\n\ngrid = (cdiv(25, 128), cdiv(1536, 8))  # = (1, 192)",
+    "fast_pseudocode": "# AFTER (regressed): persistent while-loop with autotune\n@triton.autotune(configs=[...], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = pid_y * YBLOCK\n    while yoffset < ynumel:\n        xoffset = pid_x * XBLOCK\n        while xoffset < xnumel:\n            # same load/store logic\n            xoffset += grid_x * XBLOCK\n        yoffset += grid_y * YBLOCK\n\n# BUG: launcher still uses old fixed grid, not SM-capped grid\ngrid = (cdiv(25, 128), cdiv(1536, 8))  # = (1, 192) \u2014 unchanged!",
+    "applicable_when": "Never: this specific combination of persistent loop + autotune on a tiny-grid kernel caused regression. The pattern may work for larger grids where the loop overhead is amortized.",
+    "do_not_apply_when": "Kernel has very small total element count (<100K elements), grid is already near-minimal (waves_per_sm < 0.1), and the launcher grid is not updated to match the persistent-loop intent. The while-loop control flow adds branch overhead that dominates for short-running kernels. Also avoid when the autotune key does not change between calls (constant ynumel/xnumel), as autotune overhead is paid every cold start.",
+    "framework_notes": "In Triton, @triton.autotune requires the launcher to pass a dynamic grid closure (lambda meta: ...) not a pre-computed tuple, otherwise the autotuned XBLOCK/YBLOCK values are ignored by the grid calculation. The regression here was partly caused by the launcher still using the old fixed grid=(cdiv(25,128), cdiv(1536,8)) instead of the SM-capped dynamic grid described in the plan."
+  }
+]

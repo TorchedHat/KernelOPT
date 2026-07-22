@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "3ccc1701",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_eliminate_partial_wave",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_eliminate_partial_wave \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_eliminate_partial_wave' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has xnumel=9 but XBLOCK=128, meaning 119 out of 128 threads per block are masked out and do no useful work. This inflates the grid to 4096 blocks (grid = cdiv(9,128)=1 x cdiv(32768,8)=4096), producing 1 full wave + 1984-block partial wave on 132 SMs. The LaunchConfiguration rule flags this as up to 50% runtime waste. The fix is to shrink XBLOCK to 16 (covers xnumel=9 with minimal waste) and increase YBLOCK (e.g., 64) so each block does more work, reducing total grid size and eliminating the partial wave. Using @triton.autotune lets the runtime find the best combination automatically.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp-001-autotune-yblock-xblock-partial-wave",
+    "iteration": 1,
+    "speedup": 1.1486,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_block_dims_to_eliminate_partial_wave",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 1.94,
+        "Launch.block_size": 128.0,
+        "Launch.grid_size": 4096.0,
+        "Occupancy.achieved_occupancy_pct": 71.01,
+        "GPU_SOL.duration_us": 5.18,
+        "GPU_SOL.compute_throughput_pct": 40.38,
+        "GPU_SOL.memory_throughput_pct": 39.87,
+        "Launch.registers_per_thread": 28.0,
+        "Launch.dynamic_smem_per_block_bytes": 4096.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.97,
+        "Launch.block_size": 64.0,
+        "Launch.grid_size": 4096.0,
+        "Occupancy.achieved_occupancy_pct": 33.68,
+        "GPU_SOL.duration_us": 4.51,
+        "GPU_SOL.compute_throughput_pct": 7.32,
+        "GPU_SOL.memory_throughput_pct": 5.37,
+        "Launch.registers_per_thread": 16.0,
+        "Launch.dynamic_smem_per_block_bytes": 0.0
+      }
+    },
+    "strategy_title": "Autotune YBLOCK/XBLOCK to fix partial-wave tail effect",
+    "strategy_description": "When a Triton kernel has a small xnumel (e.g., 9) but a large XBLOCK (e.g., 128), most threads per block are masked out doing no useful work, inflating the grid and creating a costly partial wave. Adding @triton.autotune with configs that sweep YBLOCK and XBLOCK (including XBLOCK=1 or 16 for small xnumel) lets the runtime select a configuration that minimizes wasted threads and eliminates the partial wave, reducing register pressure and shared memory usage as a side effect. The LaunchConfiguration NCU rule with speedup_pct \u2265 30% and waves_per_sm near 2.0 (indicating ~1 full wave + large partial wave) is the key signal.",
+    "slow_pseudocode": "# XBLOCK=128 but xnumel=9 \u2192 119/128 threads masked per block\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel  # 119 of 128 threads masked\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # grid=(1, 4096), waves~1.94",
+    "fast_pseudocode": "# Autotune sweeps YBLOCK in {32,64,128,256} x XBLOCK in {1,16}\n@triton.autotune(configs=[\n    triton.Config({'YBLOCK': 32,  'XBLOCK': 1},  num_warps=2),\n    triton.Config({'YBLOCK': 64,  'XBLOCK': 1},  num_warps=4),\n    triton.Config({'YBLOCK': 128, 'XBLOCK': 1},  num_warps=4),\n    triton.Config({'YBLOCK': 256, 'XBLOCK': 1},  num_warps=8),\n    triton.Config({'YBLOCK': 32,  'XBLOCK': 16}, num_warps=2),\n    triton.Config({'YBLOCK': 64,  'XBLOCK': 16}, num_warps=4),\n    triton.Config({'YBLOCK': 128, 'XBLOCK': 16}, num_warps=4),\n    triton.Config({'YBLOCK': 256, 'XBLOCK': 16}, num_warps=8),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel  # also add ymask guard\n    tl.load(..., xmask & ymask)\n    tl.store(..., xmask & ymask)\n\n# grid computed by autotune; best config: block_size=64, waves~0.97",
+    "applicable_when": "LaunchConfiguration NCU rule fires with speedup_pct >= 30%; waves_per_sm is between 1.5 and 2.5 (one full wave + large partial wave); xnumel or ynumel is much smaller than the fixed XBLOCK or YBLOCK constexpr (ratio < 0.5); kernel has 2D grid (program_id(0) and program_id(1))",
+    "do_not_apply_when": "xnumel and ynumel are both large relative to block dims (thread utilization > 80%); kernel is already autotuned; grid is already a single full wave (waves_per_sm < 1.1); problem size varies widely at runtime making autotune overhead significant",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with triton.Config dicts specifying constexpr tile sizes. Equivalent in CUDA would be choosing launch block dimensions empirically. The key insight (XBLOCK should match xnumel granularity) applies to any tiled GPU kernel."
+  }
+]

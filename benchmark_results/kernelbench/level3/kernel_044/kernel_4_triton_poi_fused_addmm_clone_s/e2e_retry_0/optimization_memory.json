@@ -1,0 +1,40 @@
+[
+  {
+    "item_id": "triton_autotune_larger_block_memory_bound_regression_001",
+    "iteration": 1,
+    "speedup": 0.7916,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_autotune_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 244.26,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.01,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 35.0,
+        "Occupancy.Achieved Occupancy": 43.81,
+        "Scheduler Statistics.No Eligible": 64.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.46,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.33,
+        "Instruction Statistics.Executed Instructions": 67633152.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 308.58,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 25.09,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 68.32,
+        "Occupancy.Achieved Occupancy": 68.84,
+        "Scheduler Statistics.No Eligible": 32.08,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.58,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.86,
+        "Instruction Statistics.Executed Instructions": 161218560.0
+      }
+    },
+    "strategy_title": "Larger XBLOCK Autotune Regresses Memory-Bound Pointwise Kernels",
+    "strategy_description": "Increasing block size (XBLOCK) via autotune to hide L1TEX latency can backfire on memory-bound pointwise kernels: while occupancy improved (43.8%\u219268.8%) and idle cycles dropped (64.65%\u219232.08%), the executed instruction count exploded 2.4x (67M\u2192161M) and DRAM throughput fell (32%\u219225%), causing a 23% slowdown. The root cause is that adding a runtime xmask check (xindex < xnumel) when the kernel was previously mask-free (tl.full([XBLOCK], True)) introduces per-thread predication overhead that multiplies with the larger block size. Additionally, the autotune grid call was not updated to use META['XBLOCK'], so the grid remained fixed at cdiv(xnumel, 128) regardless of the selected config, causing each thread to process more elements than intended and inflating instruction count.",
+    "slow_pseudocode": "# XBLOCK=128, no mask needed (xnumel divisible by 128)\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no masking\n    tmp0 = tl.load(in_ptr0 + idx, None, eviction_policy='evict_last')\n    tmp1 = tl.load(in_ptr1 + idx, None)\n    tl.store(out_ptr0 + xindex, tmp0 + tmp1, None)\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# WRONG: grid not updated to META['XBLOCK'], mask added unnecessarily\n@triton.autotune(configs=[triton.Config({'XBLOCK': 1024}, ...), ...], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel  # unnecessary mask added\n    tmp0 = tl.load(in_ptr0 + idx, xmask, eviction_policy='evict_last')\n    tmp1 = tl.load(in_ptr1 + idx, xmask)\n    tl.store(out_ptr0 + xindex, tmp0 + tmp1, xmask)\n\n# BUG: grid still uses hardcoded 128, not META['XBLOCK']\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](...)  # XBLOCK not passed, autotune selects it",
+    "applicable_when": "Kernel has low eligible warps per scheduler (<1.0), high L1TEX stall share (>60% of CPI), low achieved occupancy (<50%), and is not already at register/shared-memory block limits.",
+    "do_not_apply_when": "The kernel is memory-bandwidth-bound (DRAM throughput already >50%) or the xnumel is not evenly divisible by all candidate XBLOCK values (requiring mask introduction). Also do not apply when the grid launch expression is not updated to use META['XBLOCK'] \u2014 this implementation flaw causes the grid to remain fixed at the old block size, inflating instruction count 2-3x and causing regression regardless of occupancy gains.",
+    "framework_notes": "In Triton, when adding @triton.autotune with variable XBLOCK, the grid lambda MUST use META['XBLOCK']: `grid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)`. Failing to do so keeps the grid at the old size, causing each program instance to process more elements than intended. Also, if xnumel is divisible by all candidate XBLOCK values, keep xmask=tl.full([XBLOCK], True, tl.int1) to avoid predication overhead."
+  }
+]

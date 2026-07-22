@@ -1,0 +1,68 @@
+--- baseline
++++ rebuilt
+@@ -5,28 +5,50 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 4},  num_warps=2),
++        triton.Config({'XBLOCK': 4},  num_warps=4),
++        triton.Config({'XBLOCK': 8},  num_warps=4),
++        triton.Config({'XBLOCK': 16}, num_warps=4),
++        triton.Config({'XBLOCK': 32}, num_warps=8),
++        triton.Config({'XBLOCK': 8},  num_warps=2),
++    ],
++    key=['xnumel'],
++)
+ @triton.jit
+-def triton_poi_fused_clone_transpose_view_8(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+-    xnumel = 50331648
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+-    xmask = tl.full([XBLOCK], True, tl.int1)[:]
+-    x0 = (xindex % 96)
+-    x1 = ((xindex // 96) % 8)
+-    x2 = ((xindex // 768) % 512)
+-    x3 = xindex // 393216
+-    x4 = xindex
+-    tmp0 = tl.load(in_ptr0 + (x0 + 96*x2 + 49152*x1 + 393216*x3), None)
+-    tl.store(out_ptr0 + (x4), tmp0, None)
+-
+-
++def triton_poi_fused_clone_transpose_view_8(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):
++    # pid0 encodes (x3, x1): batch x3 in [0,128), head x1 in [0,8)
++    # XBLOCK is used as TILE_X2: tile size over the x2 (seq) dimension
++    pid0 = tl.program_id(0)   # range [0, 1024): all (x3, x1) pairs
++    pid1 = tl.program_id(1)   # range [0, cdiv(512, XBLOCK)): tiles over x2
++    x3 = pid0 // 8
++    x1 = pid0 % 8
++    x2_base = pid1 * XBLOCK
++    x2_offs = x2_base + tl.arange(0, XBLOCK)   # [XBLOCK]
++    x2_mask = x2_offs < 512
++    # x0: head_dim=96, pad to 128 (next power of 2) with mask
++    x0_offs = tl.arange(0, 128)                 # [128]
++    x0_mask = x0_offs < 96
++    # 2D broadcasting: [XBLOCK, 128]
++    x2_2d = x2_offs[:, None]
++    x0_2d = x0_offs[None, :]
++    mask_2d = x2_mask[:, None] & x0_mask[None, :]
++    # SOURCE: in_ptr0 strides (49152, 96, 1)
++    # x1 and x3 are scalar per CTA -> coalesced load along x0 (stride-1)
++    src_offset = x0_2d + 96 * x2_2d + 49152 * x1 + 393216 * x3
++    tmp = tl.load(in_ptr0 + src_offset, mask=mask_2d, other=0.0)
++    # DEST: out_ptr0 strides (393216, 768, 96, 1)
++    dst_offset = x0_2d + 96 * x1 + 768 * x2_2d + 393216 * x3
++    tl.store(out_ptr0 + dst_offset, tmp, mask=mask_2d)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+     arg_1 = inputs[1]
+     xnumel = 50331648
+     grid = (triton.cdiv(xnumel, 128),)
+-    triton_poi_fused_clone_transpose_view_8[grid](arg_0, arg_1, 50331648, XBLOCK=128)
++    triton_poi_fused_clone_transpose_view_8[grid](arg_0, arg_1, 50331648)
+     return arg_1
+ 
+ def get_inputs():

@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "b674b4e7",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "right_size_tile_blocks_for_small_xnumel",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + SOLBottleneck + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "right_size_tile_blocks_for_small_xnumel \u2014 correctness failure",
+    "strategy_description": "Plan 'right_size_tile_blocks_for_small_xnumel' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "xnumel=9 but XBLOCK=128 means 119 of 128 threads per block are masked out in the X dimension \u2014 a 93% waste of thread slots. The grid is (1, 2048), producing only ~0.97 waves across 132 SMs, leaving most SMs idle. YBLOCK=8 is too small to amortize launch overhead or fill warps. The MemoryCacheAccessPattern rule confirms only 18/32 bytes per sector are used, caused by the mismatch between the non-power-of-2 xnumel=9 and the oversized XBLOCK=128. Reducing XBLOCK to 16 (smallest power-of-2 >= xnumel=9) and increasing YBLOCK to 32 or 64 will: (1) eliminate masked-thread waste, (2) increase grid coverage across SMs, (3) improve memory coalescing by having more active threads per warp doing useful work.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_persistent_tile_scheduling_regression_001",
+    "iteration": 1,
+    "speedup": 0.0057,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.9,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5796.0,
+        "Instruction Statistics.Executed Instructions": 819200.0,
+        "Launch Statistics.Registers Per Thread": 28.0,
+        "Launch Statistics.Waves Per SM": 0.97,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 64.37,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.87
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 686.05,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 1028964.0,
+        "Instruction Statistics.Executed Instructions": 208093184.0,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Launch Statistics.Waves Per SM": 1.29,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 63.38,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.85,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.68
+      }
+    },
+    "strategy_title": "Persistent Tile Loop Causes Massive Instruction Explosion",
+    "strategy_description": "Adding a persistent while-loop inside a Triton kernel to process multiple tiles per CTA caused a ~254x increase in executed instructions (819K \u2192 208M) and a ~176x increase in kernel duration (3.9 \u00b5s \u2192 686 \u00b5s). The while-loop tile scheduling logic (integer division and modulo for tile_id decomposition) is computed in scalar registers every iteration, and the loop itself prevents the compiler from statically unrolling or optimizing the tile traversal. Additionally, the increased register pressure (28 \u2192 40 registers/thread) reduced theoretical occupancy from 100% to 75%, and eligible warps per scheduler dropped from 3.69 to 1.85, worsening the IssueSlotUtilization bottleneck rather than fixing it. For very short-duration kernels (< 10 \u00b5s) that are already near the 1-wave boundary, persistent kernel patterns introduce more overhead than they eliminate.",
+    "slow_pseudocode": "# Persistent loop version (AFTER - actually slower)\npid = tl.program_id(0)\nnum_programs = tl.num_programs(0)\nnum_tiles = num_ytiles * num_xtiles\ntile_id = pid\nwhile tile_id < num_tiles:\n    ytile = tile_id // num_xtiles  # expensive scalar div each iter\n    xtile = tile_id % num_xtiles   # expensive scalar mod each iter\n    yoffset = ytile * YBLOCK\n    xoffset = xtile * XBLOCK\n    # ... load/store ...\n    tile_id += num_programs",
+    "fast_pseudocode": "# Original 2D grid version (BEFORE - actually faster)\nyoffset = tl.program_id(1) * YBLOCK\nxoffset = tl.program_id(0) * XBLOCK\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]\nxmask = xindex < xnumel\ntmp0 = tl.load(in_ptr0 + (xindex + 9*yindex), xmask)\ntl.store(out_ptr0 + (y0 + 512*xindex + 4608*y1), tmp0, xmask)",
+    "applicable_when": "Never applicable as described \u2014 persistent while-loop tile scheduling in Triton is harmful for small, short-duration kernels",
+    "do_not_apply_when": "Kernel duration is under ~10 \u00b5s; total instruction count is already low (< 1M); the kernel is a simple memory-movement/permutation with no compute; the grid is near 1 wave (waves_per_sm \u2248 1.0); registers per thread are already near the occupancy-limiting threshold. The persistent loop's per-iteration overhead (integer div/mod for tile decomposition, loop branch) dominates over any scheduling benefit when the total work per tile is tiny.",
+    "framework_notes": "Triton-specific: the while-loop inside a @triton.jit kernel is not optimized away by the compiler \u2014 each iteration executes scalar integer division and modulo instructions for tile index decomposition. The @triton.autotune decorator also did not fix the grid launch (the grid calculation in kernel_function still used the old formula triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8) rather than the persistent 1D grid), meaning the autotune ran but the persistent loop still received the wrong number of programs, compounding the regression."
+  }
+]

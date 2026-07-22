@@ -1,0 +1,63 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,15 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_20(arg_A, arg_B, out_ptr0):
+-    EVEN_K : tl.constexpr = False
++    EVEN_K : tl.constexpr = True
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 64
+     BLOCK_N : tl.constexpr = 64
+-    BLOCK_K : tl.constexpr = 32
++    BLOCK_K : tl.constexpr = 16
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+@@ -59,23 +60,20 @@
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+-        a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+-        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+-
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
++        k_offs = offs_k + k_idx * BLOCK_K   # shape [BLOCK_K], absolute k indices
+ 
+         idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
++        idx_n = k_offs[None, :]
+         xindex = idx_n + 240*idx_m
+-        a = tl.load(A + (xindex), mask=a_mask, other=0.0)
++        a = tl.load(A + (xindex))   # no K mask needed: EVEN_K=True
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 40*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 240*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)), mask=b_mask, other=0.0)
+-
+-
++        # Load B directly as [BLOCK_K, BLOCK_N]: k outer, n inner
++        # B stored as B[n, k] = B_ptr + n*stride_bn + k*stride_bk = B_ptr + n*240 + k*1
++        # Access pattern: b[k_local, n_local] = B_ptr + k_offs[k_local]*1 + offs_b_n[n_local]*240
++        b_ptrs = B + k_offs[:, None] * stride_bk + offs_b_n[None, :] * stride_bn  # [BLOCK_K, BLOCK_N]
++        b_mask2d = offs_b_n[None, :] < N   # only N-dim mask; K-dim dropped (EVEN_K=True)
++        b = tl.load(b_ptrs, mask=b_mask2d, other=0.0)  # shape [BLOCK_K, BLOCK_N]
++        # tl.dot(a, b): a=[BLOCK_M, BLOCK_K], b=[BLOCK_K, BLOCK_N] -> acc=[BLOCK_M, BLOCK_N]
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+ 
+@@ -89,8 +87,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 40*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

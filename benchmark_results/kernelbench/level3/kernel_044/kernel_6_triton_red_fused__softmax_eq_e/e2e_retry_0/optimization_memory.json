@@ -1,0 +1,80 @@
+[
+  {
+    "item_id": "exp_triton_autotune_tile_softmax_001",
+    "iteration": 1,
+    "speedup": 898.4862,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_size_to_eliminate_register_spill",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (ms)": 10.09,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 68.52,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 13.97,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 7.85,
+        "Scheduler Statistics.No Eligible (%)": 88.98,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.16,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 135.06,
+        "Launch Statistics.Stack Size": 9648.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 11.23,
+        "GPU Speed Of Light Throughput.DRAM Throughput (%)": 17.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 62.09,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 60.75,
+        "Scheduler Statistics.No Eligible (%)": 23.33,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.34,
+        "Launch Statistics.Stack Size": 1024.0
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Eliminate Register Spill in Reduction Kernels",
+    "strategy_description": "When a Triton reduction kernel uses a fixed, oversized R_BLOCK (e.g., R0_BLOCK=512 with XBLOCK=128), the per-CTA register footprint can exceed L1 capacity, causing register spill to local memory. NCU signals this via MemoryCacheAccessPattern warnings showing only 1 of 32 bytes utilized per sector for local loads/stores, combined with high DRAM throughput (>60%) and very low compute throughput (<15%). Adding @triton.autotune with configs that sweep smaller R_BLOCK values (e.g., 16\u2013512) allows the autotuner to find a tile size where the working set fits in L1/L2, eliminating spill, dramatically improving scheduler eligibility (0.16\u21924.82 eligible warps/scheduler), and shifting the bottleneck from memory to compute.",
+    "slow_pseudocode": "# Fixed large tile \u2014 causes register spill\n@triton.jit\ndef kernel(in_out_ptr, in_ptr, xnumel, r_numel,\n           XBLOCK: tl.constexpr,   # fixed=128\n           R0_BLOCK: tl.constexpr): # fixed=512\n    # XBLOCK*R0_BLOCK*4 bytes = 256KB per CTA >> L1\n    for r0_offset in range(0, r_numel, R0_BLOCK):\n        data = tl.load(in_ptr + ...)   # spills to local mem\n        acc  = tl.load(in_out_ptr + ...)  # spills to local mem\n        ...\n    for r0_offset in range(0, r_numel, R0_BLOCK):\n        data = tl.load(in_ptr + ...)   # re-reads from DRAM\n        acc  = tl.load(in_out_ptr + ...)  # re-reads from DRAM\n        tl.store(in_out_ptr + ..., result)",
+    "fast_pseudocode": "# Autotuned tile \u2014 autotuner picks small R0_BLOCK to fit in L1/L2\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 512}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 256}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 4,   'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 8,   'R0_BLOCK': 64},  num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 32},  num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 16},  num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 16},  num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 16},  num_warps=8, num_stages=3),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(in_out_ptr, in_ptr, xnumel, r_numel,\n           XBLOCK: tl.constexpr,   # autotuned\n           R0_BLOCK: tl.constexpr): # autotuned (small = fits in L1)\n    xmask = xindex < xnumel  # also add proper xmask\n    for r0_offset in range(0, r_numel, R0_BLOCK):\n        data = tl.load(in_ptr + ..., mask=xmask & r0_mask, eviction_policy='evict_last')\n        acc  = tl.load(in_out_ptr + ..., mask=xmask & r0_mask, eviction_policy='evict_last')\n        ...\n    for r0_offset in range(0, r_numel, R0_BLOCK):\n        data = tl.load(in_ptr + ..., mask=xmask & r0_mask, eviction_policy='evict_first')\n        acc  = tl.load(in_out_ptr + ..., mask=xmask & r0_mask, eviction_policy='evict_first')\n        tl.store(in_out_ptr + ..., result, mask=xmask & r0_mask)\n\n# Grid no longer passes fixed XBLOCK/R0_BLOCK \u2014 autotune handles it\ngrid = (triton.cdiv(xnumel, XBLOCK),)\nkernel[grid](in_out_ptr, in_ptr, xnumel, r0_numel)",
+    "applicable_when": "Triton reduction kernel with fixed large R_BLOCK causing register spill; NCU shows MemoryCacheAccessPattern warning with ~1 byte utilized per 32-byte sector for local loads/stores; DRAM throughput >50% while Compute SM throughput <20%; eligible warps per scheduler <0.5; warp cycles per issued instruction >100; stack size in launch stats is large (>4KB indicating spill frames).",
+    "do_not_apply_when": "Kernel is already compute-bound (Compute SM throughput >70%); R_BLOCK is already small and fits in L1; kernel has no reduction loop (no multi-pass structure); autotuning overhead is unacceptable (e.g., very short-lived one-shot kernels where autotuning cost exceeds savings).",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter. The key=['xnumel', 'r0_numel'] ensures autotuning is re-run when problem dimensions change. Equivalent in CUDA would be template parameter sweeping or dynamic shared memory sizing. Also: use eviction_policy='evict_first' on second-pass loads in two-pass algorithms to avoid polluting L1/L2 with data that won't be reused. Add proper xmask = xindex < xnumel when XBLOCK becomes variable (previously safe to omit only when xnumel was always a multiple of fixed XBLOCK)."
+  },
+  {
+    "item_id": "exp_triton_coalescing_xblock1_softmax_001",
+    "iteration": 1,
+    "speedup": 502.991,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_strided_access_by_setting_xblock_to_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 13.97,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 68.52,
+        "GPU Speed Of Light Throughput.Duration_ms": 10.09,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 7.85,
+        "Memory Workload Analysis.L2 Hit Rate": 52.12,
+        "Scheduler Statistics.No Eligible": 88.98,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 135.06,
+        "Compute Workload Analysis.Issue Slots Busy": 11.03,
+        "Launch Statistics.Waves Per SM": 1.94
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 71.7,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 9.6,
+        "GPU Speed Of Light Throughput.Duration_us": 20.06,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 50.58,
+        "Memory Workload Analysis.L2 Hit Rate": 58.53,
+        "Scheduler Statistics.No Eligible": 19.17,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.57,
+        "Compute Workload Analysis.Issue Slots Busy": 80.8,
+        "Launch Statistics.Waves Per SM": 7.76
+      }
+    },
+    "strategy_title": "Set XBLOCK=1 to Fix Stride-N Memory Coalescing",
+    "strategy_description": "When a Triton reduction kernel uses XBLOCK>1 and the primary tensor is indexed as `r_idx + stride * x_idx`, consecutive warp threads differ in x_idx, causing stride-N uncoalesced access (NCU reports ~1/32 bytes per sector utilized). Setting XBLOCK=1 makes x_idx a per-block scalar and r_idx the warp-contiguous dimension, achieving stride-1 coalesced access. This collapsed warp stall cycles from 135 to 18 cycles/instruction and raised SM compute throughput from 14% to 72%, yielding a >500x speedup.",
+    "slow_pseudocode": "# XBLOCK=128, stride-N uncoalesced\nxoffset = program_id(0) * 128\nxindex = xoffset + arange(0, 128)[:, None]   # shape [128, 1]\nr_base = arange(0, R0_BLOCK)[None, :]         # shape [1, R0_BLOCK]\n# consecutive threads differ in xindex => stride-512 access\ndata = load(ptr + r_idx + 512 * x_idx)        # 1/32 sector utilization\ngrid = (cdiv(524288, 128),)  # 4096 blocks",
+    "fast_pseudocode": "# XBLOCK=1, stride-1 coalesced\n@autotune(configs=[\n    Config({'XBLOCK': 1, 'R0_BLOCK': 512}, num_warps=16, num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 256}, num_warps=8,  num_stages=1),\n    Config({'XBLOCK': 1, 'R0_BLOCK': 128}, num_warps=4,  num_stages=1),\n], key=['xnumel', 'r0_numel'], restore_value=['in_out_ptr0'])\nxoffset = program_id(0) * 1\nxindex = xoffset + arange(0, 1)[:, None]      # shape [1, 1] \u2014 scalar per block\nr_base = arange(0, R0_BLOCK)[None, :]         # shape [1, R0_BLOCK]\n# x_idx is scalar per block => consecutive threads differ in r_idx => stride-1\ndata = load(ptr + r_idx + 512 * x_idx)        # 32/32 sector utilization\ngrid = (cdiv(524288, 1),)  # 524288 blocks, one per row",
+    "applicable_when": "NCU MemoryCacheAccessPattern rule fires with ~1/32 bytes per sector utilization on local loads/stores; primary tensor indexed as `r_idx + stride * x_idx` where stride equals the reduction dimension size; DRAM throughput high (>60%) but SM compute throughput low (<20%); warp cycles per issued instruction >100; scheduler 'No Eligible' >80%.",
+    "do_not_apply_when": "The kernel is already compute-bound (SM throughput >70%); the tensor access pattern is already stride-1 in the x-dimension; XBLOCK=1 would create too many blocks to fit in L2 cache or cause excessive kernel launch overhead; the reduction dimension is very small (e.g., <32 elements) making per-row blocks wasteful.",
+    "framework_notes": "Triton-specific: use @triton.autotune with restore_value=[...] for in-place tensors (in_out_ptr) to ensure autotuning correctness. The grid must be updated from cdiv(xnumel, XBLOCK_old) to cdiv(xnumel, 1) = xnumel. Also update xmask from tl.full([XBLOCK], True) to xindex < xnumel when XBLOCK=1 to handle boundary correctly. In CUDA, the equivalent is assigning one thread block per reduction row."
+  }
+]

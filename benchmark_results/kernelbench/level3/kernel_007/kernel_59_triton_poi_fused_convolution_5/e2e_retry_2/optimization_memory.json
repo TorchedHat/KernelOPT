@@ -1,0 +1,98 @@
+[
+  {
+    "item_id": "ac10af3f",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_triton_autotune \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'add_triton_autotune' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 229, in benchmark\n    timings = {config: self._bench(*args, c",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 256 CTAs on a 132-SM H200, producing 0.12 waves/SM \u2014 the GPU is almost entirely idle. The current XBLOCK=128 with xnumel=25 wastes ~80% of threads per block (only 25 of 128 are unmasked). Switching to a persistent kernel where each SM processes multiple tiles in a loop, combined with autotuned smaller XBLOCK (e.g., 32) that matches xnumel=25 better, will dramatically improve SM utilization and thread efficiency.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packa",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_persistent_kernel_tiny_grid_regression_001",
+    "iteration": 1,
+    "speedup": 0.032,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_autotuned_block_sizes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.56,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3824.0,
+        "Occupancy.Achieved Occupancy (%)": 11.16,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Launch Statistics.Grid Size": 256.0,
+        "Instruction Statistics.Executed Instructions": 102400.0,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 81.6,
+        "Scheduler Statistics.No Eligible (%)": 83.73
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 79.9,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 119793.0,
+        "Occupancy.Achieved Occupancy (%)": 6.06,
+        "Launch Statistics.Waves Per SM": 0.06,
+        "Launch Statistics.Grid Size": 256.0,
+        "Instruction Statistics.Executed Instructions": 5985280.0,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 2.78,
+        "Scheduler Statistics.No Eligible (%)": 89.64
+      }
+    },
+    "strategy_title": "Persistent Kernel Loop Causes Massive Instruction Explosion",
+    "strategy_description": "Adding a persistent while-loop inside a Triton kernel to handle multiple tiles per CTA caused a 58x increase in executed instructions (102K \u2192 5.98M) and a 31x increase in kernel duration (2.56 \u00b5s \u2192 79.9 \u00b5s). The grid was not updated to use the persistent SM-count-based launch (it remained at the original 256 CTAs), so each CTA iterated through all tiles sequentially rather than in parallel, serializing work that was previously parallel. This anti-pattern occurs when the persistent loop is added but the grid size is not simultaneously reduced to the SM count \u2014 the original grid already covered all tiles, so the loop caused each CTA to redundantly process all tiles.",
+    "slow_pseudocode": "# Original: 2D grid, each CTA handles one tile\ngrid = (cdiv(xnumel, XBLOCK), cdiv(ynumel, YBLOCK))  # = (1, 256)\n@triton.jit\ndef kernel(...):\n    xoffset = tl.program_id(0) * XBLOCK\n    yoffset = tl.program_id(1) * YBLOCK\n    # process single tile\n    tl.load(...); tl.store(...)",
+    "fast_pseudocode": "# WRONG persistent attempt: grid unchanged, loop added\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # still (1, 256)!\n@triton.jit\ndef kernel(...):\n    tile_id = tl.program_id(0)\n    num_programs = tl.num_programs(0)  # = 256\n    while tile_id < num_tiles:  # each of 256 CTAs loops over ALL tiles\n        # process tile\n        tile_id += num_programs  # stride = 256, but num_tiles also ~256 \u2192 each CTA does all tiles",
+    "applicable_when": "Never apply this pattern as implemented \u2014 it is always wrong when the grid is not changed to SM_COUNT.",
+    "do_not_apply_when": "Do NOT add a persistent while-loop to a Triton kernel without simultaneously changing the grid to (SM_COUNT,) or (SM_COUNT * multiplier,). If the grid remains the same as the original tile-covering grid, each CTA will iterate over all tiles, multiplying total work by num_tiles and causing catastrophic slowdown. This is especially harmful for tiny kernels (< 1000 \u00b5s) where launch overhead is already the bottleneck.",
+    "framework_notes": "In Triton, persistent kernels require: (1) grid = (SM_COUNT * multiplier,) \u2014 NOT the original tile-covering grid; (2) num_programs = tl.num_programs(0) must equal the new smaller grid size; (3) the while-loop stride must be num_programs (the new grid size), not the original grid size. The kernel_function wrapper in this case still used the old grid formula `(cdiv(xnumel, 128), cdiv(ynumel, 8))` instead of `(SM_COUNT * 4,)`, which is the root cause of the regression."
+  },
+  {
+    "item_id": "exp_001_autotune_small_grid_regression",
+    "iteration": 1,
+    "speedup": 0.8421,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_small_grid_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy",
+      "key_metric_before": {
+        "Occupancy.Achieved Occupancy": 11.16,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "GPU Speed Of Light Throughput.Duration": 2.56,
+        "Memory Workload Analysis.L2 Hit Rate": 59.99,
+        "Scheduler Statistics.No Eligible": 83.73,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 256.0
+      },
+      "key_metric_after": {
+        "Occupancy.Achieved Occupancy": 5.7,
+        "Launch Statistics.Waves Per SM": 0.06,
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "Memory Workload Analysis.L2 Hit Rate": 35.5,
+        "Scheduler Statistics.No Eligible": 92.97,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Grid Size": 256.0,
+        "Memory Workload Analysis.Memory Throughput": 410.95
+      }
+    },
+    "strategy_title": "Autotune tile sizes to fix low-occupancy small-grid kernels",
+    "strategy_description": "When a kernel has very low achieved occupancy (e.g., ~11%) due to a tile dimension (XBLOCK) far exceeding the actual problem size in that dimension, reducing XBLOCK via autotune was expected to expand the grid and improve SM utilization. However, in this case the autotune decorator was added but the grid lambda was not updated \u2014 the kernel_function still used the hardcoded old grid formula (cdiv(xnumel, 128), cdiv(ynumel, 8)) instead of a dynamic lambda reading meta['XBLOCK'] and meta['YBLOCK']. As a result, the grid remained fixed at 256 blocks regardless of the autotuned tile sizes, waves/SM dropped from 0.12 to 0.06 (halved), achieved occupancy fell from 11.2% to 5.7%, L2 hit rate dropped from 60% to 35.5% (fewer reuses due to smaller blocks), and duration increased from 2.56 \u00b5s to 3.04 \u00b5s.",
+    "slow_pseudocode": "# BEFORE: fixed grid, fixed tile\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # = (1, 256)\nkernel[grid](arg0, arg1, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# INTENDED AFTER (not correctly implemented):\n@triton.autotune(configs=[...], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(...):\n    ...\n\n# CRITICAL: grid must be a lambda reading meta tile sizes\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](arg0, arg1, ynumel, xnumel)  # no XBLOCK/YBLOCK kwargs",
+    "applicable_when": "Kernel has achieved occupancy far below theoretical (e.g., <20%), waves_per_sm < 0.2, and a tile dimension (XBLOCK/YBLOCK) is much larger than the actual problem size in that dimension, causing most threads in a block to be idle.",
+    "do_not_apply_when": "The grid lambda is not updated to use meta['XBLOCK'] and meta['YBLOCK'] \u2014 this implementation flaw causes the grid to remain fixed while block size shrinks, halving waves_per_sm and worsening occupancy. Also avoid when the kernel is already memory-bandwidth bound and L2 hit rate is high (smaller tiles reduce reuse).",
+    "framework_notes": "In Triton, @triton.autotune requires the grid to be a lambda function that reads meta['XBLOCK'] and meta['YBLOCK'] to dynamically compute the grid dimensions. If the grid is a static tuple computed before the kernel call, autotuning tile sizes has no effect on grid shape \u2014 the grid stays fixed while block size changes, which reduces waves_per_sm proportionally and degrades performance."
+  }
+]

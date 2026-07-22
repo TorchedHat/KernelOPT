@@ -1,0 +1,75 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_convolution_hardtanh_6(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 2304000
+    pid = tl.program_id(0)
+    num_sms = tl.num_programs(0)
+    num_tiles = tl.cdiv(xnumel, XBLOCK)
+
+    # HOISTED: load all 16-element coefficient arrays once into registers before loop
+    # Since XBLOCK=128 is always a multiple of 16, rep_idx gives the correct
+    # repeating [0..15, 0..15, ...] pattern for any tile offset
+    rep_idx = tl.arange(0, XBLOCK) % 16
+    coeff_mask = rep_idx < 16
+    c_mean = tl.load(in_ptr0 + rep_idx, mask=coeff_mask)   # shape [XBLOCK], stays in registers
+    c_var  = tl.load(in_ptr1 + rep_idx, mask=coeff_mask)   # shape [XBLOCK], stays in registers
+    c_wt   = tl.load(in_ptr2 + rep_idx, mask=coeff_mask)   # shape [XBLOCK], stays in registers
+    c_bias = tl.load(in_ptr3 + rep_idx, mask=coeff_mask)   # shape [XBLOCK], stays in registers
+
+    tile_id = pid
+    while tile_id < num_tiles:
+        xoffset = tile_id * XBLOCK
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = xindex < xnumel
+        x2 = xindex
+        tmp0 = tl.load(in_out_ptr0 + (x2), xmask, eviction_policy='evict_first')
+        # Use preloaded register arrays - no global memory traffic for coefficients
+        tmp1  = c_mean
+        tmp3  = c_var
+        tmp12 = c_wt
+        tmp14 = c_bias
+        tmp2 = tmp0 - tmp1
+        tmp4 = tl.full([1], 1e-05, tl.float32)
+        tmp5 = tmp3 + tmp4
+        tmp_inv = tl.math.rsqrt(tmp5)
+        tmp11 = tmp2 * tmp_inv
+        tmp15 = tl.math.fma(tmp11, tmp12, tmp14)
+        tl.store(in_out_ptr0 + (x2), tmp15, xmask)
+        tile_id += num_sms
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    xnumel = 2304000
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_convolution_hardtanh_6[grid](arg_0, arg_1, arg_2, arg_3, arg_4, 2304000, XBLOCK=128)
+    return arg_4
+
+def get_inputs():
+    arg_0 = rand_strided((10, 16, 120, 120), (230400, 1, 1920, 16), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((16,), (1,), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

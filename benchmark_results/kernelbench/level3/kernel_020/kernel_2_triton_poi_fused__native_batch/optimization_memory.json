@@ -1,0 +1,40 @@
+[
+  {
+    "item_id": "exp_001_autotune_larger_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.7133,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "add_autotune_with_larger_xblock_for_vectorized_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 21.89,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.05,
+        "GPU Speed Of Light Throughput.Memory Throughput": 23.64,
+        "Occupancy.Achieved Occupancy": 56.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.4,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 83.24,
+        "Launch Statistics.Registers Per Thread": 17.0,
+        "Instruction Statistics.Executed Instructions": 9282560.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 30.69,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 82.58,
+        "GPU Speed Of Light Throughput.Memory Throughput": 24.76,
+        "Occupancy.Achieved Occupancy": 86.77,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.59,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 65.95,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 19850880.0
+      }
+    },
+    "strategy_title": "Larger XBLOCK autotune regresses due to instruction bloat",
+    "strategy_description": "Increasing XBLOCK from 128 to 512\u20132048 via autotune doubled register usage (17\u219232 registers/thread) and more than doubled total executed instructions (9.3M\u219219.9M), causing a 40% slowdown despite improving achieved occupancy (56%\u219287%) and compute throughput (54%\u219283%). The L1/TEX hit rate dropped from 83% to 66%, indicating that larger tiles caused cache thrashing on the per-channel broadcast tensors (size 32) accessed via modulo indexing. The net effect was that the extra instruction count and cache pressure outweighed the latency-hiding benefit of higher occupancy, resulting in a longer kernel duration (21.9 \u00b5s\u219230.7 \u00b5s). When a kernel already has high L1 hit rate on small broadcast tensors and moderate compute throughput, increasing tile size can destroy cache locality and inflate instruction count without proportional throughput gain.",
+    "slow_pseudocode": "# XBLOCK=128, 17 regs/thread, 9.3M instructions, L1 hit=83%, duration=21.9us\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0..3, xnumel, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = tl.full([XBLOCK], True, tl.int1)\n    x0 = xindex % 32  # channel index into small broadcast tensors\n    tmp0 = tl.load(in_out_ptr0 + xindex, None)\n    tmp1 = tl.load(in_ptr0 + x0, None, eviction_policy='evict_last')\n    # ... batch norm + hardtanh ...\n    tl.store(in_out_ptr0 + xindex, result, None)\ngrid = (cdiv(xnumel, 128),)",
+    "fast_pseudocode": "# XBLOCK autotuned {512,1024,2048}, 32 regs/thread, 19.9M instructions, L1 hit=66%, duration=30.7us\n@triton.autotune(configs=[Config({'XBLOCK':512},num_warps=4), ...Config({'XBLOCK':2048},num_warps=32)], key=['xnumel'])\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0..3, xnumel, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    x0 = xindex % 32\n    tmp0 = tl.load(in_out_ptr0 + xindex, xmask)\n    tmp1 = tl.load(in_ptr0 + x0, xmask, eviction_policy='evict_last')\n    # ... batch norm + hardtanh ...\n    tl.store(in_out_ptr0 + xindex, result, xmask)\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)",
+    "applicable_when": "Never beneficial in this configuration; generally avoid when small broadcast tensors (e.g., per-channel BN params) are accessed via modulo indexing and already have high L1 hit rate (>80%), and when register count is near the block-limit-register boundary.",
+    "do_not_apply_when": "Kernel has high L1/TEX hit rate (>75%) on small broadcast tensors accessed via modulo; kernel is already achieving moderate compute throughput (>50%); increasing XBLOCK would double register usage and push block-limit-registers lower, reducing effective occupancy ceiling; total instruction count scales super-linearly with XBLOCK due to predicated/masked operations.",
+    "framework_notes": "In Triton, adding @triton.autotune with larger XBLOCK configs causes the compiler to allocate more registers per thread (17\u219232 in this case), which halves the Block Limit Registers (21\u219216 blocks/SM). The xmask predication on all loads/stores also adds instruction overhead that compounds with larger XBLOCK. The grid must be updated to lambda meta: (cdiv(xnumel, meta['XBLOCK']),) when using autotune, but the static grid=(cdiv(xnumel,128),) in kernel_function was not updated, meaning autotune configs with XBLOCK>128 would use an oversized grid \u2014 this implementation flaw may have contributed to the regression."
+  }
+]

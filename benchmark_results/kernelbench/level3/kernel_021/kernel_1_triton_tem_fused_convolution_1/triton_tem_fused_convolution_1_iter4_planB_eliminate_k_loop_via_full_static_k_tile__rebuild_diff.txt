@@ -1,0 +1,77 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,15 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_tem_fused_convolution_1(in_ptr0, arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = False
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 128
+-    BLOCK_N : tl.constexpr = 16
+-    BLOCK_K : tl.constexpr = 16
++    BLOCK_N : tl.constexpr = 8
++    K_STATIC : tl.constexpr = 4  # next power-of-2 >= K=3; boundary_check pads 4th element to zero
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+@@ -54,25 +55,32 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
++    offs_k_static = tl.arange(0, K_STATIC)  # [0, 1, 2, 3]
+ 
+-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
++    # Load full A tile [BLOCK_M, K_STATIC] in one shot -- no loop
++    a_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),   # (3, 1)
++        offsets=(pid_m * BLOCK_M, 0),     # start at row=pid_m*BLOCK_M, col=0
++        block_shape=(BLOCK_M, K_STATIC),
++        order=(1, 0)                       # K is the fast/contiguous dim
++    )
++    a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')  # shape [BLOCK_M, K_STATIC]
+ 
+-        a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+-        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
++    # Load full B tile [BLOCK_N, K_STATIC] in one shot -- K is fast dim (stride=1), coalesced
++    b_n_mask = offs_b_n[:, None] < N                    # shape [BLOCK_N, 1]
++    b_k_mask = offs_k_static[None, :] < K               # shape [1, K_STATIC]; masks the padded 4th element
++    b_mask_nk = b_n_mask & b_k_mask
++    b_nk = tl.load(B + offs_b_n[:, None] * stride_bn + offs_k_static[None, :] * stride_bk,
++                   mask=b_mask_nk, other=0.0)            # shape [BLOCK_N, K_STATIC]
++    b = tl.trans(b_nk)                                  # shape [K_STATIC, BLOCK_N]
+ 
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 3*idx_m
+-        a = tl.load(A + (xindex), mask=a_mask, other=0.0)
+-
+-        b = tl.load(B + b_k_idx_vals * 1 + offs_b_n[None, :] * 3, mask=b_mask, other=0.0)
+-
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
++    # Single fused reduction over K_STATIC=4 -- compiler sees all FMAs at once
++    acc = tl.sum(
++        tl.reshape(a, (BLOCK_M, K_STATIC, 1)) * tl.reshape(b, (1, K_STATIC, BLOCK_N)),
++        axis=1
++    )  # shape [BLOCK_M, BLOCK_N]
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -86,7 +94,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

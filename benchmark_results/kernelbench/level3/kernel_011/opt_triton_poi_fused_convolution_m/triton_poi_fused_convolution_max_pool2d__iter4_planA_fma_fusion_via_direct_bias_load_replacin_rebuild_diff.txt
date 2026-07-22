@@ -1,0 +1,73 @@
+--- baseline
++++ rebuilt
+@@ -4,12 +4,17 @@
+ import torch.nn.functional as F
+ 
+ 
++
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+         triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16),
+     ],
+     key=['numel'],
+ )
+@@ -25,33 +30,41 @@
+ ):
+     pid = tl.program_id(0)
+     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    # Hint: offsets are contiguous and aligned to BLOCK_SIZE -> enables LDG.128
++    offsets = tl.max_contiguous(tl.multiple_of(offsets, BLOCK_SIZE), BLOCK_SIZE)
+     mask = offsets < numel
+-    
++
+     # Compute channel index for bias
+     # Layout: [N, C, H, W] -> channel = (offset / spatial) % channels
+     # But we store in NHWC-like after conv template, so need to handle both
+     # For standard NCHW: channel = (offset // spatial) % channels
+     chan_idx = (offsets // spatial) % channels
+-    
+-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+-    bias = tl.load(bias_ptr + chan_idx, mask=mask, other=0.0)
+-    
+-    result = x + bias
+-    result = tl.maximum(result, 0.0)
+-    
+-    tl.store(out_ptr + offsets, result, mask=mask)
++
++    x = tl.load(x_ptr + offsets, mask=mask, other=0.0, eviction_policy='evict_first')
++
++    # Direct indexed load: eliminates tl.gather and enables FFMA fusion
++    bias = tl.load(bias_ptr + chan_idx, mask=mask, other=0.0, eviction_policy='evict_last')
++
++    result = tl.maximum(x + bias, 0.0)
++
++    tl.store(out_ptr + offsets, result, mask=mask, eviction_policy='evict_first')
+ 
+ 
+ @triton.autotune(
+     configs=[
++        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+         triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
++        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
++        triton.Config({'BLOCK_SIZE': 16384}, num_warps=16),
+     ],
+     key=['numel'],
+ )
+ @triton.jit
++
+ def bias_relu_nhwc_kernel(
+     x_ptr,
+     bias_ptr,
