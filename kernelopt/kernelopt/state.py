@@ -74,10 +74,10 @@ class PipelineConfig:
     T: int = 5          # max iterations
     N: int = 4          # plans per iteration
     K: int = 1          # executor attempts per plan
-    TopK: int = 4       # max experience items added to memory per iteration
-    ExpN: int = 8       # memory queue capacity
-    t_pos: float = 1.04  # min speedup to store positive item
-    t_neg: float = 1.15  # min slowdown factor to store negative item
+    keep_n: int = 4       # max experience items added to memory per iteration
+    q_cap: int = 8        # memory queue capacity
+    spe_gate: float = 1.05  # min speedup to store positive item
+    slo_gate: float = 1.20  # min slowdown factor to store negative item
 
     # NCU options
     kernel_name: str | None = None

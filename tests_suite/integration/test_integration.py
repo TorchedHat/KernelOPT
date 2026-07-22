@@ -198,7 +198,7 @@ class TestDataFlow:
         import tempfile
 
         # Select top items
-        top = select_top_k(sample_memory_items, top_k=1, t_pos=1.04, t_neg=1.15)
+        top = select_top_k(sample_memory_items, top_k=1, spe_gate=1.05, slo_gate=1.20)
 
         # Append to memory
         memory = append_items([], top, capacity=5)

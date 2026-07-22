@@ -290,7 +290,7 @@ def optimize_all_kernels(
             T=state.config.T,
             N=state.config.N,
             K=state.config.K,
-            TopK=state.config.TopK,
+            keep_n=state.config.keep_n,
             model=state.config.model,
             api_key=state.config.api_key,
             project_id=state.config.project_id,
@@ -386,7 +386,7 @@ def optimize_all_kernels(
                             _retry_dir = kernel_output_dir / f"e2e_retry_{_e2e_attempt}"
                             _retry_dir.mkdir(parents=True, exist_ok=True)
                             retry_cfg = PipelineConfig(
-                                T=1, N=2, K=2, TopK=_scfg.TopK,
+                                T=1, N=2, K=2, keep_n=_scfg.keep_n,
                                 model=_scfg.model, api_key=_scfg.api_key,
                                 project_id=_scfg.project_id, region=_scfg.region,
                                 llm_provider=_scfg.llm_provider,

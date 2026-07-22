@@ -1765,17 +1765,18 @@ def summarize_results(state: GraphState) -> dict:
     # can avoid repeating broken implementations.
     failure_items = state.get("correctness_failure_items", [])
     if failure_items:
-        memory = append_items(memory, failure_items, cfg.ExpN)
+        memory = append_items(memory, failure_items, cfg.q_cap)
 
     # Apply memory curation for profiled candidates
-    top_items = select_top_k(experience_items, cfg.TopK, cfg.t_pos, cfg.t_neg)
+    top_items = select_top_k(experience_items, cfg.keep_n, cfg.spe_gate, cfg.slo_gate)
     if top_items:
-        memory = append_items(memory, top_items, cfg.ExpN)
+        memory = append_items(memory, top_items, cfg.q_cap)
 
     # Write to persistent memory bank (cross-run learning)
     try:
         from kernelopt.memory_bank import (
             MemoryBank, MemoryEntry, classify_kernel_structure, get_hardware_info,
+            compute_metric_deltas,
         )
         bank = MemoryBank()
         kernel_struct = classify_kernel_structure(current_kernel, profiling_before)
@@ -1799,6 +1800,12 @@ def summarize_results(state: GraphState) -> dict:
                     fromfile="baseline", tofile="optimized", n=3,
                 ))
 
+            _metric_deltas = {}
+            if profiling_before and getattr(c, "profiling_context", None):
+                _base_sections = profiling_before.get("sections", profiling_before)
+                _cand_sections = c.profiling_context.get("sections", c.profiling_context)
+                _metric_deltas = compute_metric_deltas(_base_sections, _cand_sections)
+
             entry = MemoryEntry(
                 kernel_structure=kernel_struct,
                 hardware=hw_info,
@@ -1817,6 +1824,7 @@ def summarize_results(state: GraphState) -> dict:
                 ),
                 code_pattern=c.optimized_kernel[:500] if is_success else "",
                 code_diff=_code_diff,
+                metric_deltas=_metric_deltas,
             )
             bank.add(entry)
     except Exception as e:
@@ -3006,8 +3014,8 @@ def _write_final_outputs(
     cfg = state.config
     lines += [
         "## Config\n\n",
-        f"- T={cfg.T}, N={cfg.N}, K={cfg.K}, TopK={cfg.TopK}, ExpN={cfg.ExpN}\n",
-        f"- t_pos={cfg.t_pos}, t_neg={cfg.t_neg}\n",
+        f"- T={cfg.T}, N={cfg.N}, K={cfg.K}, keep_n={cfg.keep_n}, q_cap={cfg.q_cap}\n",
+        f"- spe_gate={cfg.spe_gate}, slo_gate={cfg.slo_gate}\n",
         f"- replay_mode={cfg.replay_mode}\n",
         f"- kernel_args: `{' '.join(cfg.kernel_args) or '—'}`\n",
     ]

@@ -227,7 +227,7 @@ class TestSchemaContracts:
             'T',  # max iterations
             'N',  # plans per iteration
             'K',  # attempts per plan
-            'TopK',  # top K memory items
+            'keep_n',  # top K memory items
             'model',
         ]
 
@@ -391,7 +391,7 @@ class TestBackwardsCompatibility:
         ]
 
         # Should work with current code
-        selected = select_top_k(old_format_memory, top_k=1, t_pos=1.04, t_neg=1.15)
+        selected = select_top_k(old_format_memory, top_k=1, spe_gate=1.05, slo_gate=1.20)
         assert len(selected) > 0
 
         memory = append_items([], old_format_memory, capacity=10)
@@ -490,7 +490,7 @@ class TestConfigurationContracts:
         assert cfg.T > 0
         assert cfg.N > 0
         assert cfg.K >= 1
-        assert cfg.TopK > 0
+        assert cfg.keep_n > 0
 
     def test_pipeline_config_accepts_overrides(self):
         """PipelineConfig should accept parameter overrides."""
@@ -500,13 +500,13 @@ class TestConfigurationContracts:
             T=10,
             N=8,
             K=3,
-            TopK=5,
+            keep_n=5,
         )
 
         assert cfg.T == 10
         assert cfg.N == 8
         assert cfg.K == 3
-        assert cfg.TopK == 5
+        assert cfg.keep_n == 5
 
     def test_config_is_immutable_during_run(self):
         """Config should not change during pipeline execution."""

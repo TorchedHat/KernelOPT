@@ -410,7 +410,7 @@ def run(
                 T=t0,
                 N=n0,
                 K=k0,
-                TopK=top_k,
+                keep_n=top_k,
                 kernel_name=kernel_name,
                 launch_skip=launch_skip,
                 launch_count=launch_count,
@@ -451,7 +451,7 @@ def run(
             T=t0,
             N=n0,
             K=k0,
-            TopK=top_k,
+            keep_n=top_k,
             kernel_name=kernel_name,
             launch_skip=launch_skip,
             launch_count=launch_count,
@@ -516,7 +516,7 @@ def run(
         f"[bold green]kernelopt[/] starting on "
         f"[cyan]{kernel_path.name}[/]\n"
         f"  T={cfg.T} iterations, N={cfg.N} plans/iter, "
-        f"K={cfg.K} attempts/plan, TopK={cfg.TopK}\n"
+        f"K={cfg.K} attempts/plan, keep_n={cfg.keep_n}\n"
         f"  Output: [cyan]{resolved_output}/[/]\n"
         f"  Backend: [cyan]{cfg.llm_provider}[/] ({cfg.model})"
         f"{extra}{hud_note}"
@@ -671,7 +671,7 @@ def run(
                     kernel_output_dir.mkdir(parents=True, exist_ok=True)
 
                     kernel_cfg = PipelineConfig(
-                        T=cfg.T, N=cfg.N, K=cfg.K, TopK=cfg.TopK,
+                        T=cfg.T, N=cfg.N, K=cfg.K, keep_n=cfg.keep_n,
                         model=cfg.model, api_key=cfg.api_key,
                         project_id=cfg.project_id, region=cfg.region,
                         llm_provider=cfg.llm_provider,

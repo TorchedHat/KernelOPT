@@ -139,7 +139,7 @@ Final best: 5180 ns  (0.7104×)
 
 ## Config
 
-- T=1, N=2, K=2, TopK=4, ExpN=8
-- t_pos=1.04, t_neg=1.15
+- T=1, N=2, K=2, keep_n=4, q_cap=8
+- spe_gate=1.04, slo_gate=1.15
 - replay_mode=kernel
 - kernel_args: `—`

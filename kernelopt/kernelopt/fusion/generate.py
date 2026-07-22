@@ -301,35 +301,48 @@ import sys
 import json
 import importlib.util
 import torch
+import os
+import tempfile
 
 args = json.loads(sys.argv[1])
 original_model_path = args["original_model_path"]
 fused_source = args["fused_source"]
 output_dir = args["output_dir"]
 
-# ---- Load original model ----
-spec = importlib.util.spec_from_file_location("original_model", original_model_path)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+def _find_callable(mod):
+    for attr in ("call", "kernel_function"):
+        fn = getattr(mod, attr, None)
+        if callable(fn):
+            return fn
+    for cls_name in ("AsyncCompiledModel", "Runner"):
+        cls = getattr(mod, cls_name, None)
+        if cls is not None:
+            try:
+                return cls().call
+            except Exception:
+                pass
+    return None
 
-# Find the Runner/AsyncCompileKernel class or call() function
-if hasattr(mod, "call"):
-    original_call = mod.call
-elif hasattr(mod, "AsyncCompiledModel"):
-    original_call = mod.AsyncCompiledModel().call
-elif hasattr(mod, "Runner"):
-    original_call = mod.Runner().call
-else:
-    # Try to find a call function
-    original_call = None
-    for name in dir(mod):
-        obj = getattr(mod, name)
-        if callable(obj) and name.lower() == "call":
-            original_call = obj
-            break
-    if original_call is None:
-        print(json.dumps({"ok": False, "speedup": 0.0, "msg": "Cannot find call() in original model"}))
-        sys.exit(0)
+def _find_get_inputs(mod):
+    fn = getattr(mod, "get_inputs", None)
+    if callable(fn):
+        return fn
+    return None
+
+# ---- Load original model ----
+try:
+    spec = importlib.util.spec_from_file_location("original_model", original_model_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+except Exception as e:
+    print(json.dumps({"ok": False, "speedup": 0.0, "msg": f"Original model import failed: {e}"}))
+    sys.exit(0)
+
+original_call = _find_callable(mod)
+get_inputs = _find_get_inputs(mod)
+if original_call is None:
+    print(json.dumps({"ok": False, "speedup": 0.0, "msg": "Cannot find call() in original model"}))
+    sys.exit(0)
 
 # ---- Load fused kernel ----
 fused_ns = {}
@@ -339,38 +352,82 @@ except Exception as e:
     print(json.dumps({"ok": False, "speedup": 0.0, "msg": f"Fused kernel exec failed: {e}"}))
     sys.exit(0)
 
-fused_call = fused_ns.get("fused_kernel_call")
-if fused_call is None:
-    print(json.dumps({"ok": False, "speedup": 0.0, "msg": "fused_kernel_call not found in fused source"}))
+fused_fn = fused_ns.get("fused_kernel_call") or fused_ns.get("kernel_function")
+if fused_fn is None:
+    print(json.dumps({"ok": False, "speedup": 0.0, "msg": "No fused_kernel_call or kernel_function in fused source"}))
     sys.exit(0)
 
 # ---- Correctness test (2 seeds) ----
 correct = True
 msg = "OK"
-for seed in [0, 42]:
-    torch.manual_seed(seed)
-    try:
-        # We can only test if original model is inspectable; skip if not runnable
-        break
-    except Exception as e:
-        correct = False
-        msg = f"Correctness test failed (seed={seed}): {e}"
-        break
+max_diff = 0.0
+
+if get_inputs is not None:
+    for seed in [0, 42]:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        try:
+            inputs = get_inputs()
+            if not isinstance(inputs, (list, tuple)):
+                inputs = [inputs]
+            inputs = [t.cuda() if isinstance(t, torch.Tensor) else t for t in inputs]
+
+            with torch.no_grad():
+                ref_out = original_call(*[t.clone() if isinstance(t, torch.Tensor) else t for t in inputs])
+                fused_out = fused_fn(*[t.clone() if isinstance(t, torch.Tensor) else t for t in inputs])
+
+            if not isinstance(ref_out, (list, tuple)):
+                ref_out = [ref_out]
+            if not isinstance(fused_out, (list, tuple)):
+                fused_out = [fused_out]
+
+            for i, (r, f) in enumerate(zip(ref_out, fused_out)):
+                if isinstance(r, torch.Tensor) and isinstance(f, torch.Tensor):
+                    if r.shape != f.shape:
+                        correct = False
+                        msg = f"Shape mismatch at output {i}: ref={r.shape} fused={f.shape} (seed={seed})"
+                        break
+                    diff = (r.float() - f.float()).abs().max().item()
+                    max_diff = max(max_diff, diff)
+                    if not torch.allclose(r.float(), f.float(), rtol=1e-3, atol=1e-3):
+                        correct = False
+                        msg = f"Correctness failed at output {i}: max_diff={diff:.2e} (seed={seed})"
+                        break
+            if not correct:
+                break
+        except Exception as e:
+            correct = False
+            msg = f"Correctness test failed (seed={seed}): {e}"
+            break
+else:
+    msg = "No get_inputs() available — skipping correctness (exec-only validation passed)"
 
 # ---- Benchmark ----
 speedup = 1.0
-try:
-    from triton.testing import do_bench
-    if original_call is not None and fused_call is not None:
+if correct and get_inputs is not None:
+    try:
+        from triton.testing import do_bench
         torch.manual_seed(0)
-        orig_ms = do_bench(lambda: original_call(*[t.clone() if isinstance(t, torch.Tensor) else t for t in get_inputs_orig()]), warmup=10, rep=50)
-        fused_ms = do_bench(lambda: fused_call(*[t.clone() if isinstance(t, torch.Tensor) else t for t in get_inputs_orig()]), warmup=10, rep=50)
-        speedup = round(orig_ms / fused_ms, 3) if fused_ms > 0 else 1.0
-except Exception as _bench_err:
-    speedup = 1.0
-    msg = f"Benchmark failed: {_bench_err}"
+        inputs = get_inputs()
+        if not isinstance(inputs, (list, tuple)):
+            inputs = [inputs]
+        inputs = [t.cuda() if isinstance(t, torch.Tensor) else t for t in inputs]
 
-result = {"ok": correct, "speedup": speedup, "msg": msg}
+        orig_ms = do_bench(
+            lambda: original_call(*[t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]),
+            warmup=10, rep=50,
+        )
+        fused_ms = do_bench(
+            lambda: fused_fn(*[t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]),
+            warmup=10, rep=50,
+        )
+        speedup = round(orig_ms / fused_ms, 3) if fused_ms > 0 else 1.0
+    except Exception as _bench_err:
+        speedup = 1.0
+        if "OK" in msg:
+            msg = f"Benchmark failed: {_bench_err}"
+
+result = {"ok": correct, "speedup": speedup, "msg": msg, "max_diff": max_diff}
 print(json.dumps(result))
 '''
 
