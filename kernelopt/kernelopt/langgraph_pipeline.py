@@ -1776,6 +1776,7 @@ def summarize_results(state: GraphState) -> dict:
     try:
         from kernelopt.memory_bank import (
             MemoryBank, MemoryEntry, classify_kernel_structure, get_hardware_info,
+            compute_metric_deltas,
         )
         bank = MemoryBank()
         kernel_struct = classify_kernel_structure(current_kernel, profiling_before)
@@ -1799,6 +1800,12 @@ def summarize_results(state: GraphState) -> dict:
                     fromfile="baseline", tofile="optimized", n=3,
                 ))
 
+            _metric_deltas = {}
+            if profiling_before and getattr(c, "profiling_context", None):
+                _base_sections = profiling_before.get("sections", profiling_before)
+                _cand_sections = c.profiling_context.get("sections", c.profiling_context)
+                _metric_deltas = compute_metric_deltas(_base_sections, _cand_sections)
+
             entry = MemoryEntry(
                 kernel_structure=kernel_struct,
                 hardware=hw_info,
@@ -1817,6 +1824,7 @@ def summarize_results(state: GraphState) -> dict:
                 ),
                 code_pattern=c.optimized_kernel[:500] if is_success else "",
                 code_diff=_code_diff,
+                metric_deltas=_metric_deltas,
             )
             bank.add(entry)
     except Exception as e:
