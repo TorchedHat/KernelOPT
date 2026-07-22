@@ -1,0 +1,168 @@
+[
+  {
+    "item_id": "2d8b08dc",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.196e-02 > atol=0.001\nseed=42 output[0]: max_diff=6.842e-02 > atol=0.001\nseed=1337 output[0]: max_diff=7.552e-02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a 1960x16x480 GEMM (fused convolution epilogue) with ALLOW_TF32=False hardcoded, meaning tl.dot uses FP32 FFMA and never engages Tensor Cores. Compute SOL is only 3.59%, and the HighPipeUtilization rule flags 95% potential speedup. Enabling allow_tf32=True routes tl.dot through TF32 Tensor Cores, which deliver ~8x the throughput of FP32 FFMA on Ampere/Hopper. The problem dimensions (M=1960, N=16, K=480) are GEMM-shaped and the output is a convolution bias-add where TF32 precision (10-bit mantissa) is acceptable. Additionally, adding @triton.autotune with larger tile configurations will increase the grid size and improve SM utilization, directly addressing the 0.05 waves/SM underutilization.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.196e-02 > atol=0.001\nseed=42 output[0]: max_diff=6.842e-02 > atol=0.001\nseed=1337 output[0]: max_diff=7.552e-02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "d154af66",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "eliminate_shared_memory_bank_conflicts_via_wider_n_tile",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "eliminate_shared_memory_bank_conflicts_via_wider_n_tile \u2014 correctness failure",
+    "strategy_description": "Plan 'eliminate_shared_memory_bank_conflicts_via_wider_n_tile' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: NaN/Inf position mismatch (1960 elements)\nseed=42 output[0]: max_diff=5.658e+02 > atol=0.001\nseed=1337 output[0]: max_diff=4.577e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a 1960x16x480 GEMM with hardcoded BLOCK_N=16. With FP32 (4 bytes/element), BLOCK_N=16 means each row of the B tile occupies 64 bytes = 2 consecutive 32-byte bank groups. When 32 threads in a warp each access a different row of this 16-wide tile, they all map to the same 2 banks, producing the observed 18-way bank conflict. NCU confirms 83.33% of shared load wavefronts are conflicts and 78.5% of warp stall cycles are MIO scoreboard waits caused by these conflicts. Increasing BLOCK_N to 32 (128 bytes = 4 banks) spreads accesses across more banks, dramatically reducing conflicts. TF32 was already tried and failed correctness (K=480 accumulates too much mantissa error). The fix is purely structural: widen the N tile in the autotune configs.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: NaN/Inf position mismatch (1960 elements)\nseed=42 output[0]: max_diff=5.658e+02 > atol=0.001\nseed=1337 output[0]: max_diff=4.577e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a7c3f291",
+    "iteration": 3,
+    "speedup": 1.3977,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tma_block_ptr_loads_replace_scalar_pointer_arithmetic",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 26.91,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 40342.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 53.2,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.89,
+        "Scheduler Statistics.No Eligible": 85.66,
+        "Compute Workload Analysis.Executed Ipc Active": 0.29,
+        "Memory Workload Analysis.Memory Throughput": 141.42
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 19.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 29855.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 72.45,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.68,
+        "Scheduler Statistics.No Eligible": 78.73,
+        "Compute Workload Analysis.Executed Ipc Active": 0.43,
+        "Memory Workload Analysis.Memory Throughput": 190.92
+      }
+    },
+    "strategy_title": "Replace Scalar Pointer Arithmetic with TMA Block Pointers",
+    "strategy_description": "Replacing per-thread scalar pointer arithmetic loads with tl.make_block_ptr + tl.load (TMA) on Hopper GPUs offloads address generation from SM scalar execution units to dedicated TMA hardware, eliminating L1TEX stall cycles. This reduced Warp Cycles Per Issued Instruction from 6.89 to 4.68 and elapsed cycles from 40342 to 29855, yielding a 1.40x speedup. Pairing TMA block pointers with higher num_stages (4\u20135) in autotune configs enables software pipelining that overlaps async bulk copies with tl.dot compute, further hiding memory latency.",
+    "slow_pseudocode": "offs_k = tl.arange(0, BLOCK_K)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    xindex = (offs_k[None,:] + k_idx*BLOCK_K) + 480*offs_a_m[:,None]\n    a = tl.load(A + xindex)  # scalar ptr arithmetic, synchronous\n    b_T = tl.load(B + (offs_b_n[:,None]*480 + (offs_k[None,:]+k_idx*BLOCK_K)))\n    b = tl.trans(b_T)\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# Create TMA block pointers BEFORE the k loop\nA_block_ptr = tl.make_block_ptr(\n    base=A, shape=(M, K), strides=(stride_am, stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))\nB_block_ptr = tl.make_block_ptr(\n    base=B, shape=(K, N), strides=(stride_bk, stride_bn),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(0, 1))\nacc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(B_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc += tl.dot(a, b, allow_tf32=False)\n    A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))\n    B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))\n# Autotune: add num_stages=4,5 configs alongside num_stages=3",
+    "applicable_when": "Triton GEMM kernel on Hopper (compute capability 9.0) where: (1) CPIStall rule fires for L1TEX stalls (>20% of cycles) caused by per-thread scalar pointer arithmetic in the K-loop; (2) Warp Cycles Per Issued Instruction > 5; (3) Scheduler No Eligible > 75%; (4) the kernel is latency-bound rather than compute-bound (Compute SOL < 10%). B matrix stored in transposed layout (e.g., [N,K] with strides (K,1)) that must be reinterpreted as [K,N] for GEMM \u2014 set strides=(stride_bk, stride_bn) and order=(0,1) accordingly.",
+    "do_not_apply_when": "Kernel is already compute-bound (Compute SOL > 50%) where TMA overhead may not pay off. Do not enable allow_tf32=True alongside this change if the accumulation depth K is large (e.g., K=480) \u2014 TF32 mantissa errors accumulate and cause correctness failures (max_diff > 0.07). Do not widen BLOCK_N beyond the fixed N dimension (N=16 here) as this causes NaN/Inf correctness failures.",
+    "framework_notes": "Triton-specific: tl.make_block_ptr maps to Hopper TMA cp.async.bulk hardware. The order= parameter must match the contiguous dimension of the underlying storage (order=(1,0) for row-major A; order=(0,1) for column-major B reinterpreted as [K,N]). boundary_check=(0,1) is required when M or K are not exact multiples of BLOCK_M/BLOCK_K. tl.advance() steps the block pointer each iteration. num_stages >= 3 in @triton.autotune enables Triton's software pipeline to prefetch the next tile's TMA load while the current tl.dot executes."
+  },
+  {
+    "item_id": "b9e1d472",
+    "iteration": 4,
+    "speedup": 0.8489,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_block_m_to_improve_grid_coverage_and_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 19.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 29855.0,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Scheduler Statistics.No Eligible": 78.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.68,
+        "Instruction Statistics.Executed Instructions": 715476.0,
+        "Memory Workload Analysis.Memory Throughput": 190.92,
+        "SharedMemoryConflicts speedup_pct": 57.96
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 32.83,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 49233.0,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 164.0,
+        "Launch Statistics.Waves Per SM": 0.08,
+        "Scheduler Statistics.No Eligible": 59.27,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.45,
+        "Instruction Statistics.Executed Instructions": 2320348.0,
+        "Memory Workload Analysis.Memory Throughput": 116.52,
+        "SharedMemoryConflicts speedup_pct": 51.07
+      }
+    },
+    "strategy_title": "Reverting TMA to scalar loads with larger BLOCK_M regresses badly",
+    "strategy_description": "This iteration attempted to increase BLOCK_M to 128 while simultaneously reverting from TMA block pointers back to scalar pointer arithmetic loads. The register count exploded from 66 to 164 registers/thread, collapsing theoretical occupancy from 43.75% to 18.75% and increasing elapsed cycles from 29855 to 49233 (64% more). Although Warp Cycles Per Issued Instruction improved from 4.68 to 2.45 (fewer stalls per instruction), the instruction count tripled from 715K to 2.32M due to the larger tile and the overhead of scalar address computation, resulting in a net 18% slowdown. The critical error was reverting TMA block pointers to scalar loads: the register pressure from computing per-thread addresses for a 128-row tile caused register spilling and destroyed the occupancy gains that motivated the change.",
+    "slow_pseudocode": "# TMA block pointers (fast baseline from iter 3)\nA_block_ptr = tl.make_block_ptr(base=A, shape=(M,K), strides=(stride_am,stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1,0))\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(B_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc += tl.dot(a, b, allow_tf32=False)\n    A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))\n# BLOCK_M=32, 66 registers/thread, 19.94us",
+    "fast_pseudocode": "# Scalar pointer arithmetic (regression)\nrm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # BLOCK_M=128\noffs_k = tl.arange(0, BLOCK_K)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    xindex = (offs_k[None,:] + k_idx*BLOCK_K) + 480*offs_a_m[:,None]\n    a = tl.load(A + xindex)  # scalar loads, 128-row tile\n    b_T = tl.load(B + (offs_b_n[:,None]*480 + (offs_k[None,:]+k_idx*BLOCK_K)))\n    b = tl.trans(b_T)\n    acc += tl.dot(a, b, allow_tf32=False)\n# BLOCK_M=128, 164 registers/thread, 32.83us",
+    "applicable_when": "Never beneficial \u2014 documented as anti-pattern. Do not revert TMA block pointers to scalar loads when increasing BLOCK_M.",
+    "do_not_apply_when": "When TMA block pointers are already in use (from a prior successful optimization), do not revert to scalar pointer arithmetic even when increasing BLOCK_M. Scalar loads for large tiles (BLOCK_M=128) require per-thread address computation for 128 rows, causing register pressure to spike (66\u2192164 registers/thread) and collapsing theoretical occupancy (43.75%\u219218.75%). The achieved occupancy remains unchanged (3.12%) because the grid is too small, but the instruction count triples. Always keep TMA block pointers when changing tile sizes on Hopper.",
+    "framework_notes": "Triton on Hopper (SM 9.0): tl.make_block_ptr offloads address generation to TMA hardware and keeps register usage low. Reverting to scalar loads (tl.arange + arithmetic) for large tiles causes register explosion. If BLOCK_M must be increased, do so while keeping tl.make_block_ptr \u2014 only update the block_shape parameter."
+  },
+  {
+    "item_id": "c3e2f847",
+    "iteration": 5,
+    "speedup": 0.7018,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_block_k_to_reduce_bank_conflict_amortization",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 27.55,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 41266.0,
+        "Launch Statistics.Registers Per Thread": 58.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 12.29,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.73,
+        "Instruction Statistics.Executed Instructions": 811450.0,
+        "Memory Workload Analysis.Memory Throughput": 138.03,
+        "Memory Workload Analysis.L2 Hit Rate": 20.26,
+        "SharedMemoryConflicts speedup_pct": 76.05
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 39.71,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 59553.0,
+        "Launch Statistics.Registers Per Thread": 112.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 73.73,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.36,
+        "Instruction Statistics.Executed Instructions": 2596680.0,
+        "Memory Workload Analysis.Memory Throughput": 96.33,
+        "Memory Workload Analysis.L2 Hit Rate": 61.77,
+        "SharedMemoryConflicts speedup_pct": 66.82
+      }
+    },
+    "strategy_title": "Increasing BLOCK_K with scalar loads explodes registers and smem",
+    "strategy_description": "This iteration attempted to reduce shared memory bank conflict overhead by increasing BLOCK_K from 32 to 64 and simultaneously reverting from TMA block pointers to scalar pointer arithmetic loads with tl.trans(). The register count jumped from 58 to 112 registers/thread, and dynamic shared memory per block ballooned from 12 KB to 74 KB, collapsing theoretical occupancy from 50% to 18.75%. Although Warp Cycles Per Issued Instruction improved from 11.73 to 5.36 (fewer stalls per instruction), the instruction count tripled from 811K to 2.6M and elapsed cycles grew from 41K to 59K, yielding a 30% slowdown. The root cause is that reverting TMA block pointers to scalar loads (with tl.trans) for a larger BLOCK_K tile caused register pressure to spike and shared memory to balloon, destroying occupancy and negating any bank-conflict reduction benefit.",
+    "slow_pseudocode": "# TMA block pointers, BLOCK_M=32, BLOCK_K=32 (baseline before this iter)\nA_block_ptr = tl.make_block_ptr(base=A, shape=(M,K), strides=(stride_am,stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1,0))\nB_block_ptr = tl.make_block_ptr(base=B, shape=(K,N), strides=(stride_bk,stride_bn),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1,0))\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(A_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(B_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc += tl.dot(a, b, allow_tf32=False)\n    A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))\n    B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))\n# 58 regs/thread, 12KB smem, 27.55us",
+    "fast_pseudocode": "# Scalar loads + tl.trans, BLOCK_M=128, BLOCK_K=64 (regression)\noffs_k = tl.arange(0, BLOCK_K)  # BLOCK_K=64\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    xindex = (offs_k[None,:] + k_idx*BLOCK_K) + 480*offs_a_m[:,None]\n    mask_a = (idx_m < M) & (idx_n < K)\n    a = tl.load(A + xindex, mask=mask_a, other=0.0)\n    idx_n2 = offs_b_n[:,None]\n    idx_k2 = offs_k[None,:] + (k_idx * BLOCK_K)\n    mask_b = (idx_n2 < N) & (idx_k2 < K)\n    b_T = tl.load(B + (idx_n2*480 + idx_k2*1), mask=mask_b, other=0.0)\n    b = tl.trans(b_T)\n    acc += tl.dot(a, b, allow_tf32=False)\n# 112 regs/thread, 74KB smem, 39.71us",
+    "applicable_when": "Never beneficial as described \u2014 documented as anti-pattern. Do not combine BLOCK_K increase with reversion from TMA block pointers to scalar loads.",
+    "do_not_apply_when": "When TMA block pointers are already in use, do not revert to scalar pointer arithmetic (with tl.trans for B) even when increasing BLOCK_K. Scalar loads for large tiles require per-thread address computation, causing register pressure to spike (58\u2192112 registers/thread) and shared memory to balloon (12KB\u219274KB), collapsing theoretical occupancy (50%\u219218.75%). The achieved occupancy remains unchanged (6.25%) because the grid is too small, but instruction count triples. If BLOCK_K must be increased, keep TMA block pointers and only update block_shape.",
+    "framework_notes": "Triton on Hopper (SM 9.0): tl.make_block_ptr offloads address generation to TMA hardware and keeps register/smem usage low. Reverting to scalar loads + tl.trans for B causes register explosion and smem bloat. If BLOCK_K must be increased to amortize bank conflicts, do so while keeping tl.make_block_ptr \u2014 only update the block_shape=(BLOCK_K, BLOCK_N) parameter. The tl.trans approach for B is particularly costly because it materializes the transposed tile in registers before the dot."
+  }
+]

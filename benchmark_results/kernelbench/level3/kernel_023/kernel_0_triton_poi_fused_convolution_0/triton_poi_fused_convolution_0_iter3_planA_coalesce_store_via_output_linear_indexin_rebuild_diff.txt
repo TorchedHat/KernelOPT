@@ -1,0 +1,71 @@
+--- baseline
++++ rebuilt
+@@ -5,24 +5,44 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=4, num_stages=4),
++        triton.Config({'XBLOCK': 2048, 'YBLOCK': 1}, num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 512,  'YBLOCK': 1}, num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 256,  'YBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 256,  'YBLOCK': 1}, num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 128,  'YBLOCK': 1}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 128,  'YBLOCK': 1}, num_warps=2, num_stages=2),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused_convolution_0(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 30
+-    xnumel = 50176
+-    yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = yindex < ynumel
++    # Total output elements: numel = ynumel * xnumel = 30 * 50176 = 1505280
++    # We iterate linearly over the OUTPUT address space for coalesced stores.
++    # out_ptr0 strides: (150528, 1, 672, 3) — channels-last layout
++    # in_ptr0 strides:  (150528, 50176, 224, 1) — channels-first layout
++    numel = 1505280  # 10 * 3 * 224 * 224
+     xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y3 = yindex
+-    y0 = (yindex % 3)
+-    y1 = yindex // 3
+-    tmp0 = tl.load(in_ptr0 + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_last')
+-    tl.store(out_ptr0 + (y0 + 3*x2 + 150528*y1), tmp0, xmask & ymask)
+-
+-
++    # Linear index into OUTPUT buffer (stride-1 in output)
++    out_idx = tl.max_contiguous(
++        tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK),
++        XBLOCK
++    )
++    mask = out_idx < numel
++    # Decompose output linear index: out = b*150528 + hw*3 + c
++    # => c = out_idx % 3, hw = (out_idx // 3) % 50176, b = out_idx // 150528
++    c  = out_idx % 3
++    hw = (out_idx // 3) % 50176
++    b  = out_idx // 150528
++    # Input address: in = b*150528 + c*50176 + hw
++    in_idx = hw + 50176 * c + 150528 * b
++    tmp0 = tl.load(in_ptr0 + in_idx, mask, eviction_policy='evict_last')
++    # Store to contiguous output (out_idx is stride-1 in output buffer)
++    tl.store(out_ptr0 + out_idx, tmp0, mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -30,7 +50,7 @@
+     ynumel = 30
+     xnumel = 50176
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused_convolution_0[grid](arg_0, arg_1, 30, 50176)
+     return arg_1
+ 
+ def get_inputs():

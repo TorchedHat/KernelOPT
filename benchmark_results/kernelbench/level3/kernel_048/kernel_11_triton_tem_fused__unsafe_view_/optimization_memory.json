@@ -1,0 +1,196 @@
+[
+  {
+    "item_id": "exp_iter2_triton_tf32_ipc_improvement",
+    "iteration": 2,
+    "speedup": 1.0546,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "enable_tf32_for_triton_dot_ops",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9022.0,
+        "GPU Speed Of Light Throughput.Duration": 6.05,
+        "Compute Workload Analysis.Executed Ipc Active": 1.5,
+        "Compute Workload Analysis.Issue Slots Busy": 37.46,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.61,
+        "Scheduler Statistics.No Eligible": 62.39
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8746.0,
+        "GPU Speed Of Light Throughput.Duration": 5.86,
+        "Compute Workload Analysis.Executed Ipc Active": 1.64,
+        "Compute Workload Analysis.Issue Slots Busy": 41.16,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 2.45,
+        "Scheduler Statistics.No Eligible": 57.59
+      }
+    },
+    "strategy_title": "Enable TF32 in Triton dot to improve IPC",
+    "strategy_description": "Changing ALLOW_TF32 from False to True in Triton tl.dot calls reduces warp cycles per issued instruction (2.61\u21922.45) and increases issue slot utilization (37.5%\u219241.2%), yielding a modest but real latency reduction. The change allows the dot product to use Tensor Core MMA instructions instead of FP32 FFMA, which completes faster per cycle even when the kernel is severely underutilized due to a small grid. This optimization is most effective when the kernel already has a compute bottleneck or high stall-due-to-no-eligible-warp fraction.",
+    "slow_pseudocode": "# Triton kernel constexpr\nALLOW_TF32: tl.constexpr = False\n...\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)  # uses FP32 FFMA",
+    "fast_pseudocode": "# Triton kernel constexpr\nALLOW_TF32: tl.constexpr = True\n...\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)  # uses TF32 Tensor Core MMA",
+    "applicable_when": "Triton kernel uses tl.dot with ALLOW_TF32=False; IssueSlotUtilization rule fires with high 'No Eligible' warp percentage (>50%); kernel is compute-bound or has significant dot-product work in inner loop; FP32 precision in matrix multiply is not strictly required (attention scores, general GEMM)",
+    "do_not_apply_when": "Full FP32 mantissa precision is required (e.g., scientific computing, loss accumulation); kernel is purely memory-bound with negligible dot-product work; the speedup from TF32 is already captured by using fp16/bf16 inputs to tl.dot",
+    "framework_notes": "Triton-specific: set ALLOW_TF32: tl.constexpr = True and pass allow_tf32=ALLOW_TF32 to tl.dot. In CUDA, the equivalent is setting cublasMath_t to CUBLAS_TF32_TENSOR_OP_MATH or using __nv_bfloat16 accumulation. Note: the planned grid fix (1\u219232768) did not appear in the actual diff, suggesting only the TF32 change was applied; the 5.5% speedup is attributable solely to TF32 enabling improved IPC on the existing single-block kernel."
+  },
+  {
+    "item_id": "exp_triton_tf32_grid_fix_iter2",
+    "iteration": 2,
+    "speedup": 1.0492,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_with_grid_fix",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9022.0,
+        "GPU Speed Of Light Throughput.Duration": 6.05,
+        "GPU Speed Of Light Throughput.SM Active Cycles": 53.69,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 0.22,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Compute Workload Analysis.Issue Slots Busy": 37.46,
+        "Compute Workload Analysis.Executed Ipc Active": 1.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8810.0,
+        "GPU Speed Of Light Throughput.Duration": 5.89,
+        "GPU Speed Of Light Throughput.SM Active Cycles": 50.48,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 0.22,
+        "Occupancy.Achieved Occupancy": 6.22,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Compute Workload Analysis.Issue Slots Busy": 39.85,
+        "Compute Workload Analysis.Executed Ipc Active": 1.59
+      }
+    },
+    "strategy_title": "Enable TF32 and Fix Grid for Batched Matmul",
+    "strategy_description": "When a Triton batched matmul kernel launches with grid=(1,1,1) but the batch dimension is large (e.g. 32768), only one batch slice is computed and waves_per_SM stays at 0.0. Correcting the grid to (grid_m*grid_n, batch_size, 1) ensures all batch slices are covered. Simultaneously enabling allow_tf32=True in tl.dot routes computation through Tensor Cores instead of FP32 FFMA, improving IPC active from 1.50 to 1.59 and reducing elapsed cycles from 9022 to 8810. The combined effect yields a modest ~5% speedup; the grid fix is a correctness requirement while TF32 provides the compute efficiency gain.",
+    "slow_pseudocode": "# Triton kernel\nALLOW_TF32: tl.constexpr = False\n...\nacc = tl.dot(a, b, allow_tf32=ALLOW_TF32)\n\n# Launch\ngrid = (1, 1, 1)  # BUG: only 1 of 32768 batch slices computed\nkernel[grid](...)  ",
+    "fast_pseudocode": "# Triton kernel\nALLOW_TF32: tl.constexpr = True\n...\nacc = tl.dot(a, b, allow_tf32=ALLOW_TF32)\n\n# Launch\nbatch_size = arg_0.shape[0]  # e.g. 32768\ngrid_m = triton.cdiv(M, BLOCK_M)\ngrid_n = triton.cdiv(N, BLOCK_N)\ngrid = (grid_m * grid_n, batch_size, 1)\nkernel[grid](...)  ",
+    "applicable_when": "Triton batched matmul kernel with grid_size=1 and waves_per_SM=0.0 despite large batch dimension; ALLOW_TF32=False constexpr in kernel body; K is small (<=128) making TF32 rounding error negligible; NCU LaunchConfiguration rule fires with high speedup_pct (>90%)",
+    "do_not_apply_when": "Grid is already correctly sized to cover all batch slices; K is large (>512) where TF32 mantissa truncation may accumulate significant error; output requires strict FP32 precision (atol < 1e-3); kernel is not a batched matmul pattern",
+    "framework_notes": "Triton-specific: ALLOW_TF32 is a tl.constexpr that gates the allow_tf32 argument to tl.dot. In CUDA, the equivalent is using CUBLAS_COMPUTE_32F_FAST_TF32 or setting cudaDeviceSetSharedMemConfig. The grid fix is framework-agnostic: any batched kernel must have grid dim covering all batch elements."
+  },
+  {
+    "item_id": "exp_iter2_tf32_tensor_cores_triton_001",
+    "iteration": 2,
+    "speedup": 1.0439,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.05,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 9022.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 0.22,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 39.42,
+        "Memory Workload Analysis.L2 Hit Rate": 65.8,
+        "Scheduler Statistics.No Eligible": 62.39,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 25.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.92,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8844.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 0.23,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 40.15,
+        "Memory Workload Analysis.L2 Hit Rate": 75.36,
+        "Scheduler Statistics.No Eligible": 59.24,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Theoretical Occupancy": 25.0
+      }
+    },
+    "strategy_title": "Enable TF32 Tensor Cores in Triton tl.dot",
+    "strategy_description": "When a Triton kernel uses tl.dot with ALLOW_TF32=False, it falls back to FP32 FFMA instead of TF32 Tensor Cores, leaving significant throughput on the table. Setting ALLOW_TF32=True (as a tl.constexpr) routes the dot product through Tensor Core MMA instructions, which deliver ~8x higher throughput on H100/A100-class GPUs. The improvement is modest here (1.04x) because the kernel is severely underutilized (grid=1 block, 0 waves across 132 SMs), so the TF32 benefit is masked by the launch bottleneck; the L2 hit rate improved from 65.8% to 75.4% and elapsed cycles dropped from 9022 to 8844.",
+    "slow_pseudocode": "# Triton kernel\nALLOW_TF32: tl.constexpr = False\n...\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)  # uses FP32 FFMA",
+    "fast_pseudocode": "# Triton kernel\nALLOW_TF32: tl.constexpr = True\n...\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)  # uses TF32 Tensor Cores",
+    "applicable_when": "Triton kernel uses tl.dot with ALLOW_TF32=False or unset; FMA pipeline is the highest-utilized pipe (>20% active cycles); kernel is compute-bound or has moderate occupancy; FP32 precision is not strictly required (TF32 truncates mantissa from 23 to 10 bits); BLOCK_K >= 16 so Tensor Core MMA tiles are well-utilized",
+    "do_not_apply_when": "Strict FP32 numerical precision is required (e.g., scientific computing with large accumulation chains); BLOCK_K is very small (<16) making MMA tiles inefficient; kernel is already memory-bandwidth bound (DRAM throughput >80%) where compute throughput is not the bottleneck; the kernel grid is severely under-launched (grid=1 with 100+ SMs) without fixing the launch configuration first, as the TF32 benefit will be masked",
+    "framework_notes": "Triton-specific: set ALLOW_TF32: tl.constexpr = True in the kernel signature or pass ALLOW_TF32=True as a constexpr at the call site. The tl.dot call must use allow_tf32=ALLOW_TF32. Keep ACC_TYPE=tl.float32 so accumulation remains FP32 even with TF32 inputs. In CUDA, the equivalent is using __nv_bfloat16 or setting cudaDeviceSetSharedMemConfig; in cuBLAS it is CUBLAS_COMPUTE_32F_FAST_TF32."
+  },
+  {
+    "item_id": "94f5beb6",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_tiles",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + AchievedOccupancy + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_via_smaller_tiles \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_via_smaller_tiles' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has 121 registers/thread from oversized 64x64 accumulator tiles. This limits Block Limit Registers to 4 blocks/SM and theoretical occupancy to 25%, with achieved occupancy collapsing to 6.2% because only 1 block runs on the entire GPU (grid=1). Shrinking tiles to BLOCK_M=32, BLOCK_N=32, BLOCK_K=16 will: (a) reduce the accumulator tile from 64x64=4096 FP32 values to 32x32=1024 values, dramatically cutting register demand; (b) allow more blocks per SM; (c) increase the grid from 1 tile to 4 tiles per batch slice x 32768 batches = 131072 total blocks, filling all 132 SMs with ~993 waves.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6c2882e2",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_tile_sizes",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_via_smaller_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_via_smaller_tile_sizes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 with M=N=K=64, meaning the entire matrix fits in one tile with no tiling benefit. This large tile size drives register usage to 121 registers/thread, limiting Block Limit Registers to 4 blocks/SM and capping theoretical occupancy at 25%. Achieved occupancy is only 6.22% because the grid=(1,1,1) launch only covers 1 of 32,768 batch slices. The grid must be fixed to (grid_m*grid_n, batch_size, 1). Reducing BLOCK_M=32, BLOCK_N=32, BLOCK_K=16 will cut register usage significantly (estimated 60-70 registers/thread), raising Block Limit Registers from 4 to 8+ blocks/SM and doubling theoretical occupancy from 25% to 50%+. With 32768 batch tiles and higher occupancy, the 132 SMs will be properly saturated.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6b56b925",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_tile_sizes",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_via_smaller_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_via_smaller_tile_sizes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 which drives register usage to 121 registers/thread. Block Limit Registers=4 caps theoretical occupancy at 25%. With only 1 block launched (grid=(1,1,1)), achieved occupancy is 6.2% and 59% of scheduler cycles have no eligible warp. Reducing tile sizes to BLOCK_M=32, BLOCK_N=32, BLOCK_K=16 cuts the accumulator tile from 4096 to 1024 FP32 elements, dramatically reducing live register pressure and allowing more blocks per SM. grid[0] must also be updated from 1 to 4 (=ceil(64/32)*ceil(64/32)) to cover all M x N output tiles.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c6f4bf28",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_tiles_with_corrected_grid",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + TheoreticalOccupancy + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_via_smaller_tiles_with_corrected_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_via_smaller_tiles_with_corrected_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches grid=(1,1,1) on a 132-SM GPU with a batch of 32,768 \u2014 only 1 of 32,768 batch slices is computed (correctness bug + massive underutilization). The correct grid is (grid_m*grid_n, batch_size, 1) = (4, 32768, 1) with BLOCK_M=BLOCK_N=32. Additionally, 121 registers/thread limits Block Limit Registers to 4 blocks/SM, capping theoretical occupancy at 25% and achieved at only 6.22%. Reducing BLOCK_M and BLOCK_N from 64 to 32 shrinks the accumulator tile from 64x64=4096 FP32 values to 32x32=1024 FP32 values, dramatically cutting register demand. With fewer registers per thread, more blocks can reside per SM simultaneously (Block Limit Registers rises from 4 to 8+), improving theoretical occupancy from 25% to 50%+ and giving the warp scheduler more eligible warps to hide latency. The grid fix is the primary correctness+performance fix; the tile-size reduction is the secondary occupancy improvement that distinguishes this plan from all banned directions.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.119e+01 > atol=0.001\nseed=42 output[0]: max_diff=3.076e+01 > atol=0.001\nseed=1337 output[0]: max_diff=2.955e+01 > atol=0.001",
+    "framework_notes": null
+  }
+]

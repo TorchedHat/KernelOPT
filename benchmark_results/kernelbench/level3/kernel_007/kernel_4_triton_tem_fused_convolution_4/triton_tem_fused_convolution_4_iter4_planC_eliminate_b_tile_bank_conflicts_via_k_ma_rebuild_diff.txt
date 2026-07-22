@@ -1,0 +1,77 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused_convolution_4(in_ptr0, arg_A, arg_B, out_ptr0):
+@@ -54,27 +55,41 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # A block pointer: order=(1,0) — K is fast dim (stride_ak=1)
++    A_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0)
++    )
++    # B block pointer: K-major layout — load [BLOCK_K, BLOCK_N] directly, no transpose needed
++    # order=(0,1): dim 0 (K, stride_bk=1) is the fast (contiguous) dimension
++    # Eliminates 8-way shared memory bank conflicts from tl.trans() staging
++    B_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1)
++    )
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
++        # Load A: [BLOCK_M, BLOCK_K]
++        a = tl.load(A_block_ptr)
++        # Load B K-major: [BLOCK_K, BLOCK_N] — no transpose needed, zero bank conflicts
++        b = tl.load(B_block_ptr, boundary_check=(0, 1))  # shape: [BLOCK_K, BLOCK_N]
+ 
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 480*idx_m
+-        a = tl.load(A + (xindex))
++        # Direct dot: [BLOCK_M, BLOCK_K] x [BLOCK_K, BLOCK_N] = [BLOCK_M, BLOCK_N]
++        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 64*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 480*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-        
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
++        # Advance A along K dim (axis 1), B along K dim (now axis 0)
++        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
++        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -88,8 +103,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

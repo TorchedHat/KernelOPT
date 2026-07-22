@@ -1,0 +1,36 @@
+[
+  {
+    "item_id": "exp_001_retile_mismatched_xblock_permute",
+    "iteration": 1,
+    "speedup": 1.1,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "retile_small_xnumel_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + SOLBottleneck + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "Occupancy.Achieved Occupancy": 21.91,
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "Scheduler Statistics.No Eligible": 70.2,
+        "Instruction Statistics.Executed Instructions": 204800.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Occupancy.Achieved Occupancy": 8.39,
+        "GPU Speed Of Light Throughput.Duration": 2.5,
+        "Scheduler Statistics.No Eligible": 89.75,
+        "Instruction Statistics.Executed Instructions": 23808.0
+      }
+    },
+    "strategy_title": "Autotune tile sizes when XBLOCK >> xnumel",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=9), the vast majority of threads per block are masked and do no useful work, wasting thread slots and inflating instruction counts. Adding @triton.autotune with configs that use small XBLOCK values (\u2264 xnumel) and larger YBLOCK values allows the runtime to select tile proportions that match the actual problem dimensions, reducing wasted threads and total instruction count. In this case, executed instructions dropped from 204,800 to 23,808 (~8.6x fewer), and kernel duration fell from 2.75 \u00b5s to 2.5 \u00b5s despite lower achieved occupancy, because the work per thread became more efficient.",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=9: 93% of threads masked\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xnumel = 9\n    ynumel = 4096\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]  # no ymask guard\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr0 + (xindex + 9*yindex), xmask, eviction_policy='evict_last')\n    tl.store(out_ptr0 + (yindex%128 + 128*xindex + 1152*(yindex//128)), tmp0, xmask)\n\ngrid = (cdiv(9, 128), cdiv(4096, 8))  # = (1, 512)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune selects XBLOCK <= xnumel, larger YBLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 64},  num_warps=2),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 4,  'YBLOCK': 64},  num_warps=4),\n        triton.Config({'XBLOCK': 4,  'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 32},  num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 32},  num_warps=4),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xnumel = 9\n    ynumel = 4096\n    yindex = tl.program_id(1) * YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel  # proper ymask guard\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr0 + (xindex + 9*yindex), xmask & ymask)  # removed evict_last\n    tl.store(out_ptr0 + (yindex%128 + 128*xindex + 1152*(yindex//128)), tmp0, xmask & ymask)\n\ngrid = lambda meta: (cdiv(9, meta['XBLOCK']), cdiv(4096, meta['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton pointwise/permute kernel where XBLOCK is set much larger than xnumel (XBLOCK >> xnumel), resulting in most threads being masked (xmask covers <50% of threads), high 'No Eligible' warp percentage (>60%), and low achieved occupancy relative to theoretical. SOLBottleneck and IssueSlotUtilization rules triggered. Executed instruction count is inflated relative to actual work.",
+    "do_not_apply_when": "xnumel is large (close to or larger than XBLOCK), or the kernel is already compute-bound with high SM throughput. Also avoid if the grid is already large enough to saturate SMs (waves_per_sm >= 2). Note: in this case, the autotuned result actually reduced waves_per_sm further (0.24 \u2192 0.12) and occupancy (21.9% \u2192 8.4%), yet still achieved a speedup due to dramatically fewer total instructions \u2014 so occupancy alone is not the right signal to optimize for small kernels.",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] so configs are re-evaluated if tensor dimensions change. The grid lambda must reference meta['XBLOCK'] and meta['YBLOCK'] rather than hardcoded values. Remove eviction_policy='evict_last' when it is not needed, as it can add overhead. Always add proper ymask guard (yindex < ynumel) when YBLOCK may exceed ynumel."
+  }
+]

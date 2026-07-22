@@ -1,0 +1,99 @@
+--- baseline
++++ rebuilt
+@@ -3,17 +3,20 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=3),
+     ],
+-    key=['n_elements'],
++    key=['channel_stride', 'n_channels'],
+ )
+ @triton.jit
+-def bias_relu_kernel(
++def bias_relu_kernel_2d(
+     x_ptr,
+     bias_ptr,
+     out_ptr,
+@@ -22,29 +25,45 @@
+     channel_stride,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    pid = tl.program_id(0)
+-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+-    mask = offsets < n_elements
+-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+-    # Determine channel index for bias
+-    # For NCHW layout: channel = (offset / channel_stride) % n_channels
+-    chan = (offsets // channel_stride) % n_channels
+-    bias = tl.load(bias_ptr + chan, mask=mask, other=0.0)
+-    result = x + bias
+-    result = tl.maximum(result, 0.0)
+-    tl.store(out_ptr + offsets, result, mask=mask)
++    pid_c = tl.program_id(0)   # channel index
++    pid_s = tl.program_id(1)   # spatial tile index
++
++    # Load bias for this channel ONCE — scalar, no gather
++    # pid_c is always < n_channels (grid axis-0 = C), so mask is always True
++    bias_val = tl.load(bias_ptr + pid_c, mask=pid_c < n_channels, other=0.0)
++
++    # Spatial positions: tile over N*H*W for this channel
++    n_spatial = n_elements // n_channels  # N * H * W
++    spatial_offsets = pid_s * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = spatial_offsets < n_spatial
++
++    # Clamp out-of-bounds spatial offsets to 0 to avoid illegal memory addresses
++    safe_spatial = tl.where(mask, spatial_offsets, 0)
++
++    # Map spatial offset to NCHW flat index:
++    # spatial_offset s covers all batches: batch = s // (H*W), hw = s % (H*W)
++    # flat = batch * C * H*W + pid_c * H*W + hw
++    batch_idx = safe_spatial // channel_stride
++    hw_idx    = safe_spatial %  channel_stride
++    global_offsets = batch_idx * (n_channels * channel_stride) + pid_c * channel_stride + hw_idx
++
++    x = tl.load(x_ptr + global_offsets, mask=mask, other=0.0)
++    result = tl.maximum(x + bias_val, 0.0)  # bias_val broadcast — free
++    tl.store(out_ptr + global_offsets, result, mask=mask)
+ 
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+-        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+-        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_SIZE': 256},  num_warps=4, num_stages=2),
+     ],
+     key=['n_elements'],
+ )
+ @triton.jit
++
+ def bias_relu_nhwc_kernel(
+     x_ptr,
+     bias_ptr,
+@@ -135,7 +154,7 @@
+     # NCHW: channel stride = H*W
+     channel_stride = H * W
+     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+-    bias_relu_kernel[grid](
++    bias_relu_kernel_2d[grid](
+         out, bias, result,
+         n_elements, C, channel_stride,
+     )

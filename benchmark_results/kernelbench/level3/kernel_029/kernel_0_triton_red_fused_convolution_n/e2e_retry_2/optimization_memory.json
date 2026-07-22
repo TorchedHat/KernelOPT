@@ -1,0 +1,67 @@
+[
+  {
+    "item_id": "1823d166",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "vectorized_loads_and_r0_block_right_sizing",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "vectorized_loads_and_r0_block_right_sizing \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'vectorized_loads_and_r0_block_right_sizing' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "Two compounding problems: (1) R0_BLOCK=512 is 5.3x larger than r0_numel=96, allocating excess shared memory that limits blocks/SM to 3 and theoretical occupancy to 18.75%. Reducing R0_BLOCK to 96 eliminates this waste and allows more blocks per SM. (2) The load pattern `in_ptr0 + (x0 + 3136*r0_2 + 301056*x1)` strides by 3136 floats between consecutive r0 elements, causing 1/32 sector utilization and 84.7% L1TEX stall cycles. Adding tl.max_contiguous and tl.multiple_of hints on the r0 index tells the compiler the access is contiguous within a warp, enabling 128-bit vectorized loads and dramatically reducing sector count.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, targe",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_r0block_spill_elimination",
+    "iteration": 1,
+    "speedup": 85.7734,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "eliminate_register_spill_by_matching_r0_block_to_r0_numel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 779.68,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 13.07,
+        "GPU Speed Of Light Throughput.Memory Throughput": 39.19,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 36.01,
+        "Scheduler Statistics.No Eligible": 94.9,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.05,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 4.33,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Launch Statistics.Registers Per Thread": 32.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 9.09,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.67,
+        "GPU Speed Of Light Throughput.Memory Throughput": 45.85,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.8,
+        "Scheduler Statistics.No Eligible": 62.24,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.58,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 33.72,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Shared Mem": 12.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.1,
+        "Launch Statistics.Registers Per Thread": 128.0
+      }
+    },
+    "strategy_title": "Match R0_BLOCK to r0_numel to Eliminate Register Spill",
+    "strategy_description": "When a Triton reduction kernel's R0_BLOCK tile parameter is set much larger than the actual reduction dimension (r0_numel), the accumulator arrays (e.g., Welford mean/m2/weight tensors of shape [XBLOCK, R0_BLOCK]) exceed register file capacity and spill to local memory. NCU reports ~1/32 bytes utilized per sector for local loads and stores, with 84-95% of scheduler cycles having no eligible warp due to L1TEX scoreboard stalls. Setting R0_BLOCK equal to r0_numel (or the next power-of-two that fits) eliminates the spill entirely, reducing warp stall cycles per instruction from ~36 to ~5 and improving compute throughput from 13% to 33%. The fix is to add a @triton.autotune decorator with configs that constrain R0_BLOCK to the actual reduction size, and let autotune select the best XBLOCK.",
+    "slow_pseudocode": "# R0_BLOCK=512 >> r0_numel=96 -> spills [XBLOCK, R0_BLOCK] x3 accumulators to local mem\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    tmp4_mean = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    tmp4_m2   = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    tmp4_weight = tl.zeros([XBLOCK, R0_BLOCK], ...)\n    for r0_offset in range(0, r0_numel, R0_BLOCK):  # 1 iter but huge arrays\n        welford_reduce(tmp3, tmp4_mean, tmp4_m2, tmp4_weight, ...)\n\n# Launch with hardcoded oversized tile:\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# R0_BLOCK=128 (<=r0_numel=96 rounded up) -> accumulators fit in registers\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4),\n        # ... more XBLOCK variants\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # same body, but [XBLOCK, R0_BLOCK] accumulators now fit in registers\n    ...\n\n# Launch: autotune selects config, grid adapts to XBLOCK\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # no explicit XBLOCK/R0_BLOCK",
+    "applicable_when": "NCU MemoryCacheAccessPattern rule fires on local loads/stores with ~1/32 bytes utilized per sector; 'No Eligible' scheduler cycles >80%; L1TEX scoreboard stalls >80% of warp cycles; Dynamic Shared Memory Per Block is large (>32KB) due to Triton spilling accumulators; R0_BLOCK in kernel config is significantly larger than actual r0_numel (e.g., 5x or more); kernel performs a reduction with Welford or similar multi-accumulator pattern.",
+    "do_not_apply_when": "R0_BLOCK is already close to r0_numel (within 2x); the kernel does not use large accumulator arrays; the bottleneck is compute-bound rather than memory-stall-bound; reducing R0_BLOCK would require multiple loop iterations that increase arithmetic overhead more than the spill costs.",
+    "framework_notes": "Triton-specific: R0_BLOCK is a tl.constexpr tile parameter controlling the reduction loop tile size. When R0_BLOCK >> r0_numel, Triton allocates [XBLOCK, R0_BLOCK]-shaped accumulator tensors that exceed register capacity and spill to local memory (visible as large Dynamic Shared Memory Per Block in NCU, and uncoalesced local load/store patterns). The fix uses @triton.autotune to explore R0_BLOCK values at or near r0_numel. In CUDA, the equivalent is ensuring shared memory or register arrays for reductions are sized to the actual problem dimension, not a padded constant."
+  }
+]

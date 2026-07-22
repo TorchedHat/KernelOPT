@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "a8d78a55",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.216e-02 > atol=0.001\nseed=42 output[0]: max_diff=4.233e-02 > atol=0.001\nseed=1337 output[0]: max_diff=3.920e-02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has ALLOW_TF32=False, forcing tl.dot to use scalar FP32 FFMA instructions (~67 TFLOPS peak on H200). Enabling TF32 (allow_tf32=True) routes the dot product through Tensor Cores at ~989 TFLOPS peak \u2014 a 14.7x theoretical throughput improvement. With K=128 (small accumulation depth), the TF32 mantissa reduction from 23 to 10 bits introduces negligible numerical error. The kernel is severely underutilized (Compute SOL=1.56%) and the primary bottleneck is that compute pipelines are idle (HighPipeUtilization rule, 95.28% speedup). Enabling Tensor Cores is the single highest-impact change available. Additionally, the tile sizes (BLOCK_M=16, BLOCK_N=32) are small and should be enlarged to better saturate Tensor Core MMA units and improve occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.216e-02 > atol=0.001\nseed=42 output[0]: max_diff=4.233e-02 > atol=0.001\nseed=1337 output[0]: max_diff=3.920e-02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_persistent_kernel_tiny_matmul_regression",
+    "iteration": 1,
+    "speedup": 0.602,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_kernel_for_wave_limited_tiny_matmul",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 9.5,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 14203.0,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Instruction Statistics.Executed Instructions": 120384.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 12.68,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.83,
+        "SharedMemoryConflicts.speedup_pct": 64.67
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 15.78,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 23617.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Instruction Statistics.Executed Instructions": 199968.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.19,
+        "SharedMemoryConflicts.speedup_pct": 69.85
+      }
+    },
+    "strategy_title": "Persistent Kernel Loop Regresses Tiny Wave-Limited Matmul",
+    "strategy_description": "Adding a persistent kernel loop (range(pid, total_tiles, num_programs)) to a tiny matmul that only launches 32 blocks on 132 SMs increased duration from 9.5 \u00b5s to 15.78 \u00b5s (0.60x). Despite the intent to fill more SMs, the achieved occupancy barely changed (6.23% \u2192 6.25%) because the grid size remained 32 blocks \u2014 the persistent loop was added but the launch grid was not updated to use min(132, total_tiles). The instruction count grew by 66% (120K \u2192 200K) due to loop overhead and index recomputation inside the persistent loop, while L1 hit rate collapsed from 12.68% to 0.75% because the loop body recomputes offsets without the tl.max_contiguous/tl.multiple_of hints that were removed, destroying cache-friendly access patterns. The dominant bottleneck (shared memory bank conflicts, MIO stalls) was unchanged, so the extra instruction overhead only added latency.",
+    "slow_pseudocode": "# Before: single tile per CTA, fixed BLOCK_M=16, BLOCK_N=32, grid=32\npid = tl.program_id(0)\npid_m, pid_n = swizzle(pid, grid_m, grid_n, GROUP_M)\nrm = pid_m * BLOCK_M + arange(BLOCK_M)\nrn = pid_n * BLOCK_N + arange(BLOCK_N)\noffs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)  # hint preserved\nacc = zeros(BLOCK_M, BLOCK_N)\nfor k in range(K // BLOCK_K):\n    a = load(A + ...)\n    b = load(B + ...)\n    acc += dot(a, b)\nstore(out + ..., acc + bias)",
+    "fast_pseudocode": "# After: persistent loop, BLOCK_M=8, BLOCK_N=16, grid still=32 (bug: not updated)\npid_start = tl.program_id(0)\nnum_programs = tl.num_programs(0)  # still 32, not min(132, total_tiles)\nfor tile_idx in range(pid_start, total_tiles, num_programs):  # loop overhead added\n    pid_m, pid_n = swizzle(tile_idx, grid_m, grid_n, GROUP_M)\n    rm = pid_m * BLOCK_M + arange(BLOCK_M)\n    rn = pid_n * BLOCK_N + arange(BLOCK_N)\n    offs_a_m = rm % M  # max_contiguous hint removed -> worse cache\n    acc = zeros(BLOCK_M, BLOCK_N)\n    for k in range(K // BLOCK_K):\n        a = load(A + ...)\n        b = load(B + ...)\n        acc += dot(a, b)\n    store(out + ..., acc + bias)",
+    "applicable_when": "Never \u2014 this specific pattern (persistent loop without updating the launch grid) is always a regression. The general persistent kernel pattern is applicable when: grid_size << sm_count, waves_per_sm < 0.5, and the launch grid is actually increased to min(sm_count, total_tiles).",
+    "do_not_apply_when": "Do not add a persistent kernel loop without simultaneously updating the kernel launch grid to use min(sm_count, total_tiles) blocks. Do not remove tl.max_contiguous / tl.multiple_of access hints when restructuring load address computation inside a persistent loop \u2014 their removal collapses L1 hit rate. Do not apply persistent kernel transformation when the dominant bottleneck is shared memory bank conflicts (SharedMemoryConflicts speedup_pct > 60%) rather than occupancy \u2014 the bank conflicts will remain and the loop overhead adds net latency.",
+    "framework_notes": "In Triton, tl.num_programs(0) returns the actual launch grid size, not the logical total_tiles. If the grid_fn lambda is not updated to return min(sm_count, total_tiles), the persistent loop iterates the same 32 tiles sequentially per CTA instead of distributing them across more SMs. Also, tl.max_contiguous and tl.multiple_of are Triton-specific compiler hints that enable vectorized/coalesced loads; removing them when refactoring address expressions degrades L1 hit rate significantly."
+  }
+]

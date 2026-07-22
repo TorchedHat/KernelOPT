@@ -1,0 +1,67 @@
+--- baseline
++++ rebuilt
+@@ -5,12 +5,26 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=2),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=1, num_stages=3),
++        triton.Config({}, num_warps=1, num_stages=4),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_mean_relu_sigmoid_25(arg_A, arg_B, out_ptr1):
+     EVEN_K : tl.constexpr = True
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+-    BLOCK_M : tl.constexpr = 16
++    BLOCK_M : tl.constexpr = 2
+     BLOCK_N : tl.constexpr = 32
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+@@ -59,19 +73,16 @@
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
++        k_offs = offs_k + k_idx * BLOCK_K  # shape [BLOCK_K], values = k_idx*32 + [0..31]
+ 
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 288*idx_m
+-        a = tl.load(A + (xindex))
++        # A load (unchanged semantics): A[m, k] = A_ptr[288*m + k]
++        a_ptrs = A + offs_a_m[:, None] * 288 + k_offs[None, :]  # [BLOCK_M, BLOCK_K]
++        a = tl.load(a_ptrs, mask=(offs_a_m[:, None] < M) & (k_offs[None, :] < K), other=0.0)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 1152*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 288*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
++        # B load (FIXED): B[n,k]=B_ptr[288*n+k], so B tile [BLOCK_K,BLOCK_N] = B_ptr[k+288*n]
++        # K is now the fast axis (stride 1) — conflict-free, coalesced
++        b_ptrs = B + k_offs[:, None] + 288 * offs_b_n[None, :]  # [BLOCK_K, BLOCK_N]
++        b = tl.load(b_ptrs, mask=(k_offs[:, None] < K) & (offs_b_n[None, :] < N), other=0.0)
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+@@ -87,8 +98,6 @@
+     xindex = idx_n + 1152*idx_m
+     tmp0 = tl.sigmoid(acc)
+     tl.store(out_ptr1 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp0, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

@@ -1,0 +1,190 @@
+[
+  {
+    "item_id": "f2cacf29",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_fix_b_load_order_and_tile_sizes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_fix_b_load_order_and_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_fix_b_load_order_and_tile_sizes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B matrix has stride_bk=1, stride_bn=480, meaning it is stored as [K=480, N=16] in memory (K-major). The load expression 'tl.broadcast_to(idx_m + 480*idx_n, [BLOCK_K, BLOCK_N])' accesses B with a stride of 480 floats between consecutive N elements. This causes threads in the same warp to access memory locations 480*4=1920 bytes apart, creating severe 12-way shared memory bank conflicts. Additionally, BLOCK_M=128 with BLOCK_N=16 is a highly asymmetric tile (8:1 ratio) that inflates register usage to 96/thread, limiting theoretical occupancy to 31.25%. Fixing the B load index to be contiguous along K (stride=1) and rebalancing the tile to BLOCK_M=64, BLOCK_N=32 will eliminate bank conflicts and reduce register pressure.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_wider_block_n_bank_conflict",
+    "iteration": 1,
+    "speedup": 0.5975,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_wider_block_n_to_fix_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 962.02,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 98.3,
+        "Occupancy.Theoretical Occupancy (%)": 31.25,
+        "Occupancy.Achieved Occupancy (%)": 30.01,
+        "Launch Statistics.Registers Per Thread": 96.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.34,
+        "Memory Workload Analysis.Mem Busy (%)": 96.89,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.conflict_wavefront_pct": 74.91
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 1610.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 97.35,
+        "Occupancy.Theoretical Occupancy (%)": 18.75,
+        "Occupancy.Achieved Occupancy (%)": 18.45,
+        "Launch Statistics.Registers Per Thread": 160.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.05,
+        "Memory Workload Analysis.Mem Busy (%)": 95.7,
+        "SharedMemoryConflicts.bank_conflict_way": 13.3,
+        "SharedMemoryConflicts.conflict_wavefront_pct": 79.87,
+        "Instruction Statistics.Executed Instructions": 284388160.0
+      }
+    },
+    "strategy_title": "Widening BLOCK_N with autotune worsens register pressure and occupancy",
+    "strategy_description": "Changing BLOCK_N from 16 to 32 in a tall-thin GEMM kernel (M>>N) while adding @triton.autotune over num_warps/num_stages caused registers per thread to jump from 96 to 160, cutting theoretical occupancy from 31.25% to 18.75% and nearly doubling kernel duration (962us \u2192 1610us). Despite the intent to fix 12-way shared memory bank conflicts, the bank conflict rate actually worsened (74.91% \u2192 79.87% wavefront conflict ratio, 12-way \u2192 13.3-way), and executed instructions nearly doubled (154M \u2192 284M). The autotune configs only varied num_warps/num_stages without actually changing BLOCK_N in the kernel signature (BLOCK_N remained a hardcoded constexpr=32), so the tile-widening effect was applied unconditionally while the autotune overhead and register spill dominated.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 128\n    BLOCK_N: tl.constexpr = 16  # narrow tile, 12-way bank conflicts\n    BLOCK_K: tl.constexpr = 32\n    # registers_per_thread = 96, occupancy = 31.25%",
+    "fast_pseudocode": "# ATTEMPTED (caused regression):\n@triton.autotune(\n    configs=[triton.Config({}, num_warps=4, num_stages=3), ...],  # no BLOCK_N in configs\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 128\n    BLOCK_N: tl.constexpr = 32  # hardcoded wider tile\n    BLOCK_K: tl.constexpr = 32\n    # registers_per_thread = 160, occupancy = 18.75% -- WORSE",
+    "applicable_when": "Never apply this specific pattern. Do not use as a positive template.",
+    "do_not_apply_when": "Do not unconditionally widen BLOCK_N (or any tile dimension) as a hardcoded constexpr when the kernel is already register-pressure-limited (registers_per_thread >= 80, Block Limit Registers <= 5). Widening a tile dimension increases register usage and can cut occupancy more than it reduces bank conflicts. Do not add @triton.autotune with configs that only vary num_warps/num_stages without including the tile dimension (BLOCK_N) as an autotuned parameter \u2014 this applies the tile change unconditionally without finding the optimal tradeoff. Particularly dangerous for tall-thin GEMMs where N is small (N=16) and the output tile BLOCK_M\u00d7BLOCK_N already stresses the register file.",
+    "framework_notes": "In Triton, if BLOCK_N is a hardcoded constexpr inside the kernel body rather than a kernel parameter, @triton.autotune configs cannot vary it. To autotune tile sizes, BLOCK_N must be a kernel parameter (tl.constexpr argument) and included in the configs dict. Autotune over only num_warps/num_stages without tile size variation does not address bank conflict root causes."
+  },
+  {
+    "item_id": "0fc40b59",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_block_k_to_break_shared_memory_bank_conflicts",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_block_k_to_break_shared_memory_bank_conflicts \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_block_k_to_break_shared_memory_bank_conflicts' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is 98.54% L1/TEX-bound due to 12-way shared memory bank conflicts on B-tile loads. B has strides=(1, 480) \u2014 K-major layout \u2014 so when BLOCK_K=32, the B tile in shared memory is [32 x 16] floats. Consecutive threads accessing the N-dimension of B step by BLOCK_K=32 floats in shared memory, which is exactly 32 banks \u2014 a perfect conflict stride causing 12-way conflicts. Increasing BLOCK_K to 48 changes the N-stride to 48 floats; 48 mod 32 = 16, so each successive N-element lands on a different bank set, breaking the conflict alignment. BLOCK_K=48 also divides K=480 evenly (480/48=10 iterations), so no partial-tile boundary issues arise. The accumulator tile (BLOCK_M=128 x BLOCK_N=16) is unchanged, so register pressure from the output tile does not increase. Prior failed attempts (widening BLOCK_N, changing B load order, TMA block_ptr, autotune num_warps/stages) are all excluded by history.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, tar",
+    "framework_notes": null
+  },
+  {
+    "item_id": "361a81c4",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_cut_register_pressure_and_improve_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_to_cut_register_pressure_and_improve_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_to_cut_register_pressure_and_improve_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is L1/shared-memory bound (L1/TEX at 98.29%, Mem Busy 97%). The dominant bottleneck is 12-way shared memory bank conflicts (74.91% of wavefronts are conflict wavefronts), causing MIO queue stalls (9.6 cycles) and scoreboard stalls (7.6 cycles) that together account for ~73% of warp stall time. The root cause is the B matrix load pattern: B is stored K-major [K=480, N=16] with stride_bn=480, so the load index `idx_m + 480*idx_n` strides 480 floats (1920 bytes) between consecutive N elements, mapping 16 N-columns to the same 32 shared memory banks repeatedly. The current BLOCK_M=128 forces 96 registers/thread, limiting Block Limit Registers to 5 blocks/SM and theoretical occupancy to 31.25%. Reducing BLOCK_M from 128 to 64 will: (1) cut the accumulator tile from 128x16=2048 to 64x16=1024 elements, reducing register pressure significantly; (2) allow more blocks per SM, increasing theoretical occupancy toward 50-62%; (3) more active warps per scheduler means more latency hiding for the remaining bank-conflict stalls. Prior attempts to fix bank conflicts by widening BLOCK_N (exp_001) caused register explosion (96->160 regs) and 67% slowdown. Prior attempt to reindex B loads (f2cacf29) caused correctness failure. This plan avoids both pitfalls.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "bd3bd2aa",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_via_autotune_to_cut_register_pressure_and_improve_occupancy",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_via_autotune_to_cut_register_pressure_and_improve_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_via_autotune_to_cut_register_pressure_and_improve_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-pressure-limited: 160 registers/thread caps theoretical occupancy at 18.75% (Block Limit Registers=3). The accumulator tile BLOCK_M x BLOCK_N = 128x32 = 4096 floats requires ~128 registers per thread in a 128-thread block. Reducing BLOCK_M from 128 to 32 or 64 cuts the accumulator to 512-2048 floats, allowing 2-4x more blocks per SM and dramatically improving occupancy. The 13.3-way bank conflicts (77.76% speedup potential) are caused by the B matrix load pattern. Prior attempt (exp_001) failed because BLOCK_N was hardcoded as a constexpr inside the body rather than a kernel parameter \u2014 autotune could not vary it. This plan correctly exposes BLOCK_M as a kernel parameter so autotune can explore smaller tiles.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f0a48af0",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_64_with_correct_grid_and_indexing",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_to_64_with_correct_grid_and_indexing \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_to_64_with_correct_grid_and_indexing' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely bottlenecked by 12-way shared memory bank conflicts on B-tile loads (73.86% speedup potential). The current BLOCK_M=128 forces 80 registers/thread, limiting Block Limit Registers to 6 blocks/SM and theoretical occupancy to 37.5%. With only 0.30 eligible warps/scheduler (79.31% no-eligible cycles), there are insufficient active warps to hide the bank-conflict MIO stalls (12.6 + 9.7 = 22.3 stall cycles per instruction). Reducing BLOCK_M from 128 to 64 halves the accumulator tile from 128x16=2048 to 64x16=1024 elements, cutting register pressure significantly. This allows more blocks per SM, improving theoretical occupancy from 37.5% toward 62.5%, providing more active warps to hide the remaining bank-conflict latency. Prior attempts to reduce BLOCK_M failed due to implementation flaws in grid/indexing recomputation. Prior BLOCK_K changes crashed (non-power-of-2 unsupported by tl.dot). Prior BLOCK_N widening caused register explosion.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "bd623696",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_and_remove_maxnreg_to_eliminate_local_memory_spill",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (local loads/stores) + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_and_remove_maxnreg_to_eliminate_local_memory_spill \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_and_remove_maxnreg_to_eliminate_local_memory_spill' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The #1 NCU rule (92.64% speedup) is uncoalesced local loads AND stores \u2014 this is register spill to local memory. With BLOCK_M=128 and 128 threads/block, the accumulator tile is 128x16=2048 float32 elements. Each thread owns 16 accumulator registers. With maxnreg=64 capping registers, Triton spills the accumulator or loop-carried values to local (L1-backed) memory, causing strided local loads/stores that each use only 1 of 32 bytes per sector \u2014 exactly what NCU reports. The fix is twofold: (1) reduce BLOCK_M from 128 to 64, halving the accumulator tile to 64x16=1024 elements so each thread owns only 8 accumulator registers, dramatically reducing register demand; (2) remove the maxnreg=64 cap from all autotune configs so the compiler can allocate registers freely without spilling. The grid MUST be updated from 3920 to 7840 to cover all M=501760 rows. The previous reduce_block_m attempt (item 361a81c4) failed correctness \u2014 almost certainly due to forgetting to update the grid from 3920 to 7840 in kernel_function().",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "3021667a",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_eliminate_local_memory_spill_with_correct_grid",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (local loads/stores)",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_to_eliminate_local_memory_spill_with_correct_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_to_eliminate_local_memory_spill_with_correct_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The #1 NCU rule (92% speedup) is uncoalesced local loads AND stores \u2014 this is register spill to local memory. With BLOCK_M=128 and BLOCK_N=16, the accumulator acc is 128x16=2048 float32 elements. This forces 96 registers/thread, hitting the register file limit and causing the compiler to spill the accumulator to local memory. Local memory accesses are strided (not coalesced), causing the 92% L1/TEX overhead. The fix is to halve BLOCK_M from 128 to 64, reducing the accumulator to 64x16=1024 elements, which should cut register pressure enough to eliminate spill. CRITICAL: the grid is hardcoded as (3920,1,1) = ceil(501760/128)*ceil(16/16). With BLOCK_M=64, the grid must be updated to (7840,1,1) = ceil(501760/64)*ceil(16/16). Prior reduce_block_m attempts (item 361a81c4) failed correctness because the grid was NOT updated to match the new BLOCK_M, causing output tiles to be skipped or double-written.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.303e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.110e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.168e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

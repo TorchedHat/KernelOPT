@@ -1,0 +1,103 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+@triton.jit
+def triton_poi_fused_cat_convolution_max_pool2d_with_indices_relu_15(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+    ynumel = 16384
+    xnumel = 3969
+    yoffset = tl.program_id(1) * YBLOCK
+    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+    xmask = xindex < xnumel
+    x3 = xindex // 63
+    x2 = (xindex % 63)
+    y4 = yindex
+    x5 = xindex
+    y0 = (yindex % 256)
+    y1 = yindex // 256
+    tmp0 = 2*x3
+    tmp1 = tl.full([1, 1], 0, tl.int64)
+    tmp2 = tmp0 >= tmp1
+    tmp3 = tl.full([1, 1], 126, tl.int64)
+    tmp4 = tmp0 < tmp3
+    tmp5 = tmp2 & tmp4
+    tmp6 = 2*x2
+    tmp7 = tmp6 >= tmp1
+    tmp8 = tmp6 < tmp3
+    tmp9 = tmp7 & tmp8
+    tmp10 = tmp5 & tmp9
+    tmp11 = tl.load(in_ptr0 + (2*x2 + 252*x3 + 15904*y4), tmp10 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp12 = 1 + 2*x2
+    tmp13 = tmp12 >= tmp1
+    tmp14 = tmp12 < tmp3
+    tmp15 = tmp13 & tmp14
+    tmp16 = tmp5 & tmp15
+    tmp17 = tl.load(in_ptr0 + (1 + 2*x2 + 252*x3 + 15904*y4), tmp16 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp18 = tl.maximum(tmp11, tmp17)
+    tmp19 = 2 + 2*x2
+    tmp20 = tmp19 >= tmp1
+    tmp21 = tmp19 < tmp3
+    tmp22 = tmp20 & tmp21
+    tmp23 = tmp5 & tmp22
+    tmp24 = tl.load(in_ptr0 + (2 + 2*x2 + 252*x3 + 15904*y4), tmp23 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp25 = tl.maximum(tmp18, tmp24)
+    tmp26 = 1 + 2*x3
+    tmp27 = tmp26 >= tmp1
+    tmp28 = tmp26 < tmp3
+    tmp29 = tmp27 & tmp28
+    tmp30 = tmp29 & tmp9
+    tmp31 = tl.load(in_ptr0 + (126 + 2*x2 + 252*x3 + 15904*y4), tmp30 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp32 = tl.maximum(tmp25, tmp31)
+    tmp33 = tmp29 & tmp15
+    tmp34 = tl.load(in_ptr0 + (127 + 2*x2 + 252*x3 + 15904*y4), tmp33 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp35 = tl.maximum(tmp32, tmp34)
+    tmp36 = tmp29 & tmp22
+    tmp37 = tl.load(in_ptr0 + (128 + 2*x2 + 252*x3 + 15904*y4), tmp36 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp38 = tl.maximum(tmp35, tmp37)
+    tmp39 = 2 + 2*x3
+    tmp40 = tmp39 >= tmp1
+    tmp41 = tmp39 < tmp3
+    tmp42 = tmp40 & tmp41
+    tmp43 = tmp42 & tmp9
+    tmp44 = tl.load(in_ptr0 + (252 + 2*x2 + 252*x3 + 15904*y4), tmp43 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp45 = tl.maximum(tmp38, tmp44)
+    tmp46 = tmp42 & tmp15
+    tmp47 = tl.load(in_ptr0 + (253 + 2*x2 + 252*x3 + 15904*y4), tmp46 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp48 = tl.maximum(tmp45, tmp47)
+    tmp49 = tmp42 & tmp22
+    tmp50 = tl.load(in_ptr0 + (254 + 2*x2 + 252*x3 + 15904*y4), tmp49 & xmask, eviction_policy='evict_last', other=float("-inf"))
+    tmp51 = tl.maximum(tmp48, tmp50)
+    tl.store(out_ptr0 + (y0 + 256*x5 + 1016064*y1), tmp51, xmask)
+
+
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    ynumel = 16384
+    xnumel = 3969
+    grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+    triton_poi_fused_cat_convolution_max_pool2d_with_indices_relu_15[grid](arg_0, arg_1, 16384, 3969, YBLOCK=8, XBLOCK=128)
+    return arg_1
+
+def get_inputs():
+    arg_0 = rand_strided((64, 256, 126, 126), (4071424, 15904, 126, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((64, 256, 63, 63), (1016064, 1, 16128, 256), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

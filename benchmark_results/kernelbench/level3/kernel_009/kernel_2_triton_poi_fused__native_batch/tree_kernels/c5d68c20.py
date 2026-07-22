@@ -1,0 +1,69 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_relu_2(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, xnumel, XBLOCK : tl.constexpr):
+    NCHAN: tl.constexpr = 32
+    chan_idx = tl.arange(0, NCHAN)          # [32] indices 0..31
+    # One coalesced 128-byte load per array, done ONCE per block:
+    smem_mean   = tl.load(in_ptr0 + chan_idx, None)   # shape [32]
+    smem_var    = tl.load(in_ptr1 + chan_idx, None)   # shape [32]
+    smem_weight = tl.load(in_ptr2 + chan_idx, None)   # shape [32]
+    smem_bias   = tl.load(in_ptr3 + chan_idx, None)   # shape [32]
+
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex  = xoffset + tl.arange(0, XBLOCK)[:]       # [XBLOCK]
+    # xnumel=4014080 is exactly divisible by XBLOCK=128 — no mask needed
+    x2 = xindex
+    x0 = (xindex % NCHAN)                             # channel index per element
+
+    tmp0   = tl.load(in_out_ptr0 + (x2), None, eviction_policy='evict_first')
+    # Register-level gather from preloaded [32] vectors (no L1TEX round-trip):
+    tmp1   = tl.gather(smem_mean,   x0, 0)
+    tmp3   = tl.gather(smem_var,    x0, 0)
+    tmp12  = tl.gather(smem_weight, x0, 0)
+    tmp14  = tl.gather(smem_bias,   x0, 0)
+
+    # Explicit FMA — forces FFMA PTX, bypassing LLVM's heuristic FMA contraction
+    # that may fail across the rsqrt() libdevice call boundary
+    inv_std         = tl.math.rsqrt(tmp3 + 1e-5)
+    neg_mean_scaled = -tmp1 * inv_std                              # FMUL
+    norm            = tl.math.fma(tmp0, inv_std, neg_mean_scaled)  # FFMA: tmp0*inv_std + (-tmp1*inv_std)
+    out             = tl.math.fma(norm, tmp12, tmp14)              # FFMA: norm*weight + bias
+    result          = tl.maximum(0.0, out)                         # ReLU
+    tl.store(in_out_ptr0 + (x2), result, None, eviction_policy='evict_first')
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    xnumel = 4014080
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_relu_2[grid](arg_0, arg_1, arg_2, arg_3, arg_4, 4014080, XBLOCK=128)
+    return arg_4
+
+def get_inputs():
+    arg_0 = rand_strided((10, 32, 112, 112), (401408, 1, 3584, 32), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((32,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((32,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((32,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((32,), (1,), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

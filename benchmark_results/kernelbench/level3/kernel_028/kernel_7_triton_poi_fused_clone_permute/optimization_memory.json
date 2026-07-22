@@ -1,0 +1,317 @@
+[
+  {
+    "item_id": "exp_persistent_tile_scheduling_permute_002",
+    "iteration": 2,
+    "speedup": 1.2436,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_for_underutilized_permute_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4497.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 43.25,
+        "Scheduler Statistics.No Eligible": 70.21,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.41,
+        "Memory Workload Analysis.Memory Throughput": 266.44,
+        "Instruction Statistics.Executed Instructions": 211184.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4091.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 26.61,
+        "Scheduler Statistics.No Eligible": 87.35,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.3,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.3,
+        "Memory Workload Analysis.Memory Throughput": 294.42,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      }
+    },
+    "strategy_title": "Persistent while-loop tile scheduling reduces kernel duration",
+    "strategy_description": "For small pointwise/permute kernels with sub-1-wave grid coverage (waves_per_sm < 1.0), replacing the single-tile-per-CTA pattern with a persistent while-loop (grid fixed at NUM_SM, each CTA iterates over ceil(num_tiles/NUM_SM) tiles) reduces total elapsed cycles and kernel duration even when occupancy drops. In this case, duration fell from 3.04 \u00b5s to 2.75 \u00b5s (1.24x speedup) and memory throughput rose from 266 to 294 GB/s, while executed instructions dropped from 211K to 82K \u2014 indicating the persistent loop eliminated redundant per-CTA overhead (prologue/epilogue, barrier synchronization, scheduler setup). Notably, achieved occupancy dropped further (43% \u2192 27%) and no-eligible rate worsened (70% \u2192 87%), yet the kernel was still faster because fewer total instructions were executed and memory bandwidth was better utilized per active CTA.",
+    "slow_pseudocode": "# One tile per CTA, grid = cdiv(xnumel, XBLOCK) blocks\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + permute_idx(xindex), xmask)\n    tl.store(out_ptr + xindex, tmp0, xmask)\n\ngrid = (cdiv(xnumel, XBLOCK),)  # e.g. 1576 blocks\nkernel[grid](in_ptr, out_ptr, xnumel)",
+    "fast_pseudocode": "# Persistent loop: grid = NUM_SM blocks, each CTA loops over tiles\nNUM_SM = torch.cuda.get_device_properties(0).multi_processor_count\n\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    num_sm = tl.num_programs(0)          # == NUM_SM at launch\n    num_tiles = tl.cdiv(xnumel, XBLOCK)  # constexpr-safe\n    tile_id = pid\n    while tile_id < num_tiles:\n        xoffset = tile_id * XBLOCK\n        xindex = xoffset + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        tmp0 = tl.load(in_ptr + permute_idx(xindex), xmask)\n        tl.store(out_ptr + xindex, tmp0, xmask)\n        tile_id += num_sm               # stride by SM count\n\ngrid = (NUM_SM,)  # one CTA per SM\nkernel[grid](in_ptr, out_ptr, xnumel)",
+    "applicable_when": "Triton pointwise/permute kernel with: waves_per_sm < 1.0, grid_size significantly larger than sm_count (e.g. grid > 4x sm_count), kernel body is pure load/store with no shared memory or inter-CTA communication, xnumel is fixed/known at launch time, XBLOCK is tl.constexpr so tl.cdiv(xnumel, XBLOCK) is valid inside the kernel",
+    "do_not_apply_when": "Kernel uses shared memory with inter-warp synchronization (barriers inside the tile body would deadlock across iterations); kernel already has waves_per_sm >= 2 (persistent loop adds while-loop overhead without benefit); num_tiles < NUM_SM at the winning XBLOCK (some SMs do zero work, wasting launch slots \u2014 though correctness is preserved); kernel has data-dependent early exit that cannot be expressed in a while-loop",
+    "framework_notes": "Triton-specific: tl.num_programs(0) returns the actual grid dimension-0 size at runtime, which equals NUM_SM when launched with grid=(NUM_SM,). tl.cdiv(xnumel, XBLOCK) is valid inside @triton.jit when XBLOCK is tl.constexpr (Triton >= 2.1). The @triton.autotune decorator is compatible with this pattern \u2014 the grid at the call site must be fixed to (NUM_SM,) rather than a lambda. In CUDA, the equivalent is a persistent kernel using blockIdx.x as the starting tile and gridDim.x as the stride."
+  },
+  {
+    "item_id": "exp_persistent_stride_loop_pointwise_permute_002",
+    "iteration": 2,
+    "speedup": 1.1032,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_stride_loop_to_eliminate_partial_wave",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4497.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 43.25,
+        "Scheduler Statistics.No Eligible": 70.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.41,
+        "Memory Workload Analysis.Memory Throughput": 266.44
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.1,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4572.0,
+        "Launch Statistics.Waves Per SM": 1.49,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 45.06,
+        "Scheduler Statistics.No Eligible": 78.03,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 31.73,
+        "Memory Workload Analysis.Memory Throughput": 261.03
+      }
+    },
+    "strategy_title": "Persistent stride-loop kernel to eliminate partial wave tail",
+    "strategy_description": "Replacing a single-shot kernel (one tile per CTA, grid=cdiv(N, XBLOCK)) with a persistent stride-loop kernel (grid=num_sms, each CTA iterates over multiple tiles) was predicted to eliminate the partial-wave tail and reduce latency. However, in this case the approach produced a mild regression on the per-kernel duration metric (3.04 \u00b5s \u2192 3.10 \u00b5s) while waves/SM increased from 0.75 to 1.49 \u2014 the opposite of the intended effect. The grid size remained 1576 (the autotune's grid lambda was not updated to use num_sms), meaning the persistent loop added while-loop branch overhead and increased warp cycles per issued instruction (23.4 \u2192 31.7 cycles) without actually reducing the CTA count. The LaunchConfiguration rule appeared post-optimization (50% estimated speedup) because the new 1.49-wave schedule now has a larger partial tail than the original 0.75-wave schedule, indicating the rewrite made the wave imbalance worse rather than better.",
+    "slow_pseudocode": "# Single-shot: one tile per CTA, grid=cdiv(N, XBLOCK)\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask)\n    tl.store(out_ptr + xindex, tmp0, xmask)\n\ngrid = (cdiv(xnumel, 128),)  # 1576 CTAs\nkernel[grid](in_ptr, out_ptr, xnumel)",
+    "fast_pseudocode": "# Persistent stride-loop: grid=num_sms, each CTA loops over tiles\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    num_sms = tl.num_programs(0)  # grid size = num_sms\n    num_tiles = tl.cdiv(xnumel, XBLOCK)\n    tile_id = pid\n    while tile_id < num_tiles:\n        xoffset = tile_id * XBLOCK\n        xindex = xoffset + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask)\n        tl.store(out_ptr + xindex, tmp0, xmask)\n        tile_id += num_sms\n\ngrid = (num_sms,)  # 132 CTAs \u2014 BUT autotune still ran with 1576 grid\nkernel[grid](in_ptr, out_ptr, xnumel)",
+    "applicable_when": "Kernel has waves_per_sm significantly above 1.0 (e.g. >1.5) with a large partial-wave tail, LaunchConfiguration NCU rule fires with high estimated speedup (>30%), and the grid is correctly set to num_sms at the launch site (not overridden by autotune or other mechanism).",
+    "do_not_apply_when": "Kernel already has waves_per_sm <= 1.0 (no partial wave to eliminate); grid is controlled by autotune lambda that overrides the intended num_sms launch (autotune will re-expand the grid, negating the persistent schedule); kernel has very low waves_per_sm (<1.0) where the persistent loop adds branch overhead without benefit; kernel body has inter-tile dependencies or shared memory state that cannot be reset per tile.",
+    "framework_notes": "Triton-specific: tl.num_programs(0) returns the grid size along axis 0, which equals num_sms when grid=(num_sms,). CRITICAL: if @triton.autotune is present with a grid lambda like `lambda meta: (cdiv(N, meta['XBLOCK']),)`, the autotune will override the intended grid=(num_sms,) launch, expanding it back to 1576 CTAs and making the while-loop a no-op (each CTA processes exactly one tile). The persistent pattern requires either removing autotune or using a fixed grid that is not overridden. In CUDA, the equivalent is a persistent kernel with blockIdx.x stride loops, launched with exactly SM_count blocks."
+  },
+  {
+    "item_id": "exp_num_stages_cache_modifier_pointwise_permute_003",
+    "iteration": 3,
+    "speedup": 1.2128,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_num_stages_autotune_configs_for_l1tex_stall_reduction",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4091.0,
+        "Occupancy.Achieved Occupancy": 26.61,
+        "Scheduler Statistics.No Eligible": 87.35,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.3,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.3,
+        "Memory Workload Analysis.Memory Throughput": 294.42,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4161.0,
+        "Occupancy.Achieved Occupancy": 36.87,
+        "Scheduler Statistics.No Eligible": 87.31,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.31,
+        "Memory Workload Analysis.Memory Throughput": 287.64,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      }
+    },
+    "strategy_title": "Adding num_stages>1 configs and cache_modifier='.ca' for L1TEX stall reduction",
+    "strategy_description": "For small pointwise/permute kernels already using persistent tile scheduling and large XBLOCK autotune, expanding autotune configs to include num_stages=2 and num_stages=3 variants (alongside adding cache_modifier='.ca' on tl.load) did not reduce L1TEX stall cycles as predicted. Warp Cycles Per Issued Instruction remained essentially unchanged (35.3 \u2192 35.31), memory throughput slightly decreased (294 \u2192 288 GB/s), and kernel duration increased marginally (2.75 \u2192 2.82 \u00b5s), yielding a net regression at the per-kernel level despite the reported 1.21x system-level speedup. The CPIStall L1TEX stall contribution actually worsened slightly (31.2% \u2192 32.1%), indicating that Triton's software pipeliner did not effectively overlap L2-to-L1 transfers for this strided gather-like access pattern within a persistent while-loop structure.",
+    "slow_pseudocode": "# All autotune configs use num_stages=1, no cache hint\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 512},  num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 1024}, num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 2048}, num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 2048}, num_warps=16, num_stages=1),\n        triton.Config({'XBLOCK': 4096}, num_warps=8,  num_stages=1),\n        triton.Config({'XBLOCK': 4096}, num_warps=16, num_stages=1),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    # persistent while-loop body\n    tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask)\n    tl.store(out_ptr + xindex, tmp0, xmask)",
+    "fast_pseudocode": "# Added num_stages=2/3 variants and cache_modifier='.ca'\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512},  num_warps=4,  num_stages=1),\n        triton.Config({'XBLOCK': 512},  num_warps=4,  num_stages=2),\n        triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=2),\n        triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=3),\n        # ... more num_stages=2/3 variants\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    # persistent while-loop body\n    tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask,\n                   cache_modifier='.ca')  # added\n    tl.store(out_ptr + xindex, tmp0, xmask)",
+    "applicable_when": "Never clearly beneficial for this pattern; may help in kernels with sequential (non-strided) access patterns where Triton's pipeliner can emit cp.async instructions effectively, and where the kernel does NOT use a persistent while-loop structure.",
+    "do_not_apply_when": "Kernel uses a persistent while-loop (tile_id += num_sm) \u2014 Triton's software pipeliner cannot effectively pipeline across while-loop iterations, so num_stages>1 provides no latency hiding benefit. Kernel has strided/gather-like load patterns (e.g. x0 + stride*x2 + stride2*x1) where cp.async prefetch cannot be issued ahead of the address computation. When CPIStall L1TEX stall is already the dominant bottleneck and L1 hit rate is 0% \u2014 adding cache_modifier='.ca' alone does not improve hit rate if the access pattern is non-reuse.",
+    "framework_notes": "Triton-specific: num_stages controls the software pipelining depth via cp.async PTX instructions on Hopper (H100/H200). However, this mechanism is most effective for sequential tile loads (e.g. matmul K-dimension loops) where the next tile address is known before the current tile computation completes. For persistent while-loops with gather-like strided indices, the pipeliner cannot issue async prefetches across loop iterations. cache_modifier='.ca' promotes L1 caching but has no effect when the access pattern has no temporal reuse across tiles."
+  },
+  {
+    "item_id": "exp_persistent_grid_pinned_to_num_sm_003",
+    "iteration": 3,
+    "speedup": 1.1633,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_for_fractional_wave_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4091.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 26.61,
+        "Scheduler Statistics.No Eligible": 87.35,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.3,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.3,
+        "Memory Workload Analysis.Memory Throughput": 294.42,
+        "Instruction Statistics.Executed Instructions": 81952.0,
+        "Compute Workload Analysis.Executed Ipc Active": 0.44
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4382.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 42.71,
+        "Scheduler Statistics.No Eligible": 77.17,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.93,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.01,
+        "Memory Workload Analysis.Memory Throughput": 275.22,
+        "Instruction Statistics.Executed Instructions": 173360.0,
+        "Compute Workload Analysis.Executed Ipc Active": 0.83
+      }
+    },
+    "strategy_title": "Autotune config expansion without grid pinning causes regression",
+    "strategy_description": "When a persistent while-loop kernel already has a correctly-functioning persistent schedule (grid=1576, each CTA doing ~1 tile at XBLOCK=128), expanding the autotune config space to include smaller XBLOCK values (e.g. 256) without pinning the grid to NUM_SM causes the autotuner to select a config where num_tiles > grid_size, making the while-loop fire multiple times per CTA \u2014 but the grid remains at 1576 rather than 132, so occupancy rises (27% \u2192 43%) and instruction count doubles (82K \u2192 173K), increasing duration from 2.75 \u00b5s to 2.94 \u00b5s. The speedup of 1.1633x reported here is relative to an earlier baseline (3.04 \u00b5s), not the immediate prior kernel (2.75 \u00b5s); the actual change in this iteration was a regression of ~7% in duration. Adding smaller XBLOCK configs to autotune without simultaneously pinning the launch grid to NUM_SM defeats the persistent scheduling benefit.",
+    "slow_pseudocode": "# Persistent kernel with grid pinned to NUM_SM (correct)\n@triton.autotune(configs=[Config({'XBLOCK': 512}, num_warps=4), Config({'XBLOCK': 1024}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    num_sms = tl.num_programs(0)  # == NUM_SM when grid=(NUM_SM,)\n    num_tiles = tl.cdiv(xnumel, XBLOCK)\n    tile_id = pid\n    while tile_id < num_tiles:\n        xindex = tile_id * XBLOCK + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        tmp0 = tl.load(in_ptr + permute_idx(xindex), xmask)\n        tl.store(out_ptr + xindex, tmp0, xmask)\n        tile_id += num_sms\n\ngrid = (NUM_SM,)  # 132 \u2014 persistent, each SM does multiple tiles\nkernel[grid](in_ptr, out_ptr, xnumel)  # duration: 2.75 \u00b5s, 82K instructions",
+    "fast_pseudocode": "# Same persistent kernel but autotune config space expanded with smaller XBLOCK\n# and grid NOT pinned to NUM_SM \u2014 autotuner selects XBLOCK=256, grid stays 1576\n@triton.autotune(configs=[Config({'XBLOCK': 256}, num_warps=4), Config({'XBLOCK': 512}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    num_sms = tl.num_programs(0)  # returns 1576, not 132!\n    num_tiles = tl.cdiv(xnumel, XBLOCK)  # e.g. 788 at XBLOCK=256\n    tile_id = pid\n    while tile_id < num_tiles:  # most CTAs: tile_id >= num_tiles, loop fires 0 times\n        xindex = tile_id * XBLOCK + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        tmp0 = tl.load(in_ptr + permute_idx(xindex), xmask)\n        tl.store(out_ptr + xindex, tmp0, xmask)\n        tile_id += num_sms\n\ngrid = (NUM_SM,)  # intended 132, but autotune overrides or selects config that expands grid\nkernel[grid](in_ptr, out_ptr, xnumel)  # duration: 2.94 \u00b5s, 173K instructions",
+    "applicable_when": "Documenting a regression: when a persistent kernel's grid is not correctly pinned to NUM_SM and autotune config expansion causes the autotuner to select a suboptimal XBLOCK that increases instruction count and duration.",
+    "do_not_apply_when": "When the grid IS correctly pinned to NUM_SM=132 and autotune only selects XBLOCK values where num_tiles > NUM_SM (each SM does at least one tile) \u2014 in that case expanding the config space is safe and beneficial.",
+    "framework_notes": "Triton-specific: tl.num_programs(0) returns the actual grid size at runtime. If the grid is 1576 (not 132), the persistent while-loop stride is 1576, meaning most CTAs process at most 1 tile and the loop is effectively a no-op. The persistent pattern REQUIRES the launch grid to be fixed at NUM_SM, not controlled by a lambda or autotune. Adding smaller XBLOCK configs (e.g. 256) to autotune when grid=1576 means num_tiles=cdiv(201728,256)=788 < 1576, so half the CTAs do zero work \u2014 pure waste."
+  },
+  {
+    "item_id": "d756f2fc",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "l2_locality_2d_grid_reorder_for_underutilized_permute",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "l2_locality_2d_grid_reorder_for_underutilized_permute \u2014 correctness failure",
+    "strategy_description": "Plan 'l2_locality_2d_grid_reorder_for_underutilized_permute' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.418e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.803e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.084e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a fused clone+permute that reads from a strided layout (197, 8, 2, 64) with strides (1024, 64, 512, 1) and writes to a contiguous (2, 197, 8, 64) layout. The current kernel has a broken persistent while-loop: the grid is cdiv(201728, 128)=1576 CTAs but the while-loop strides by num_sms=1576 (the grid size equals the SM count coincidentally), so each CTA executes exactly one tile iteration \u2014 the persistent loop is a no-op overhead. The real problems are: (1) XBLOCK=128 is too small \u2014 each CTA only processes 128 elements, giving insufficient memory-level parallelism to hide L1TEX latency (11.9 cycles/warp stall); (2) The 1D flat grid does not exploit L2 locality \u2014 the input tensor has x2 = xindex//100864 (only 2 values: batch 0 and batch 1), meaning tiles are interleaved across batches in the 1D grid, causing L2 cache thrashing between the two 100864-element batch slices. A 2D grid (x2_dim=2, x1x0_dim=cdiv(100864, XBLOCK)) groups all tiles from the same batch together, so each SM's L2 working set is halved. Combined with removing the broken persistent loop and using a larger XBLOCK via autotune, this should improve L2 hit rate beyond 57.35% and reduce L1TEX stall cycles.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.418e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.803e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.084e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_grid_lambda_fix_simple_tile_body_004",
+    "iteration": 4,
+    "speedup": 1.0588,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_grid_lambda_and_remove_persistent_loop_with_num_stages",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4161.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 36.87,
+        "Scheduler Statistics.No Eligible": 87.31,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 35.31,
+        "Compute Workload Analysis.Executed Ipc Active": 0.36,
+        "Compute Workload Analysis.Issue Slots Busy": 9.46,
+        "Memory Workload Analysis.Memory Throughput": 287.64,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.23,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4795.0,
+        "Launch Statistics.Waves Per SM": 1.49,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Occupancy.Achieved Occupancy": 69.82,
+        "Scheduler Statistics.No Eligible": 49.98,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 3.07,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.46,
+        "Compute Workload Analysis.Executed Ipc Active": 2.21,
+        "Compute Workload Analysis.Issue Slots Busy": 56.5,
+        "Memory Workload Analysis.Memory Throughput": 250.69,
+        "Instruction Statistics.Executed Instructions": 669792.0
+      }
+    },
+    "strategy_title": "Replace persistent loop with simple tile body + num_stages pipelining",
+    "strategy_description": "When a Triton kernel uses a persistent while-loop but the launch grid is NOT pinned to num_sms (instead hardcoded to cdiv(N, fixed_block)), removing the while-loop and replacing it with a simple single-tile-per-CTA body, combined with a grid lambda using meta['XBLOCK'] and num_stages=2/3 autotune configs, dramatically improves scheduler utilization. In this iteration, Issue Slots Busy rose from 9.5% to 56.5%, Executed IPC Active from 0.36 to 2.21, and achieved occupancy from 36.9% to 69.8%, reducing warp cycles per issued instruction from 35.3 to 19.5 cycles. However, the grid remained at 1576 (the lambda did not reduce CTA count because autotune selected XBLOCK=256 rather than larger values), so duration actually increased slightly (2.82\u21923.23 \u00b5s) despite the scheduler improvements, yielding only a modest 1.06x system-level speedup \u2014 the LaunchConfiguration rule now fires with 50% estimated speedup, indicating the partial-wave tail is the next bottleneck to address.",
+    "slow_pseudocode": "# Persistent loop with grid hardcoded to cdiv(N, 128), NOT num_sms\n@triton.autotune(\n    configs=[triton.Config({'XBLOCK': X}, num_warps=W, num_stages=S) for X,W,S in ...],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    xnumel = 201728  # hardcoded\n    pid = tl.program_id(0)\n    num_sm = tl.num_programs(0)  # returns 1576, not 132\n    num_tiles = tl.cdiv(xnumel, XBLOCK)\n    tile_id = pid\n    while tile_id < num_tiles:\n        xoffset = tile_id * XBLOCK\n        xindex = xoffset + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask, cache_modifier='.ca')\n        tl.store(out_ptr + xindex, tmp0, xmask)\n        tile_id += num_sm\n\ngrid = (triton.cdiv(xnumel, 128),)  # 1576 \u2014 ignores XBLOCK from autotune\nkernel[grid](in_ptr, out_ptr, 201728)",
+    "fast_pseudocode": "# Simple single-tile-per-CTA with num_stages pipelining and grid lambda\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 2048}, num_warps=8,  num_stages=3),\n        triton.Config({'XBLOCK': 2048}, num_warps=16, num_stages=2),\n        triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=3),\n        triton.Config({'XBLOCK': 1024}, num_warps=4,  num_stages=2),\n        triton.Config({'XBLOCK': 512},  num_warps=8,  num_stages=3),\n        triton.Config({'XBLOCK': 512},  num_warps=4,  num_stages=2),\n        triton.Config({'XBLOCK': 256},  num_warps=4,  num_stages=2),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask)  # no cache_modifier\n    tl.store(out_ptr + xindex, tmp0, xmask)\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](in_ptr, out_ptr, xnumel)  # xnumel as variable, no XBLOCK kwarg",
+    "applicable_when": "Triton kernel with a broken persistent while-loop (grid NOT pinned to num_sms, so loop processes all tiles per CTA), exhibiting Issue Slots Busy < 15%, Executed IPC Active < 0.5, achieved occupancy < 40% despite theoretical 100%, Warp Cycles Per Issued Instruction > 30. Removing the loop and adding num_stages=2/3 configs improves scheduler utilization significantly.",
+    "do_not_apply_when": "Persistent loop is correctly launched with grid=(num_sms,) and each CTA genuinely processes multiple tiles \u2014 removing it would increase grid overhead. Also avoid when the kernel is already a simple single-tile-per-CTA pattern. Note: even after this fix, if autotune selects small XBLOCK (e.g. 256), the grid stays large (1576) and LaunchConfiguration partial-wave tail remains the bottleneck \u2014 further tuning of autotune config space toward larger XBLOCK is needed.",
+    "framework_notes": "Triton-specific: the grid lambda `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` only reduces CTA count if autotune selects large XBLOCK values (e.g. XBLOCK=2048 \u2192 99 CTAs). If autotune selects XBLOCK=256, the grid remains 788 CTAs \u2014 still producing a partial wave. Removing cache_modifier='.ca' had no measurable effect on this strided gather pattern. num_stages=2/3 improves scheduler utilization (Issue Slots Busy 9%\u219256%) but does not reduce duration if the grid is still too large. The next optimization step should force larger XBLOCK configs or pin the grid to eliminate the partial wave."
+  },
+  {
+    "item_id": "exp_cg_cache_modifier_streaming_gather_persistent_005",
+    "iteration": 5,
+    "speedup": 1.2436,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "cg_cache_modifier_for_streaming_gather_with_zero_l1_hit_rate",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4064.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 36.41,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 53.1,
+        "Memory Workload Analysis.Memory Throughput": 294.42,
+        "Occupancy.Achieved Occupancy": 25.72,
+        "Scheduler Statistics.No Eligible": 87.37,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4075.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 34.6,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 53.17,
+        "Memory Workload Analysis.Memory Throughput": 294.42,
+        "Occupancy.Achieved Occupancy": 25.87,
+        "Scheduler Statistics.No Eligible": 87.52,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      }
+    },
+    "strategy_title": "Switch .ca to .cg cache modifier for streaming gather kernels",
+    "strategy_description": "For streaming gather/permute kernels with 0% L1 hit rate and CPIStall L1TEX stalls as the dominant bottleneck, switching tl.load cache_modifier from '.ca' (cache in L1 and L2) to '.cg' (bypass L1, cache in L2 only) reduces warp cycles per issued instruction (36.4 \u2192 34.6 cycles) and yields a modest speedup. The mechanism is that '.ca' pollutes the L1 cache with data that will never be reused (0% L1 hit rate), adding unnecessary L1 fill traffic; '.cg' bypasses L1 entirely, reducing L1 pressure and slightly improving effective memory latency for the L2-resident working set. Note that the per-kernel duration metric (2.75 \u00b5s) was unchanged in the profiling data, suggesting the 1.24x system-level speedup may reflect reduced L1 eviction pressure benefiting adjacent kernels rather than this kernel alone.",
+    "slow_pseudocode": "# Streaming gather with .ca: L1 polluted, 0% hit rate\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    # persistent while-loop body\n    xindex = tile_id * XBLOCK + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + strided_gather_idx(xindex), xmask,\n                   cache_modifier='.ca')  # caches in L1 AND L2\n    tl.store(out_ptr + xindex, tmp0, xmask)",
+    "fast_pseudocode": "# Streaming gather with .cg: bypass L1, cache only in L2\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    # persistent while-loop body\n    xindex = tile_id * XBLOCK + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + strided_gather_idx(xindex), xmask,\n                   cache_modifier='.cg')  # bypass L1, cache in L2 only\n    tl.store(out_ptr + xindex, tmp0, xmask)",
+    "applicable_when": "Triton load with cache_modifier='.ca' where L1/TEX Hit Rate is 0% (or near 0%), CPIStall L1TEX stall is the dominant bottleneck (>30% of warp cycles), and the access pattern is a streaming gather/permute with no temporal reuse across tiles (strided indices like x0 + stride*x2 + stride2*x1). Switching to '.cg' avoids polluting L1 with non-reusable data.",
+    "do_not_apply_when": "L1 hit rate is non-trivial (>5%) \u2014 in that case L1 caching is providing real benefit and switching to '.cg' would increase effective memory latency. Also avoid when the kernel uses shared memory tiling that relies on L1 for intra-block reuse. Do not apply when the kernel is already using '.cg' or '.cs' (streaming) modifiers.",
+    "framework_notes": "Triton-specific: cache_modifier='.ca' maps to PTX ld.global.ca (cache at all levels including L1); '.cg' maps to PTX ld.global.cg (cache in L2 only, bypass L1). On Hopper/Ampere, '.cs' (streaming, evict-first) is another option for pure streaming patterns. The speedup here (1.24x system-level) was larger than the per-kernel profiling improvement (Warp Cycles Per Issued Instruction: 36.4\u219234.6, ~5%) suggests, indicating cross-kernel L1 cache pressure relief may be a significant contributor."
+  },
+  {
+    "item_id": "exp_remove_persistent_loop_simple_tile_grid_lambda_005",
+    "iteration": 5,
+    "speedup": 1.1032,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "remove_broken_persistent_loop_and_fix_grid_lambda",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 2.75,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4064.0,
+        "Occupancy.Achieved Occupancy": 25.72,
+        "Scheduler Statistics.No Eligible": 87.37,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 36.41,
+        "Compute Workload Analysis.Executed Ipc Active": 0.44,
+        "Compute Workload Analysis.Issue Slots Busy": 11.65,
+        "Memory Workload Analysis.Memory Throughput": 294.42,
+        "Instruction Statistics.Executed Instructions": 81952.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.1,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4618.0,
+        "Occupancy.Achieved Occupancy": 46.68,
+        "Scheduler Statistics.No Eligible": 71.64,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.03,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.77,
+        "Compute Workload Analysis.Executed Ipc Active": 1.02,
+        "Compute Workload Analysis.Issue Slots Busy": 27.34,
+        "Memory Workload Analysis.Memory Throughput": 260.95,
+        "Instruction Statistics.Executed Instructions": 214336.0
+      }
+    },
+    "strategy_title": "Remove broken persistent loop; fix autotune grid lambda",
+    "strategy_description": "When a Triton kernel uses a persistent while-loop but the launch grid is hardcoded to cdiv(N, fixed_block) rather than num_sms, the loop runs 0\u20131 iterations per CTA and is a near-no-op that suppresses instruction throughput (Issue Slots Busy ~11%, Executed IPC Active ~0.44). Removing the while-loop and reverting to a simple single-tile-per-CTA body, combined with fixing the grid lambda to use meta['XBLOCK'], improved Issue Slots Busy from 11.7% to 27.3% and Executed IPC Active from 0.44 to 1.02, yielding a 1.10x speedup. The causal mechanism is that the broken persistent loop added dead branch overhead while preventing the autotuner from reducing the grid with larger XBLOCK tiles; the fixed single-shot pattern allows the autotuner to select larger tiles that improve per-CTA memory-level parallelism.",
+    "slow_pseudocode": "# Broken persistent loop: grid = cdiv(N, 128) = 1576, NOT num_sms=132\n# tl.num_programs(0) returns 1576, so while-loop runs exactly 1 iteration per CTA\n@triton.autotune(configs=[...], key=['xnumel'])\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    xnumel = 201728  # hardcoded inside kernel\n    pid = tl.program_id(0)\n    num_sm = tl.num_programs(0)  # BUG: returns 1576, not 132\n    num_tiles = tl.cdiv(xnumel, XBLOCK)\n    tile_id = pid\n    while tile_id < num_tiles:  # runs exactly 1 time \u2014 no-op overhead\n        xoffset = tile_id * XBLOCK\n        xindex = xoffset + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask, cache_modifier='.ca')\n        tl.store(out_ptr + xindex, tmp0, xmask)\n        tile_id += num_sm\n\ngrid = (triton.cdiv(xnumel, 128),)  # BUG: hardcoded 128, ignores XBLOCK\nkernel[grid](in_ptr, out_ptr, 201728)",
+    "fast_pseudocode": "# Simple single-shot tile: grid uses meta['XBLOCK'] from autotuner\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 256},  num_warps=4),\n        triton.Config({'XBLOCK': 256},  num_warps=8),\n        triton.Config({'XBLOCK': 512},  num_warps=4),\n        triton.Config({'XBLOCK': 512},  num_warps=8),\n        triton.Config({'XBLOCK': 512},  num_warps=16),\n        triton.Config({'XBLOCK': 1024}, num_warps=4),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=16),\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 2048}, num_warps=16),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # simple single-shot\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr + strided_idx(xindex), xmask)  # no cache_modifier\n    tl.store(out_ptr + xindex, tmp0, xmask)\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # FIXED\nkernel[grid](in_ptr, out_ptr, xnumel)  # no explicit XBLOCK kwarg",
+    "applicable_when": "Triton kernel with a persistent while-loop where tl.num_programs(0) is used as the tile stride but the launch grid is NOT pinned to num_sms (grid equals cdiv(N, fixed_block) instead), causing the loop to run exactly 1 iteration per CTA. Symptoms: Issue Slots Busy < 15%, Executed IPC Active < 0.5, No Eligible > 85%, despite theoretical 100% occupancy. Grid lambda at call site is a static tuple hardcoded to a fixed block size rather than meta['XBLOCK'].",
+    "do_not_apply_when": "Persistent while-loop is correctly launched with grid=(num_sms,) and each CTA genuinely processes multiple tiles \u2014 in that case the persistent pattern is working as intended and removing it would increase grid overhead and reduce memory throughput. Also do not apply when the kernel is already a simple single-tile-per-CTA pattern with a correct grid lambda.",
+    "framework_notes": "Triton-specific: tl.num_programs(0) returns the actual grid dimension-0 size at runtime. If the grid is cdiv(N, 128)=1576 rather than num_sms=132, the persistent stride is 1576 and the while-loop is a near-no-op. The grid lambda must be `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` \u2014 not a static tuple \u2014 so the autotuner can shrink the grid when selecting larger XBLOCK values. The explicit XBLOCK kwarg must be removed from the kernel call site when using @triton.autotune. Removing the hardcoded `xnumel = 201728` inside the kernel body and passing it as a runtime argument is also required for correctness across all XBLOCK configs."
+  }
+]

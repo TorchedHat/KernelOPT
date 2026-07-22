@@ -1,0 +1,220 @@
+[
+  {
+    "item_id": "b4385a1f",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_matrix_load_and_reduce_tile_size_for_register_pressure",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + TheoreticalOccupancy + UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_matrix_load_and_reduce_tile_size_for_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_matrix_load_and_reduce_tile_size_for_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel hits 255 registers/thread (hardware maximum), limiting the SM to only 2 active blocks (8 warps, 12.5% occupancy). The 128x128 FP32 accumulator tile requires 128x128/128_threads = 128 registers/thread just for acc[], leaving no room for other live values and causing heavy register spills to L1TEX local memory (top NCU rule: uncoalesced local loads/stores, 59% speedup each). Additionally, the B matrix load has a structural bug: the code computes xindex = idx_n + 768*idx_m (wrong for stride_bk=1, stride_bn=768) then wraps it in tl.broadcast_to(idx_m + 768*idx_n, ...) which has the correct address formula but is applied via a broken double-broadcast. This bug has caused all prior correctness failures (max_diff ~160-220). The fix: (1) correct the B load to use B_ptr + k + 768*n directly without broadcast_to, and (2) reduce BLOCK_M/BLOCK_N from 128 to 64 to cut accumulator register count by 4x, enabling 4-8x more warps/SM.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a7f3c91e",
+    "iteration": 3,
+    "speedup": 1.1132,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tma_loads_coalesced_b_via_block_ptr",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.24,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6353814.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 40.58,
+        "GPU Speed Of Light Throughput.Memory Throughput": 59.24,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 7.12,
+        "Memory Workload Analysis.L2 Hit Rate": 92.86,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.74,
+        "Compute Workload Analysis.Issue Slots Busy": 41.65,
+        "Scheduler Statistics.No Eligible": 58.28,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.74
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.8,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5704550.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 45.35,
+        "GPU Speed Of Light Throughput.Memory Throughput": 63.22,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 35.18,
+        "Memory Workload Analysis.L2 Hit Rate": 84.28,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.24,
+        "Compute Workload Analysis.Issue Slots Busy": 46.7,
+        "Scheduler Statistics.No Eligible": 53.32,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.77
+      }
+    },
+    "strategy_title": "Load B Transposed via tl.trans to Coalesce Strided GEMM Access",
+    "strategy_description": "When a GEMM kernel loads the B matrix with a stride-N access pattern (only 1/32 bytes per sector utilized, triggering MemoryCacheAccessPattern and UncoalescedSharedAccess NCU rules), reloading B as [BLOCK_N, BLOCK_K] (the contiguous layout) and then calling tl.trans() to get [BLOCK_K, BLOCK_N] for tl.dot eliminates the strided access. This change improved L1/TEX hit rate from 7.1% to 35.2%, reduced dynamic shared memory per block from 65 KB to 33 KB, cut elapsed cycles by ~10%, and improved compute throughput from 40.6% to 45.4%. Simultaneously reducing BLOCK_K from 32 to 16 further reduces register pressure and K-loop body live values.",
+    "slow_pseudocode": "# B loaded as [BLOCK_K, BLOCK_N] with stride-N uncoalesced access\nBLOCK_K = 32\nb_offs_k = offs_k[:, None] + k_start  # [BLOCK_K, 1]\nb_offs_n = offs_b_n[None, :]           # [1, BLOCK_N]\nb = tl.load(B + b_offs_k * stride_bk + b_offs_n * stride_bn)  # stride-768 uncoalesced\nacc += tl.dot(a, b)",
+    "fast_pseudocode": "# B loaded as [BLOCK_N, BLOCK_K] (contiguous K dim), then transposed\nBLOCK_K = 16  # reduced from 32 to cut register pressure\nb_offs_n_col = offs_b_n[:, None]           # [BLOCK_N, 1]\nb_offs_k_row = offs_k[None, :] + k_start  # [1, BLOCK_K]\nb_T = tl.load(B + b_offs_n_col * stride_bn + b_offs_k_row * stride_bk)  # [BLOCK_N, BLOCK_K] coalesced\nb = tl.trans(b_T)  # -> [BLOCK_K, BLOCK_N] for tl.dot\nacc += tl.dot(a, b)",
+    "applicable_when": "Triton GEMM kernel where the B matrix has stride_bk=1 (K is the fast/column dimension) and stride_bn=N (N is the slow/row dimension), but the load pattern iterates over K in the outer index and N in the inner index, causing stride-N uncoalesced access. NCU signals: MemoryCacheAccessPattern reporting only 1/32 bytes per sector utilized for local loads/stores, UncoalescedSharedAccess with >50% excessive wavefronts, SharedMemoryConflicts with >5x average bank conflict way, and L1/TEX Hit Rate below 10%.",
+    "do_not_apply_when": "B matrix is already loaded in a coalesced pattern (L1/TEX hit rate >50%, bytes-per-sector utilization near 32/32). Also avoid if the B matrix layout has stride_bn=1 (N is the fast dimension), as the transpose would then create the uncoalesced access instead of fixing it. Do not apply if tl.trans causes compiler issues with the specific BLOCK_N/BLOCK_K shapes used.",
+    "framework_notes": "tl.trans() in Triton transposes a 2D tensor tile. The key insight is that for a row-major B matrix with shape (K, N) and strides (1, K), loading as [BLOCK_N, BLOCK_K] (iterating K in the fast dimension per row) gives contiguous access, then tl.trans() reshapes to [BLOCK_K, BLOCK_N] for tl.dot(a=[BLOCK_M, BLOCK_K], b=[BLOCK_K, BLOCK_N]). Equivalent in CUDA would be loading B^T tiles into shared memory with coalesced global loads."
+  },
+  {
+    "item_id": "b28d4e8e",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_accumulator_tile_to_cut_register_spills",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (local loads/stores) + TheoreticalOccupancy + SharedMemoryConflicts + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_accumulator_tile_to_cut_register_spills \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_accumulator_tile_to_cut_register_spills' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128 with 128 threads (4 warps). Each thread owns (128x128)/128 = 128 FP32 accumulator elements = 128 registers just for acc[], plus index/pointer temporaries, saturating all 255 hardware registers. This forces the compiler to spill to local memory (L1TEX), which is the primary source of the top NCU rules: uncoalesced local loads AND stores (61.24% speedup each). The register cap limits the SM to only 2 active blocks (8 warps, 12.5% occupancy) vs the hardware maximum of 16 blocks (64 warps). With only 1.98 active warps/scheduler and 0.77 eligible warps/scheduler, the scheduler cannot hide latency and sits idle 53.32% of cycles. Reducing BLOCK_M and BLOCK_N from 128 to 64 cuts the accumulator register count from 128 to 32 per thread (4x reduction), freeing ~96 registers/thread. This should allow 4-8x more blocks per SM, dramatically improving latency hiding. The current B-matrix load (tl.trans pattern) is already correct and must be preserved exactly.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "8db67e20",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_for_register_pressure_and_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + MemoryCacheAccessPattern + UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_for_register_pressure_and_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_for_register_pressure_and_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128, BLOCK_K=32 with 128 threads (4 warps). Each thread owns (128x128)/128 = 128 fp32 accumulator values, consuming ~128 registers just for acc[], plus index/pointer temporaries, driving the compiler to the hardware maximum of 255 registers/thread. This limits the SM to only 2 active blocks (8 warps), giving 12.5% theoretical occupancy. With only 1.97 active warps/scheduler and 0.74 eligible warps/scheduler, 59.8% of scheduler cycles have no eligible warp to issue. Reducing BLOCK_M and BLOCK_N from 128 to 64 cuts the accumulator register count by 4x (from 128 to 32 per thread), freeing enough registers to allow 4-8x more warps per SM. Additionally, the B matrix load pattern (stride-768 in N dimension) causes uncoalesced L1TEX access (1/32 bytes per sector utilized) and 5.3-way shared memory bank conflicts. Loading B as [BLOCK_N, BLOCK_K] (contiguous in K) then calling tl.trans() eliminates the strided access pattern. Memory item a7f3c91e confirms the tl.trans() approach achieved 1.11x speedup and the current kernel still shows the same uncoalesced signals.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "5a10f4b3",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tma_loads_via_make_block_ptr_for_a_and_b",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + UncoalescedSharedAccess + SharedMemoryConflicts + TheoreticalOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tma_loads_via_make_block_ptr_for_a_and_b \u2014 correctness failure",
+    "strategy_description": "Plan 'tma_loads_via_make_block_ptr_for_a_and_b' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=2.309e+02 > atol=0.001\nseed=42 output[0]: max_diff=2.151e+02 > atol=0.001\nseed=1337 output[0]: max_diff=2.452e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128, BLOCK_K=32 with 128 threads (4 warps). Each thread owns (128x128)/128=128 FP32 accumulator elements, consuming ~128 registers just for acc[], driving total register usage to the hardware maximum of 255 registers/thread. This limits the SM to only 2 active blocks (8 warps) \u2014 12.5% theoretical occupancy \u2014 leaving 87.5% of SM capacity idle and causing 59.8% of scheduler cycles to have no eligible warp. The B matrix load is additionally uncoalesced: arg_B has actual strides (768, 1) (row-major [K=768, N=768]), but the kernel hardcodes stride_bk=1 and stride_bn=768 (inverted), causing stride-768 strided access with only 1/32 bytes per sector utilized. This triggers MemoryCacheAccessPattern (59.5% speedup), UncoalescedSharedAccess (54.6%), and SharedMemoryConflicts (5.3-way average). The fix is to replace all manual pointer arithmetic with tl.make_block_ptr() for both A and B matrices. tl.make_block_ptr uses TMA hardware on Hopper to offload address generation, enables async bulk copies, and critically allows the compiler to correctly infer strides from the block pointer descriptor \u2014 fixing the B stride inversion bug. For B, the block pointer is constructed with shape=[K,N], strides=[stride_bk_actual=768, stride_bn_actual=1], and the tile is advanced along K with tl.advance(). This produces coalesced N-dimension access per K-row. Simultaneously, reducing BLOCK_K from 32 to 16 cuts K-loop body live values and register pressure.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=2.309e+02 > atol=0.001\nseed=42 output[0]: max_diff=2.151e+02 > atol=0.001\nseed=1337 output[0]: max_diff=2.452e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "e1cf3f1b",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_accumulator_tile_size_to_eliminate_register_spills",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern (local loads/stores) + TheoreticalOccupancy + SharedMemoryConflicts + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_accumulator_tile_size_to_eliminate_register_spills \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_accumulator_tile_size_to_eliminate_register_spills' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128 with 128 threads (4 warps). Each thread owns (128x128)/128 = 128 FP32 accumulator values, consuming ~128 registers just for acc[], saturating the 255-register hardware maximum. This forces the Triton compiler to spill accumulator values to L1TEX local memory, which is the direct cause of the top two NCU rules: uncoalesced local loads AND stores (61.2% speedup each). These spills are strided (one element per 32-byte sector = 1/32 utilization), matching the NCU description exactly. The register cap limits the SM to only 2 active blocks (8 warps, 12.5% occupancy) vs the hardware maximum of 64 warps. With only 1.98 active warps/scheduler and 0.77 eligible warps/scheduler, the scheduler sits idle 53.3% of cycles and cannot hide memory latency. All prior tile-reduction attempts failed correctness because they were bundled with B-load changes. The CURRENT kernel already has the correct B-load (tl.trans pattern, confirmed working by memory item a7f3c91e). Reducing BLOCK_M/BLOCK_N from 128 to 64 in isolation \u2014 without touching the B-load \u2014 should be safe and will cut accumulator registers from 128 to 32/thread (4x reduction), allowing 4-8x more blocks per SM.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "39f0164b",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_size_to_eliminate_register_spills_and_raise_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + TheoreticalOccupancy + UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_size_to_eliminate_register_spills_and_raise_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_size_to_eliminate_register_spills_and_raise_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128 with 128 threads (4 warps). Each thread owns (128x128)/128 = 128 FP32 accumulator values, consuming ~128 registers just for acc[], plus index/pointer temporaries, driving the compiler to the hardware maximum of 255 registers/thread. Block Limit Registers=2 confirms only 2 blocks fit per SM -> 8 warps -> 12.5% theoretical occupancy. The register spills to L1TEX local memory are the primary source of the MemoryCacheAccessPattern rule (61% speedup, only 1/32 bytes per sector utilized for local loads/stores). Reducing BLOCK_M and BLOCK_N from 128->64 cuts the accumulator tile from 128x128 to 64x64, reducing per-thread accumulator registers from 128 to 32 (a 4x reduction). This should allow Block Limit Registers to rise from 2->8, enabling 32 warps/SM and ~50% theoretical occupancy. The current kernel already has the correct B-load pattern (tl.trans fix applied, item a7f3c91e). Prior correctness failures (items 8db67e20, b4385a1f, 8f13863b) were caused by stride inversion bugs and broadcast errors that are now fixed in the current kernel -- the tile reduction itself is mathematically correct. The grid must be scaled up from 3072 to (65536/64)x(768/64) = 1024x12 = 12288 to cover the same MxN output.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.610e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.669e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.577e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c3f2a8d1",
+    "iteration": 5,
+    "speedup": 1.1016,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "tma_loads_a_with_block_ptr_software_pipelining",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SharedMemoryConflicts + UncoalescedSharedAccess + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.8,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5701161.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 45.32,
+        "GPU Speed Of Light Throughput.Memory Throughput": 63.18,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 35.18,
+        "Memory Workload Analysis.L2 Hit Rate": 84.24,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.24,
+        "Scheduler Statistics.No Eligible": 53.28,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.77,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.37
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.84,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5761287.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 44.82,
+        "GPU Speed Of Light Throughput.Memory Throughput": 62.07,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 26.92,
+        "Memory Workload Analysis.L2 Hit Rate": 84.44,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.29,
+        "Scheduler Statistics.No Eligible": 53.88,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.76,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.34
+      }
+    },
+    "strategy_title": "A-Matrix tl.make_block_ptr Alone Gives Marginal Gain",
+    "strategy_description": "Replacing manual A-matrix pointer arithmetic with tl.make_block_ptr() and tl.advance() in the K-loop yielded a modest 1.10x speedup, but the profiling metrics show almost no meaningful change: elapsed cycles actually increased slightly (5.70M \u2192 5.76M), L1/TEX hit rate dropped (35.2% \u2192 26.9%), and all scheduler/occupancy metrics remained essentially flat. The speedup likely comes from wall-clock measurement variance rather than a genuine structural improvement. When the kernel is already register-saturated at 255 registers/thread (occupancy capped at 12.5%), switching the A load to tl.make_block_ptr without also reducing tile sizes or register pressure does not enable software pipelining to take effect \u2014 the SMEM budget and register file are already fully committed.",
+    "slow_pseudocode": "# Manual A pointer arithmetic in K-loop\noffs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)\noffs_k = tl.arange(0, BLOCK_K)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    k_start = k_idx * BLOCK_K\n    a_offs_m = offs_a_m[:, None]\n    a_offs_k = offs_k[None, :] + k_start\n    a = tl.load(A + a_offs_m * stride_am + a_offs_k * stride_ak)\n    ...",
+    "fast_pseudocode": "# tl.make_block_ptr for A with tl.advance in K-loop\na_block_ptr = tl.make_block_ptr(\n    base=A, shape=(M, K), strides=(stride_am, stride_ak),\n    offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0)\n)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')\n    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))\n    ...",
+    "applicable_when": "Triton GEMM kernel where the A matrix is loaded via manual pointer arithmetic and the kernel is NOT register-saturated (registers/thread < 200), allowing software pipelining (num_stages >= 2) to allocate additional SMEM buffers. NCU signals: CPIStall from MIO/shared-memory stalls, IssueSlotUtilization below 50%, and eligible warps/scheduler below 1.0.",
+    "do_not_apply_when": "Kernel is already at 255 registers/thread (hardware maximum) and theoretical occupancy is capped at 12.5% or below. In this regime, tl.make_block_ptr alone cannot enable effective software pipelining because there is no register or SMEM headroom for additional pipeline stages. The L1/TEX hit rate may actually decrease (35% \u2192 27% observed here) as the block pointer access pattern changes cache utilization. Also avoid if the B matrix uses a tl.trans() pattern that must remain unchanged \u2014 the A-only block pointer change provides insufficient benefit to justify the code complexity.",
+    "framework_notes": "In Triton, tl.make_block_ptr() with order=(1,0) specifies that dimension index 1 (K) is the fastest-varying, matching row-major A layout with stride_ak=1. The boundary_check=(0,1) parameter handles M and K boundary conditions safely. num_stages at the call site controls software pipeline depth, but only takes effect if register and SMEM budgets allow it \u2014 at 255 registers/thread this budget is exhausted."
+  }
+]

@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "aade1a47",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tma_loads_with_block_ptr_and_reduced_tile",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + SharedMemoryConflicts + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tma_loads_with_block_ptr_and_reduced_tile \u2014 correctness failure",
+    "strategy_description": "Plan 'tma_loads_with_block_ptr_and_reduced_tile' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=128, BLOCK_N=128, BLOCK_K=32 with ALLOW_TF32=False (full FP32 accumulation). The 128x128 accumulator tile exhausts all 255 registers/thread, capping occupancy at 12.5% (2 blocks/SM) and leaving 58% of scheduler cycles idle. The B-matrix load uses a complex broadcast expression causing uncoalesced local loads/stores (1/32 bytes utilized) and 5.3-way shared memory bank conflicts. On Hopper H200, replacing scalar pointer arithmetic with tl.make_block_ptr + tl.load enables TMA hardware descriptors, offloads address generation from SMs, and enables asynchronous bulk copies. Reducing BLOCK_M and BLOCK_N to 64 halves the accumulator register footprint, freeing registers to raise occupancy from 12.5% to ~50%.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.664e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.697e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.604e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_tf32_smem_occupancy_regression",
+    "iteration": 1,
+    "speedup": 0.1591,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_with_larger_block_k",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 16.46,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 41.56,
+        "GPU Speed Of Light Throughput.Memory Throughput": 60.65,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Scheduler Statistics.No Eligible": 58.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.76
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 103.47,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 8.07,
+        "GPU Speed Of Light Throughput.Memory Throughput": 16.49,
+        "Occupancy.Theoretical Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 1.0,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 131.07,
+        "Scheduler Statistics.No Eligible": 91.87,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.33
+      }
+    },
+    "strategy_title": "Doubling BLOCK_K Doubles Shared Memory, Kills Occupancy",
+    "strategy_description": "Increasing BLOCK_K from 32 to 64 in a Triton GEMM kernel doubled the dynamic shared memory per block from ~65 KB to ~131 KB, which reduced Block Limit Shared Mem from 3 to 1 block per SM. This halved theoretical occupancy from 12.5% to 6.25% and caused Warp Cycles Per Issued Instruction to jump from 4.76 to 12.33, indicating severe latency-hiding loss. The net effect was a 6.3x slowdown despite the intent to reduce loop iterations, because the occupancy collapse far outweighed any loop-overhead savings. When a kernel is already register-bound (255 registers/thread, Block Limit Registers=2), any change that further reduces Block Limit Shared Mem below the register-imposed limit will cause catastrophic occupancy regression.",
+    "slow_pseudocode": "# BLOCK_K = 32 -> dynamic_smem = 65 KB -> Block Limit Shared Mem = 3\nfor k in range(0, K, BLOCK_K=32):\n    a = tl.load(A_ptr + k_offsets)  # shape [BLOCK_M, 32]\n    b = tl.load(B_ptr + k_offsets)  # shape [32, BLOCK_N]\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# BLOCK_K = 64 -> dynamic_smem = 131 KB -> Block Limit Shared Mem = 1 (REGRESSION)\nfor k in range(0, K, BLOCK_K=64):\n    a = tl.load(A_ptr + k_offsets)  # shape [BLOCK_M, 64]\n    b = tl.load(B_ptr + k_offsets)  # shape [64, BLOCK_N]\n    acc += tl.dot(a, b, allow_tf32=False)  # ALLOW_TF32 was NOT changed in actual diff",
+    "applicable_when": "Never applicable when the kernel is already at the shared-memory occupancy limit (Block Limit Shared Mem <= Block Limit Registers). Increasing tile size in this regime always reduces occupancy further.",
+    "do_not_apply_when": "Kernel has Block Limit Shared Mem <= Block Limit Registers (shared memory is already the binding occupancy constraint, or tied with registers). In this case, any increase to BLOCK_M, BLOCK_N, or BLOCK_K that grows shared memory allocation will reduce occupancy and increase latency stalls. Also: the actual diff did NOT change ALLOW_TF32 (it remained False), so TF32 Tensor Cores were never actually enabled \u2014 the plan was partially mis-implemented.",
+    "framework_notes": "In Triton, dynamic shared memory per block scales as (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N) * dtype_bytes for double-buffered tiles. Doubling BLOCK_K doubles this allocation. Always check Block Limit Shared Mem vs Block Limit Registers before increasing tile dimensions. The diff also shows ALLOW_TF32 was NOT changed from False to True in the actual kernel code (only USE_FAST_ACCUM changed), meaning the TF32 strategy was never actually tested \u2014 the regression is purely from the BLOCK_K increase."
+  }
+]

@@ -1,0 +1,149 @@
+[
+  {
+    "item_id": "bb18c417",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.067e-01 > atol=0.001\nseed=42 output[0]: max_diff=9.353e-02 > atol=0.001\nseed=1337 output[0]: max_diff=1.039e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel achieves only 9% of FP32 peak and 12.68% SM throughput because ALLOW_TF32=False forces tl.dot to use FP32 FFMA units instead of Tensor Cores. Enabling TF32 routes the dot product through Tensor Core MMA units which deliver ~8x the throughput of scalar FFMA. The workload is a fused convolution GEMM (M=490, N=256, K=832) with a bias epilogue. TF32 precision (10-bit mantissa) is appropriate here since this is a neural network convolution where small numerical differences are acceptable. The kernel is severely underutilized (6.25% occupancy, 0.32 waves/SM) and compute-starved; Tensor Core utilization will directly address the HighPipeUtilization bottleneck. Autotuning tile sizes simultaneously addresses the secondary 12-way shared memory bank conflict bottleneck (72.41% speedup potential).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.067e-01 > atol=0.001\nseed=42 output[0]: max_diff=9.353e-02 > atol=0.001\nseed=1337 output[0]: max_diff=1.039e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a7f3c291",
+    "iteration": 2,
+    "speedup": 0.3099,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_tile_sizes_to_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 48.35,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 72456.0,
+        "Memory Workload Analysis.Mem Busy": 81.65,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.35,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Instruction Statistics.Executed Instructions": 4794816.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 159.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 238455.0,
+        "Memory Workload Analysis.Mem Busy": 92.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.47,
+        "Occupancy.Achieved Occupancy": 12.5,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Launch Statistics.Registers Per Thread": 100.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Instruction Statistics.Executed Instructions": 16562624.0
+      }
+    },
+    "strategy_title": "Larger Tile Sizes Worsen Bank Conflicts and Register Pressure",
+    "strategy_description": "Increasing BLOCK_M/BLOCK_N/BLOCK_K from 32 to 64 in a Triton GEMM kernel that already has severe shared memory bank conflicts (12-way) caused a 3.2x regression. The larger tiles increased register pressure from 64 to 100 registers/thread, cutting theoretical occupancy from 50% to 25% and Block Limit Registers from 8 to 2. Critically, the bank conflict way count worsened from 12-way to 17-way and total excessive wavefronts grew from 5.96M to 23.85M, because the larger shared memory tiles amplified the conflicting access pattern rather than resolving it. When the root cause of bank conflicts is a non-power-of-2 stride in the problem dimensions (e.g., stride_bn=832, 832 mod 32 = 0), simply increasing tile sizes does not change the bank mapping \u2014 it only increases the total number of conflicting accesses while also inflating register usage and reducing occupancy.",
+    "slow_pseudocode": "# Before: small tiles, moderate bank conflicts\nBLOCK_M = 32; BLOCK_N = 32; BLOCK_K = 32\n# 12-way bank conflicts, 5.96M excessive wavefronts\n# 64 regs/thread, 50% theoretical occupancy\n# Duration: 48.35us",
+    "fast_pseudocode": "# After: larger tiles, WORSE bank conflicts\nBLOCK_M = 64; BLOCK_N = 64; BLOCK_K = 64\n# 17-way bank conflicts, 23.85M excessive wavefronts\n# 100 regs/thread, 25% theoretical occupancy\n# Duration: 159.04us (3.2x slower)",
+    "applicable_when": "Never applicable as a fix for shared memory bank conflicts caused by non-power-of-2 strides. This is a negative example to prevent future attempts.",
+    "do_not_apply_when": "Do NOT increase GEMM tile sizes (BLOCK_M/BLOCK_N/BLOCK_K) to fix shared memory bank conflicts when the conflict root cause is a non-power-of-2 problem stride (e.g., stride_bn=832 where 832 mod 32 = 0). Larger tiles amplify the conflict count proportionally and simultaneously increase register pressure, reducing theoretical occupancy. The correct fix for stride-induced bank conflicts is padding the shared memory allocation (add 1-4 elements per row) or restructuring the data layout, not enlarging tiles.",
+    "framework_notes": "In Triton, shared memory bank conflicts from non-power-of-2 strides cannot be resolved by tile size changes alone. Shared memory padding (e.g., allocating BLOCK_K+1 columns instead of BLOCK_K) is the standard fix. This is equivalent to the CUDA shared memory padding idiom: __shared__ float smem[BLOCK_M][BLOCK_K+1]."
+  },
+  {
+    "item_id": "a3f7d291",
+    "iteration": 2,
+    "speedup": 0.5345,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_eliminate_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 48.35,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 72456.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 12.58,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 88.28,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.35,
+        "Instruction Statistics.Executed Instructions": 4794816.0,
+        "Scheduler Statistics.No Eligible": 86.4
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 92.19,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 138241.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 21.96,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 90.88,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.27,
+        "Instruction Statistics.Executed Instructions": 15994592.0,
+        "Scheduler Statistics.No Eligible": 76.63
+      }
+    },
+    "strategy_title": "Larger Tile Sizes Cause Register/SMEM Pressure and Regression",
+    "strategy_description": "Increasing BLOCK_M and BLOCK_N from 32 to 64 (while reducing BLOCK_K from 128 to 32) caused registers per thread to double from 64 to 128 and dynamic shared memory per block to double from 16 to 33 KB. This halved theoretical occupancy (50%\u219225%) and reduced Block Limit Registers from 8 to 4 blocks/SM. Although warp cycles per issued instruction improved (7.35\u21924.27) and SM throughput nearly doubled (12.58%\u219221.96%), the total executed instruction count exploded 3.3x (4.8M\u219216.0M), causing elapsed cycles to nearly double (72K\u2192138K) and duration to increase from 48 to 92 \u00b5s. The net effect was a 0.53x regression: the larger tiles did more work per block but the problem size (M=490, N=256) is too small to amortize the overhead, and the grid shrank from 128 to fewer tiles, leaving SMs underutilized.",
+    "slow_pseudocode": "# BEFORE: smaller tiles, lower register pressure\nBLOCK_M = 32\nBLOCK_N = 32\nBLOCK_K = 128\n# grid = 128 blocks, 64 regs/thread, 16 KB smem/block\n# Theoretical occupancy: 50%, Duration: 48 \u00b5s",
+    "fast_pseudocode": "# AFTER: larger tiles, higher register/smem pressure\nBLOCK_M = 64\nBLOCK_N = 64\nBLOCK_K = 32\n# grid = fewer blocks, 128 regs/thread, 33 KB smem/block\n# Theoretical occupancy: 25%, Duration: 92 \u00b5s\n# Instruction count 3.3x higher \u2014 net regression",
+    "applicable_when": "Never: this specific change (BLOCK_M/N 32\u219264, BLOCK_K 128\u219232) on small problem sizes (M=490, N=256) causes severe regression due to register pressure doubling and instruction count explosion.",
+    "do_not_apply_when": "Do not increase BLOCK_M/BLOCK_N tile sizes when the problem dimensions are small (M<512, N<512) and registers per thread are already near 64, as doubling tile size doubles register usage, halves theoretical occupancy, and causes instruction count to grow super-linearly relative to the grid size reduction. The bank conflict reduction from smaller BLOCK_K does not compensate when the tile enlargement causes 3x more total instructions.",
+    "framework_notes": "In Triton, increasing BLOCK_M and BLOCK_N constexpr parameters directly increases register file usage per thread. On H200/Hopper with 128 registers/thread, Block Limit Registers drops from 8 to 4 blocks/SM, cutting theoretical occupancy in half. For small GEMM problems, prefer keeping BLOCK_M=BLOCK_N=32 and only tuning BLOCK_K to address bank conflicts."
+  },
+  {
+    "item_id": "c9e2f847",
+    "iteration": 3,
+    "speedup": 0.3099,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "make_block_ptr_to_eliminate_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 49.12,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 73632.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 93.19,
+        "Memory Workload Analysis.Mem Busy": 86.4,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.27,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 88.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Instruction Statistics.Executed Instructions": 4932544.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 159.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 238508.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 97.94,
+        "Memory Workload Analysis.Mem Busy": 93.38,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.36,
+        "Occupancy.Achieved Occupancy": 12.5,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Launch Statistics.Registers Per Thread": 80.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Instruction Statistics.Executed Instructions": 16722368.0
+      }
+    },
+    "strategy_title": "tl.make_block_ptr Does Not Fix Stride-Induced Bank Conflicts",
+    "strategy_description": "Replacing manual pointer arithmetic with tl.make_block_ptr (with order=(1,0) for A and order=(0,1) for B) failed to resolve 17-way shared memory bank conflicts caused by a non-power-of-2 stride (stride_bn=832, 832 mod 32 = 0). The change simultaneously doubled block size from 128 to 256 threads and changed tile sizes (BLOCK_M/N/K from 32/32/128 to 64/64/64), causing executed instructions to explode 3.4x (4.9M to 16.7M), warp cycles per issued instruction to nearly double (7.27 to 14.36), and duration to triple (49 to 159 \u00b5s). The bank conflict way count actually worsened from 12-way to 17-way and excessive wavefronts grew from 6.4M to 23.9M, confirming that tl.make_block_ptr does not introduce the shared memory padding needed to break power-of-2 bank alignment \u2014 the structural fix must be explicit padding of the shared memory buffer dimensions.",
+    "slow_pseudocode": "# Before: manual pointer arithmetic, BLOCK_M=32, BLOCK_N=32, BLOCK_K=128, block_size=128\n# 12-17 way bank conflicts, 6.4M excessive wavefronts\n# Duration: 49us, 4.9M instructions\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak, mask=...)\n    b = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn, mask=...)\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "# After: tl.make_block_ptr, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, block_size=256\n# 17-way bank conflicts (WORSE), 23.9M excessive wavefronts\n# Duration: 159us, 16.7M instructions (3.4x regression)\na_block_ptr = tl.make_block_ptr(base=A, shape=(M,K), strides=(stride_am, stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1,0))\nb_block_ptr = tl.make_block_ptr(base=B, shape=(K,N), strides=(stride_bk, stride_bn),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(0,1))\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = tl.load(a_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(b_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc += tl.dot(a, b)\n    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))\n    b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))",
+    "applicable_when": "Never: tl.make_block_ptr does not resolve shared memory bank conflicts from non-power-of-2 strides. This is a negative example.",
+    "do_not_apply_when": "Do NOT use tl.make_block_ptr as a fix for shared memory bank conflicts caused by non-power-of-2 strides (e.g., stride_bn=832 where 832 mod 32 = 0). The block pointer abstraction does not add padding to shared memory staging buffers \u2014 it only changes how global memory addresses are computed. When combined with tile size increases (e.g., BLOCK_M/N 32\u219264), it amplifies bank conflicts and instruction count simultaneously, causing severe regression. The correct fix is explicit shared memory padding (allocate BLOCK_K+1 or BLOCK_N+4 columns in the smem buffer).",
+    "framework_notes": "In Triton, tl.make_block_ptr with order=(1,0) or order=(0,1) controls the memory traversal order for TMA-style loads but does NOT control shared memory layout or add padding. Bank conflicts from power-of-2 strides require explicit smem dimension padding, which in Triton requires tl.allocate_shared with padded dimensions (e.g., [BLOCK_K, BLOCK_N+4]) \u2014 a feature whose availability depends on the Triton version. The autotune config changes (adding num_warps=2, removing num_warps=8 with num_stages=5) also doubled the selected block size from 128 to 256, compounding the regression."
+  }
+]

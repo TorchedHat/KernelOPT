@@ -1,0 +1,65 @@
+[
+  {
+    "item_id": "exp_triton_autotune_xblock_regression_001",
+    "iteration": 1,
+    "speedup": 0.313,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_via_autotune_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 243.9,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 34.93,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 32.04,
+        "Occupancy.Achieved Occupancy": 43.7,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.46,
+        "Scheduler Statistics.No Eligible": 64.65,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 19.36,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Instruction Statistics.Executed Instructions": 67633152.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 779.3,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 74.42,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 9.89,
+        "Occupancy.Achieved Occupancy": 85.53,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 6.8,
+        "Scheduler Statistics.No Eligible": 25.51,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.29,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Instruction Statistics.Executed Instructions": 456327168.0
+      }
+    },
+    "strategy_title": "Increasing XBLOCK via autotune caused 3.2x regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (1024\u20134096) to a pointwise kernel that was stall-bound on L1TEX latency caused a 3.2x slowdown despite improving occupancy (43.7%\u219285.5%) and issue slot utilization (35%\u219274.6%). The autotune selected a config (XBLOCK=256, num_warps=8) that doubled registers per thread (16\u219232), halving the number of concurrent blocks per SM (Block Limit Registers dropped from 32 to 8), and the grid was not updated to use the lambda form so it remained fixed at the original 128-element grid size \u2014 causing each thread to process far more iterations than intended and inflating executed instructions by 6.75x (67M\u2192456M). The structural anti-pattern is: adding autotune without also updating the grid launch expression to use `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` means the grid stays fixed while XBLOCK grows, causing massive over-computation.",
+    "slow_pseudocode": "# Before: fixed grid, small block, low register pressure\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](arg0, arg1, arg2, xnumel, XBLOCK=128)",
+    "fast_pseudocode": "# Intended after (but grid was NOT updated in actual diff):\n@triton.autotune(configs=[Config({'XBLOCK': 4096}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(...):\n    ...\n# WRONG launch (grid still fixed at 128-element granularity):\ngrid = (triton.cdiv(xnumel, 128),)  # <-- BUG: should be lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](arg0, arg1, arg2, xnumel)  # autotune picks larger XBLOCK but grid is too large",
+    "applicable_when": "Never apply this pattern as implemented; the grid must be updated to a lambda when using autotune with variable XBLOCK.",
+    "do_not_apply_when": "Do not add @triton.autotune with variable XBLOCK without simultaneously changing the grid to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. Also avoid when increasing XBLOCK causes registers per thread to double (e.g., 16\u219232), as this halves Block Limit Registers and may negate occupancy gains from larger blocks.",
+    "framework_notes": "Triton-specific: when using @triton.autotune with XBLOCK as a tunable config key, the grid MUST be a lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. A fixed grid expression like `(triton.cdiv(xnumel, 128),)` will not adapt to the autotuned XBLOCK, causing each thread to loop over far more elements than intended and massively inflating instruction count."
+  },
+  {
+    "item_id": "cac283c0",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "revert_persistent_loop_to_single_tile_cta_pattern",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "revert_persistent_loop_to_single_tile_cta_pattern \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'revert_persistent_loop_to_single_tile_cta_pattern' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel uses a persistent tl.range loop (pid, num_tiles, num_programs) which is confirmed by memory item exp_triton_persistent_tile_scheduling_regression_001 to have caused a regression from ~244us to 320us. The loop structure doubled registers per thread from 16 to 32, which halved Block Limit Registers from 32 to 16, dropping achieved occupancy from ~44% to 34.8%. With only 0.23 eligible warps/scheduler and 84.6% no-eligible cycles, the GPU cannot hide the 25.3-cycle L1TEX scoreboard stall. Removing the tl.range persistent loop and reverting to a single-tile-per-CTA pattern (xoffset = tl.program_id(0) * XBLOCK) will restore 16 registers/thread, recover Block Limit Registers to 32, and allow the scheduler to hide L1TEX latency with more concurrent warps. The autotune decorator and lambda grid must be retained for correctness.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  }
+]

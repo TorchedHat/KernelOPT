@@ -1,0 +1,44 @@
+[
+  {
+    "item_id": "triton_autotune_tile_size_reduce_strided_l1tex_stall_001",
+    "iteration": 1,
+    "speedup": 1.4655,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_size_to_reduce_strided_l1tex_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 87.33,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 39.13,
+        "Memory Workload Analysis.Mem Busy": 74.27,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 42.7,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.93,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.97,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 49.09,
+        "Launch Statistics.Registers Per Thread": 56.0,
+        "GPU Speed Of Light Throughput.Duration": 15.52
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 70.63,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 54.04,
+        "Memory Workload Analysis.Mem Busy": 55.37,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 72.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.08,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.7,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 26.68,
+        "Launch Statistics.Registers Per Thread": 96.0,
+        "GPU Speed Of Light Throughput.Duration": 10.59
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes to Reduce Strided L1TEX Pressure",
+    "strategy_description": "When a Triton kernel has a 2D tile (XBLOCK x YBLOCK) and one pointer is accessed with a large stride in the X-thread dimension (e.g., ptr[y + stride*x]), consecutive threads in the X-direction issue widely-separated memory requests, saturating L1/TEX and causing high warp stall cycles (CPIStall on L1TEX). Adding @triton.autotune over XBLOCK/YBLOCK/num_warps lets the runtime select smaller XBLOCK values that reduce the number of strided accesses per thread, dramatically cutting L1/TEX throughput from 87% to 71% and warp cycles per instruction from 16.9 to 6.1. The L1 hit rate improved from 42.7% to 72.2% as smaller tiles fit better in cache, and compute throughput rose from 39% to 54%, yielding a 1.47x speedup despite lower occupancy (49% \u2192 27%).",
+    "slow_pseudocode": "# Fixed tile: XBLOCK=128, YBLOCK=8, num_warps=4\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    # Large-stride access: consecutive x-threads stride by 16384 elements\n    val = tl.load(ptr + (yindex + large_stride * xindex))\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned tile: runtime selects best XBLOCK/YBLOCK/num_warps\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 16}, num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 32}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 64}, num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 64}, num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4},  num_warps=8, num_stages=1),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = tl.program_id(1)*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel  # add ymask when ynumel not always divisible\n    xindex = tl.program_id(0)*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    # Same large-stride access; smaller XBLOCK reduces strides per thread\n    val = tl.load(ptr + (yindex + large_stride * xindex), mask=xmask & ymask)\n    ...\n    tl.store(out + ..., val, mask=xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)  # XBLOCK/YBLOCK injected by autotune, not passed explicitly",
+    "applicable_when": "Triton 2D-tiled pointwise kernel where MemoryCacheAccessPattern rule fires (bytes utilized per sector well below 32), L1/TEX Cache Throughput >75%, CPIStall on L1TEX accounts for >40% of warp stall cycles, and at least one pointer is accessed with a stride proportional to the X-block dimension (causing consecutive threads to issue widely-separated loads). Registers per thread are high enough that reducing block size could lower register pressure.",
+    "do_not_apply_when": "Kernel is already compute-bound (Compute SM Throughput >80%) or memory access is already coalesced (bytes per sector near 32). Also avoid if the grid is very small and autotune overhead would dominate, or if occupancy is already the primary bottleneck and reducing block size would make it worse without a compensating cache benefit.",
+    "framework_notes": "Triton-specific: @triton.autotune must be placed above @triton.jit. The grid must be a lambda using META['XBLOCK'] and META['YBLOCK']. XBLOCK/YBLOCK must NOT be passed explicitly at the call site when autotuning. Also add ymask = yindex < ynumel and combine with xmask in all loads/stores when YBLOCK is no longer guaranteed to evenly divide ynumel across all configs."
+  }
+]

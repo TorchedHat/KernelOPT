@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "c7e5dca9",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_with_autotuned_block_sizes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "persistent_tile_scheduling_with_autotuned_block_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'persistent_tile_scheduling_with_autotuned_block_sizes' was applied but failed correctness. Error: Correctness subprocess failed (exit 1):  access was encountered (function ~CUDAEvent)\n[W705 20:57:45.289510946 CUDAEvent.h:57] Warning: CUDA warning: an illegal memory access was encountered (function ~CUDAEvent)\n[W705 20:57:45.289515491 CUDAEvent.h:57] Warning: CUDA warning: an illegal memory acces",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 0.3 waves/SM on a 132-SM H200, achieved occupancy of 25.7% vs 100% theoretical. The root cause is a catastrophically mismatched tile configuration: XBLOCK=128 is applied to xnumel=9, meaning 119 of 128 threads per block are masked out (93% waste). This produces a tiny 640-CTA grid that cannot fill the GPU. The fix is to add @triton.autotune with configurations that use small XBLOCK values (1, 4, 8, 16) matched to the actual xnumel=9 workload, and larger YBLOCK values (32, 64, 128) to increase parallelism and occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1):  access was encountered (function ~CUDAEvent)\n[W705 20:57:45.289510946 CUDAEvent.h:57] Warning: CUDA warning: an illegal memory access was encountered (function",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_xblock_waste_autotune_001",
+    "iteration": 1,
+    "speedup": 1.0827,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "rightsize_xblock_for_small_xnumel_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "Occupancy.Achieved Occupancy": 25.67,
+        "Scheduler Statistics.No Eligible": 65.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.39,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4243.0,
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "Launch Statistics.Waves Per SM": 0.3,
+        "Launch Statistics.Block Size": 128.0,
+        "Memory Workload Analysis.Memory Throughput": 65.42
+      },
+      "key_metric_after": {
+        "Occupancy.Achieved Occupancy": 10.86,
+        "Scheduler Statistics.No Eligible": 77.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3909.0,
+        "GPU Speed Of Light Throughput.Duration": 2.66,
+        "Launch Statistics.Waves Per SM": 0.15,
+        "Launch Statistics.Block Size": 64.0,
+        "Memory Workload Analysis.Memory Throughput": 71.13
+      }
+    },
+    "strategy_title": "Right-size XBLOCK when xnumel << XBLOCK to cut wasted threads",
+    "strategy_description": "When a Triton kernel's xnumel is much smaller than XBLOCK (e.g., xnumel=9 with XBLOCK=128), the vast majority of threads per block are masked out and do no useful work, causing low achieved occupancy and high no-eligible-warp stall cycles. Reducing XBLOCK to the next power-of-2 at or above xnumel (e.g., 16 for xnumel=9) eliminates this thread waste and reduces warp cycles per issued instruction. Adding @triton.autotune over YBLOCK and num_warps lets the runtime find the best tile shape for the remaining dimension, yielding measurable latency reduction even when overall occupancy remains low due to small grid size.",
+    "slow_pseudocode": "# XBLOCK=128, xnumel=9 \u2192 119/128 threads masked, wasted\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]  # no y-guard\n    xmask = xindex < xnumel\n    tmp0 = tl.load(ptr + (x + stride*y), xmask)\n    tl.store(out + (...), tmp0, xmask)\n\ngrid = (cdiv(9, 128), cdiv(5120, 8))  # = (1, 640)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=16, xnumel=9 \u2192 7/16 threads masked; autotune YBLOCK\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  32}, num_warps=2),\n        triton.Config({'XBLOCK': 16, 'YBLOCK':  64}, num_warps=2),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 512}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    ymask = yindex < ynumel  # proper y-guard\n    xmask = xindex < xnumel\n    tmp0 = tl.load(ptr + (x + stride*y), xmask & ymask)\n    tl.store(out + (...), tmp0, xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)  # autotune injects XBLOCK, YBLOCK",
+    "applicable_when": "Triton kernel has xnumel (or ynumel) much smaller than the fixed XBLOCK (or YBLOCK), causing >50% of threads per block to be masked; profiling shows high no-eligible-warp % (>50%), low achieved occupancy (<30%), and IssueSlotUtilization / AchievedOccupancy NCU rules triggered; kernel is a layout transpose or similar elementwise op with a small dimension.",
+    "do_not_apply_when": "xnumel is already close to or larger than XBLOCK (waste <25%); kernel is already occupancy-limited by register or shared memory pressure rather than thread masking; grid is already large enough to saturate SMs (waves_per_sm >= 1.0); autotune overhead would dominate for very short-running kernels called extremely frequently.",
+    "framework_notes": "Triton-specific: @triton.autotune must be placed above @triton.jit. The grid lambda must use META['XBLOCK'] and META['YBLOCK'] instead of hardcoded values. ymask must be a proper boolean tensor (yindex < ynumel) not tl.full([YBLOCK], True) when YBLOCK may exceed ynumel. In CUDA the equivalent is choosing blockDim.x = next_pow2(xnumel) and using __launch_bounds__ or occupancy API."
+  }
+]

@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,20 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=4, num_stages=5),
++        triton.Config({}, num_warps=8, num_stages=5),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_convolution_70(in_ptr0, arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = False
+@@ -16,6 +30,7 @@
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
++    BLOCK_N_PAD : tl.constexpr = 65  # BLOCK_N + 1 = 65; +1 padding eliminates bank conflicts
+     A = arg_A
+     B = arg_B
+ 
+@@ -57,6 +72,10 @@
+     offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # Padded smem indices (compile-time constants for shape)
++    smem_row_idx = tl.arange(0, BLOCK_K)[:, None]   # [BLOCK_K, 1]
++    smem_col_idx = tl.arange(0, BLOCK_N)[None, :]   # [1, BLOCK_N]
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+         a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+@@ -70,11 +89,26 @@
+         xindex = idx_n + 528*idx_m
+         a = tl.load(A + (xindex), mask=a_mask, other=0.0)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 128*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 528*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)), mask=b_mask, other=0.0)
++        # Load B tile: same values as original (b_k_idx_vals*1 + offs_b_n*528)
++        # shape [BLOCK_K, BLOCK_N], coalesced along K dimension
++        b_k_offs = offs_k + (k_idx * BLOCK_K)  # shape [BLOCK_K]
++        b_k_mask = b_k_offs < K                 # shape [BLOCK_K]
++        b_tile = tl.load(
++            B + (b_k_offs[:, None] * 1 + offs_b_n[None, :] * 528),
++            mask=b_k_mask[:, None] & (offs_b_n[None, :] < N),
++            other=0.0
++        )  # shape [BLOCK_K, BLOCK_N]
+ 
++        # Stage through padded flat smem buffer to eliminate bank conflicts
++        # Row stride = BLOCK_N_PAD = 65 (coprime to 32 banks)
++        b_smem_flat = tl.zeros((BLOCK_K * BLOCK_N_PAD,), dtype=ACC_TYPE)
++        tl.store(
++            b_smem_flat + smem_row_idx * BLOCK_N_PAD + smem_col_idx,
++            b_tile,
++            mask=b_k_mask[:, None] & (offs_b_n[None, :] < N)
++        )
++        # Reload from padded smem — now conflict-free
++        b = tl.load(b_smem_flat + smem_row_idx * BLOCK_N_PAD + smem_col_idx)
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+@@ -91,8 +125,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

@@ -1,0 +1,73 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'XBLOCK': 512},  num_warps=4),
+        triton.Config({'XBLOCK': 1024}, num_warps=4),
+        triton.Config({'XBLOCK': 2048}, num_warps=4),
+        triton.Config({'XBLOCK': 4096}, num_warps=8),
+        triton.Config({'XBLOCK': 2048}, num_warps=8),
+        triton.Config({'XBLOCK': 1024}, num_warps=8),
+    ],
+    key=['xnumel'],
+)
+@triton.jit
+def triton_poi_fused_convolution_62(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):
+    # XBLOCK = XBLOCK_COL * XBLOCK_ROW, where XBLOCK_COL = 64 (fixed)
+    # Each CTA processes XBLOCK_ROW rows, each row has 64 columns
+    NCOLS: tl.constexpr = 64
+    NROWS: tl.constexpr = 1960  # 10 * 14 * 14
+    IN_STRIDE_ROW: tl.constexpr = 64
+    OUT_STRIDE_ROW: tl.constexpr = 528
+    XBLOCK_COL: tl.constexpr = 64
+    XBLOCK_ROW: tl.constexpr = XBLOCK // XBLOCK_COL
+
+    pid = tl.program_id(0)
+    # 2D decomposition: pid maps to (pid_row, pid_col) but col tiles = 1 since XBLOCK_COL=NCOLS=64
+    pid_row = pid  # one col tile covers all 64 columns
+    row_off = pid_row * XBLOCK_ROW + tl.arange(0, XBLOCK_ROW)  # [XBLOCK_ROW]
+    col_off = tl.arange(0, XBLOCK_COL)                          # [XBLOCK_COL] = 0..63
+
+    row_mask = row_off < NROWS
+    col_mask = col_off < NCOLS
+
+    in_idx  = row_off[:, None] * IN_STRIDE_ROW  + col_off[None, :]  # [XBLOCK_ROW, XBLOCK_COL]
+    out_idx = row_off[:, None] * OUT_STRIDE_ROW + col_off[None, :]  # [XBLOCK_ROW, XBLOCK_COL]
+    mask2d  = row_mask[:, None] & col_mask[None, :]
+
+    tmp0 = tl.load(in_ptr0 + in_idx, mask2d)
+    tmp1 = tl.load(in_ptr1 + col_off, col_mask, eviction_policy='evict_last')  # [XBLOCK_COL]
+    tmp2 = tmp0 + tmp1[None, :]  # broadcast bias over rows
+    tl.store(out_ptr0 + out_idx, tmp2, mask2d)  # COALESCED: col is fast axis
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    xnumel = 125440
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused_convolution_62[grid](arg_0, arg_1, arg_2, 125440)
+    return arg_2
+
+def get_inputs():
+    arg_0 = rand_strided((10, 64, 14, 14), (12544, 1, 896, 64), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((64,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((10, 64, 14, 14), (103488, 1, 7392, 528), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

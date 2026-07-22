@@ -1,0 +1,58 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,18 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_relu_20(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -60,21 +72,18 @@
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 1024*idx_m
+         a = tl.load(A + (xindex))
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 1024*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 1024*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
++        # NEW: B loaded as [BLOCK_N, BLOCK_K] row-major, bank-conflict-free
++        # offs_b_n[:, None] is [BLOCK_N, 1], rk is [1, BLOCK_K] -> b_T is [BLOCK_N, BLOCK_K]
++        rk = offs_k[None, :] + k_idx * BLOCK_K
++        b_T = tl.load(B + rk * stride_bk + offs_b_n[:, None] * stride_bn)
++        # tl.trans(b_T) gives [BLOCK_K, BLOCK_N] correct shape for tl.dot second operand
++        acc += tl.dot(a, tl.trans(b_T), allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -86,8 +95,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 1024*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

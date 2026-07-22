@@ -1,0 +1,61 @@
+[
+  {
+    "item_id": "aa4c8526",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_tile_sizes_and_vectorized_loads",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_tile_sizes_and_vectorized_loads \u2014 dry-run crashed after 2 attempts",
+    "strategy_description": "Plan 'fix_tile_sizes_and_vectorized_loads' produced a kernel that crashed on execution after 2 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "XBLOCK=128 is catastrophically oversized for xnumel=25. Only 25 out of 128 threads per block are active in the x-dimension (80% masked), wasting compute and inflating the grid to 3072 blocks (1.45 waves on 132 SMs). The partial wave accounts for up to 50% of runtime per NCU. Reducing XBLOCK to 32 (next power-of-2 above 25) means only 7 threads are masked instead of 103, and the grid becomes (1, 768) blocks fitting ~5.8 waves on 132 SMs with far less tail waste. Increasing YBLOCK from 8 to 32 keeps total work per block constant and improves memory coalescing. Adding tl.max_contiguous and tl.multiple_of hints on the load pointer enables the compiler to emit 128-bit vectorized loads, directly addressing the MemoryCacheAccessPattern rule.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_reduce_xblock_for_small_xnumel",
+    "iteration": 1,
+    "speedup": 1.0652,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_xblock_to_match_small_xnumel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration (50% speedup_pct), MemoryCacheAccessPattern (8.4% speedup_pct)",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.74,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 69.53,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 33.97,
+        "Launch Statistics.Waves Per SM": 1.45,
+        "Launch Statistics.Block Size": 128.0,
+        "Occupancy.Achieved Occupancy (%)": 70.98,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 519.78,
+        "Scheduler Statistics.No Eligible (%)": 37.37
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 4.45,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput (%)": 53.63,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 15.91,
+        "Launch Statistics.Waves Per SM": 0.73,
+        "Launch Statistics.Block Size": 64.0,
+        "Occupancy.Achieved Occupancy (%)": 48.24,
+        "Memory Workload Analysis.Memory Throughput (Gbyte/s)": 553.44,
+        "Scheduler Statistics.No Eligible (%)": 59.87
+      }
+    },
+    "strategy_title": "Match XBLOCK to Small xnumel to Eliminate Wasted Threads",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=25), the majority of threads in the X dimension are masked and do no useful work, inflating the grid and causing the LaunchConfiguration NCU rule to fire with high tail-effect penalty. Reducing XBLOCK to the next power-of-2 at or above xnumel (e.g., XBLOCK=32 for xnumel=25) eliminates wasted thread slots, reduces total instruction count, and improves effective memory throughput. Adding @triton.autotune over XBLOCK/YBLOCK/num_warps combinations allows the runtime to find the optimal tile configuration for the actual problem dimensions.",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=25: 80% of X threads are masked\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)  # XBLOCK=128, xnumel=25\n    xmask = xindex < xnumel  # 103/128 threads masked\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # grid=(1, 3072), waves=1.45\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=32 ~= xnumel=25: only 7/32 threads masked\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 8},   num_warps=2),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 64},  num_warps=8),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 64},  num_warps=4),\n        # ... other configs\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)  # XBLOCK=32\n    xmask = xindex < xnumel  # only 7/32 threads masked\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)  # autotune selects best config",
+    "applicable_when": "LaunchConfiguration NCU rule fires with high speedup_pct (>20%); xnumel is much smaller than XBLOCK (wasted thread ratio >50%); MemoryCacheAccessPattern rule fires indicating low bytes-per-sector utilization; kernel is a memory-bound permutation/elementwise op with a small X dimension",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (low wasted thread ratio); kernel is compute-bound and occupancy is already near theoretical; reducing block size would drop below minimum warp size (32 threads) causing worse scheduling; grid is already well-aligned to SM count with no partial waves",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] and a lambda grid to let the runtime select XBLOCK/YBLOCK/num_warps. In CUDA, the equivalent is choosing blockDim.x to be the next power-of-2 >= the actual work dimension. Note: when YBLOCK is autotuned and ynumel may not be divisible by all YBLOCK values, ymask = yindex < ynumel should be used instead of tl.full([YBLOCK], True, tl.int1) to avoid out-of-bounds accesses."
+  }
+]

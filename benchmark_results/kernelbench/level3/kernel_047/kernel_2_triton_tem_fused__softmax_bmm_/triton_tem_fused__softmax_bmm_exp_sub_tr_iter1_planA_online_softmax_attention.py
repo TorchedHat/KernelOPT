@@ -1,0 +1,189 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_tem_fused__softmax_bmm_exp_sub_transpose_view_2(arg_A, arg_B, out_ptr0):
+    # Online softmax attention kernel (Flash Attention style)
+    # arg_A: Q reshaped as (2048*100, 32) with strides (32, 1)
+    #        i.e., Q[batch, seq_kv, head_dim] -> Q[batch, M, D_HEAD]
+    #        Actually Q is (2048, 32, 100) logically: batch=2048, M=32 queries, K=100 keys
+    # arg_B: K (and V) as (2048, 100, 512) with strides (51200, 512, 1)
+    # out_ptr0: output (2048, 32, 512) with strides (16384, 512, 1)
+    #
+    # Dimensions:
+    #   batch_size = 2048
+    #   M = 32  (query sequence length)
+    #   N_KV = 100  (key/value sequence length)
+    #   D_HEAD = 512  (head dimension for K/V output)
+    #   D_Q = 32  (query head dim used for dot product with K)
+    #
+    # Q layout: (204800, 32) with strides (32, 1)
+    #   -> Q[batch, m, k] at offset: batch*3200 + m*1 + k*32
+    #   (stride_qb=3200, stride_qm=1, stride_qk=32)
+    # K layout: (2048, 100, 512) with strides (51200, 512, 1)
+    #   -> K[batch, n, k] at offset: batch*51200 + n*512 + k*1
+    #   (stride_kb=51200, stride_kn=512, stride_kk=1)
+    # V layout: same as K (arg_B), V[batch, n, d] at offset: batch*51200 + n*512 + d*1
+    # Out layout: (2048, 32, 512) with strides (16384, 512, 1)
+    #   -> Out[batch, m, d] at offset: batch*16384 + m*512 + d*1
+
+    BLOCK_M : tl.constexpr = 32   # query tile size (covers all M=32 queries)
+    BLOCK_N : tl.constexpr = 32   # KV tile size
+    BLOCK_D : tl.constexpr = 32   # head dim tile for dot product (D_Q=32)
+    BLOCK_V : tl.constexpr = 64   # V output dim tile
+
+    M = 32
+    N_KV = 100
+    D_Q = 32    # dimension used in Q@K^T dot product
+    D_V = 512   # V/output dimension
+
+    # Strides for Q (arg_A): shape (204800, 32), strides (32, 1)
+    stride_qb = 3200   # batch stride: 100 * 32 = 3200
+    stride_qm = 1      # query row stride
+    stride_qk = 32     # key dim stride
+
+    # Strides for K/V (arg_B): shape (2048, 100, 512), strides (51200, 512, 1)
+    stride_kb = 51200  # batch stride
+    stride_kn = 512    # key row stride
+    stride_kk = 1      # key dim stride (same as V dim stride)
+
+    # Strides for output: shape (2048, 32, 512), strides (16384, 512, 1)
+    stride_ob = 16384
+    stride_om = 512
+    stride_od = 1
+
+    pid_m = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    # Query row offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # Key dim offsets (D_Q = 32 = BLOCK_D, fits in one tile)
+    offs_k = tl.arange(0, BLOCK_D)
+
+    # Load Q tile: [BLOCK_M, BLOCK_D]
+    # Q[batch, m, k] = arg_A[batch*100 + m, k] with strides (32, 1)
+    # offset = pid_batch * stride_qb + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    q_mask = offs_m[:, None] < M
+    q_ptrs = arg_A + pid_batch * stride_qb + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)  # [BLOCK_M, BLOCK_D]
+
+    # Initialize online softmax state
+    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # We process V in chunks of BLOCK_V along the D_V dimension
+    # For each KV tile, we accumulate into acc for each V chunk
+    # To keep things simple and correct, we'll do the full D_V=512 in one shot
+    # using a loop over V dimension chunks
+
+    # We need acc of shape [BLOCK_M, D_V] but D_V=512 is too large for registers
+    # Use BLOCK_V=64 chunks: 512/64 = 8 chunks
+    # We'll do two passes: first pass computes softmax weights, second accumulates V
+    # But that requires storing weights... Instead, use the standard online approach
+    # with a fixed D_V tile approach.
+    #
+    # Actually, for online softmax we need acc[BLOCK_M, D_V] in registers.
+    # D_V=512 with BLOCK_M=32 = 16384 floats = 64KB which is too large.
+    # We'll tile over D_V with an outer loop, but that breaks the online softmax.
+    #
+    # Correct approach: tile over D_V outside the KV loop.
+    # For each D_V chunk, run the full KV streaming loop independently.
+    # This re-reads K multiple times but keeps register usage manageable.
+    # Each D_V chunk needs its own (m_i, l_i) — but these are the same for all chunks!
+    # So: first compute (m_i, l_i) in one pass, then for each D_V chunk accumulate V.
+    # This is a 2-pass approach but avoids materializing the full score matrix.
+
+    # Pass 1: Compute final m_i and l_i (softmax denominator) by streaming over KV
+    for start_n in tl.range(0, N_KV, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < N_KV
+
+        # Load K tile: [BLOCK_N, BLOCK_D]
+        k_ptrs = arg_B + pid_batch * stride_kb + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
+        k = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)  # [BLOCK_N, BLOCK_D]
+
+        # Compute scores: [BLOCK_M, BLOCK_N]
+        scores = tl.dot(q, tl.trans(k), allow_tf32=False)  # [BLOCK_M, BLOCK_N]
+
+        # Mask out-of-bounds KV positions
+        scores = tl.where(kv_mask[None, :], scores, float('-inf'))
+
+        # Update running max
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))  # [BLOCK_M]
+        alpha = tl.exp(m_i - m_new)  # [BLOCK_M]
+        p = tl.exp(scores - m_new[:, None])  # [BLOCK_M, BLOCK_N]
+
+        l_i = alpha * l_i + tl.sum(p, axis=1)  # [BLOCK_M]
+        m_i = m_new
+
+    # Pass 2: For each D_V chunk, stream over KV and accumulate weighted V
+    # Re-compute m_i per chunk (same value) — we saved m_i from pass 1
+    # We need to re-stream KV for each D_V chunk
+    NUM_V_CHUNKS : tl.constexpr = 8  # 512 / 64 = 8
+    for v_chunk in tl.static_range(0, NUM_V_CHUNKS):
+        offs_d = v_chunk * BLOCK_V + tl.arange(0, BLOCK_V)
+
+        # Reset per-chunk accumulator and re-run online softmax for this D_V slice
+        acc_chunk = tl.zeros([BLOCK_M, BLOCK_V], dtype=tl.float32)
+        m_i_chunk = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
+
+        for start_n in tl.range(0, N_KV, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_mask = offs_n < N_KV
+
+            # Load K tile: [BLOCK_N, BLOCK_D]
+            k_ptrs = arg_B + pid_batch * stride_kb + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
+            k = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+
+            # Compute scores
+            scores = tl.dot(q, tl.trans(k), allow_tf32=False)
+            scores = tl.where(kv_mask[None, :], scores, float('-inf'))
+
+            m_new = tl.maximum(m_i_chunk, tl.max(scores, axis=1))
+            alpha = tl.exp(m_i_chunk - m_new)
+            p = tl.exp(scores - m_new[:, None])  # [BLOCK_M, BLOCK_N]
+
+            # Load V tile: [BLOCK_N, BLOCK_V]
+            v_ptrs = arg_B + pid_batch * stride_kb + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+            v = tl.load(v_ptrs, mask=kv_mask[:, None] & (offs_d[None, :] < D_V), other=0.0)
+
+            acc_chunk = alpha[:, None] * acc_chunk + tl.dot(p.to(tl.float32), v.to(tl.float32), allow_tf32=False)
+            m_i_chunk = m_new
+
+        # Normalize by l_i
+        out_chunk = acc_chunk / l_i[:, None]
+
+        # Store output chunk
+        out_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D_V)
+        out_ptrs = out_ptr0 + pid_batch * stride_ob + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+        tl.store(out_ptrs, out_chunk.to(tl.float32), mask=out_mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    grid = (4, 1, 1)
+    triton_tem_fused__softmax_bmm_exp_sub_transpose_view_2[grid](arg_0, arg_1, arg_2)
+    return arg_2
+
+def get_inputs():
+    arg_0 = rand_strided((204800, 32), (32, 1), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((2048, 100, 512), (51200, 512, 1), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((2048, 32, 512), (16384, 512, 1), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

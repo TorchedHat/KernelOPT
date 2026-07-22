@@ -1,0 +1,195 @@
+[
+  {
+    "item_id": "f3a2c891",
+    "iteration": 3,
+    "speedup": 1.1529,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_block_k_and_fix_b_load_indexing_to_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 132.03,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.3,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 49.15,
+        "Launch Statistics.Waves Per SM": 0.23,
+        "Scheduler Statistics.No Eligible": 69.73,
+        "Memory Workload Analysis.Mem Busy": 44.31,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 68.1,
+        "Compute Workload Analysis.Executed Ipc Active": 1.21,
+        "SharedMemoryConflicts.speedup_pct": 47.57
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 114.88,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.01,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Launch Statistics.Registers Per Thread": 236.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 24.58,
+        "Launch Statistics.Waves Per SM": 0.35,
+        "Scheduler Statistics.No Eligible": 66.82,
+        "Memory Workload Analysis.Mem Busy": 51.14,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 74.18,
+        "Compute Workload Analysis.Executed Ipc Active": 1.33,
+        "SharedMemoryConflicts.speedup_pct": 51.82
+      }
+    },
+    "strategy_title": "Halve BLOCK_K and fix B load indexing to reduce bank conflicts",
+    "strategy_description": "When a GEMM kernel suffers from 8-way shared memory bank conflicts (SharedMemoryConflicts rule triggered, CPIStall from MIO stalls ~47% of warp cycles), reducing BLOCK_K from 32 to 16 halves the shared memory tile for both A and B, changing the bank access alignment and reducing peak conflict degree. Simultaneously replacing a fragile tl.broadcast_to expression with explicit clean pointer arithmetic (offs_b_n[None,:]*stride + k_offs[:,None]) eliminates the correctness fragility that caused prior iterations to fail with max_diff~130. The combined change reduced kernel duration from 132 \u00b5s to 115 \u00b5s (1.15x speedup), with warp cycles per issued instruction dropping from 3.3 to 3.01 and dynamic shared memory per block halving from 49 KB to 25 KB, despite registers per thread increasing from 168 to 236.",
+    "slow_pseudocode": "BLOCK_K : tl.constexpr = 32\noffs_k = tl.arange(0, BLOCK_K)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)\n    b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)\n    idx_m = offs_a_m[:, None]\n    idx_n = a_k_idx_vals\n    xindex = idx_n + 768*idx_m\n    a = tl.load(A + xindex, eviction_policy='evict_first')\n    idx_m = b_k_idx_vals\n    idx_n = offs_b_n[None, :]\n    xindex = idx_n + 384*idx_m  # computed but unused as address!\n    b = tl.load(B + tl.broadcast_to(idx_m + 768*idx_n, [BLOCK_K, BLOCK_N]).broadcast_to(xindex.shape),\n                eviction_policy='evict_last')\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "BLOCK_K : tl.constexpr = 16  # halved from 32\noffs_k = tl.arange(0, BLOCK_K)\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    # A tile: [BLOCK_M, BLOCK_K]\n    k_offs_a = offs_k[None, :] + (k_idx * BLOCK_K)\n    a = tl.load(A + (offs_a_m[:, None] * 768 + k_offs_a),\n                eviction_policy='evict_first')\n    # B tile: [BLOCK_K, BLOCK_N] \u2014 explicit clean indexing\n    k_offs_b = offs_k[:, None] + (k_idx * BLOCK_K)\n    b = tl.load(B + (offs_b_n[None, :] * 768 + k_offs_b),\n                eviction_policy='evict_last')\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "applicable_when": "Triton GEMM kernel with SharedMemoryConflicts rule triggered at 8-way bank conflicts, CPIStall from MIO stalls >40% of warp cycles, BLOCK_K=32 with FP32 elements (32*4=128 bytes = exactly one shared memory bank cycle, causing maximum alignment conflicts). The B matrix load uses tl.broadcast_to with hardcoded shape arguments that become stale when tile shapes change. BLOCK_K must evenly divide K (e.g., K=768, BLOCK_K=16 \u2192 48 iterations).",
+    "do_not_apply_when": "Do not apply if: (1) BLOCK_K reduction would not evenly divide K; (2) the kernel is already register-bound (reducing shared memory by halving BLOCK_K increased registers/thread from 168 to 236 here, which lowered theoretical occupancy from 18.75% to 12.5% \u2014 if occupancy is already the binding constraint, this trade-off may not be favorable); (3) the bank conflict is not caused by BLOCK_K alignment (e.g., if it is caused by BLOCK_N or accumulator access patterns). Note: bank conflicts persisted after this change (51.82% speedup_pct still reported), so this is a partial fix.",
+    "framework_notes": "Triton-specific: tl.broadcast_to with hardcoded [BLOCK_K, BLOCK_N] shape arguments is fragile \u2014 when BLOCK_K changes as a tl.constexpr, the hardcoded shape literal does not update automatically, causing correctness failures (max_diff~130). Always use explicit broadcasting via shape-compatible tensor expressions (offs_b_n[None,:] * stride + k_offs[:,None]) instead of tl.broadcast_to with literal shape tuples. The xindex variable computed as idx_n + 384*idx_m in the original B load was a dead computation \u2014 the actual address used was the inner broadcast_to expression, not xindex."
+  },
+  {
+    "item_id": "94e92c40",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_to_cut_register_pressure_and_increase_occupancy",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + SharedMemoryConflicts + IssueSlotUtilization + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_to_cut_register_pressure_and_increase_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_to_cut_register_pressure_and_increase_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel (post-iteration-3) has BLOCK_K=16 already applied, but registers/thread ballooned to 236 (up from 168). The binding occupancy limiter is now Block Limit Registers = 2 blocks/SM, giving only 12.5% theoretical occupancy and 6.25% achieved. The accumulator tile is BLOCK_M x BLOCK_N = 64 x 128 = 8192 FP32 elements, which alone consumes ~8192 registers. Halving BLOCK_N from 128 to 64 cuts the accumulator to 64x64=4096 elements, reducing register pressure by ~50% and allowing the compiler to fit 4 blocks/SM instead of 2, doubling theoretical occupancy from 12.5% to 25%. This also doubles the grid from 93 to 186 tiles, improving SM coverage from 0.35 waves to ~0.70 waves. The 66.82% no-eligible-warp rate is directly caused by insufficient warps to hide MIO latency \u2014 more occupancy means more warps to hide stalls.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "5904501f",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_reduce_register_pressure_and_increase_sm_coverage",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + TheoreticalOccupancy + LaunchConfiguration + SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_to_reduce_register_pressure_and_increase_sm_coverage \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_to_reduce_register_pressure_and_increase_sm_coverage' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 0.23 waves/SM and 6.25% achieved occupancy. The root cause is extreme register pressure (168 regs/thread) which limits the SM to 3 blocks maximum. With BLOCK_M=64 and BLOCK_N=128, the accumulator alone is 64*128=8192 FP32 values. Reducing BLOCK_M to 32 halves the accumulator to 32*128=4096 elements, dropping total registers from 168 to ~90-100, enabling 5-6 blocks/SM and ~37-50% theoretical occupancy. The current B-load using tl.trans() is correct and must be preserved. Prior autotune failures were caused by tl.broadcast_to with hardcoded shapes \u2014 that bug is now fixed. Adding @triton.autotune with configs spanning BLOCK_M in {32,64}, BLOCK_N in {64,128}, BLOCK_K in {16,32}, num_warps in {4,8}, num_stages in {2,3} will let the runtime select the best trade-off between tile efficiency and occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "fb1dabb7",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_and_block_k_to_cut_register_pressure_and_bank_conflicts",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall + AchievedOccupancy + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_and_block_k_to_cut_register_pressure_and_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_and_block_k_to_cut_register_pressure_and_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized (0.23 waves/SM, 6.25% occupancy) due to two compounding problems: (1) 168 registers/thread with BLOCK_M=64, BLOCK_N=128 accumulator (8192 FP32 elements) limits blocks/SM to 3 via register pressure; (2) BLOCK_K=32 with FP32 creates 128-byte shared memory rows (32x4B) that align exactly to the 32-bank boundary, causing systematic 8-way bank conflicts that stall warps 47.7% of the time. Memory item f3a2c891 confirms that reducing BLOCK_K=32->16 achieved 1.15x speedup but bank conflicts persisted (51.82% speedup_pct still reported), meaning the accumulator register pressure from BLOCK_N=128 is the remaining binding constraint. The fix is to simultaneously: (a) reduce BLOCK_K 32->16 to halve shared memory tile sizes and break the 128-byte bank alignment; (b) reduce BLOCK_N 128->64 to cut the accumulator from 64x128=8192 to 64x64=4096 FP32 elements, dropping registers/thread from ~168 to ~84, enabling 6+ blocks/SM and doubling waves to ~0.47; (c) use correct explicit B load indexing B + offs_b_n[None,:]*768 + k_offs[:,None] to avoid the correctness bug that caused max_diff~130 in prior iterations.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "028632b1",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_with_correct_b_indexing_to_reduce_register_pressure",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + AchievedOccupancy + SharedMemoryConflicts + LaunchConfiguration + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_with_correct_b_indexing_to_reduce_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_with_correct_b_indexing_to_reduce_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 0.23 waves/SM and 6.25% achieved occupancy vs 18.75% theoretical. The binding limiter is Block Limit Registers = 3 blocks/SM caused by 168 registers/thread. The accumulator tile BLOCK_M=64 x BLOCK_N=128 = 8192 FP32 elements is the dominant register consumer. Reducing BLOCK_M to 32 and BLOCK_N to 64 cuts the accumulator to 2048 elements, dropping registers/thread to ~84, enabling 5-6 blocks/SM and ~37-50% theoretical occupancy. The current kernel already has the correct clean B-load indexing (b_index = (offs_k[:, None] + k_idx * BLOCK_K) + 768 * offs_b_n[None, :]) \u2014 all prior correctness failures (max_diff~130) were caused by the buggy tl.broadcast_to pattern which is no longer present. Promoting BLOCK_M, BLOCK_N, BLOCK_K to autotune parameters is now safe.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "ee05e6bc",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tma_loads_via_block_ptr_with_correct_b_indexing",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + AchievedOccupancy + TheoreticalOccupancy + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tma_loads_via_block_ptr_with_correct_b_indexing \u2014 correctness failure",
+    "strategy_description": "Plan 'tma_loads_via_block_ptr_with_correct_b_indexing' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has two compounding problems: (1) 168 registers/thread from the 64x128 FP32 accumulator limits the SM to 3 blocks (Block Limit Registers=3), giving only 6.25% achieved occupancy and 0.23 waves/SM across 132 SMs. (2) The B matrix (stride_bk=1, stride_bn=768) causes 8-way shared memory bank conflicts (48% speedup potential). All prior tile-shape reduction attempts failed with max_diff~130 due to incorrect manual index rewriting. The diversity instruction targets 'tma_loads': using tl.make_block_ptr replaces the error-prone manual index arithmetic with hardware-managed address generation, which (a) is inherently correct regardless of tile shape, (b) enables proper async pipelining via num_stages>1 to hide memory latency, and (c) allows safe reduction of BLOCK_N from 128 to 64 to cut register pressure from 168 to ~84 regs/thread, enabling 6+ blocks/SM and ~2x more waves.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "7a744101",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_to_cut_register_pressure_and_increase_sm_coverage",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "AchievedOccupancy + TheoreticalOccupancy + SharedMemoryConflicts + CPIStall + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_to_cut_register_pressure_and_increase_sm_coverage \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_to_cut_register_pressure_and_increase_sm_coverage' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized (0.23 waves/SM, 6.25% achieved occupancy). The binding constraint is register pressure: 168 registers/thread with BLOCK_M=64, BLOCK_N=128 limits the SM to only 3 blocks (Block Limit Registers=3). The accumulator alone is BLOCK_M x BLOCK_N = 64x128 = 8192 FP32 values. Reducing BLOCK_N from 128 to 64 halves the accumulator to 4096 FP32 elements, which should drop registers/thread from ~168 to ~84-100, enabling 5-6 blocks/SM and raising theoretical occupancy from 18.75% toward 37-50%. This also doubles the grid from 93 to 186 blocks (grid_n doubles from 3 to 6), covering all 132 SMs with more than 1 wave. Memory item f3a2c891 confirms that the B load must use explicit clean pointer arithmetic to avoid the correctness bug (max_diff~130) seen in all prior failed iterations. The current kernel's B load already uses the correct explicit form, so reducing BLOCK_N is safe.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "0da27998",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_tile_sizes_via_autotune_to_improve_parallelism_and_cache_utilization",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_tile_sizes_via_autotune_to_improve_parallelism_and_cache_utilization \u2014 correctness failure",
+    "strategy_description": "Plan 'increase_tile_sizes_via_autotune_to_improve_parallelism_and_cache_utilization' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel computes GEMM (M=1960, N=384, K=768) with fixed BLOCK_M=64, BLOCK_N=128, BLOCK_K=32. Only 93 blocks are launched against 132 SMs (0.23 waves), and 168 registers/thread limits blocks/SM to 3 (18.75% theoretical, 6.25% achieved occupancy). The existing @triton.autotune only varies num_warps and num_stages \u2014 it never explores BLOCK_M, BLOCK_N, or BLOCK_K. Smaller BLOCK_N=64 reduces the accumulator from 64x128=8192 to 64x64=4096 FP32 elements, cutting register pressure and enabling more blocks/SM. BLOCK_N=64 also increases grid from 93 to 186 blocks (1.41 waves), fully covering all 132 SMs. Larger BLOCK_K=64 halves K-loop iterations from 24 to 12, improving arithmetic intensity. Memory item f3a2c891 confirms the current B-load indexing is correct and achieved 1.15x speedup. Prior correctness failures were caused by tl.broadcast_to with hardcoded shapes \u2014 the current source already uses clean explicit indexing, so tile size changes are safe.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.291e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.356e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.394e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

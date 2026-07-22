@@ -1,0 +1,267 @@
+[
+  {
+    "item_id": "e606b2ed",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_coalescing_and_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + CPIStall + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_tile_sizes_for_coalescing_and_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_tile_sizes_for_coalescing_and_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.120e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.085e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs an NCHW->NHWC-like layout permutation. Two compounding problems: (1) The store address y0 + 3*x2 + 150528*y1 has stride-3 in x, so consecutive threads write to addresses 3 apart, causing 23% excess sectors. (2) With YBLOCK=8 the grid is only 1568 blocks for 132 SMs -> 0.74 waves, leaving most SMs idle. Reducing YBLOCK to 1 expands the grid to ~11790 blocks (~89 waves), filling all SMs. Adding autotune explores the best XBLOCK/YBLOCK/num_warps/num_stages combination to maximally hide L1TEX latency and fill the SM array.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.120e+00 > atol=0.001\nseed=42 output[0]: max_diff=4.900e+00 > atol=0.001\nseed=1337 output[0]: max_diff=5.085e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_autotune_block_size_occupancy_001",
+    "iteration": 1,
+    "speedup": 1.5125,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_block_size_to_increase_waves_per_sm",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization + UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Occupancy.Achieved Occupancy": 54.92,
+        "Scheduler Statistics.One or More Eligible": 29.53,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.37,
+        "GPU Speed Of Light Throughput.Duration": 6.05,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Memory Workload Analysis.L2 Hit Rate": 60.46,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 38.64
+      },
+      "key_metric_after": {
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Occupancy.Achieved Occupancy": 65.72,
+        "Scheduler Statistics.One or More Eligible": 60.91,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.72,
+        "GPU Speed Of Light Throughput.Duration": 4.0,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Memory Workload Analysis.L2 Hit Rate": 75.81,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      }
+    },
+    "strategy_title": "Autotune Block Size to Double Waves-per-SM",
+    "strategy_description": "When a Triton kernel launches with fewer than 1.0 waves/SM (grid too small to saturate the GPU), adding @triton.autotune with larger XBLOCK/YBLOCK configs allows the autotuner to select a configuration that doubles or more the waves/SM, directly increasing achieved occupancy and eligible warps per scheduler. In this case, doubling block size from 128 to 256 threads (selected by autotune) raised waves/SM from 0.74 to 1.48, improved scheduler eligibility from 29.5% to 60.9%, and halved warp stall cycles (30.4 \u2192 17.7 cycles/instruction), yielding a 1.51x speedup. Additionally, larger block sizes can reduce register pressure per thread (26 \u2192 18 registers), further enabling higher occupancy.",
+    "slow_pseudocode": "# Fixed block size, under-utilizes GPU\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotuned block size, selects config that maximizes waves/SM\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1024, 'YBLOCK': 1}, num_warps=8),\n        triton.Config({'XBLOCK': 512,  'YBLOCK': 2}, num_warps=8),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 4}, num_warps=4),\n        triton.Config({'XBLOCK': 256,  'YBLOCK': 2}, num_warps=4),\n        triton.Config({'XBLOCK': 128,  'YBLOCK': 8}, num_warps=4),\n        triton.Config({'XBLOCK': 64,   'YBLOCK': 8}, num_warps=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Also add vectorization hints on contiguous load dimension:\n    xrange = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)\n    ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](in_ptr, out_ptr, ynumel, xnumel)  # no explicit XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel has waves/SM < 1.0 (grid too small); IssueSlotUtilization rule fires with eligible warps per scheduler near 1.0; CPIStall rule fires with high L1TEX stall cycles; achieved occupancy significantly below theoretical; block size is hardcoded rather than autotuned.",
+    "do_not_apply_when": "Kernel already achieves >2.0 waves/SM or >80% achieved occupancy; shared memory usage is near the per-SM limit (increasing block size would reduce blocks/SM); the kernel is compute-bound rather than latency-bound.",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter. The grid must be changed from a static tuple to a lambda meta: (...) to consume the autotuned XBLOCK/YBLOCK. tl.max_contiguous and tl.multiple_of are Triton compiler hints that enable 128-bit vectorized loads (LDG.128) on contiguous memory dimensions without changing computed pointer values. CUDA equivalent: use __launch_bounds__ and experiment with block sizes via separate kernel launches."
+  },
+  {
+    "item_id": "exp_triton_swap_arange_axes_coalesced_store_001",
+    "iteration": 1,
+    "speedup": 1.4901,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "swap_arange_axes_to_coalesce_stride1_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 6.05,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8959.0,
+        "Memory Workload Analysis.Memory Throughput": 996.36,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 30.37,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.1,
+        "Occupancy.Achieved Occupancy": 54.92,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 23.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 20.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.06,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6055.0,
+        "Memory Workload Analysis.Memory Throughput": 791.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 26.26,
+        "Launch Statistics.Registers Per Thread": 20.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.05,
+        "Occupancy.Achieved Occupancy": 53.71,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7
+      }
+    },
+    "strategy_title": "Swap Triton arange axes to make stride-1 dim warp-fast",
+    "strategy_description": "In a 2D Triton kernel with YBLOCK\u00d7XBLOCK tiling, the dimension placed on `tl.arange(0, N)[None, :]` (the column/fast axis) is warp-parallel. If the output tensor's stride-1 dimension is currently on the slow axis (`[:, None]`), consecutive threads write with a stride > 1, causing uncoalesced stores (NCU UncoalescedGlobalAccess, low bytes-per-sector). Swapping the arange axes\u2014putting the stride-1 output dimension on `[None, :]` and the strided dimension on `[:, None]`\u2014makes consecutive threads write to consecutive addresses, reducing excessive sectors and L1TEX stall cycles. This swap also reduces register pressure (26\u219220 registers/thread) and shared memory usage, yielding a 1.49\u00d7 speedup even though the uncoalesced-access metric paradoxically worsened in the after profile (the store pattern changed but the load pattern became the new bottleneck).",
+    "slow_pseudocode": "# y0 (stride-1 in output) on slow axis [:, None] \u2014 UNCOALESCED stores\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # slow\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # fast (warp-parallel)\ny0 = yindex % 3   # output stride = 1, but on slow axis\ntl.store(out_ptr + (y0 + 3*x2 + 150528*y1), val, mask)  # stride-3 per thread",
+    "fast_pseudocode": "# y0 (stride-1 in output) on fast axis [None, :] \u2014 coalesced stores\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]  # slow\nyindex = yoffset + tl.arange(0, YBLOCK)[None, :]  # fast (warp-parallel)\ny0 = yindex % 3   # output stride = 1, now on fast axis\ntl.store(out_ptr + (y0 + 3*x2 + 150528*y1), val, mask)  # stride-1 per thread",
+    "applicable_when": "Triton 2D kernel where the output tensor's stride-1 dimension is mapped to the slow arange axis ([:, None]) while a strided dimension is on the fast axis ([None, :]); NCU reports UncoalescedGlobalAccess with >10% excessive sectors and MemoryCacheAccessPattern showing <32 bytes/sector for stores; CPIStall on L1TEX is a top stall reason (>10 cycles/warp).",
+    "do_not_apply_when": "The load pattern is the primary bottleneck and swapping axes would uncoalesce loads while coalescing stores (net negative); when both dimensions have the same stride; when the kernel is compute-bound rather than memory-latency-bound; when the swap would break correctness due to data dependencies across the tile.",
+    "framework_notes": "Triton-specific: the fast-varying warp-parallel axis is `tl.arange(0, N)[None, :]` (columns) in a 2D tile. Swapping `[:, None]` and `[None, :]` between two index variables changes which dimension is warp-parallel without changing the grid or block sizes. Adding `@triton.autotune` with multiple YBLOCK/XBLOCK configs and varying `num_warps` further reduces register pressure and shared memory per block."
+  },
+  {
+    "item_id": "07d648c3",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "coalesce_store_by_swapping_y_to_fast_warp_axis",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "coalesce_store_by_swapping_y_to_fast_warp_axis \u2014 correctness failure",
+    "strategy_description": "Plan 'coalesce_store_by_swapping_y_to_fast_warp_axis' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.663e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs an NCHW->NHWC layout permutation. The output tensor out_ptr0 has stride-1 in the y0 = yindex % 3 dimension (channel-minor in NHWC), but yindex is placed on the SLOW axis [:, None]. The fast warp-parallel axis [None, :] carries xindex (x2), which maps to stride-3 in the output (y0 + 3*x2 + 150528*y1). This means consecutive threads in a warp write to addresses 3 floats apart (12 bytes stride), causing 50% excessive sectors and only 10.7/32 bytes utilized per sector. Swapping so that yindex (the stride-1 output dimension) is on the fast axis [None, :] and xindex is on the slow axis [:, None] makes consecutive warp threads write to consecutive output addresses (stride-1), eliminating the uncoalesced store penalty. Memory item exp_triton_swap_arange_axes_coalesced_store_001 confirms this exact pattern yielded 1.49x speedup on a prior similar kernel.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.777e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.663e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_evict_first_yblock1_autotune_001",
+    "iteration": 3,
+    "speedup": 1.4439,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_yblock1_with_evict_first_for_streaming_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.16,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6162.0,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Occupancy.Achieved Occupancy": 68.15,
+        "Scheduler Statistics.One or More Eligible": 62.57,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.22,
+        "Memory Workload Analysis.L2 Hit Rate": 76.44,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7,
+        "GPU and Memory Workload Distribution.Total SM Elapsed Cycles": 848494.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.19,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6243.0,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Occupancy.Achieved Occupancy": 68.2,
+        "Scheduler Statistics.One or More Eligible": 62.72,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.6,
+        "Memory Workload Analysis.L2 Hit Rate": 76.33,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7,
+        "GPU and Memory Workload Distribution.Total SM Elapsed Cycles": 791398.0
+      }
+    },
+    "strategy_title": "YBLOCK=1 Autotune + evict_first for Streaming Layout Kernels",
+    "strategy_description": "Adding YBLOCK=1 autotune configs and changing load eviction policy from evict_last to evict_first was expected to coalesce stores and reduce L1TEX pressure in a layout-permutation kernel, but the profiling metrics show essentially no change: waves/SM remained 1.48, achieved occupancy stayed at ~68%, uncoalesced excessive sectors remained at 50%, and store bytes-per-sector stayed at 10.7. The 1.44x reported speedup is inconsistent with the flat NCU metrics and likely reflects autotuner selection of a marginally better config from the expanded config set rather than the structural improvements targeted. The root cause (stride-3 stores causing 50% excessive sectors) was not resolved by YBLOCK=1 because the store address y0 + 3*x2 still has stride-3 in the warp-fast x dimension regardless of YBLOCK.",
+    "slow_pseudocode": "# YBLOCK>=2, evict_last load\n@triton.autotune(configs=[Config({'XBLOCK':128,'YBLOCK':8}, num_warps=4), ...], key=['ynumel','xnumel'])\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    xindex = (xoffset + arange(0,XBLOCK))[:, None]\n    yindex = yoffset + arange(0,YBLOCK)[None, :]\n    tmp0 = tl.load(in_ptr + (x2 + 50176*y3), mask, eviction_policy='evict_last')\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), tmp0, mask)  # stride-3 in x",
+    "fast_pseudocode": "# YBLOCK=1 added, evict_first load\n@triton.autotune(configs=[\n    Config({'XBLOCK':1024,'YBLOCK':1}, num_warps=8, num_stages=4),\n    Config({'XBLOCK':512, 'YBLOCK':1}, num_warps=8, num_stages=4),\n    # ... plus original configs\n], key=['xnumel','ynumel'])\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    xindex = (xoffset + arange(0,XBLOCK))[:, None]\n    yindex = yoffset + arange(0,YBLOCK)[None, :]\n    tmp0 = tl.load(in_ptr + (x2 + 50176*y3), mask, eviction_policy='evict_first')\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), tmp0, mask)  # still stride-3 in x",
+    "applicable_when": "Triton layout-permutation kernel with streaming (single-pass) loads where evict_last is used; YBLOCK=1 configs are absent from autotune set; waves/SM is already near 1.5 and uncoalesced stores are the primary bottleneck.",
+    "do_not_apply_when": "The store address still has a stride > 1 in the warp-fast dimension after YBLOCK=1 (i.e., y0 = yindex % K with K > 1 is still multiplied into the fast-axis store offset); in that case YBLOCK=1 does not resolve uncoalesced stores. Do not apply when waves/SM is already >= 1.5 and the bottleneck is uncoalesced stores \u2014 the grid expansion from YBLOCK=1 will not help if the store stride is inherent to the permutation.",
+    "framework_notes": "Triton-specific: eviction_policy='evict_first' on tl.load signals the L1TEX cache to evict the loaded data first, suitable for streaming (non-reused) reads. YBLOCK=1 makes yoffset a per-CTA scalar, but if the store address still contains a stride-K term in the x (warp-fast) dimension, coalescing is not achieved. The fix for stride-K stores requires either transposing the tile assignment or using shared memory staging."
+  },
+  {
+    "item_id": "e27154c2",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "flat_1d_output_linear_kernel_with_coalesced_stores",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + LaunchConfiguration + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "flat_1d_output_linear_kernel_with_coalesced_stores \u2014 correctness failure",
+    "strategy_description": "Plan 'flat_1d_output_linear_kernel_with_coalesced_stores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.306e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs NCHW->NHWC layout permutation. The output tensor has stride (150528, 1, 672, 3): the fastest-varying output dimension is y0 = yindex % 3 (stride-1 in NHWC channel-minor layout). However, in the current 2D tiling, xindex is on the warp-fast axis [None,:] and maps to stride-3 in the output (y0 + 3*x2 + ...), causing 50% excessive sectors. All prior attempts to fix this by swapping 2D arange axes failed correctness because the index decomposition (y0 = yindex%3, y1 = yindex//3) was not correctly re-derived after the swap. The correct fix is to rewrite as a 1D kernel that iterates over the OUTPUT tensor in linear order: each thread owns one output element at flat index out_idx, computes the corresponding input index via inverse permutation, loads from input, and stores to output. This guarantees stride-1 stores (consecutive threads write consecutive output addresses), eliminates the uncoalesced store entirely, and with a flat 1D grid of ~1.5M elements / XBLOCK threads, produces ~1470 blocks for XBLOCK=1024 (11.1 waves on 132 SMs) far better than the current 1.48 waves.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.306e+00 > atol=0.001\nseed=42 output[0]: max_diff=6.802e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.835e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "triton_swap_arange_axes_coalesced_store_v2_iter4",
+    "iteration": 4,
+    "speedup": 1.5012,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "swap_arange_axes_to_coalesce_stride1_stores_v2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.19,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6243.0,
+        "Memory Workload Analysis.Memory Throughput": 192.37,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.6,
+        "Occupancy.Achieved Occupancy": 68.2,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Memory Workload Analysis.L2 Hit Rate": 76.33,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.03,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6010.0,
+        "Memory Workload Analysis.Memory Throughput": 200.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.21,
+        "Occupancy.Achieved Occupancy": 67.49,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Memory Workload Analysis.L2 Hit Rate": 76.23,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7
+      }
+    },
+    "strategy_title": "Swap Triton arange axes + evict_last for coalesced stores",
+    "strategy_description": "In a 2D Triton NCHW\u2192NHWC permutation kernel, placing xindex (the HW/strided output dimension) on the slow axis `[:, None]` and yindex (the channel/stride-1 output dimension) on the fast warp-parallel axis `[None, :]` is the correct structural fix for uncoalesced stores. This iteration achieved a 1.50x speedup by correctly swapping the arange broadcasting axes and restoring `eviction_policy='evict_last'` on the load, while also refreshing the autotune config set. Notably, the NCU metrics for UncoalescedGlobalAccess excessive sectors and store bytes-per-sector did not visibly improve in the after profile (still 50% and 10.7), yet wall-clock duration dropped from 4.19 \u00b5s to 4.03 \u00b5s \u2014 suggesting the speedup comes from the autotuner selecting a marginally better config rather than from structural store coalescing. The axis swap itself is correct and passes correctness checks, but the store coalescing benefit may be masked by the small ynumel=30 dimension.",
+    "slow_pseudocode": "# xindex on fast [None,:] axis \u2014 stride-3 stores (UNCOALESCED)\nxindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[None, :]  # fast\nyindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # slow\ny0 = yindex % 3   # stride-1 in output but on SLOW axis\ntl.store(out_ptr + (y0 + 3*x2 + 150528*y1), val, mask)  # stride-3 per warp thread",
+    "fast_pseudocode": "# xindex on slow [:,None] axis \u2014 yindex (stride-1) on fast [None,:] axis\nxindex = tl.max_contiguous(tl.multiple_of(xoffset + tl.arange(0, XBLOCK), XBLOCK), XBLOCK)[:, None]  # slow\nyindex = yoffset + tl.arange(0, YBLOCK)[None, :]  # fast (warp-parallel)\ny0 = yindex % 3   # stride-1 in output, now on FAST axis\n# eviction_policy='evict_last' on load (not evict_first)\ntmp0 = tl.load(in_ptr + (x2 + 50176*y3), mask, eviction_policy='evict_last')\ntl.store(out_ptr + (y0 + 3*x2 + 150528*y1), val, mask)  # stride-1 per warp thread",
+    "applicable_when": "Triton 2D kernel performing a layout permutation (e.g. NCHW\u2192NHWC) where the output tensor's stride-1 dimension (e.g. channel) is currently on the slow arange axis `[:, None]` and a strided dimension is on the fast axis `[None, :]`; NCU reports UncoalescedGlobalAccess with ~50% excessive sectors and MemoryCacheAccessPattern showing ~10.7/32 bytes/sector for stores; waves/SM is already \u22651.0 so occupancy is not the primary bottleneck.",
+    "do_not_apply_when": "When ynumel (the fast-axis dimension after swap) is very small (e.g. \u226430) relative to warp width (32), the coalescing benefit may be minimal because the warp cannot fully utilize the stride-1 dimension; when the load pattern becomes the new bottleneck after the swap; when prior axis-swap attempts failed correctness due to incomplete index variable updates \u2014 ensure ALL derived indices (x2, y3, y0, y1, xmask, ymask) are recomputed from the new axis assignments.",
+    "framework_notes": "Triton-specific: the fast-varying warp-parallel axis is `tl.arange(0, N)[None, :]` (columns in a 2D tile). Swapping `[:, None]` and `[None, :]` between xindex and yindex changes which dimension is warp-parallel without changing the grid or block sizes. Correctness requires updating ALL derived index variables consistently. Use `eviction_policy='evict_last'` (not 'evict_first') for layout-permutation loads that benefit from L1TEX caching. The autotune config set should include YBLOCK values matching the small ynumel dimension (e.g. YBLOCK=1,2,4,8,16 for ynumel=30)."
+  },
+  {
+    "item_id": "triton_yblock32_warp_width_coalesced_store_001",
+    "iteration": 4,
+    "speedup": 1.321,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "yblock32_warp_width_tile_for_coalesced_stores",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.19,
+        "Launch Statistics.Waves Per SM": 1.48,
+        "Occupancy.Achieved Occupancy": 68.2,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.6,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 76.33,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7,
+        "Launch Statistics.Block Size": 256.0,
+        "Launch Statistics.Registers Per Thread": 18.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.58,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Occupancy.Achieved Occupancy": 52.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.3,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 43.75,
+        "Memory Workload Analysis.L2 Hit Rate": 64.88,
+        "Source Counters.UncoalescedGlobalAccess excessive_sectors_pct": 50.0,
+        "MemoryCacheAccessPattern store_bytes_per_sector": 10.7,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 28.0
+      }
+    },
+    "strategy_title": "YBLOCK=32 Warp-Width Tile Does Not Fix Stride-3 Stores",
+    "strategy_description": "Setting YBLOCK=32 to match warp width was intended to make the warp-parallel y dimension cover enough elements for coalesced stores in a layout-permutation kernel. However, the profiling shows the uncoalesced store metric was completely unchanged (50% excessive sectors, 10.7 bytes/sector) because the store address y0 + 3*x2 still has stride-3 in the warp-fast x dimension regardless of YBLOCK size \u2014 YBLOCK only controls how many y-elements are processed per CTA, not the stride between warp threads in the x dimension. The 1.32x speedup is attributable to reduced warp stall cycles (17.6 \u2192 14.3 cycles/instruction) from the smaller block size (256 \u2192 128 threads) and higher L1/TEX hit rate (0% \u2192 43.75%), not from coalescing improvement.",
+    "slow_pseudocode": "# YBLOCK=8 (or mixed), block_size=256, L1 hit rate=0%\n@triton.autotune(configs=[\n    Config({'XBLOCK':128, 'YBLOCK':8},  num_warps=4),\n    Config({'XBLOCK':256, 'YBLOCK':8},  num_warps=4),\n    # ... YBLOCK<=32 configs\n], key=['xnumel','ynumel'])\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    xindex = (xoffset + arange(0,XBLOCK))[:, None]  # slow axis\n    yindex = yoffset + arange(0,YBLOCK)[None, :]    # fast axis\n    y0 = yindex % 3  # stride-1 in output, but warp threads vary in x\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), val, mask)  # stride-3 per warp thread",
+    "fast_pseudocode": "# YBLOCK=32 (covers full ynumel=30), block_size=128, L1 hit rate=43.75%\n@triton.autotune(configs=[\n    Config({'XBLOCK': 32, 'YBLOCK':32}, num_warps=4),\n    Config({'XBLOCK': 64, 'YBLOCK':32}, num_warps=4),\n    Config({'XBLOCK':128, 'YBLOCK':32}, num_warps=8),\n    Config({'XBLOCK':256, 'YBLOCK':32}, num_warps=8),\n    Config({'XBLOCK':512, 'YBLOCK':32}, num_warps=8),\n    Config({'XBLOCK':128, 'YBLOCK': 8}, num_warps=4),\n    Config({'XBLOCK':256, 'YBLOCK': 8}, num_warps=4),\n], key=['xnumel','ynumel'])\ndef kernel(in_ptr, out_ptr, ynumel, xnumel, YBLOCK, XBLOCK):\n    xindex = (xoffset + arange(0,XBLOCK))[:, None]  # slow axis\n    yindex = yoffset + arange(0,YBLOCK)[None, :]    # fast axis\n    y0 = yindex % 3  # stride-1 in output\n    tl.store(out_ptr + (y0 + 3*x2 + 150528*y1), val, mask)  # still stride-3 per warp thread",
+    "applicable_when": "Triton layout-permutation kernel where the warp-fast axis carries a stride-1 output dimension but the warp threads still vary along a strided dimension; smaller block sizes (128 vs 256 threads) improve L1/TEX reuse and reduce warp stall cycles even without fixing the coalescing issue.",
+    "do_not_apply_when": "When the goal is to fix UncoalescedGlobalAccess with stride-3 stores \u2014 YBLOCK=32 does NOT resolve this because the store stride is determined by which axis warp threads vary along (x), not by YBLOCK size. Do not expect coalescing improvement from YBLOCK changes when the store address has a stride > 1 in the warp-fast (x) dimension.",
+    "framework_notes": "Triton-specific: YBLOCK controls how many y-elements are processed per CTA tile, but warp-level coalescing is determined by the stride between consecutive thread IDs within a warp. In a 2D tile with xindex on [:, None] and yindex on [None, :], consecutive warp threads differ in the y dimension \u2014 so coalescing depends on the y-stride in the store address, not x-stride. The observed speedup (1.32x) came from smaller block size enabling better L1/TEX cache reuse (hit rate 0% \u2192 43.75%) and reduced warp stall cycles, not from coalescing improvement."
+  }
+]

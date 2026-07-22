@@ -1,0 +1,305 @@
+[
+  {
+    "item_id": "exp_tile_size_match_small_gemm_002",
+    "iteration": 2,
+    "speedup": 1.3723,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "match_tile_size_to_problem_dimension_for_small_gemm",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4748.0,
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.64,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.35,
+        "Instruction Statistics.Executed Instructions": 2256.0,
+        "Occupancy.Achieved Occupancy": 6.21,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Grid Size": 3.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4150.0,
+        "GPU Speed Of Light Throughput.Duration": 2.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.82,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.35,
+        "Instruction Statistics.Executed Instructions": 2256.0,
+        "Occupancy.Achieved Occupancy": 6.21,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Grid Size": 3.0
+      }
+    },
+    "strategy_title": "Match BLOCK_M/BLOCK_K to actual M/K in tiny GEMMs",
+    "strategy_description": "When a GEMM tile dimension (BLOCK_M, BLOCK_K) is much larger than the actual problem dimension (M=2 with BLOCK_M=16, K=24 with BLOCK_K=32), the vast majority of each tile is masked out, wasting instruction budget and causing shared memory bank conflicts. Reducing BLOCK_M to match M and BLOCK_K to the nearest power-of-2 below K eliminates masked computation, cuts warp cycles per issued instruction (10.64\u21929.82), reduces elapsed cycles (~12%), and lowers shared memory bank conflict pressure. This is a cumulative improvement on top of a prior iteration that already applied the same direction, confirming the strategy generalizes across successive refinements of tile parameters.",
+    "slow_pseudocode": "# BLOCK_M=16 >> M=2, BLOCK_K=32 >> K=24: heavy masking waste\nBLOCK_M: tl.constexpr = 16\nBLOCK_K: tl.constexpr = 32\nGROUP_M: tl.constexpr = 8\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):  # 1 iteration, 8/32 K-lanes active\n    a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)\n    acc += tl.dot(a, b, ...)",
+    "fast_pseudocode": "# BLOCK_M=2 == M=2, BLOCK_K=16 < K=24: 2 iterations, less masking\nBLOCK_M: tl.constexpr = 2\nBLOCK_K: tl.constexpr = 16\nGROUP_M: tl.constexpr = 1\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):  # 2 iterations, 16/16 then 8/16 lanes\n    a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)\n    acc += tl.dot(a, b, ...)",
+    "applicable_when": "GEMM tile dimension (BLOCK_M, BLOCK_N, or BLOCK_K) is significantly larger than the actual problem dimension; NCU LaunchConfiguration rule fires; executed instructions are high relative to useful work; shared memory bank conflicts are elevated; warp cycles per issued instruction are high due to L1TEX stalls from masked/wasted loads",
+    "do_not_apply_when": "Problem dimensions are large enough that the tile fits within the dimension (M >= BLOCK_M, K >= BLOCK_K); reducing tile size would fragment the grid excessively and increase launch overhead relative to compute; kernel is already memory-bandwidth bound and tile size reduction would hurt cache reuse",
+    "framework_notes": "In Triton, BLOCK_M/BLOCK_N/BLOCK_K are tl.constexpr values set inside the kernel or passed as constexpr args. BLOCK_M must be a power of 2 and >= 2 for tl.dot compatibility. GROUP_M=1 is safe when grid_m=1. The equivalent in CUDA would be reducing template tile parameters. Use triton.autotune to sweep tile configs when problem dimensions vary at runtime."
+  },
+  {
+    "item_id": "b3c7d1a2-4e8f-4b9c-a1d5-6f2e3c8b0e47",
+    "iteration": 2,
+    "speedup": 1.0516,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_kernel_with_cta_tile_loop",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 3.0,
+        "Occupancy.Achieved Occupancy": 6.21,
+        "GPU Speed Of Light Throughput.Duration": 3.2,
+        "Scheduler Statistics.No Eligible": 90.26,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 1152.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 4.35,
+        "Instruction Statistics.Executed Instructions": 2256.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 3.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "Scheduler Statistics.No Eligible": 90.94,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 2304.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.3,
+        "Instruction Statistics.Executed Instructions": 3564.0
+      }
+    },
+    "strategy_title": "Persistent Tile-Loop for Tiny Under-Tiled GEMMs",
+    "strategy_description": "When a GEMM produces very few output tiles (e.g., 3 tiles on a 132-SM GPU), reducing BLOCK_N halves tile size and doubles tile count, while a persistent while-loop inside each CTA iterates over multiple tiles strided by num_programs(0). This amortizes kernel launch overhead and keeps accumulators warm in registers across tiles. The speedup is modest (~5%) because the problem is fundamentally too small to fill the GPU, but the approach is correct and avoids the correctness failures of split-K and autotune-based approaches on this workload.",
+    "slow_pseudocode": "# Fixed grid = 3 CTAs, BLOCK_N=32, single tile per CTA\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M=2; BLOCK_N=32; BLOCK_K=16\n    pid = tl.program_id(0)\n    # compute pid_m, pid_n from pid\n    # single tile computation\n    acc = tl.zeros((BLOCK_M, BLOCK_N))\n    for k in range(cdiv(K, BLOCK_K)):\n        acc += tl.dot(load_A(...), load_B(...))\n    tl.store(out + ..., acc)\n\ngrid = (3, 1, 1)",
+    "fast_pseudocode": "# Persistent loop, BLOCK_N=16 \u2192 6 tiles, each CTA loops over assigned tiles\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M=2; BLOCK_N=16; BLOCK_K=16\n    grid_m = cdiv(M, BLOCK_M); grid_n = cdiv(N, BLOCK_N)\n    num_tiles = grid_m * grid_n  # = 6\n    cta_id = tl.program_id(0).to(tl.int32)\n    num_ctas = tl.num_programs(0).to(tl.int32)\n    tile_idx = cta_id\n    while tile_idx < num_tiles:\n        pid_m, pid_n = decompose_tile(tile_idx, grid_m, grid_n)\n        acc = tl.zeros((BLOCK_M, BLOCK_N))\n        for k in range(cdiv(K, BLOCK_K)):\n            acc += tl.dot(load_A(...), load_B(...))\n        tl.store(out + ..., acc)\n        tile_idx += num_ctas\n\ngrid = (min(num_tiles, num_SMs),)",
+    "applicable_when": "LaunchConfiguration NCU rule fires with speedup_pct > 90%; grid_size << sm_count (e.g., 3 vs 132); achieved occupancy < 10%; waves_per_sm = 0; the GEMM is tiny (M*N*K product small) and split-K or autotune approaches have failed correctness; reducing BLOCK_N can double or more the tile count without correctness risk.",
+    "do_not_apply_when": "The grid already has enough tiles to fill most SMs (waves_per_sm >= 0.5); the problem is large enough that reducing BLOCK_N would hurt L2 reuse; split-K is available and correct (it provides more parallelism than tile-loop for K-bound workloads); shared memory bank conflicts are the primary bottleneck (this approach increased bank conflicts from 1152 to 2304 wavefronts due to smaller BLOCK_N).",
+    "framework_notes": "Triton: use tl.num_programs(0) (not a hardcoded constant) for the CTA stride in the persistent loop. Grid lambda must use meta['BLOCK_N'] if autotuning. ALLOW_TF32=False must be preserved for correctness on this workload. The while-loop construct is valid Triton JIT syntax."
+  },
+  {
+    "item_id": "e1ef99b0",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_to_fix_bank_conflicts_and_expand_grid",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_to_fix_bank_conflicts_and_expand_grid \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_to_fix_bank_conflicts_and_expand_grid' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.434e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.633e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.390e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B matrix has stride_bn=24 (non-power-of-2). With BLOCK_N=32, each warp's shared memory loads for B access columns spaced 24 apart, causing 9-way bank conflicts (66.67% of shared load wavefronts are conflict wavefronts). Reducing BLOCK_N from 32 to 16 changes the tile count from ceil(96/32)=3 to ceil(96/16)=6, doubling the grid from 3 to 6 blocks. This simultaneously (a) expands the grid to use more SMs and (b) reduces the shared memory bank conflict severity by narrowing the column span per tile. The persistent kernel loop (while tile_id < num_tiles) is already in place, so the grid expansion is free. BLOCK_M=2 and BLOCK_K=16 are already correctly set.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.434e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.633e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.390e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f7b2d3e1-5c4a-4f8b-a9e2-1d6c0b7f4e83",
+    "iteration": 4,
+    "speedup": 1.4549,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "expand_autotune_num_warps_configs_for_tiny_gemm",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3977.0,
+        "GPU Speed Of Light Throughput.Duration": 2.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.59,
+        "Instruction Statistics.Executed Instructions": 537.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Scheduler Statistics.No Eligible": 89.25,
+        "Launch Statistics.Grid Size": 3.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3943.0,
+        "GPU Speed Of Light Throughput.Duration": 2.66,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.26,
+        "Instruction Statistics.Executed Instructions": 537.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Scheduler Statistics.No Eligible": 89.28,
+        "Launch Statistics.Grid Size": 3.0
+      }
+    },
+    "strategy_title": "Expand Autotune num_warps Configs to Include 8 and 16",
+    "strategy_description": "Expanding the @triton.autotune config space to include num_warps in {1,2,4,8,16} x num_stages in {1,2} (from the prior {1,2,4} x {1,2}) allows the runtime to empirically select a warp configuration that better hides L1TEX stall latency. The profiling metrics show nearly identical hardware counters before and after (same block_size=32, registers=66, executed instructions=537), indicating the autotune selected the same num_warps=1 winning config \u2014 the speedup (1.45x) is therefore attributable to the broader search space enabling a marginally better config or reduced autotuning overhead, not a structural kernel change. This strategy is low-risk: adding more configs to autotune never regresses correctness, and the runtime discards suboptimal configs.",
+    "slow_pseudocode": "# autotune with num_warps in {1,2,4} x num_stages in {1,2} \u2014 6 configs\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=1, num_stages=1),\n        triton.Config({}, num_warps=2, num_stages=1),\n        triton.Config({}, num_warps=4, num_stages=1),\n        triton.Config({}, num_warps=1, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...): ...",
+    "fast_pseudocode": "# autotune with num_warps in {1,2,4,8,16} x num_stages in {1,2} \u2014 10 configs\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=1, num_stages=1),\n        triton.Config({}, num_warps=2, num_stages=1),\n        triton.Config({}, num_warps=4, num_stages=1),\n        triton.Config({}, num_warps=8, num_stages=1),\n        triton.Config({}, num_warps=16, num_stages=1),\n        triton.Config({}, num_warps=1, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=16, num_stages=2),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...): ...",
+    "applicable_when": "Kernel already uses @triton.autotune with a limited num_warps search space (max num_warps=4); SharedMemoryConflicts or IssueSlotUtilization NCU rules fire; kernel is tiny (< 5us, grid << SM count); tile sizes are compile-time constants so key=[] is valid; adding configs has zero correctness risk",
+    "do_not_apply_when": "Autotune key=[] is incorrect (problem dimensions vary at runtime); kernel is already at the optimal num_warps from a prior autotune run and the search space is already exhaustive; kernel duration is dominated by autotuning overhead itself (very fast kernels called rarely); maxnreg constraint is already applied and limits the effective warp count",
+    "framework_notes": "Triton-specific: num_warps=8 means 256 threads/block, num_warps=16 means 512 threads/block. For tiny GEMMs with BLOCK_M=2, BLOCK_N=32, the tl.dot minimum warp requirement is 1 warp. Adding num_warps=8/16 is safe as long as the tile sizes are large enough for tl.dot. The maxnreg=32 change proposed in the plan was NOT reflected in the diff \u2014 only the autotune config expansion was applied. The speedup is real (1.45x) despite the profiling metrics appearing nearly identical, suggesting the improvement comes from the autotuner selecting a slightly better config across the expanded search."
+  },
+  {
+    "item_id": "f7b2d3e1-5c4a-4f8b-9e2d-1a6c0b7f4d83",
+    "iteration": 4,
+    "speedup": 1.2987,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_maxnreg",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Block Limit Registers": 28.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3977.0,
+        "GPU Speed Of Light Throughput.Duration": 2.69,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.59,
+        "Instruction Statistics.Executed Instructions": 537.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Block Limit Registers": 64.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4394.0,
+        "GPU Speed Of Light Throughput.Duration": 2.98,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.21,
+        "Instruction Statistics.Executed Instructions": 567.0
+      }
+    },
+    "strategy_title": "Cap Registers via maxnreg to Raise Theoretical Occupancy",
+    "strategy_description": "Adding maxnreg=32 to all triton.Config entries successfully halved registers per thread from 66 to 32, raising Block Limit Registers from 28 to 64 warps/SM and theoretical occupancy from 43.75% to 50%. However, the speedup (1.30x) came despite NCU showing slightly worse elapsed cycles (3977\u21924394) and higher warp cycles per issued instruction (9.59\u219211.21), suggesting the wall-clock improvement was captured at the benchmark level rather than in the single-kernel NCU trace \u2014 likely due to reduced register spill overhead or faster kernel launch. The maxnreg cap is a valid lever when TheoreticalOccupancy is register-limited (Block Limit Registers < Block Limit Warps), but forced register spilling can increase L1TEX stall cycles, partially offsetting occupancy gains.",
+    "slow_pseudocode": "# 66 registers/thread \u2192 Block Limit Registers = 28 warps/SM \u2192 43.75% theoretical occupancy\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=1, num_stages=1),\n        triton.Config({}, num_warps=2, num_stages=1),\n        triton.Config({}, num_warps=4, num_stages=1),\n        triton.Config({}, num_warps=1, num_stages=2),\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_N: tl.constexpr = 32  # hardcoded\n    ...",
+    "fast_pseudocode": "# 32 registers/thread \u2192 Block Limit Registers = 64 warps/SM \u2192 50% theoretical occupancy\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=1, num_stages=1, maxnreg=32),\n        triton.Config({}, num_warps=2, num_stages=1, maxnreg=32),\n        triton.Config({}, num_warps=4, num_stages=1, maxnreg=32),\n        triton.Config({}, num_warps=1, num_stages=2, maxnreg=32),\n        triton.Config({}, num_warps=2, num_stages=2, maxnreg=32),\n        triton.Config({}, num_warps=4, num_stages=2, maxnreg=32),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_N: tl.constexpr = 32\n    ...",
+    "applicable_when": "TheoreticalOccupancy NCU rule fires with register count as the stated limiter (Block Limit Registers < Block Limit Warps); registers_per_thread is significantly above 32 (e.g., 48\u2013128); the kernel is small/latency-bound and additional warp-level parallelism can hide stalls; Triton >= 2.1 is available (maxnreg is a per-Config kwarg).",
+    "do_not_apply_when": "The kernel is already register-efficient (registers_per_thread \u2264 32); the kernel is compute-bound or memory-bandwidth-bound (register spilling will add L1TEX stall pressure that outweighs occupancy gains); the kernel has complex control flow or large live variable sets where spilling causes severe performance degradation; Block Limit Registers already equals Block Limit Warps (register pressure is not the occupancy limiter).",
+    "framework_notes": "In Triton, maxnreg is passed as a keyword argument to triton.Config (e.g., triton.Config({}, num_warps=4, maxnreg=32)). This is supported in Triton >= 2.1. The equivalent in CUDA PTX is .maxnreg directive or __launch_bounds__(block_size, min_blocks_per_sm). Forcing maxnreg below the compiler's natural allocation causes register spilling to local memory (L1TEX), which increases CPIStall for L1TEX operations \u2014 visible as higher Warp Cycles Per Issued Instruction in NCU."
+  },
+  {
+    "item_id": "f3a2b8c1-7d4e-4f9a-b6c2-1e5d0a3f8b72",
+    "iteration": 4,
+    "speedup": 1.1185,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "transposed_b_load_to_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3977.0,
+        "GPU Speed Of Light Throughput.Duration": 2.69,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2.18,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 288.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.59,
+        "Instruction Statistics.Executed Instructions": 537.0,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Launch Statistics.Grid Size": 3.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5127.0,
+        "GPU Speed Of Light Throughput.Duration": 3.46,
+        "Launch Statistics.Registers Per Thread": 62.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 1.15,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 576.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.57,
+        "Instruction Statistics.Executed Instructions": 792.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Launch Statistics.Grid Size": 3.0
+      }
+    },
+    "strategy_title": "Transposed B Load + tl.trans Worsens Bank Conflicts",
+    "strategy_description": "Switching the B-matrix load from [BLOCK_K, BLOCK_N] to a transposed [BLOCK_N, BLOCK_K] layout followed by tl.trans() for tl.dot was intended to eliminate shared memory bank conflicts caused by a non-power-of-2 stride (stride_bn=24). Instead, bank conflict wavefronts doubled (288\u2192576) and elapsed cycles increased by 29% (3977\u21925127 cycles), while executed instructions grew by 47% (537\u2192792). The autotune decorator did select a lower register count (66\u219262) and slightly improved theoretical occupancy (43.75%\u219250%), but these gains were overwhelmed by the instruction overhead and worsened conflict pattern introduced by the transposed load path. Triton's shared memory staging for tl.dot does not reliably produce conflict-free layouts when the tile is transposed, regardless of the load access pattern.",
+    "slow_pseudocode": "# B loaded [BLOCK_K, BLOCK_N] with stride-24 in N-dim\nBLOCK_N: tl.constexpr = 32\nb_k_vals = offs_k[:, None] + k_idx * BLOCK_K\nb_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)\nxindex_b = tl.broadcast_to(b_k_vals + 24 * offs_b_n[None, :], [BLOCK_K, BLOCK_N])\nb = tl.load(B + xindex_b, mask=b_mask, other=0.0)\nacc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# B loaded [BLOCK_N, BLOCK_K] transposed + tl.trans \u2014 WORSE outcome\nBLOCK_N: tl.constexpr = 16\nb_k_vals_T = offs_k[None, :] + k_idx * BLOCK_K\nb_mask_T = offs_k[None, :] < (K - k_idx * BLOCK_K)\nxindex_b_T = tl.broadcast_to(offs_b_n[:, None] * 24 + b_k_vals_T, [BLOCK_N, BLOCK_K])\nb_T = tl.load(B + xindex_b_T, mask=b_mask_T, other=0.0)\nacc += tl.dot(a, tl.trans(b_T), allow_tf32=False)  # bank conflicts doubled",
+    "applicable_when": "Never: this transformation consistently worsens bank conflicts and instruction count on this kernel shape (M=2, N=96, K=24, BLOCK_N=16, BLOCK_K=16) regardless of autotune configuration.",
+    "do_not_apply_when": "When the kernel is launch-overhead-dominated (grid_size << sm_count, LaunchConfiguration rule > 90% speedup potential); when the B-matrix has a non-power-of-2 column stride and BLOCK_N is small (\u226416); when executed instruction count is already low and any added overhead dominates conflict savings; when tl.trans() is used as the sole mechanism to fix bank conflicts in tl.dot staging.",
+    "framework_notes": "In Triton, tl.trans() is described as a zero-cost metadata operation, but the actual shared memory staging for tl.dot may still produce bank conflicts depending on how Triton lowers the transposed tile. Across two iterations (iter 3 and iter 4), the transposed B load consistently doubled bank conflict wavefronts (1152\u21922304 in iter 3, 288\u2192576 in iter 4) and increased elapsed cycles. The autotune decorator's register reduction benefit (66\u219262 registers) was insufficient to offset the instruction overhead increase."
+  },
+  {
+    "item_id": "a9c4e2f1-3b7d-4e8a-c5f2-0d1b6a9e3c74",
+    "iteration": 5,
+    "speedup": 0.6472,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "expand_launch_grid_to_match_tile_count_and_reduce_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3943.0,
+        "GPU Speed Of Light Throughput.Duration": 2.66,
+        "Launch Statistics.Grid Size": 3.0,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Instruction Statistics.Executed Instructions": 537.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.26,
+        "Scheduler Statistics.No Eligible": 89.28,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 288.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8944.0,
+        "GPU Speed Of Light Throughput.Duration": 5.98,
+        "Launch Statistics.Grid Size": 3.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "Instruction Statistics.Executed Instructions": 6480.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.18,
+        "Scheduler Statistics.No Eligible": 91.44,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 4608.0
+      }
+    },
+    "strategy_title": "Removing Autotune + Expanding Grid Causes Severe Regression",
+    "strategy_description": "Removing @triton.autotune and hardcoding BLOCK_N=8 with a persistent tile-loop (grid still 3, num_ctas=3) caused elapsed cycles to more than double (3943\u21928944 cycles, 2.27x worse) and executed instructions to explode 12x (537\u21926480). The grid remained at 3 blocks because the persistent loop still ran all 12 tiles through 3 CTAs sequentially, but without autotune the compiler chose block_size=128 (4 warps) instead of the optimal block_size=32 (1 warp), quadrupling thread count and warp overhead for a tiny GEMM. Shared memory bank conflicts also worsened dramatically (288\u21924608 wavefronts, 16x) because BLOCK_N=8 with 4 warps creates more conflict-prone access patterns. The key lesson: for tiny GEMMs where autotune had selected num_warps=1 as optimal, removing autotune and forcing a larger block size is catastrophically harmful \u2014 the instruction count and bank conflict overhead far outweigh any theoretical occupancy improvement.",
+    "slow_pseudocode": "# BEFORE: autotune selects num_warps=1 (block_size=32), BLOCK_N=32, grid=3\n@triton.autotune(configs=[Config({}, num_warps=1..16, num_stages=1..2)], key=[])\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_N: tl.constexpr = 32\n    # persistent loop: tile_id += NUM_SMS (132)\n    # 3 tiles, each CTA handles 1 tile\n    ...\ngrid = (3, 1, 1)  # block_size=32 chosen by autotune",
+    "fast_pseudocode": "# AFTER: no autotune, BLOCK_N=8, block_size=128 forced, grid=3\n# persistent loop: tile_idx += num_ctas (3), so each CTA handles 4 tiles sequentially\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_N: tl.constexpr = 8\n    num_ctas = tl.num_programs(0)  # = 3\n    tile_idx = cta_id\n    while tile_idx < 12:  # 12 tiles, 4 per CTA\n        ...  # 12x more iterations, 4x more threads = 12x instruction explosion\n        tile_idx += num_ctas\ngrid = (3, 1, 1)  # block_size=128 (compiler default without autotune)",
+    "applicable_when": "Never apply this pattern: removing autotune from a kernel where autotune had selected a small num_warps (1-2) while simultaneously reducing BLOCK_N and keeping the same grid size.",
+    "do_not_apply_when": "Always avoid: (1) removing @triton.autotune when the winning config is num_warps=1 for a tiny GEMM \u2014 the compiler will default to a larger block size causing instruction explosion; (2) reducing BLOCK_N without actually expanding the grid (persistent loop with same num_ctas just serializes more tiles per CTA); (3) combining BLOCK_N reduction with autotune removal \u2014 bank conflicts scale with both BLOCK_N reduction and increased warp count.",
+    "framework_notes": "In Triton, removing @triton.autotune causes the compiler to use its default block size (often 128 or 256 threads), which is suboptimal for tiny GEMMs. The persistent while-loop with tile_idx += num_ctas(0) does NOT expand parallelism if the grid size stays the same \u2014 it only serializes more work per CTA. To actually expand parallelism, the grid must be set to num_tiles, not num_SMs or a small constant. The autotune decorator is essential for tiny kernels where the optimal num_warps is 1."
+  },
+  {
+    "item_id": "a9c4e7f2-3b1d-4e8c-b5a0-2f7d1c6e9b34",
+    "iteration": 5,
+    "speedup": 0.7648,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_block_n_as_constexpr_with_persistent_loop_for_grid_expansion",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3943.0,
+        "GPU Speed Of Light Throughput.Duration": 2.66,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.26,
+        "Instruction Statistics.Executed Instructions": 537.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Launch Statistics.Grid Size": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 2180.0,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 288.0,
+        "Scheduler Statistics.No Eligible": 89.28
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 7557.0,
+        "GPU Speed Of Light Throughput.Duration": 5.06,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.18,
+        "Instruction Statistics.Executed Instructions": 1284.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Launch Statistics.Registers Per Thread": 58.0,
+        "Launch Statistics.Grid Size": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 640.0,
+        "Memory Workload Analysis.SharedMemoryConflicts bank conflict wavefronts": 1152.0,
+        "Scheduler Statistics.No Eligible": 92.07
+      }
+    },
+    "strategy_title": "Hardcoding BLOCK_N=8 in Body Regresses vs Autotuned BLOCK_N=32",
+    "strategy_description": "Changing BLOCK_N from 32 to 8 as a hardcoded constexpr inside the kernel body (without making it a true autotuned parameter in the kernel signature) caused a 1.91x slowdown: elapsed cycles nearly doubled (3943\u21927557), executed instructions more than doubled (537\u21921284), warp cycles per issued instruction worsened (9.26\u219212.18), and shared memory bank conflict wavefronts quadrupled (288\u21921152). Despite the plan's intent to expand the grid via smaller tiles, the grid remained at 3 blocks because the grid lambda was not updated to use the new BLOCK_N=8 value \u2014 the persistent loop now processes 4x more tiles per CTA instead of expanding the grid, adding instruction overhead with no SM utilization benefit. The autotune config change (replacing num_warps=16 with num_stages=3 configs) also removed the previously winning configuration, further degrading performance.",
+    "slow_pseudocode": "# AFTER (regressed): BLOCK_N=8 hardcoded, grid still 3, 4x more tiles per CTA\n@triton.autotune(\n    configs=[triton.Config({}, num_warps=w, num_stages=s) for w,s in [(1,1),(2,1),(4,1),(8,1),(1,2),(2,2),(4,2),(8,2),(1,3),(2,3),(4,3),(8,3)]],\n    key=[],\n)\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_N: tl.constexpr = 8  # hardcoded, not in signature\n    num_tiles = 12  # 1 * ceil(96/8)\n    num_programs = tl.num_programs(0)  # = 3 (grid unchanged)\n    tile_id = tl.program_id(0)\n    while tile_id < num_tiles:  # each CTA processes 4 tiles\n        ...compute tile...\n        tile_id += num_programs  # stride=3, 4 iterations per CTA\n\ngrid = (3, 1, 1)  # NOT updated to use BLOCK_N=8",
+    "fast_pseudocode": "# BEFORE (better): BLOCK_N=32, grid=3, 1 tile per CTA, autotune includes num_warps=16\n@triton.autotune(\n    configs=[triton.Config({}, num_warps=w, num_stages=s) for w,s in [(1,1),(2,1),(4,1),(8,1),(16,1),(1,2),(2,2),(4,2),(8,2),(16,2)]],\n    key=[],\n)\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_N: tl.constexpr = 32\n    num_tiles = 3\n    tile_id = tl.program_id(0)\n    while tile_id < num_tiles:\n        ...compute tile...\n        tile_id += tl.num_programs(0)\n\ngrid = (3, 1, 1)",
+    "applicable_when": "Never apply this specific pattern: reducing BLOCK_N as a hardcoded constexpr without simultaneously updating the grid lambda to reflect the new tile count. The grid must be updated to lambda meta: (cdiv(N, BLOCK_N),) for the tile expansion to actually increase SM utilization.",
+    "do_not_apply_when": "Any time BLOCK_N is reduced inside the kernel body but the grid launch expression is not correspondingly updated. Also avoid replacing num_warps=16 configs with num_stages=3 configs when the prior autotune had already converged on a winning config \u2014 this removes the winning configuration from the search space and forces a regression.",
+    "framework_notes": "In Triton, reducing BLOCK_N inside the kernel body while keeping the grid fixed causes the persistent loop to iterate more times per CTA rather than distributing work across more CTAs. The grid lambda must be updated to `lambda meta: (triton.cdiv(N, meta['BLOCK_N']),)` and BLOCK_N must appear in the kernel signature as `BLOCK_N: tl.constexpr` for the autotune to correctly vary it. The diff shows the grid was NOT updated (still hardcoded to (3,1,1) implicitly), which is the root cause of the regression."
+  }
+]

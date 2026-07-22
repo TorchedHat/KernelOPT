@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "2515c0ad",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_tile_sizes_eliminate_partial_wave",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_tile_sizes_eliminate_partial_wave \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'increase_tile_sizes_eliminate_partial_wave' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is a 2D transpose over a (256 Y) x (16384 X) space. Current tile XBLOCK=128, YBLOCK=8 produces a 4096-block grid on 132 SMs, yielding 1.94 waves with a costly partial wave (50% speedup potential per NCU). The load pattern strides by 256 floats along X causing L1TEX cache misses and 58.8% stall rate. Increasing YBLOCK from 8 to 32 and XBLOCK from 128 to 256 reduces the grid to 512 blocks (3.88 waves) and gives each block more Y-dimension reuse to amortize the non-coalesced load stride. Adding @triton.autotune lets the runtime find the optimal tile configuration automatically.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_transpose_regression_001",
+    "iteration": 1,
+    "speedup": 0.7944,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_for_coalesced_transpose",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + LaunchConfiguration + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.01,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 16347.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 33.95,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 83.48,
+        "Memory Workload Analysis.L2 Hit Rate": 67.24,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 67.19,
+        "Occupancy.Achieved Occupancy": 81.31
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 13.86,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 20682.0,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 52.65,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 61.83,
+        "Memory Workload Analysis.L2 Hit Rate": 66.5,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 65.98,
+        "Occupancy.Achieved Occupancy": 80.35
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes for Transpose Coalescing Regresses",
+    "strategy_description": "Adding @triton.autotune with varied XBLOCK/YBLOCK configs to a small transpose kernel caused a 26% regression (11.01 us \u2192 13.86 us). The DRAM throughput increased (33.95% \u2192 52.65%) while L2 throughput dropped (83.48% \u2192 61.83%), indicating the autotune selected a config that bypassed L2 reuse and went directly to DRAM more often. The warp stall cycles per instruction barely changed (67.19 \u2192 65.98), confirming the coalescing hypothesis was wrong \u2014 the bottleneck was not coalescing width but rather the autotune overhead and/or a selected config that degraded L2 hit rate. Additionally, the grid was not updated to use a lambda with meta['XBLOCK']/meta['YBLOCK'], so the autotuned kernel was launched with the old fixed grid (128, 8) regardless of the selected config, causing a correctness/efficiency mismatch.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # fixed XBLOCK=128, YBLOCK=8\n    tmp0 = tl.load(in_ptr0 + (offset + y0 + stride*x1), ymask, evict_last)\n    tl.store(out_ptr0 + (x1 + out_stride*y0), tmp0, ymask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](arg0, arg1, 256, 16384, YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# REGRESSION \u2014 do not use this pattern\n@triton.autotune(configs=[...8 configs...], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    tmp0 = tl.load(in_ptr0 + (offset + y0 + stride*x1), mask=xmask & ymask, evict_last)\n    tl.store(out_ptr0 + (x1 + out_stride*y0), tmp0, mask=xmask & ymask)\n\n# BUG: grid still hardcoded to (cdiv(xnumel,128), cdiv(ynumel,8)) \u2014 not a lambda\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # should be lambda meta: (...)\nkernel[grid](arg0, arg1, 256, 16384)  # no XBLOCK/YBLOCK kwargs",
+    "applicable_when": "Never apply this exact pattern \u2014 the grid was not updated to a lambda, breaking the autotune contract.",
+    "do_not_apply_when": "Do not add @triton.autotune to a kernel without simultaneously updating the grid to a lambda that reads meta['XBLOCK'] and meta['YBLOCK']. Without the lambda grid, the kernel launches with the old fixed tile dimensions regardless of which config autotune selects, wasting autotune overhead and potentially degrading L2 reuse. Also avoid autotuning very small kernels (ynumel=256, xnumel=16384, ~11 us) where autotune overhead dominates and the L2 already provides 67% hit rate \u2014 the existing config may already be near-optimal.",
+    "framework_notes": "Triton @triton.autotune requires the launch grid to be a lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']), triton.cdiv(ynumel, meta['YBLOCK']))`. Using a fixed tuple grid with autotune is an implementation flaw that causes the selected config's tile sizes to be ignored at launch time. The mask change from `ymask` to `xmask & ymask` is benign since xmask is always True for these xnumel values, but adds unnecessary instruction overhead."
+  }
+]

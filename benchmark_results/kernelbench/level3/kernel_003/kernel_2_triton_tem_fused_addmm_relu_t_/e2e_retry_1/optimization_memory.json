@@ -1,0 +1,67 @@
+[
+  {
+    "item_id": "f64ff91e",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLFPRoofline + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.133e-01 > atol=0.001\nseed=42 output[0]: max_diff=5.455e-01 > atol=0.001\nseed=1337 output[0]: max_diff=5.057e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "ALLOW_TF32=False forces scalar FP32 FFMA (67 TFLOPS peak) instead of Tensor Core MMA (989 TFLOPS peak FP32 tensor). The H200 has a ~14.7x throughput gap between these two paths. The kernel currently achieves only 37.45% of the FP32 FFMA peak, meaning Tensor Cores are completely idle. Enabling TF32 routes tl.dot through HMMA instructions, which will dramatically increase compute throughput. The L1/TEX saturation (87.47%) and shared memory bank conflicts (8-way, 69.99% of wavefronts) are secondary effects of the slow scalar accumulation loop \u2014 more iterations means more shared memory traffic. Enabling TF32 reduces the effective compute time per tile, alleviating the shared memory pressure. For M=128, N=16384, K=16384 (neural network linear layer), TF32 precision loss is within acceptable tolerance for standard deep learning workloads.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.133e-01 > atol=0.001\nseed=42 output[0]: max_diff=5.455e-01 > atol=0.001\nseed=1337 output[0]: max_diff=5.057e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_larger_block_k_regression",
+    "iteration": 1,
+    "speedup": 0.0288,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_block_k_to_reduce_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_ms": 4.03,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput_%": 87.47,
+        "Memory Workload Analysis.Mem Busy_%": 84.51,
+        "Occupancy.Achieved Occupancy_%": 12.26,
+        "Occupancy.Theoretical Occupancy_%": 18.75,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Launch Statistics.Waves Per SM": 0.65,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.06,
+        "Scheduler Statistics.No Eligible_%": 61.23
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_ms": 140.16,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput_%": 17.87,
+        "Memory Workload Analysis.Mem Busy_%": 21.54,
+        "Occupancy.Achieved Occupancy_%": 6.25,
+        "Occupancy.Theoretical Occupancy_%": 6.25,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Occupancy.Block Limit Shared Mem": 1.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 18.68,
+        "Scheduler Statistics.No Eligible_%": 94.64,
+        "Launch Statistics.Dynamic Shared Memory Per Block_Kbyte": 131.07,
+        "Launch Statistics.Stack Size": 10416.0
+      }
+    },
+    "strategy_title": "Increasing BLOCK_K Alone Causes Shared Memory Occupancy Collapse",
+    "strategy_description": "Doubling BLOCK_K (32\u219264) and BLOCK_N (64\u2192128) in a Triton GEMM kernel caused a 35x regression. The larger tile sizes increased dynamic shared memory per block from 49 KB to 131 KB, which reduced Block Limit Shared Mem from 3 to 1 block per SM, collapsing theoretical occupancy from 18.75% to 6.25%. This triggered severe L1TEX stalls (Warp Cycles Per Issued Instruction jumped from 5.06 to 18.68, No Eligible warps from 61% to 95%), as the single active warp per scheduler could not hide memory latency. The instruction count also ballooned 4.6x (1.2B\u21925.5B instructions), suggesting the larger tiles introduced significant register spilling to local memory (stack size grew from 1024 to 10416 bytes), causing uncoalesced local load/store patterns that NCU flagged as new bottlenecks.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 larger tiles collapse occupancy\nBLOCK_M = 128\nBLOCK_N = 128  # was 64\nBLOCK_K = 64   # was 32\n# dynamic_smem = 131 KB/block \u2192 Block Limit Shared Mem = 1\n# stack_size = 10416 bytes \u2192 register spill to local memory\n# Warp Cycles/Issued Inst = 18.68, No Eligible = 95%",
+    "fast_pseudocode": "# BEFORE (baseline) \u2014 smaller tiles preserve occupancy\nBLOCK_M = 128\nBLOCK_N = 64\nBLOCK_K = 32\n# dynamic_smem = 49 KB/block \u2192 Block Limit Shared Mem = 3\n# registers_per_thread = 168 (no spill)\n# Warp Cycles/Issued Inst = 5.06, No Eligible = 61%",
+    "applicable_when": "Never \u2014 this specific change (increasing BLOCK_K and BLOCK_N simultaneously without autotune) caused a severe regression. The strategy of increasing tile sizes to reduce bank conflicts is only valid when the resulting shared memory footprint does not reduce Block Limit Shared Mem below 2, and when register pressure does not cause spilling.",
+    "do_not_apply_when": "When increasing tile sizes (BLOCK_K, BLOCK_N) would push dynamic shared memory per block above ~64 KB on Hopper (H200/A100), causing Block Limit Shared Mem to drop to 1. Also avoid when the kernel already uses 168 registers/thread \u2014 larger tiles will cause register spilling to local memory, introducing uncoalesced local load/store patterns that are far worse than the original bank conflicts. Do not apply without autotune to empirically validate the config.",
+    "framework_notes": "Triton on Hopper (H200): increasing BLOCK_K from 32 to 64 with BLOCK_N from 64 to 128 pushed dynamic shared memory from 49 KB to 131 KB per block. On H200 with 228 KB shared memory per SM, this limits to 1 block/SM. The kernel also had 168 registers/thread before \u2014 larger tiles caused spilling (stack size 1024\u219210416 bytes). The plan called for @triton.autotune but the actual diff only changed hardcoded constexprs without adding autotune, so the worst single config was selected."
+  }
+]

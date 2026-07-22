@@ -1,0 +1,85 @@
+--- baseline
++++ rebuilt
+@@ -5,14 +5,34 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=2),
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=5),
++        triton.Config({}, num_warps=4, num_stages=6),
++        triton.Config({}, num_warps=8, num_stages=5),
++        triton.Config({}, num_warps=8, num_stages=6),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=5),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_mean_relu_sigmoid_30(arg_A, arg_B, out_ptr1):
+     EVEN_K : tl.constexpr = False
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+-    BLOCK_M : tl.constexpr = 16
+-    BLOCK_N : tl.constexpr = 32
+-    BLOCK_K : tl.constexpr = 32
++    BLOCK_M : tl.constexpr = 2
++    BLOCK_N : tl.constexpr = 128
++    BLOCK_K : tl.constexpr = 64
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+@@ -60,24 +80,24 @@
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+ 
+         a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+-        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+ 
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 432*idx_m
+-        a = tl.load(A + (xindex), mask=a_mask, other=0.0)
++        a = tl.load(A + (xindex), mask=a_mask, other=0.0, eviction_policy='evict_first')
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 1728*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 432*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)), mask=b_mask, other=0.0)
+-
+-
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
++        # Load B transposed: [BLOCK_N, BLOCK_K] instead of [BLOCK_K, BLOCK_N]
++        # This makes consecutive threads access consecutive N elements (stride-1),
++        # eliminating the 12-way shared memory bank conflicts from stride-1728 access.
++        b_k_vals = offs_k[None, :] + (k_idx * BLOCK_K)   # shape [1, BLOCK_K]
++        b_n_vals = offs_b_n[:, None]                       # shape [BLOCK_N, 1]
++        b_mask_t = b_k_vals < (K - k_idx * BLOCK_K)       # shape [1, BLOCK_K] broadcasts to [BLOCK_N, BLOCK_K]
++        xindex_b = b_n_vals + 1728 * b_k_vals             # shape [BLOCK_N, BLOCK_K], N-major layout
++        b_t = tl.load(B + xindex_b, mask=b_mask_t, other=0.0, eviction_policy='evict_first')
++        # b_t shape is [BLOCK_N, BLOCK_K]; tl.trans gives [BLOCK_K, BLOCK_N] for tl.dot
++        acc += tl.dot(a, tl.trans(b_t), allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -90,8 +110,6 @@
+     xindex = idx_n + 1728*idx_m
+     tmp0 = tl.sigmoid(acc)
+     tl.store(out_ptr1 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp0, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

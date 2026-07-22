@@ -1,0 +1,222 @@
+[
+  {
+    "item_id": "exp_triton_autotune_register_spill_occupancy_drop_001",
+    "iteration": 1,
+    "speedup": 0.7663,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_with_evict_first_on_memory_bound_pointwise",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Occupancy.Achieved Occupancy": 93.91,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 36.88,
+        "GPU Speed Of Light Throughput.Duration": 578.37,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 95.66,
+        "Scheduler Statistics.No Eligible": 59.53,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.53,
+        "Instruction Statistics.Executed Instructions": 180224000.0,
+        "Source Counters.Branch Efficiency": 100.0,
+        "Source Counters.Avg. Divergent Branches": 0.0
+      },
+      "key_metric_after": {
+        "Occupancy.Achieved Occupancy": 58.46,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Launch Statistics.Registers Per Thread": 48.0,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.58,
+        "GPU Speed Of Light Throughput.Duration": 754.78,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 81.73,
+        "Scheduler Statistics.No Eligible": 31.66,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.95,
+        "Instruction Statistics.Executed Instructions": 404488192.0,
+        "Source Counters.Branch Efficiency": 87.88,
+        "Source Counters.Avg. Divergent Branches": 7943.76
+      }
+    },
+    "strategy_title": "Autotune + evict_first caused register spill and occupancy collapse",
+    "strategy_description": "Adding @triton.autotune with variable XBLOCK/YBLOCK configs to a kernel that previously used compile-time-constant tile sizes caused registers per thread to jump from 32 to 48, collapsing theoretical occupancy from 100% to 62.5% and achieved occupancy from 93.91% to 58.46%. The autotune configs also introduced masked loads (xmask & ymask) where the original kernel used unconditional full-tile loads, inflating executed instructions by 2.25x and introducing 7943 divergent branches. Despite reducing warp cycles per issued instruction (36.88 \u2192 13.58), the net effect was a 30% longer kernel duration because the occupancy loss and instruction bloat outweighed the latency-hiding benefit. For kernels already at near-100% occupancy with register-limited block counts, adding autotune with variable tile shapes is an anti-pattern: it forces the compiler to allocate more registers to handle dynamic tile sizes, directly reducing occupancy.",
+    "slow_pseudocode": "# Before: fixed tile, no mask, 32 regs/thread, 93.91% occupancy\n@triton.jit\ndef kernel(in_ptr0, ..., YBLOCK: constexpr, XBLOCK: constexpr):\n    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]  # no masking\n    xmask = tl.full([XBLOCK], True, tl.int1)[None, :]\n    tmp0 = tl.load(in_ptr0 + offset, None, eviction_policy='evict_last')\n    ...\n    tl.store(out_ptr0 + offset, result, None)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# After (SLOWER): autotune + masks + evict_first, 48 regs/thread, 58.46% occupancy\n@triton.autotune(configs=[Config({'XBLOCK':128,'YBLOCK':8}, num_warps=4, num_stages=2), ...], key=['ynumel','xnumel'])\n@triton.jit\ndef kernel(in_ptr0, ..., YBLOCK: constexpr, XBLOCK: constexpr):\n    ymask = yindex < ynumel  # dynamic mask added\n    xmask = xindex < xnumel\n    tmp0 = tl.load(in_ptr0 + offset, xmask & ymask, eviction_policy='evict_first')\n    ...\n    tl.store(out_ptr0 + offset, result, xmask & ymask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)  # XBLOCK/YBLOCK chosen by autotune",
+    "applicable_when": "Never: this specific pattern (autotune with variable tile shapes on a kernel already at 100% theoretical occupancy with register-limited block count) is always harmful. The general direction of evict_first for streaming tensors may still be valid when applied without autotune.",
+    "do_not_apply_when": "Kernel is already at or near 100% theoretical occupancy; registers per thread are at or near the register-limit boundary (e.g., 32 regs with Block Limit Registers = 16); tile dimensions evenly divide the problem size (making masks unnecessary); adding autotune would require dynamic masking that inflates instruction count.",
+    "framework_notes": "Triton-specific: @triton.autotune forces the compiler to treat XBLOCK/YBLOCK as runtime-variable even though they are tl.constexpr, causing register pressure to increase. When tile sizes evenly divide the tensor dimensions, tl.full([BLOCK], True, tl.int1) masks are zero-cost; replacing them with dynamic comparisons (yindex < ynumel) adds predication overhead and can cause warp divergence at tile boundaries."
+  },
+  {
+    "item_id": "exp_triton_rsqrt_register_reduction_occupancy_boost_002",
+    "iteration": 2,
+    "speedup": 1.5376,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_rsqrt_and_arithmetic_simplification",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + FPInstructions",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 47.0,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 58.37,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 88.49,
+        "GPU Speed Of Light Throughput.Duration": 564.83,
+        "Instruction Statistics.Executed Instructions": 393216000.0,
+        "Source Counters.Avg. Divergent Branches": 3971.88,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 30.35
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 93.73,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 73.09,
+        "GPU Speed Of Light Throughput.Duration": 376.16,
+        "Instruction Statistics.Executed Instructions": 211288064.0,
+        "Source Counters.Avg. Divergent Branches": 0.0,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0
+      }
+    },
+    "strategy_title": "Replace sqrt+int-div BN sequence with rsqrt to cut registers",
+    "strategy_description": "When a batch-norm normalization sequence uses an integer constant divided by sqrt (e.g., `int32(1) / sqrt(var + eps)`), the compiler allocates extra registers for the int32 intermediate and cannot fuse subsequent multiplications into FMA chains, inflating registers-per-thread and capping theoretical occupancy via Block Limit Registers. Replacing the entire sequence with `libdevice.rsqrt(var + eps)` and expressing the scale/bias as a single FMA-fusible chain (`(x - mean) * rsqrt_val * weight + bias`) collapses 7\u201310 intermediate values into 1, reducing registers-per-thread from 47 to 32, lifting Block Limit Registers from 10 to 16, and raising theoretical occupancy from 62.5% to 100%. The instruction count drops by ~46% (393M \u2192 211M) and kernel duration falls by ~33% (564 \u00b5s \u2192 376 \u00b5s), with warp divergence eliminated entirely.",
+    "slow_pseudocode": "# High register pressure: int32 division prevents FMA fusion\ntmp4 = tl.full([1,1], 1e-05, tl.float32)\ntmp5 = tmp3 + tmp4                        # var + eps\ntmp6 = tl.sqrt_rn(tmp5)                   # sqrt(var+eps)\ntmp7 = tl.full([1,1], 1, tl.int32)        # int32 constant (extra register)\ntmp8 = (tmp7 / tmp6)                      # int32 / float32 \u2014 no FMA\ntmp9 = tl.full([1,1], 1.0, tl.float32)\ntmp10 = tmp8 * tmp9\ntmp11 = tmp2 * tmp10\ntmp13 = tmp11 * tmp12\ntmp15 = tmp13 + tmp14\ntmp16 = tl.full([1,1], 0, tl.int32)       # int32 zero for ReLU\ntmp17 = tl.maximum(tmp16, tmp15)\ntl.store(out_ptr0 + offset, tmp17, mask)",
+    "fast_pseudocode": "# Low register pressure: rsqrt + FMA-fusible chain\ntmp4 = libdevice.rsqrt(tmp3 + 1e-5)       # 1/sqrt(var+eps), single SFU instruction\ntmp5 = tmp2 * tmp4 * tmp12 + tmp14        # FMA-fusible: (x-mean)*rsqrt*weight+bias\ntmp6 = tl.maximum(tl.zeros([1,1], tl.float32), tmp5)  # float32 zero for ReLU\ntl.store(out_ptr0 + offset, tmp6, mask)",
+    "applicable_when": "Triton kernel performing batch-norm normalization where: (1) registers-per-thread is high (>40) due to many BN intermediates; (2) TheoreticalOccupancy NCU rule fires with Block Limit Registers as the binding constraint; (3) FPInstructions rule flags a high ratio of non-fused to fused FP32 instructions (>2:1); (4) the normalization sequence contains an integer constant divided by a float sqrt result.",
+    "do_not_apply_when": "Kernel is already at 100% theoretical occupancy with registers not being the binding constraint; when numerical precision requirements prohibit the ~1 ULP difference between rsqrt and 1/sqrt; when the BN sequence is already expressed as a single FMA chain with no int32 intermediates.",
+    "framework_notes": "Triton-specific: `libdevice.rsqrt(x)` maps to the MUFU.RSQ hardware instruction on NVIDIA GPUs (single-cycle SFU throughput), which is faster than `tl.sqrt_rn` + integer division. Requires `from triton.language.extra import libdevice`. Replacing `tl.full([1,1], 0, tl.int32)` with `tl.zeros([1,1], tl.float32)` in ReLU eliminates the last int32 register. In CUDA, the equivalent is `__frsqrt_rn()` or `rsqrtf()` combined with FMA via `__fmaf_rn()`."
+  },
+  {
+    "item_id": "exp_triton_maxnreg_register_spill_memory_bound_002",
+    "iteration": 2,
+    "speedup": 0.8102,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "maxnreg_cap_to_improve_occupancy_on_compute_bound_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Occupancy.Achieved Occupancy": 58.37,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Launch Statistics.Registers Per Thread": 47.0,
+        "Occupancy.Block Limit Registers": 10.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.47,
+        "GPU Speed Of Light Throughput.Duration": 564.83,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 88.49,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 18.62,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 23.48,
+        "Scheduler Statistics.No Eligible": 11.08,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 4.07,
+        "Instruction Statistics.Executed Instructions": 393216000.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 33.29
+      },
+      "key_metric_after": {
+        "Occupancy.Achieved Occupancy": 70.13,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Block Limit Registers": 12.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 32.62,
+        "GPU Speed Of Light Throughput.Duration": 713.89,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 33.99,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 60.55,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 86.75,
+        "Scheduler Statistics.No Eligible": 65.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.66,
+        "Instruction Statistics.Executed Instructions": 192937984.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 11.14
+      }
+    },
+    "strategy_title": "maxnreg cap caused register spill and memory bottleneck shift",
+    "strategy_description": "Capping registers per thread via maxnreg=40 on a compute-bound kernel (88.49% SM throughput, only 18.62% DRAM throughput) successfully raised theoretical occupancy from 62.5% to 75% and achieved occupancy from 58.37% to 70.13%, but caused the compiler to spill registers to local memory. This shifted the bottleneck from compute to memory: DRAM throughput jumped from 18.62% to 60.55%, L2 cache throughput from 23.48% to 86.75%, and warp cycles per issued instruction tripled from 10.47 to 32.62 cycles, with eligible warps per scheduler collapsing from 4.07 to 0.66. The net result was a 26% longer kernel duration despite the occupancy gain, because the spill-induced L1TEX stalls (56.4% of stall cycles per CPIStall rule) overwhelmed any latency-hiding benefit from additional warps. Applying maxnreg to force occupancy improvement is counterproductive when the kernel is already compute-bound and the register cap causes spilling.",
+    "slow_pseudocode": "# Before: compute-bound, 47 regs/thread, 88.49% SM throughput, 18.62% DRAM\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),\n    # ... other configs without maxnreg\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(...):\n    tmp5 = tmp3 + 1e-5\n    tmp6 = tl.sqrt_rn(tmp5)\n    tmp7 = tl.full([1,1], 1, tl.int32)\n    tmp8 = tmp7 / tmp6\n    tmp9 = tl.full([1,1], 1.0, tl.float32)\n    tmp10 = tmp8 * tmp9  # 4-instruction rsqrt sequence\n    tmp11 = tmp2 * tmp10",
+    "fast_pseudocode": "# After (SLOWER): maxnreg=40 causes spill, memory-bound, 40 regs/thread, 60.55% DRAM\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=2, maxnreg=40),\n    # ... all configs with maxnreg=40\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(...):\n    tmp5 = tmp3 + 1e-5\n    tmp10 = libdevice.rsqrt(tmp5)  # 1 instruction, but spill overhead dominates\n    tmp11 = tmp2 * tmp10",
+    "applicable_when": "Never apply maxnreg as a hard cap when the kernel is already compute-bound (SM throughput >80%, DRAM throughput <25%); the register spill to local memory will shift the bottleneck to memory and cause regression. The rsqrtf/libdevice.rsqrt arithmetic simplification alone is safe and beneficial.",
+    "do_not_apply_when": "Kernel is compute-bound (SM throughput >80%) with low DRAM utilization (<30%); the kernel has complex address computations requiring many simultaneously live index variables; eligible warps per scheduler is already >2 (sufficient latency hiding). In these cases, maxnreg will cause register spilling that creates L1TEX stalls far worse than the original occupancy limitation.",
+    "framework_notes": "Triton-specific: maxnreg=40 in triton.Config is a hard upper bound on registers per thread. When the compiler cannot fit the kernel in the allotted registers, it spills to local memory (L1TEX traffic), which is visible as a CPIStall rule firing with L1TEX stall cycles. The libdevice.rsqrt() simplification (replacing 4-instruction sqrt+div sequence) is independently valid and reduces instruction count by ~50% for the BN normalization step, but was insufficient to overcome the spill penalty in this case."
+  },
+  {
+    "item_id": "exp_triton_explicit_fma_bn_relu_003",
+    "iteration": 3,
+    "speedup": 1.5447,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "explicit_fma_fusion_for_batch_norm_relu_arithmetic",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 376.16,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 73.09,
+        "GPU Speed Of Light Throughput.Memory Throughput": 61.15,
+        "Instruction Statistics.Executed Instructions": 211288064.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.39,
+        "Scheduler Statistics.No Eligible": 26.56,
+        "Occupancy.Achieved Occupancy": 93.73,
+        "Launch Statistics.Registers Per Thread": 32.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 374.43,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 72.99,
+        "GPU Speed Of Light Throughput.Memory Throughput": 61.07,
+        "Instruction Statistics.Executed Instructions": 211288064.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.41,
+        "Scheduler Statistics.No Eligible": 26.44,
+        "Occupancy.Achieved Occupancy": 93.72,
+        "Launch Statistics.Registers Per Thread": 32.0
+      }
+    },
+    "strategy_title": "Explicit FMA for BN arithmetic yields negligible NCU-level gain",
+    "strategy_description": "Replacing a chained multiply-add BN expression (`a * b * c + d`) with an explicit `libdevice.fma(a*b, c, d)` call in Triton was predicted to reduce non-fused FP32 instructions and alleviate CPIStall pressure, but the NCU profiling metrics show essentially no change: executed instructions remained at 211.3M, warp cycles per issued instruction moved from 20.39 to 20.41, and kernel duration dropped only 0.5% (376.16 \u00b5s \u2192 374.43 \u00b5s). The 1.54x reported speedup appears to originate from measurement variance or system-level effects rather than the arithmetic change, since all NCU-visible compute and memory metrics are statistically identical before and after. When a kernel is already balanced between compute (73% SM) and memory (61% L1/TEX) with near-100% occupancy, explicit FMA rewriting of a single BN expression does not produce measurable NCU-level improvement even when the FPInstructions rule fires.",
+    "slow_pseudocode": "# BN normalization: chained multiply-add (compiler may not fuse)\ntmp4 = libdevice.rsqrt(var + 1e-5)\ntmp5 = tmp2 * tmp4 * weight + bias   # emitted as FMUL, FMUL, FADD by compiler",
+    "fast_pseudocode": "# Explicit FMA: split intermediate + libdevice.fma\ntmp4 = libdevice.rsqrt(var + 1e-5)\ntmp4b = tmp2 * tmp4                        # (x - mean) * rsqrt\ntmp5 = libdevice.fma(tmp4b, weight, bias)  # explicit FFMA instruction",
+    "applicable_when": "FPInstructions NCU rule fires with a high non-fused to fused ratio (>2:1); kernel is compute-bound (SM throughput >80%) with low memory pressure; the BN arithmetic expression is the dominant compute bottleneck; registers per thread are well below the spill threshold.",
+    "do_not_apply_when": "Kernel is already balanced between compute and memory (SM ~73%, L1/TEX ~61%); occupancy is near-theoretical maximum (>93%); the FPInstructions rule fires but the kernel is not purely compute-bound \u2014 in this regime the arithmetic change does not produce measurable speedup and the NCU-estimated 38% FP32 throughput gain does not materialize at the kernel level.",
+    "framework_notes": "Triton-specific: `libdevice.fma(a, b, c)` maps to the FFMA PTX instruction. The Triton compiler may already fuse `a * b * c + d` into FFMA chains in some cases; explicit splitting into an intermediate variable plus `libdevice.fma` is the most reliable way to force FFMA emission, but the benefit is only observable when arithmetic throughput is the true bottleneck. In CUDA, the equivalent is `__fmaf_rn(a, b, c)`."
+  },
+  {
+    "item_id": "exp_triton_larger_autotune_tiles_cpi_not_selected_005",
+    "iteration": 5,
+    "speedup": 1.5455,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "larger_tile_configs_to_reduce_cpi_not_selected_stall",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 376.22,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 72.76,
+        "GPU Speed Of Light Throughput.Memory Throughput": 60.92,
+        "Scheduler Statistics.No Eligible": 26.72,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 6.14,
+        "Scheduler Statistics.Active Warps Per Scheduler": 14.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.34,
+        "Instruction Statistics.Executed Instructions": 211288064.0,
+        "Occupancy.Achieved Occupancy": 93.73,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Grid Size": 262144.0,
+        "Launch Statistics.Waves Per SM": 124.12,
+        "Memory Workload Analysis.L2 Hit Rate": 51.07
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 374.24,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 72.76,
+        "GPU Speed Of Light Throughput.Memory Throughput": 60.9,
+        "Scheduler Statistics.No Eligible": 26.65,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 6.13,
+        "Scheduler Statistics.Active Warps Per Scheduler": 14.96,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 20.39,
+        "Instruction Statistics.Executed Instructions": 211288064.0,
+        "Occupancy.Achieved Occupancy": 93.72,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Grid Size": 262144.0,
+        "Launch Statistics.Waves Per SM": 124.12,
+        "Memory Workload Analysis.L2 Hit Rate": 51.49
+      }
+    },
+    "strategy_title": "Adding larger autotune tile configs yields negligible NCU gain",
+    "strategy_description": "Appending 6 larger-tile autotune configs (XBLOCK up to 512, YBLOCK up to 64) to an existing autotune list was predicted to reduce grid size and cut CPIStall 'not selected' cycles, but all NCU-visible metrics are statistically unchanged: grid size remained 262144, waves/SM stayed at 124.12, warp cycles per issued instruction moved from 20.34 to 20.39, and kernel duration dropped only 0.5% (376.22 \u00b5s \u2192 374.24 \u00b5s). The autotune empirically selected the same small-tile config as before (block_size=128, grid_size=262144), meaning none of the new larger-tile configs won the autotuning competition. The 1.55x reported speedup appears to originate from measurement variance or system-level effects rather than the tile-size change, since all NCU-visible compute, memory, and scheduler metrics are statistically identical before and after. When a kernel is already at near-100% occupancy and balanced between compute and memory, adding larger autotune tile configs does not reduce scheduler contention if the autotuner selects the same winning config.",
+    "slow_pseudocode": "# Before: 10 small-tile autotune configs, grid fixed at (cdiv(65536,128), cdiv(4096,8)) = 262144 blocks\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 64,  'YBLOCK': 32}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=4, num_stages=3),\n    # ... 7 more small-tile configs\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(..., YBLOCK: constexpr, XBLOCK: constexpr):\n    ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "fast_pseudocode": "# After: same 10 small-tile configs + 6 new large-tile configs appended\n@triton.autotune(configs=[\n    # ... all 10 existing small-tile configs ...\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 32}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 64}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 64}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 512, 'YBLOCK': 32}, num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=4, num_stages=3),\n    triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=4, num_stages=3),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(..., YBLOCK: constexpr, XBLOCK: constexpr):\n    ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\n# Autotune still selects XBLOCK=128, YBLOCK=8 \u2014 grid unchanged at 262144 blocks",
+    "applicable_when": "CPIStall 'not selected' rule fires with high speedup_pct (>30%); kernel has a very large grid (>100K blocks) with many waves/SM (>50); the autotune search space does not yet include large-tile configs; the kernel body uses power-of-2 tile sizes that evenly divide the problem dimensions so no masking overhead is introduced.",
+    "do_not_apply_when": "The kernel is already at near-100% occupancy (>93%) with registers as the binding constraint (Block Limit Registers = 16 at 32 regs/thread); the autotune has already explored the tile-size space and converged on a small-tile winner due to cache/coalescing constraints; the CPIStall 'not selected' stall is present but the kernel has a non-coalesced store pattern (e.g., NHWC layout) that penalizes larger tiles more than the scheduler contention benefit they provide.",
+    "framework_notes": "Triton-specific: @triton.autotune empirically benchmarks all configs and selects the fastest; adding larger configs to the list does not guarantee they will win. If the autotuner consistently selects the same small-tile config despite larger options being available, the bottleneck is not scheduler contention from grid size but rather a cache/coalescing constraint that favors smaller tiles. The grid lambda `lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))` is required for autotune to vary grid size, but the winning config determines the actual grid."
+  }
+]

@@ -1,0 +1,101 @@
+[
+  {
+    "item_id": "88d48c1d",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_and_fix_b_matrix_coalescing_via_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_and_fix_b_matrix_coalescing_via_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_and_fix_b_matrix_coalescing_via_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.898e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.405e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.621e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has two compounding problems. First, the B matrix (stride_bk=1, stride_bn=256, shape [256,128]) is accessed with index `idx_m + 256*idx_n` inside the K loop \u2014 this is a column-major layout being read in a row-major pattern, causing non-contiguous memory accesses and 8-way shared memory bank conflicts (47.6% speedup opportunity). Second, BLOCK_M=64 x BLOCK_N=128 x BLOCK_K=32 tiles consume 156 registers/thread, limiting the SM to only 3 blocks and 18.75% theoretical occupancy (6.25% achieved). With only 123 blocks on 132 SMs (0.31 waves), the GPU is severely underutilized. Reducing BLOCK_N from 128 to 64 halves the accumulator tile, dramatically cutting register usage and enabling more concurrent warps. Adding @triton.autotune allows the runtime to find the optimal (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) combination. The B-matrix load index must also be corrected to use contiguous stride ordering.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.898e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.405e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.621e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_small_grid_regression_001",
+    "iteration": 1,
+    "speedup": 0.5649,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_on_register_heavy_low_occupancy_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + AchievedOccupancy",
+      "key_metric_before": {
+        "Launch.RegistersPerThread": 156.0,
+        "Occupancy.AchievedOccupancy": 6.25,
+        "Occupancy.TheoreticalOccupancy": 18.75,
+        "GPU Speed Of Light Throughput.Duration": 47.36,
+        "Scheduler Statistics.ActiveWarpsPerScheduler": 1.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 70870.0,
+        "Memory Workload Analysis.SharedMemoryBankConflicts": 3526656.0
+      },
+      "key_metric_after": {
+        "Launch.RegistersPerThread": 255.0,
+        "Occupancy.AchievedOccupancy": 3.12,
+        "Occupancy.TheoreticalOccupancy": 12.5,
+        "GPU Speed Of Light Throughput.Duration": 83.84,
+        "Scheduler Statistics.ActiveWarpsPerScheduler": 1.01,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 125670.0,
+        "Memory Workload Analysis.SharedMemoryBankConflicts": 1763328.0
+      }
+    },
+    "strategy_title": "Autotuning num_warps on register-saturated low-occupancy kernels regresses",
+    "strategy_description": "Adding @triton.autotune with varying num_warps configs to a kernel that is already register-saturated (156+ registers/thread) and occupancy-limited caused registers/thread to jump from 156 to 255 and achieved occupancy to drop from 6.25% to 3.12%, nearly doubling kernel duration (47 \u00b5s \u2192 84 \u00b5s). When a kernel is already bottlenecked by register pressure and shared memory bank conflicts, autotuning num_warps alone does not address the root cause and can force the compiler to spill more registers or choose worse configurations, further degrading occupancy. The actual plan intent (enabling TF32 via ALLOW_TF32=True) was not reflected in the diff \u2014 the diff only added autotune configs without changing ALLOW_TF32, so the intended optimization was never applied.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(...):\n    ALLOW_TF32: tl.constexpr = False\n    # block_size=128, registers=156/thread, occupancy=6.25%\n    acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)",
+    "fast_pseudocode": "# WRONG: adding autotune without fixing root cause\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=3),\n        # ...\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    ALLOW_TF32: tl.constexpr = False  # <-- still False, root cause unaddressed\n    # block_size=64 selected, registers=255/thread, occupancy=3.12%\n    acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)",
+    "applicable_when": "Never applicable as a standalone fix when the kernel is register-saturated and the root cause is a constexpr flag (e.g. ALLOW_TF32=False) that forces scalar FP32 instead of Tensor Core MMA.",
+    "do_not_apply_when": "Do not add @triton.autotune with only num_warps/num_stages variation when: (1) registers/thread > 128 and occupancy < 10%, (2) the primary bottleneck is a constexpr flag controlling compute path (scalar vs tensor core), (3) the grid is already smaller than SM count (waves_per_sm < 0.5). In these cases, fix the root cause (e.g. ALLOW_TF32=True) before or instead of autotuning.",
+    "framework_notes": "In Triton, @triton.autotune with key=[] means autotuning runs once but still compiles multiple configs. When registers/thread is near the hardware maximum (255), reducing num_warps (e.g. from 4 to 2) halves the block size and can cause the compiler to allocate even more registers per thread due to reduced register sharing, worsening occupancy. The intended fix (ALLOW_TF32: tl.constexpr = False \u2192 True) was never applied in the actual diff despite being the stated plan."
+  },
+  {
+    "item_id": "4de93ebe",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_and_fix_b_matrix_load_coalescing",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + UncoalescedSharedAccess + SharedMemoryConflicts + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_and_fix_b_matrix_load_coalescing \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_and_fix_b_matrix_load_coalescing' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.898e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.405e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.621e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-saturated at 255 registers/thread (hardware maximum), caused by the BLOCK_M=64 x BLOCK_N=128 accumulator tile requiring 8,192 FP32 elements. This limits theoretical occupancy to 12.5% and achieved occupancy to 3.12% \u2014 only 2 active warps per SM. Simultaneously, the B matrix (shape [256,128], stride_bk=1, stride_bn=256, column-major K\u00d7N layout) is loaded with a strided pattern causing 5.3-way shared memory bank conflicts (43% speedup opportunity). Reducing BLOCK_N from 128 to 64 halves the accumulator tile, cutting register pressure roughly in half and enabling more concurrent warps per SM. The B-matrix load must simultaneously be corrected to use a coalescing-friendly access pattern. A previous attempt (item 88d48c1d) failed correctness because the B-matrix index rewrite was incorrect \u2014 this plan provides the correct index derivation.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.898e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.405e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.621e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6505f879",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "eliminate_b_matrix_bank_conflicts_via_smem_padding",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "eliminate_b_matrix_bank_conflicts_via_smem_padding \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'eliminate_b_matrix_bank_conflicts_via_smem_padding' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B matrix has layout [K=256, N=128] with stride_bk=1 (K-contiguous) and stride_bn=256 (N-stride=256 elements). Inside the K-loop, the load `B + b_k_idx_vals + 256 * offs_b_n[None, :]` accesses B[k, n] where consecutive threads in the warp step along the N-dimension with stride 256. Since 256 % 32 == 0, every thread in a warp maps to the same shared memory bank, producing the observed 8-way bank conflict. NCU confirms 3,526,656 bank conflicts = 66% of all shared wavefronts. The fix is to stage B tiles through explicitly allocated shared memory with a +8-element padding on the N-dimension (BLOCK_N+8 columns), so that consecutive K-rows land on different banks. This is a purely structural change \u2014 the mathematical values loaded and the accumulation are identical \u2014 so correctness is preserved. Previous attempts that changed the index formula caused correctness failures (items 88d48c1d, 4de93ebe); padding avoids any index rewrite. The CPIStall (45.8% of cycles stalled on MIO/shared memory) confirms shared memory latency is the dominant stall reason.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen",
+    "framework_notes": null
+  }
+]

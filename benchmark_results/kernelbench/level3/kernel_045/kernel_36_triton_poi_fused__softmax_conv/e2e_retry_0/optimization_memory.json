@@ -1,0 +1,76 @@
+[
+  {
+    "item_id": "exp_001_xblock_waste_elimination",
+    "iteration": 1,
+    "speedup": 1.1758,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "eliminate_xblock_masked_thread_waste_by_matching_xnumel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.block_size": 128.0,
+        "Launch.waves_per_sm": 0.48,
+        "Occupancy.Achieved Occupancy": 39.48,
+        "GPU Speed Of Light Throughput.Duration": 3.01,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.18,
+        "Scheduler Statistics.No Eligible": 59.41,
+        "Instruction Statistics.Executed Instructions": 339968.0
+      },
+      "key_metric_after": {
+        "Launch.block_size": 64.0,
+        "Launch.waves_per_sm": 0.24,
+        "Occupancy.Achieved Occupancy": 13.26,
+        "GPU Speed Of Light Throughput.Duration": 2.56,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.63,
+        "Scheduler Statistics.No Eligible": 80.05,
+        "Instruction Statistics.Executed Instructions": 113152.0
+      }
+    },
+    "strategy_title": "Match XBLOCK to xnumel to Eliminate Masked-Thread Waste",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=4), nearly all X-dimension threads are masked on every load/store, wasting ~97% of compute work per CTA. Setting XBLOCK equal to xnumel eliminates this masking overhead and dramatically reduces total executed instructions (339K \u2192 113K here). The speedup is modest (1.18x) because the kernel remains latency-bound and wave-count-limited, but instruction count drops by 67% and warp cycles per issued instruction improve from 16.2 to 10.6.",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=4: 96.9% of X threads masked\nxoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # 128 elements\nxmask = xindex < xnumel  # only 4 of 128 valid\ntmp0 = tl.load(ptr + (x + 4*y), xmask)  # 124/128 threads do nothing\ntl.store(out + (...), tmp0, xmask)\n# grid = (cdiv(4, 128)=1, cdiv(8192, 8)=1024)",
+    "fast_pseudocode": "# XBLOCK=4 == xnumel=4: no X masking needed\n# Use autotune to sweep YBLOCK over {32, 64, 128, 256}\n@triton.autotune(configs=[Config({'YBLOCK': 64, 'XBLOCK': 4}, num_warps=4), ...], key=['ynumel','xnumel'])\nxindex = tl.arange(0, XBLOCK)[None, :]  # XBLOCK=4, no offset, no mask\nymask = yindex < ynumel\ntmp0 = tl.load(ptr + (x + 4*y), ymask)  # all X threads active\ntl.store(out + (...), tmp0, ymask)\n# grid = (1, cdiv(8192, YBLOCK))",
+    "applicable_when": "XBLOCK (or YBLOCK) is significantly larger than the corresponding dimension size (xnumel or ynumel), causing the majority of threads in that dimension to be masked on every memory access. Symptom: high executed instruction count relative to useful work, xmask or ymask rejecting most threads, SOLBottleneck rule triggered with low waves_per_sm.",
+    "do_not_apply_when": "XBLOCK is already close to xnumel, or when the kernel is memory-bandwidth-bound (DRAM throughput near 100%) rather than compute/latency-bound. Also avoid if reducing block size causes register spills or shared memory bank conflicts that outweigh the masking savings.",
+    "framework_notes": "Triton-specific: XBLOCK and YBLOCK are compile-time constexpr tile sizes. Use @triton.autotune to sweep YBLOCK values when XBLOCK is fixed to xnumel, allowing the autotuner to find the best CTA shape for wave coverage. The grid lambda must be updated to use meta['YBLOCK'] when autotuning. In CUDA, the equivalent is choosing threadblock dimensions to match the actual work dimensions rather than over-provisioning."
+  },
+  {
+    "item_id": "exp_001_fix_oversized_xblock_for_small_xnumel",
+    "iteration": 1,
+    "speedup": 1.1622,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_oversized_xblock_for_small_xnumel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.48,
+        "Occupancy.Achieved Occupancy": 39.48,
+        "Scheduler Statistics.No Eligible": 59.41,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.18,
+        "GPU Speed Of Light Throughput.Duration": 3.01,
+        "Launch.block_size": 128.0,
+        "Launch.registers_per_thread": 27.0,
+        "Instruction Statistics.Executed Instructions": 339968.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.24,
+        "Occupancy.Achieved Occupancy": 14.4,
+        "Scheduler Statistics.No Eligible": 75.73,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.5,
+        "GPU Speed Of Light Throughput.Duration": 2.59,
+        "Launch.block_size": 64.0,
+        "Launch.registers_per_thread": 16.0,
+        "Instruction Statistics.Executed Instructions": 123392.0
+      }
+    },
+    "strategy_title": "Match XBLOCK to xnumel to eliminate idle threads",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=4), nearly all X-dimension threads are masked off (xmask=False), wasting register pressure and instruction slots without doing useful work. Setting XBLOCK equal to xnumel eliminates the wasted lanes, reduces register usage (27\u219216 registers/thread), and cuts executed instructions by ~64%. The resulting kernel is faster despite lower achieved occupancy, because the per-thread work is now fully utilized and stall cycles per instruction drop (16.18\u219210.5 cycles/issued instruction).",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=4: 97% of X threads are idle\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    xmask = xindex < xnumel  # only 4/128 threads active in X\n    ymask = tl.full([YBLOCK], True, tl.int1)[:, None]  # no Y guard\n    tmp0 = tl.load(ptr + offset, xmask)  # 124/128 threads do nothing\n    tl.store(out + offset, tmp0, xmask)\n\n# Launch: grid=(cdiv(4,128), cdiv(8192,8)) = (1, 1024), XBLOCK=128, YBLOCK=8",
+    "fast_pseudocode": "# XBLOCK=4 == xnumel=4: all X threads active\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 32},  num_warps=2),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 64},  num_warps=4),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 256}, num_warps=8),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 512}, num_warps=8),\n        triton.Config({'XBLOCK': 4, 'YBLOCK': 1024},num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    xmask = xindex < xnumel   # all 4 threads active\n    ymask = yindex < ynumel   # proper Y boundary guard\n    tmp0 = tl.load(ptr + offset, xmask & ymask)\n    tl.store(out + offset, tmp0, xmask & ymask)\n\n# Launch: grid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\n# Autotune selects best YBLOCK at runtime",
+    "applicable_when": "XBLOCK (or YBLOCK) is set to a power-of-two default that far exceeds the actual numel in that dimension (ratio > 4x), causing most threads in that dimension to be masked off via xmask/ymask. Symptoms: high 'No Eligible' warp % (>50%), high registers/thread, executed instructions much larger than expected for the data size, SOLBottleneck rule triggered.",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (waste is minimal). Also avoid if reducing XBLOCK would drop waves_per_sm below ~0.5 and the kernel is already memory-bandwidth bound (DRAM throughput >50%), as the occupancy reduction could hurt latency hiding.",
+    "framework_notes": "Triton-specific: use @triton.autotune with fixed XBLOCK=xnumel and sweep YBLOCK configs. The grid lambda must use meta['XBLOCK'] and meta['YBLOCK'] instead of hardcoded values. When YBLOCK does not evenly divide ynumel, replace tl.full([YBLOCK], True, tl.int1)[:, None] with yindex < ynumel to add a proper boundary guard."
+  }
+]

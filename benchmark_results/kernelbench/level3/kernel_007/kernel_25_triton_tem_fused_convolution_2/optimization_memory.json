@@ -1,0 +1,128 @@
+[
+  {
+    "item_id": "1727ddc0",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_fix_smem_bank_conflicts_and_occupancy",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_fix_smem_bank_conflicts_and_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_fix_smem_bank_conflicts_and_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 with 128 registers/thread. Shared memory is the binding occupancy limiter (3 blocks/SM max), yielding only 6.25% achieved occupancy. The B matrix is loaded with a broadcast pattern that causes 11.9-way average bank conflicts \u2014 77.52% of all shared load wavefronts are wasted. Reducing BLOCK_M and BLOCK_N to 32 halves the shared memory footprint per block, allowing more blocks per SM (from 3 to potentially 6+), doubling occupancy. Smaller tiles also reduce register pressure (128 \u2192 ~64 registers/thread), further improving occupancy. The grid grows from 123 to 490+ blocks, fully covering all 132 SMs with ~3.7 waves. These must be exposed as kernel parameters (not hardcoded constexprs) so the grid lambda can recompute correctly.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_warps_only_regression_001",
+    "iteration": 2,
+    "speedup": 0.6995,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_only_without_tile_size_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization + SharedMemoryConflicts + LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 32.7,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 48962.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Memory Workload Analysis.Mem Busy": 72.39,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 84.45,
+        "Scheduler Statistics.No Eligible": 78.34
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 46.66,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 69912.0,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Theoretical Occupancy": 9.38,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Memory Workload Analysis.Mem Busy": 29.3,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 34.84,
+        "Scheduler Statistics.No Eligible": 69.22
+      }
+    },
+    "strategy_title": "Autotuning num_warps alone without tile size changes causes regression",
+    "strategy_description": "Adding @triton.autotune with only num_warps/num_stages configs (empty dicts with no BLOCK_M/BLOCK_N/BLOCK_K variation) caused a 43% slowdown. The autotuner selected a smaller block size (64 threads vs 128), which doubled register pressure per thread (128\u2192255 registers/thread), halved theoretical occupancy (18.75%\u21929.38%), and halved achieved occupancy (6.25%\u21923.12%), increasing elapsed cycles from 48962 to 69912. The root cause is that without tile size parameters in the autotune config dict, the compiler must spill more values to registers to handle the same work with fewer threads, and the autotuner cannot compensate because the grid size and tile dimensions remain fixed. This pattern is confirmed across two iterations with identical 0.6995x speedup.",
+    "slow_pseudocode": "# Before: fixed block_size=128, registers=128, occupancy=6.25%\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64\n    BLOCK_N: tl.constexpr = 64\n    BLOCK_K: tl.constexpr = 64\n    # grid = (123, 1, 1) fixed",
+    "fast_pseudocode": "# After (WRONG): autotune only num_warps/num_stages, no tile size variation\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=3),  # empty dict = no tile changes\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=2),\n        # ...\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64  # still hardcoded\n    # grid = (123, 1, 1) still fixed\n# Result: block_size halved to 64, registers doubled to 255, occupancy halved",
+    "applicable_when": "Never: this specific pattern (autotune with empty config dicts varying only num_warps) is always harmful when tile sizes are hardcoded constexprs inside the kernel body.",
+    "do_not_apply_when": "Always avoid autotuning num_warps/num_stages in isolation when BLOCK_M/BLOCK_N/BLOCK_K are hardcoded constexprs inside the kernel body and not exposed as kernel parameters. The autotuner will select smaller warp counts, reducing block size, which increases register pressure per thread and collapses occupancy. To properly autotune, tile sizes must be promoted to kernel parameters and included in the config dicts.",
+    "framework_notes": "In Triton, @triton.autotune configs with empty dicts {} only vary num_warps and num_stages. If BLOCK_M/BLOCK_N/BLOCK_K are defined as tl.constexpr literals inside the kernel body (not as kernel arguments), they cannot be varied by the autotuner. The correct pattern is to pass them as kernel arguments with tl.constexpr type annotations and include them in the config dict: triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3)."
+  },
+  {
+    "item_id": "exp_triton_maxnreg_with_transpose_removal_regression_001",
+    "iteration": 4,
+    "speedup": 0.4864,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "cap_registers_with_maxnreg_and_remove_tl_trans",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + MemoryCacheAccessPattern + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 32.83,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 49183.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Memory Workload Analysis.Mem Busy": 72.33,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 5.95,
+        "Memory Workload Analysis.L2 Hit Rate": 38.82,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.65,
+        "Instruction Statistics.Executed Instructions": 4809292.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 67.1,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 100581.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Memory Workload Analysis.Mem Busy": 51.71,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 59.33,
+        "Memory Workload Analysis.L2 Hit Rate": 94.06,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 6.81,
+        "Instruction Statistics.Executed Instructions": 6656752.0
+      }
+    },
+    "strategy_title": "maxnreg + tl.trans removal causes 2x slowdown via L2 thrashing",
+    "strategy_description": "Adding maxnreg=64 to autotune configs successfully halved registers per thread (128\u219264) and doubled the register-based block limit (4\u21928 blocks/SM), but achieved occupancy remained identical at 6.25% because shared memory (3 blocks/SM) remained the binding limiter. Meanwhile, removing tl.trans() and switching to a direct [BLOCK_K, BLOCK_N] load dramatically increased L2 traffic: L2 input sectors grew from 69,613 to 3,486,522 (50x), L2 hit rate jumped from 38.82% to 94.06% indicating massive L2 pressure, and executed instructions grew from 4.8M to 6.7M. The net effect was a 2x increase in kernel duration (32.83\u219267.1 \u00b5s). When shared memory is the binding occupancy limiter, capping registers via maxnreg provides zero occupancy benefit while the associated code restructuring (transpose removal) can introduce new memory access inefficiencies that overwhelm any theoretical gain.",
+    "slow_pseudocode": "# Before: 128 regs/thread, tl.trans pattern, 32.83us\n@triton.autotune(configs=[triton.Config({}, num_warps=4, num_stages=3), ...], key=[])\ndef kernel(...):\n    offs_bk_row = offs_k[None, :] + k_idx * BLOCK_K  # [1, BLOCK_K]\n    offs_bn_col = offs_b_n[:, None]                   # [BLOCK_N, 1]\n    b_T = tl.load(B + offs_bn_col*256 + offs_bk_row*1)  # [BLOCK_N, BLOCK_K]\n    b = tl.trans(b_T)                                 # [BLOCK_K, BLOCK_N]\n    acc += tl.dot(a, b, ...)",
+    "fast_pseudocode": "# After (WRONG): maxnreg=64, no tl.trans, 67.1us (2x slower)\n@triton.autotune(configs=[triton.Config({}, num_warps=4, num_stages=3, maxnreg=64), ...], key=[])\ndef kernel(...):\n    offs_bk_col = offs_k[:, None] + k_idx * BLOCK_K  # [BLOCK_K, 1]\n    offs_bn_row = offs_b_n[None, :]                   # [1, BLOCK_N]\n    b = tl.load(B + offs_bk_col*1 + offs_bn_row*256) # [BLOCK_K, BLOCK_N] direct\n    acc += tl.dot(a, b, ...)  # no tl.trans",
+    "applicable_when": "Never: this combination is harmful when shared memory is the binding occupancy limiter (Block Limit Shared Mem < Block Limit Registers). maxnreg provides no occupancy benefit in this regime, and restructuring the B-matrix load to avoid tl.trans introduces massive L2 pressure.",
+    "do_not_apply_when": "Do not apply maxnreg to cap registers when shared memory is already the binding occupancy limiter (Block Limit Shared Mem \u2264 Block Limit Registers). In this case, reducing registers does not increase the number of concurrent blocks per SM, so there is zero occupancy benefit. Additionally, removing tl.trans() by switching from [BLOCK_N, BLOCK_K] to [BLOCK_K, BLOCK_N] load layout can cause a 50x increase in L2 sector traffic and a 38% increase in total executed instructions, overwhelming any theoretical bank-conflict savings. The shared memory bank conflicts (11.9-way) persist unchanged after this transformation.",
+    "framework_notes": "In Triton, maxnreg is a per-config parameter in @triton.autotune that caps the register file usage per thread. It only improves occupancy when registers are the binding limiter (Block Limit Registers < Block Limit Shared Mem). Check NCU Occupancy section: if Block Limit Shared Mem \u2264 Block Limit Registers, maxnreg is useless. The tl.trans() removal did not eliminate shared memory bank conflicts (SharedMemoryConflicts rule still fired with identical 11.9-way conflicts and 77.51% wasted wavefronts after the change), suggesting Triton's internal shared memory layout for tl.dot operands is independent of whether tl.trans() is used in the load path."
+  },
+  {
+    "item_id": "00aa28cb",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_shared_memory_footprint_via_smaller_block_m_with_correct_grid_and_kernel_params",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_shared_memory_footprint_via_smaller_block_m_with_correct_grid_and_kernel_params \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_shared_memory_footprint_via_smaller_block_m_with_correct_grid_and_kernel_params' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.310e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.341e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.507e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel computes M=7840, N=64, K=256 GEMM with BLOCK_M=64, BLOCK_N=64, BLOCK_K=64. Since N=64=BLOCK_N, grid_n=1, so the entire grid is (ceil(7840/64),1,1)=123 blocks for 132 SMs \u2014 only 0.31 waves/SM. Shared memory is the binding occupancy limiter (Block Limit Shared Mem=3 vs Block Limit Registers=5), causing only 6.25% achieved occupancy. The 11.9-way shared memory bank conflicts (62.96% speedup potential) dominate MIO stalls (61.5% of all cycles). Reducing BLOCK_M from 64 to 32 halves shared memory per block, allowing up to 6 blocks/SM (doubling theoretical occupancy to 37.5%), and grows the grid from 123 to 245 blocks (1.86 waves/SM). The prior attempt (item_id=1727ddc0) failed correctness because the grid lambda was not updated \u2014 the fix is to expose BLOCK_M/BLOCK_N/BLOCK_K as kernel parameters and use a grid lambda with meta['BLOCK_M'].",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.310e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.341e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.507e+01 > atol=0.001",
+    "framework_notes": null
+  }
+]

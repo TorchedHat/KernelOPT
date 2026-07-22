@@ -1,0 +1,190 @@
+[
+  {
+    "item_id": "3cb49bf6",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_b_matrix_load_and_reduce_tile_size_for_register_pressure",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_b_matrix_load_and_reduce_tile_size_for_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_b_matrix_load_and_reduce_tile_size_for_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.193e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.130e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.127e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B matrix has physical strides stride_bk=1, stride_bn=512 (B stored as K x N row-major). The current load uses `tl.broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N])` where idx_m=b_k_idx_vals (K-dim [BLOCK_K,1]) and idx_n=offs_b_n (N-dim [1,BLOCK_N]). While the index arithmetic `k + 512*n` is numerically correct for B[k,n], the `tl.broadcast_to` wrapper obscures the 2D shape from Triton's memory access optimizer, preventing it from generating coalesced loads and causing 12-way shared memory bank conflicts (77.65% of all wavefronts are excessive). Replacing with explicit 2D indexing `b_k_idx_vals[:,None] + 512*offs_b_n[None,:]` gives Triton the shape information to coalesce. Additionally, BLOCK_M=64 x BLOCK_N=64 accumulator requires 4096 FP32 values = 128 registers/thread with 128 threads/block, hard-capping occupancy at 4 blocks/SM (25% theoretical, only 6.25% achieved). Reducing to BLOCK_M=32, BLOCK_N=32 cuts accumulator to 1024 values, targeting ~32-48 registers/thread and doubling achievable occupancy. Grid grows from 128 to 512 blocks, fully covering all 132 SMs.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.193e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.130e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.127e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_block_ptr_order_0_1_still_worsens_bank_conflicts",
+    "iteration": 2,
+    "speedup": 0.5916,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_block_ptr_to_fix_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.35,
+        "Memory Workload Analysis.Mem Busy": 83.17,
+        "GPU Speed Of Light Throughput.Duration": 58.14,
+        "SharedMemoryConflicts.bank_conflict_wavefronts": 7340032.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 77.65,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Scheduler Statistics.No Eligible": 77.02
+      },
+      "key_metric_after": {
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.17,
+        "Memory Workload Analysis.Mem Busy": 92.21,
+        "GPU Speed Of Light Throughput.Duration": 98.72,
+        "SharedMemoryConflicts.bank_conflict_wavefronts": 14680064.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 82.28,
+        "Occupancy.Achieved Occupancy": 12.49,
+        "Scheduler Statistics.No Eligible": 85.89
+      }
+    },
+    "strategy_title": "Changing block_ptr order=(0,1) for B still doubles bank conflicts",
+    "strategy_description": "A second attempt to fix shared memory bank conflicts by switching the B-matrix block_ptr from order=(1,0) to order=(0,1) produced identical regression to the first attempt: bank conflict wavefronts doubled (7.3M \u2192 14.7M), average conflict way increased (12-way \u2192 17-way), warp cycles per issued instruction jumped from 4.35 to 14.17, and kernel duration nearly doubled from 58.1\u00b5s to 98.7\u00b5s. The profiling metrics after are statistically identical to exp_001, confirming that the order parameter alone cannot fix the underlying access pattern \u2014 the root cause is structural in how the B matrix is logically accessed (transposed broadcast pattern), not a simple order flag mismatch. Switching to tl.make_block_ptr in any order configuration is an anti-pattern for this kernel until the transposed B-matrix access logic is fundamentally restructured.",
+    "slow_pseudocode": "# BEFORE: scalar pointer arithmetic with transposed B load (baseline, 58\u00b5s)\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + (offs_k[None,:] + k_idx*BLOCK_K) + 512*offs_a_m[:,None])\n    b = tl.load(B + broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N]))  # transposed broadcast\n    acc += tl.dot(a, b, ...)",
+    "fast_pseudocode": "# AFTER (STILL WORSE): block_ptr with order=(0,1) for B \u2014 conflicts still doubled\na_ptr = tl.make_block_ptr(A, shape=(M,K), strides=(stride_am,stride_ak),\n                          offsets=(pid_m*BM,0), block_shape=(BM,BK), order=(1,0))\nb_ptr = tl.make_block_ptr(B, shape=(K,N), strides=(stride_bk,stride_bn),\n                          offsets=(0,pid_n*BN), block_shape=(BK,BN), order=(0,1))  # changed from (1,0)\nfor k_idx in range(K // BK):\n    a = tl.load(a_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(b_ptr, boundary_check=(0,1), padding_option='zero')\n    acc = tl.dot(a, b, acc, ...)\n    a_ptr = tl.advance(a_ptr, (0, BK))\n    b_ptr = tl.advance(b_ptr, (BK, 0))",
+    "applicable_when": "Never \u2014 this direction has now failed twice with identical profiling outcomes regardless of the order parameter value.",
+    "do_not_apply_when": "Do not apply tl.make_block_ptr as a replacement for scalar pointer arithmetic in this kernel in any order=(0,1) or order=(1,0) configuration. Both iterations produced identical regressions: bank conflict wavefronts doubled, warp stall cycles tripled, and duration nearly doubled. The B-matrix has a fundamentally transposed access pattern (physical strides stride_bk=1, stride_bn=512 but logically accessed as idx_m + 512*idx_n) that block_ptr cannot fix by changing the order flag alone. A structural rewrite of the B-matrix indexing logic is required before block_ptr can help.",
+    "framework_notes": "Triton-specific: tl.make_block_ptr order parameter controls shared memory staging layout but cannot compensate for a logically transposed access pattern in the original kernel. When the original code uses tl.broadcast_to(idx_m + stride*idx_n, ...) for B (a transposed gather), the physical strides passed to make_block_ptr do not reflect the actual access order, so any order value will produce a conflicting layout. Two iterations (order=(1,0) in exp_001, order=(0,1) in exp_002) both produced identical 14.7M conflict wavefronts and 14.17 warp cycles/instruction, confirming the order parameter is not the lever to pull here."
+  },
+  {
+    "item_id": "exp_003_pretranspose_b_worsens_bank_conflicts_further",
+    "iteration": 3,
+    "speedup": 0.5904,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "pretranspose_b_matrix_to_eliminate_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 58.02,
+        "Memory Workload Analysis.Mem Busy": 83.3,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.35,
+        "SharedMemoryConflicts.bank_conflict_wavefronts": 7340032.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 77.65,
+        "SharedMemoryConflicts.avg_conflict_way": 12.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Scheduler Statistics.No Eligible": 77.11,
+        "Compute Workload Analysis.Executed Ipc Active": 0.92
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 98.91,
+        "Memory Workload Analysis.Mem Busy": 92.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.18,
+        "SharedMemoryConflicts.bank_conflict_wavefronts": 14680064.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 82.28,
+        "SharedMemoryConflicts.avg_conflict_way": 17.0,
+        "Occupancy.Achieved Occupancy": 12.49,
+        "Scheduler Statistics.No Eligible": 85.9,
+        "Compute Workload Analysis.Executed Ipc Active": 0.56
+      }
+    },
+    "strategy_title": "Pre-transposing B matrix doubles bank conflicts, not fixes them",
+    "strategy_description": "Physically pre-transposing the B matrix in the host wrapper (reshape + .t().contiguous()) and switching to tl.make_block_ptr with order=(1,0) for the transposed layout produced the same regression as prior block_ptr attempts: bank conflict wavefronts doubled (7.3M \u2192 14.7M), average conflict way increased (12-way \u2192 17-way), warp cycles per issued instruction tripled (4.35 \u2192 14.18), and kernel duration nearly doubled (58\u00b5s \u2192 99\u00b5s). Despite the physical memory layout being correct (stride_bk=1 contiguous after transpose), the tl.make_block_ptr staging into shared memory still generates severe conflicts, indicating the conflict source is in the shared memory access pattern during tl.dot, not the global load pattern. The scalar pointer arithmetic baseline (58\u00b5s) remains superior to any block_ptr variant tried across three iterations.",
+    "slow_pseudocode": "# BEFORE: scalar pointer arithmetic with transposed B broadcast (baseline, 58\u00b5s)\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + offs_k[None,:] + k_idx*BLOCK_K + 512*offs_a_m[:,None])\n    b = tl.load(B + broadcast_to(b_k_idx_vals + 512*offs_b_n, [BLOCK_K, BLOCK_N]))\n    acc += tl.dot(a, b, ...)",
+    "fast_pseudocode": "# AFTER (STILL WORSE): host pre-transposes B, kernel uses block_ptr \u2014 conflicts still doubled\n# Host:\narg_1_T = arg_1.reshape(512, 1024).t().contiguous()  # (N=1024, K=512), stride_bk=1\n# Kernel:\nb_block_ptr = tl.make_block_ptr(arg_B, shape=(N,K), strides=(stride_bn,stride_bk),\n                                offsets=(pid_n*BN,0), block_shape=(BN,BK), order=(1,0))\nfor k_idx in range(K // BK):\n    a = tl.load(a_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b_T = tl.load(b_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc = tl.dot(a, tl.trans(b_T), acc, ...)\n    a_block_ptr = tl.advance(a_block_ptr, (0, BK))\n    b_block_ptr = tl.advance(b_block_ptr, (0, BK))",
+    "applicable_when": "Never \u2014 this direction has now failed three times with statistically identical profiling outcomes regardless of block_ptr order parameter or physical memory layout of B.",
+    "do_not_apply_when": "Do not apply tl.make_block_ptr (in any order configuration) or host-side B pre-transposition as a fix for shared memory bank conflicts in this kernel. Three iterations (order=(1,0), order=(0,1), and pre-transposed B with order=(1,0)) all produced identical regressions: bank conflict wavefronts doubled to ~14.7M, warp stall cycles tripled, and duration nearly doubled to ~99\u00b5s. The scalar pointer arithmetic baseline at 58\u00b5s is consistently superior. The bank conflicts appear to originate from the shared memory access pattern during tl.dot accumulation, not from the global load pattern, and cannot be fixed by changing block_ptr order or physical B layout alone.",
+    "framework_notes": "Triton-specific: tl.make_block_ptr with tl.trans() for a pre-transposed B matrix does not eliminate shared memory bank conflicts when the conflict source is in the tl.dot shared memory staging, not the global load. Three iterations confirm this anti-pattern. The original scalar broadcast load (tl.broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N])) at 58\u00b5s is the better baseline to preserve while seeking other optimizations (e.g., padding shared memory, changing BLOCK_K to a non-power-of-32-multiple, or restructuring the accumulation)."
+  },
+  {
+    "item_id": "a33e9e44",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_break_bank_conflict_alignment_and_increase_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + AchievedOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_break_bank_conflict_alignment_and_increase_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_break_bank_conflict_alignment_and_increase_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.193e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.130e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.127e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "Three root causes compound: (1) BLOCK_K=32 is a power-of-2 causing systematic 12-way shared memory bank conflicts in tl.dot staging. (2) BLOCK_M=64 x BLOCK_N=64 accumulator = 4096 FP32 values requires 128 registers/thread, hard-capping at 4 blocks/SM (25% theoretical, only 6.25% achieved). (3) Grid=128 < 132 SMs means some SMs are idle. All block_ptr and pre-transpose approaches worsened conflicts (confirmed by 3 prior iterations). Reducing BLOCK_M=32, BLOCK_N=32, BLOCK_K=16 cuts accumulator to 1024 FP32 values (~32-48 registers/thread), grows grid to 512 blocks (covering all 132 SMs with ~3.9 waves), and changes the shared memory access stride pattern.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.193e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.130e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.127e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "c616b0af",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "revert_to_scalar_ptr_b_load_no_trans_with_reduced_tiles",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "revert_to_scalar_ptr_b_load_no_trans_with_reduced_tiles \u2014 correctness failure",
+    "strategy_description": "Plan 'revert_to_scalar_ptr_b_load_no_trans_with_reduced_tiles' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.193e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.130e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.127e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The current kernel uses tl.make_block_ptr for B as shape (N=1024, K=512) with order=(1,0), then calls tl.dot(a, tl.trans(b_T)). The tl.trans() forces Triton to stage the [BLOCK_N, BLOCK_K] tile through shared memory in transposed order before feeding it to the MMA unit. This transpose-in-SMEM is the source of the 17-way bank conflicts (confirmed by memory items exp_002 and exp_003: every block_ptr variant with tl.trans doubles conflicts to 14.7M wavefronts vs 7.3M in the scalar-ptr baseline at 58us). The fix is to replace the block_ptr B load + tl.trans with scalar pointer arithmetic that loads B[k, n] directly as a [BLOCK_K, BLOCK_N] tile, eliminating the shared memory transpose entirely. Additionally, reducing BLOCK_M and BLOCK_N from 64 to 32 cuts register pressure (80 to ~40 regs/thread), allowing more blocks/SM and improving occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.193e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.130e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.127e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_004_nonpower2_block_k_padding_causes_register_spill_regression",
+    "iteration": 4,
+    "speedup": 0.4314,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "pad_shared_memory_via_nonpower2_block_k_to_eliminate_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 57.98,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 86892.0,
+        "Memory Workload Analysis.Mem Busy": 83.2,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.35,
+        "SharedMemoryConflicts.bank_conflict_wavefronts": 7340032.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 77.65,
+        "SharedMemoryConflicts.avg_conflict_way": 12.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Scheduler Statistics.No Eligible": 77.01,
+        "Instruction Statistics.Executed Instructions": 9796416.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 135.36,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 202891.0,
+        "Memory Workload Analysis.Mem Busy": 77.94,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.81,
+        "SharedMemoryConflicts.bank_conflict_wavefronts": 14680064.0,
+        "SharedMemoryConflicts.bank_conflict_pct": 77.71,
+        "SharedMemoryConflicts.avg_conflict_way": 12.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65.54,
+        "Scheduler Statistics.No Eligible": 79.25,
+        "Instruction Statistics.Executed Instructions": 20515136.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 58.72
+      }
+    },
+    "strategy_title": "Non-power-of-2 BLOCK_K causes register spill, doubles instructions",
+    "strategy_description": "Setting BLOCK_K=33 (a non-power-of-2 value) in Triton requires padding tl.arange to the next power-of-2 (64) and adding per-element masks on every load. This caused registers per thread to explode from 128 to 255 (hitting the hardware maximum), theoretical occupancy to drop from 25% to 12.5%, dynamic shared memory to double (32KB \u2192 65KB), and executed instructions to more than double (9.8M \u2192 20.5M). Critically, bank conflict wavefronts also doubled (7.3M \u2192 14.7M) rather than decreasing, because the padded arange with masking does not actually change the shared memory layout seen by tl.dot \u2014 the conflict pattern is unchanged. The masking overhead and register spill completely dominate, producing a 2.3\u00d7 slowdown. Do not use non-power-of-2 BLOCK_K values in Triton matmul kernels; the tl.arange power-of-2 constraint forces masking overhead that causes severe register pressure and instruction count inflation without fixing the underlying bank conflict pattern.",
+    "slow_pseudocode": "# BEFORE: BLOCK_K=32, no masking needed, 128 regs/thread, 58us\nBLOCK_K : tl.constexpr = 32\noffs_k = tl.arange(0, BLOCK_K)  # power-of-2, no mask needed\nfor k_idx in range(K // BLOCK_K):\n    a = tl.load(A + offs_k[None,:] + k_idx*BLOCK_K + 512*offs_a_m[:,None])\n    b = tl.load(B + offs_k[:,None] + k_idx*BLOCK_K + 512*offs_b_n[None,:])\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# AFTER (WORSE): BLOCK_K=33, must pad to 64, masking causes 255 regs/thread, 135us\nBLOCK_K : tl.constexpr = 33\nBLOCK_K_POW2 : tl.constexpr = 64  # tl.arange requires power-of-2\noffs_k = tl.arange(0, BLOCK_K_POW2)  # [0..63], padded\nfor k_idx in range(tl.cdiv(K, BLOCK_K)):\n    k_mask = offs_k < BLOCK_K  # extra mask per iteration\n    a_mask = (idx_m < M) & (a_k_idx_vals < K) & (k_mask[None,:])\n    b_mask = (b_k_idx_vals < K) & (k_mask[:,None]) & (offs_b_n[None,:] < N)\n    a = tl.load(A + xindex, mask=a_mask, other=0.0)  # masked load\n    b = tl.load(B + xindex, mask=b_mask, other=0.0)  # masked load\n    acc += tl.dot(a, b, allow_tf32=False)\n# Result: registers 128->255, instructions 9.8M->20.5M, bank conflicts DOUBLED",
+    "applicable_when": "Never applicable in Triton \u2014 non-power-of-2 BLOCK_K values always require padding tl.arange to the next power-of-2, which causes register explosion and instruction count doubling without fixing bank conflicts.",
+    "do_not_apply_when": "Always avoid non-power-of-2 BLOCK_K (e.g., 33, 48) in Triton matmul kernels. The tl.arange power-of-2 constraint forces masking overhead that: (1) doubles instruction count, (2) pushes registers/thread to the hardware maximum (255), (3) halves theoretical occupancy, (4) doubles dynamic shared memory, and (5) does NOT reduce bank conflicts because tl.dot's shared memory staging layout is determined by the padded power-of-2 tile shape, not the masked BLOCK_K value. The classic '+1 padding' trick for shared memory bank conflicts cannot be applied via non-power-of-2 BLOCK_K in Triton.",
+    "framework_notes": "Triton-specific: tl.arange() requires a compile-time power-of-2 upper bound. Using BLOCK_K=33 forces BLOCK_K_POW2=64, effectively making the tile [BLOCK_M, 64] in shared memory with 31 wasted lanes \u2014 this is worse than BLOCK_K=64 directly because it adds masking overhead without the benefit of a full 64-wide tile. The bank conflict pattern in tl.dot is determined by the power-of-2 padded shape, so BLOCK_K=33 padded to 64 produces the same conflict pattern as BLOCK_K=64 but with 2\u00d7 the instruction overhead. Also note: USE_FAST_ACCUM was changed from False to True in this diff, which may affect numerical accuracy."
+  }
+]

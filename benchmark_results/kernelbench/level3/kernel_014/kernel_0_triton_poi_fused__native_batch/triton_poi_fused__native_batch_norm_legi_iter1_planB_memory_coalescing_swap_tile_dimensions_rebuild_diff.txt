@@ -1,0 +1,80 @@
+--- baseline
++++ rebuilt
+@@ -5,25 +5,39 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 64}, num_warps=4, num_stages=3),
++        triton.Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=8, num_stages=3),
++        triton.Config({'XBLOCK': 32, 'YBLOCK': 128}, num_warps=8, num_stages=4),
++        triton.Config({'XBLOCK': 16, 'YBLOCK': 64}, num_warps=4, num_stages=3),
++    ],
++    key=['ynumel', 'xnumel'],
++)
+ @triton.jit
+ def triton_poi_fused__native_batch_norm_legit_no_training_relu_0(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr0, ynumel, xnumel, YBLOCK : tl.constexpr, XBLOCK : tl.constexpr):
+-    ynumel = 320
+-    xnumel = 50176
++    # X axis = batch*channel (ynumel=320, fast for output store — stride-1 in channel)
++    xoffset = tl.program_id(0) * XBLOCK
++    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]  # [1, XBLOCK]
++    xmask = xindex < ynumel  # ynumel=320
++    # Y axis = spatial (xnumel=50176, slow for output store)
+     yoffset = tl.program_id(1) * YBLOCK
+-    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]
+-    ymask = yindex < ynumel
+-    xoffset = tl.program_id(0) * XBLOCK
+-    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]
+-    xmask = xindex < xnumel
+-    x2 = xindex
+-    y3 = yindex
+-    y0 = (yindex % 32)
+-    y1 = yindex // 32
+-    tmp0 = tl.load(in_ptr0 + (x2 + 50176*y3), xmask & ymask, eviction_policy='evict_last')
+-    tmp1 = tl.load(in_ptr1 + (y0), ymask, eviction_policy='evict_last')
+-    tmp3 = tl.load(in_ptr2 + (y0), ymask, eviction_policy='evict_last')
+-    tmp12 = tl.load(in_ptr3 + (y0), ymask, eviction_policy='evict_last')
+-    tmp14 = tl.load(in_ptr4 + (y0), ymask, eviction_policy='evict_last')
++    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]  # [YBLOCK, 1]
++    ymask = yindex < xnumel  # xnumel=50176
++    # Derived indices
++    ch_idx = xindex   # 0..319 (batch*channel combined)
++    sp_idx = yindex   # 0..50175 (spatial H*W)
++    ch0 = ch_idx % 32    # channel within group (0..31)
++    batch = ch_idx // 32  # batch index (0..9)
++    # Load input (NCHW layout): in_ptr0 has strides (1605632, 50176, 224, 1)
++    tmp0 = tl.load(in_ptr0 + (sp_idx + 50176*ch_idx), mask=ymask & xmask, eviction_policy='evict_last')
++    tmp1 = tl.load(in_ptr1 + (ch0), mask=xmask, eviction_policy='evict_last')
++    tmp3 = tl.load(in_ptr2 + (ch0), mask=xmask, eviction_policy='evict_last')
++    tmp12 = tl.load(in_ptr3 + (ch0), mask=xmask, eviction_policy='evict_last')
++    tmp14 = tl.load(in_ptr4 + (ch0), mask=xmask, eviction_policy='evict_last')
++    # BN + ReLU math (unchanged)
+     tmp2 = tmp0 - tmp1
+     tmp4 = tl.full([1, 1], 1e-05, tl.float32)
+     tmp5 = tmp3 + tmp4
+@@ -37,9 +51,9 @@
+     tmp15 = tmp13 + tmp14
+     tmp16 = tl.full([1, 1], 0, tl.int32)
+     tmp17 = tl.maximum(tmp16, tmp15)
+-    tl.store(out_ptr0 + (y0 + 32*x2 + 1605632*y1), tmp17, xmask & ymask)
+-
+-
++    # Store (NHWC layout): ch0 + 32*sp_idx + 1605632*batch
++    # ch0 varies along xindex (fast/warp dimension) -> stride-1 -> COALESCED
++    tl.store(out_ptr0 + (ch0 + 32*sp_idx + 1605632*batch), tmp17, mask=ymask & xmask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]
+@@ -51,7 +65,7 @@
+     ynumel = 320
+     xnumel = 50176
+     grid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))
+-    triton_poi_fused__native_batch_norm_legit_no_training_relu_0[grid](arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, 320, 50176, YBLOCK=8, XBLOCK=128)
++    triton_poi_fused__native_batch_norm_legit_no_training_relu_0[grid](arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, 320, 50176)
+     return arg_5
+ 
+ def get_inputs():

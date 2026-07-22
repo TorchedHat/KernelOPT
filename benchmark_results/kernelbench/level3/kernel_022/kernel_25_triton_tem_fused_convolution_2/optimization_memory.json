@@ -1,0 +1,126 @@
+[
+  {
+    "item_id": "exp_triton_autotune_numwarps_numstages_only_regression_001",
+    "iteration": 1,
+    "speedup": 0.7037,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_num_stages_without_tile_size_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + SharedMemoryConflicts + HighPipeUtilization",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 128.0,
+        "Launch.block_size": 128.0,
+        "Occupancy.achieved_occupancy_pct": 6.25,
+        "Occupancy.theoretical_occupancy_pct": 18.75,
+        "GPU_SOL.duration_us": 32.54,
+        "GPU_SOL.l1_tex_throughput_pct": 83.85,
+        "SharedMemory.bank_conflict_way": 11.9,
+        "SharedMemory.conflict_pct_of_wavefronts": 77.52,
+        "Scheduler.warp_cycles_per_issued_instruction": 4.67
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 255.0,
+        "Launch.block_size": 64.0,
+        "Occupancy.achieved_occupancy_pct": 3.12,
+        "Occupancy.theoretical_occupancy_pct": 12.5,
+        "GPU_SOL.duration_us": 46.24,
+        "GPU_SOL.l1_tex_throughput_pct": 34.65,
+        "SharedMemory.bank_conflict_way": 8.0,
+        "SharedMemory.conflict_pct_of_wavefronts": 69.57,
+        "Scheduler.warp_cycles_per_issued_instruction": 3.3
+      }
+    },
+    "strategy_title": "Autotuning num_warps/num_stages Without Tile Size Changes Regresses",
+    "strategy_description": "Adding @triton.autotune that only varies num_warps and num_stages\u2014without changing BLOCK_M, BLOCK_N, or BLOCK_K\u2014caused registers per thread to jump from 128 to 255, halving achieved occupancy from 6.25% to 3.12% and increasing kernel duration by 42%. The autotune overhead and the compiler's register allocation for additional software-pipeline stages outweighed any latency-hiding benefit when tile sizes remained fixed at their original large values. When a kernel is already register-bound (128 regs/thread, occupancy limited by registers), adding num_stages without simultaneously reducing tile sizes will increase register pressure further and worsen occupancy.",
+    "slow_pseudocode": "# Before: fixed large tiles, no autotune\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64\n    BLOCK_N: tl.constexpr = 64\n    BLOCK_K: tl.constexpr = 64\n    # 128 regs/thread, 6.25% occupancy\n    ...",
+    "fast_pseudocode": "# After (regressed): autotune only num_warps/num_stages, tiles unchanged\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=4),\n        # ... no BLOCK_M/N/K variation\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64  # unchanged\n    BLOCK_N: tl.constexpr = 64  # unchanged\n    BLOCK_K: tl.constexpr = 64  # unchanged\n    # 255 regs/thread, 3.12% occupancy \u2014 WORSE",
+    "applicable_when": "Never: this specific pattern (autotune only num_warps/num_stages with fixed large tile sizes on a register-bound kernel) is always harmful.",
+    "do_not_apply_when": "Kernel is already register-bound (registers_per_thread >= 64, theoretical occupancy <= 25%); increasing num_stages without reducing BLOCK_M/BLOCK_N/BLOCK_K will increase register pressure and reduce occupancy further. Always pair num_stages increases with tile size reductions when register pressure is the occupancy limiter.",
+    "framework_notes": "Triton: num_stages controls software pipelining depth and directly increases register usage for prefetch buffers. When BLOCK_K is large (e.g. 64), each additional pipeline stage allocates BLOCK_M*BLOCK_K or BLOCK_K*BLOCK_N additional registers for the prefetched tiles. The correct fix for a register-bound GEMM kernel is to reduce BLOCK_M, BLOCK_N, BLOCK_K in the autotune configs, not just vary num_warps/num_stages."
+  },
+  {
+    "item_id": "fbf9a091",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_relieve_register_pressure_and_bank_conflicts",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_relieve_register_pressure_and_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_relieve_register_pressure_and_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=7.310e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.341e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.507e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-bound: 128 registers/thread with block_size=128 limits the SM to only 4 blocks (block_limit_registers=4), yielding 18.75% theoretical and 6.25% achieved occupancy. The 11.9-way shared memory bank conflicts (77.52% of all wavefronts) are caused by the tl.trans(b) pattern \u2014 B is loaded as [BLOCK_N, BLOCK_K] then transposed for tl.dot, which creates strided shared memory access. Reducing BLOCK_M to 32 and BLOCK_K to 32 will: (1) cut register count from ~128 to ~64, allowing 2x more blocks per SM, (2) reduce the bank conflict severity by halving the K-dimension stride in shared memory, (3) increase the grid from 123 to ~245 blocks covering all 132 SMs with ~1.9 waves instead of 0.31. The memory item confirms that changing num_warps/num_stages WITHOUT reducing tile sizes regressed performance \u2014 tile size reduction is the correct lever here.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=7.310e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.341e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.507e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "022245db",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_cut_register_pressure_and_improve_occupancy",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + SharedMemoryConflicts + HighPipeUtilization + LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_cut_register_pressure_and_improve_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_cut_register_pressure_and_improve_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-bound: 128 registers/thread with BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 limits the SM to only 4 blocks (Block Limit Registers=4) and 3 blocks (Block Limit Shared Mem=3), yielding only 18.75% theoretical and 6.25% achieved occupancy. With only 123 blocks for 132 SMs, waves_per_sm=0.31 means most SMs sit idle after the first wave. The scheduler shows 78.54% no-eligible cycles. Reducing BLOCK_M, BLOCK_N, BLOCK_K from 64 to 32 will cut register pressure ~4x, allow more blocks per SM, reduce shared memory per block, and increase grid from 123 to ~492 blocks filling all 132 SMs with ~3.7 waves. Memory note confirms: never autotune num_warps/num_stages alone without reducing tile sizes on a register-bound kernel.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "ac588bb9",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_increase_occupancy_and_reduce_bank_conflicts",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + TheoreticalOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_increase_occupancy_and_reduce_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_increase_occupancy_and_reduce_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is bottlenecked by two coupled problems: (1) Shared memory bank conflicts at 11.9-way severity (77.52% of all shared load wavefronts are conflict replays) stall warps 61.7% of the time on MIO scoreboard dependencies. (2) The large BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 tiles consume so much shared memory that only 3 blocks can reside per SM, giving 18.75% theoretical occupancy and only 6.25% achieved \u2014 not enough warps to hide latency. The B matrix has column-major strides (1, 256), meaning its K dimension is stride-1 in memory; when loaded as a (64, 64) tile with order=(0,1), the tl.dot access pattern along N causes 11.9-way bank conflicts. Reducing BLOCK_M to 32 and BLOCK_K to 32 cuts shared memory per block by ~4x, allowing 6-8 blocks/SM instead of 3, raising theoretical occupancy from 18.75% toward 50-75%. Past memory confirms that varying only num_warps/num_stages without reducing tile sizes worsens register pressure \u2014 tile size reduction MUST accompany any num_stages change.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "1fdeaffd",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_relieve_register_pressure_and_improve_occupancy",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_sizes_to_relieve_register_pressure_and_improve_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_sizes_to_relieve_register_pressure_and_improve_occupancy' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely register-bound: 255 registers/thread (the hardware maximum) limits theoretical occupancy to 12.5% and achieved occupancy to only 3.12% (2 active warps/SM). With only 123 blocks for 132 SMs and 0.23 waves/SM, the GPU is massively underutilized. The root cause is the fixed large tile sizes BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 \u2014 each 64x64 accumulator tile alone requires 4096 FP32 values in registers per warp, forcing the compiler to allocate 255 regs/thread. The prior autotune attempt (iteration 1) only varied num_warps/num_stages without changing tile sizes, which worsened register pressure from 128 to 255 regs/thread and regressed performance by 30%. The correct fix is to reduce BLOCK_M and BLOCK_N (and optionally BLOCK_K) in the autotune configs so the compiler can allocate far fewer registers, enabling more warps per SM, better latency hiding, and more blocks per SM to fill the GPU. Smaller tiles also increase the grid size (more blocks), improving SM utilization beyond the current <1 wave.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=8.269e+01 > atol=0.001\nseed=42 output[0]: max_diff=7.852e+01 > atol=0.001\nseed=1337 output[0]: max_diff=7.633e+01 > atol=0.001",
+    "framework_notes": null
+  }
+]

@@ -1,0 +1,65 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,20 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=3),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_mm_native_layer_norm_t_view_31(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -58,23 +72,17 @@
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
++        k_offs = offs_k + k_idx * BLOCK_K
+ 
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
++        # A load: A[m, k] = A + m*768 + k, shape [BLOCK_M, BLOCK_K]
++        a = tl.load(A + offs_a_m[:, None] * 768 + k_offs[None, :], eviction_policy='evict_first')
+ 
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 768*idx_m
+-        a = tl.load(A + (xindex))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 384*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 768*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
++        # B load: B has shape (384, 768) with strides (768, 1)
++        # B[n, k] = B + n*768 + k
++        # We need B tile of shape [BLOCK_K, BLOCK_N]: B[k_offs[i], offs_b_n[j]]
++        b = tl.load(B + k_offs[:, None] + 768 * offs_b_n[None, :], eviction_policy='evict_last')
+ 
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -85,9 +93,7 @@
+ 
+     # inductor generates a suffix
+     xindex = idx_n + 384*idx_m
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
++    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask, eviction_policy='evict_first')
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

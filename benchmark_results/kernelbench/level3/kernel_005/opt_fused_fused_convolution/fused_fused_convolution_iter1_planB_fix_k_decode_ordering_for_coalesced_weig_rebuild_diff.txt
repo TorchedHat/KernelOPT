@@ -1,0 +1,108 @@
+--- baseline
++++ rebuilt
+@@ -12,6 +12,7 @@
+ # ============================================================
+ # Fused Conv2d + Bias + ReLU kernel (implicit GEMM style)
+ # ============================================================
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_warps=4, num_stages=2),
+@@ -37,67 +38,78 @@
+     # M = BATCH * OUT_H * OUT_W, N = OUT_C, K = IN_C * KERNEL_H * KERNEL_W
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+-    
++
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    
++
+     M_TOTAL = BATCH * OUT_H * OUT_W
+-    
++
+     # Decode M index -> (batch, out_h, out_w)
+     out_w = offs_m % OUT_W
+     tmp = offs_m // OUT_W
+     out_h = tmp % OUT_H
+     batch = tmp // OUT_H
+-    
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    
++
+     TOTAL_K = IN_C * KERNEL_H * KERNEL_W
+-    
++
+     for k_off in range(0, TOTAL_K, BLOCK_K):
+         offs_k = k_off + tl.arange(0, BLOCK_K)
+-        
+-        # Decode K -> (in_c, kh, kw)
+-        in_c = offs_k % IN_C
+-        kw = (offs_k // IN_C) % KERNEL_W
+-        kh = offs_k // (IN_C * KERNEL_W)
+-        
++
++        # Decode K -> (in_c, kh, kw) with kw innermost for coalesced W loads
++        kw   = offs_k % KERNEL_W
++        kh   = (offs_k // KERNEL_W) % KERNEL_H
++        in_c = offs_k // (KERNEL_W * KERNEL_H)
++
+         # Input coordinates
+         ih = out_h[:, None] * STRIDE_H + kh[None, :] - PAD_H
+         iw = out_w[:, None] * STRIDE_W + kw[None, :] - PAD_W
+-        
++
+         valid_m = offs_m[:, None] < M_TOTAL
+         valid_k = offs_k[None, :] < TOTAL_K
+         valid_ih = (ih >= 0) & (ih < IN_H)
+         valid_iw = (iw >= 0) & (iw < IN_W)
+         mask_x = valid_m & valid_k & valid_ih & valid_iw
+-        
++
+         # X is NCHW: stride = (IN_C*IN_H*IN_W, IN_H*IN_W, IN_W, 1)
+         x_idx = batch[:, None] * (IN_C * IN_H * IN_W) + in_c[None, :] * (IN_H * IN_W) + ih * IN_W + iw
+         x_tile = tl.load(X_ptr + x_idx, mask=mask_x, other=0.0)
+-        
++
+         # W is (OUT_C, IN_C, KERNEL_H, KERNEL_W): stride = (IN_C*KH*KW, KH*KW, KW, 1)
+         # We need W[out_c, in_c, kh, kw] for each (k, n)
+         # w_idx[k, n] = offs_n[n] * (IN_C*KH*KW) + in_c[k] * (KH*KW) + kh[k] * KW + kw[k]
+         w_idx = offs_n[None, :] * (IN_C * KERNEL_H * KERNEL_W) + in_c[:, None] * (KERNEL_H * KERNEL_W) + kh[:, None] * KERNEL_W + kw[:, None]
+         valid_w = (offs_k[:, None] < TOTAL_K) & (offs_n[None, :] < OUT_C)
+         w_tile = tl.load(W_ptr + w_idx, mask=valid_w, other=0.0)
+-        
++
+         acc += tl.dot(x_tile, w_tile, allow_tf32=False)
+-    
++
+     # Add bias
+     bias = tl.load(B_ptr + offs_n, mask=offs_n < OUT_C, other=0.0)
+     acc = acc + bias[None, :]
+-    
++
+     # ReLU
+     if USE_RELU:
+         acc = tl.maximum(acc, 0.0)
+-    
++
+     # Store: output is NCHW
+     # Y[batch, out_c, out_h, out_w] = Y[batch * OUT_C*OUT_H*OUT_W + out_c * OUT_H*OUT_W + out_h * OUT_W + out_w]
+     mask_out = (offs_m[:, None] < M_TOTAL) & (offs_n[None, :] < OUT_C)
+     y_idx = batch[:, None] * (OUT_C * OUT_H * OUT_W) + offs_n[None, :] * (OUT_H * OUT_W) + out_h[:, None] * OUT_W + out_w[:, None]
+     tl.store(Y_ptr + y_idx, acc.to(tl.float32), mask=mask_out)
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
++        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
++        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
++    ],
++    key=['BATCH', 'C', 'IN_H', 'IN_W', 'OUT_H', 'OUT_W', 'KH', 'KW', 'STRIDE_H', 'STRIDE_W'],
++)
++@triton.jit
+ 
+ def conv2d_bias_relu(x, w, b, stride_h, stride_w, pad_h, pad_w, use_relu=True):
+     BATCH, IN_C, IN_H, IN_W = x.shape

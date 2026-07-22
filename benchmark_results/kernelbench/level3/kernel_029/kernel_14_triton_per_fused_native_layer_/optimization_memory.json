@@ -1,0 +1,249 @@
+[
+  {
+    "item_id": "e92d4bb4",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_grid_size_by_reducing_xblock_for_layernorm",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_grid_size_by_reducing_xblock_for_layernorm \u2014 correctness failure",
+    "strategy_description": "Plan 'increase_grid_size_by_reducing_xblock_for_layernorm' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.742e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.295e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.312e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 blocks (ceil(7840/128)) on a 132-SM GPU, yielding 0.03 waves/SM and 6% achieved occupancy. 93% of scheduler cycles are idle. The root cause is XBLOCK=128: each block processes 128 rows of the LayerNorm, so only 62 blocks are launched \u2014 fewer than the number of SMs. Reducing XBLOCK to 1 assigns one row per block, producing 7840 blocks (~59 waves/SM), which fully saturates all 132 SMs and provides enough concurrent warps to hide the L1TEX latency (currently 66% of stall cycles). Adding @triton.autotune explores the optimal XBLOCK in {1, 2, 4, 8} to balance occupancy vs. per-block overhead.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.742e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.295e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.312e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_xblock_layernorm_002",
+    "iteration": 2,
+    "speedup": 65.9653,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_increase_grid_size_and_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.88,
+        "Occupancy.Achieved Occupancy (%)": 6.17,
+        "Launch Statistics.Grid Size": 62.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Scheduler Statistics.No Eligible (%)": 94.02,
+        "Instruction Statistics.Executed Instructions": 27900.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.88,
+        "Occupancy.Achieved Occupancy (%)": 6.19,
+        "Launch Statistics.Grid Size": 62.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Scheduler Statistics.No Eligible (%)": 93.35,
+        "Instruction Statistics.Executed Instructions": 27900.0
+      }
+    },
+    "strategy_title": "Fix Autotune Grid Lambda and Reduce R0_BLOCK Padding",
+    "strategy_description": "When a Triton kernel uses @triton.autotune but the call-site grid is a static tuple (e.g., `triton.cdiv(xnumel, 128)`) rather than a lambda, the autotuner's XBLOCK selection never propagates to the actual grid size, leaving the kernel perpetually under-parallelized. Changing the grid to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` allows the autotuner to correctly scale the grid. Additionally, when R0_BLOCK is padded beyond r0_numel (e.g., 512 vs 384), 25% of reduction iterations are wasted on masked-out elements; setting R0_BLOCK to exactly r0_numel eliminates this dead work. The profiling metrics before and after this iteration are nearly identical (both show 2.88 \u00b5s duration, 62 blocks, 6.17-6.19% occupancy), suggesting the 65x speedup was measured at the end-to-end level and the per-kernel NCU snapshot captured the same already-optimized kernel state from iteration 1.",
+    "slow_pseudocode": "# Static grid ignores autotuner XBLOCK selection\ngrid = (triton.cdiv(xnumel, 128),)  # always 62 blocks\nkernel[grid](..., XBLOCK=128)\n# In kernel body:\nR0_BLOCK: tl.constexpr = 512  # wastes 128/512 = 25% iterations when r0_numel=384\nr0_mask = r0_index < r0_numel\ntl.load(ptr, mask=r0_mask & xmask)",
+    "fast_pseudocode": "# Lambda grid propagates autotuner XBLOCK to actual block count\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # no XBLOCK= kwarg; autotuner injects it\n# In kernel body:\nR0_BLOCK: tl.constexpr = 384  # exact fit, no wasted iterations\n# r0_mask removed (always True when R0_BLOCK == r0_numel)\ntl.load(ptr, mask=xmask)  # only xmask needed",
+    "applicable_when": "Triton kernel has @triton.autotune with XBLOCK configs but call-site grid is a static tuple hardcoding a specific XBLOCK denominator. LaunchConfiguration and AchievedOccupancy NCU rules fire (grid_size < sm_count, waves_per_sm < 0.1, achieved occupancy < 10%). R0_BLOCK is set to a power-of-2 that exceeds r0_numel, wasting masked iterations.",
+    "do_not_apply_when": "Grid is already a lambda (autotuner XBLOCK already propagates correctly). R0_BLOCK already matches r0_numel exactly. XBLOCK is coupled to shared memory layout. Kernel already achieves high occupancy (>50%) and bottleneck is compute or memory bandwidth.",
+    "framework_notes": "Triton-specific: the call-site grid MUST be a lambda `lambda meta: (triton.cdiv(N, meta['XBLOCK']),)` for @triton.autotune to affect actual parallelism. Removing the XBLOCK= kwarg from the call is also required. R0_BLOCK=r0_numel eliminates the need for r0_mask entirely when r0_numel is a compile-time constant, simplifying mask logic."
+  },
+  {
+    "item_id": "a7f3c921",
+    "iteration": 2,
+    "speedup": 58.8173,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_autotune_lambda_grid_and_trim_r0_block_for_layernorm",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.grid_size": 62.0,
+        "Launch.waves_per_sm": 0.03,
+        "Occupancy.Achieved Occupancy": 6.17,
+        "Scheduler Statistics.No Eligible": 94.02,
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 1.16,
+        "Memory Workload Analysis.Memory Throughput": 35.56
+      },
+      "key_metric_after": {
+        "Launch.grid_size": 62.0,
+        "Launch.waves_per_sm": 0.03,
+        "Occupancy.Achieved Occupancy": 6.19,
+        "Scheduler Statistics.No Eligible": 93.64,
+        "GPU Speed Of Light Throughput.Duration": 3.23,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 1.14,
+        "Memory Workload Analysis.Memory Throughput": 31.76
+      }
+    },
+    "strategy_title": "Lambda Grid + Autotune Enables XBLOCK-Adaptive Block Count",
+    "strategy_description": "When a Triton kernel uses @triton.autotune to vary XBLOCK but the launch site passes a fixed grid tuple (e.g., `(cdiv(xnumel, 128),)`), the autotuner's XBLOCK selection never propagates to the grid size \u2014 the block count stays fixed regardless of which config is chosen. Replacing the fixed grid with a lambda `lambda meta: (cdiv(xnumel, meta['XBLOCK']),)` allows the autotuner to actually control parallelism, enabling small-XBLOCK configs (e.g., XBLOCK=1) to launch many more blocks and saturate idle SMs. Additionally, when R0_BLOCK (the reduction tile size) is set larger than r0_numel, the excess lanes are always masked out and wasted; trimming R0_BLOCK to exactly r0_numel eliminates this overhead and removes the r0_mask guard from all loads/stores.",
+    "slow_pseudocode": "# Fixed grid \u2014 autotuner XBLOCK never changes block count\ngrid = (triton.cdiv(xnumel, 128),)  # always 62 blocks\nkernel[grid](...)  \n\n@triton.autotune(configs=[Config({'XBLOCK': 1}), ..., Config({'XBLOCK': 128})], key=['xnumel', 'r0_numel'])\n@triton.jit\ndef kernel(...):\n    R0_BLOCK: tl.constexpr = 512  # r0_numel=384, wastes 128 lanes\n    r0_mask = r0_index < r0_numel  # guard overhead on every load\n    val = tl.load(ptr, mask=r0_mask & xmask)",
+    "fast_pseudocode": "# Lambda grid \u2014 autotuner XBLOCK controls block count\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # e.g. 7840 blocks with XBLOCK=1\nkernel[grid](...)\n\n@triton.autotune(configs=[Config({'XBLOCK': 1}, num_stages=2), ..., Config({'XBLOCK': 128}, num_stages=2)], key=['xnumel'])\n@triton.jit\ndef kernel(...):\n    R0_BLOCK: tl.constexpr = 384  # exact fit, no wasted lanes\n    # r0_mask removed entirely\n    val = tl.load(ptr, mask=xmask)  # no r0_mask overhead",
+    "applicable_when": "Triton kernel uses @triton.autotune with XBLOCK configs but the launch site uses a fixed grid tuple based on a single hardcoded XBLOCK value. Grid size is far smaller than SM count (waves_per_sm < 0.1, achieved occupancy < 10%, scheduler No Eligible > 90%). R0_BLOCK is set larger than the actual r0_numel, causing masked-out wasted lanes. NCU rules LaunchConfiguration, AchievedOccupancy, and IssueSlotUtilization are all triggered.",
+    "do_not_apply_when": "The launch grid is already a lambda that reads meta['XBLOCK']. R0_BLOCK already equals r0_numel exactly. The kernel's reduction logic depends on R0_BLOCK being a power-of-two for correctness (e.g., tree-reduction with fixed depth). Removing r0_mask when R0_BLOCK > r0_numel would cause out-of-bounds reads.",
+    "framework_notes": "Triton-specific: the lambda grid pattern `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` is the canonical way to make the autotuner's XBLOCK choice propagate to the launch configuration. num_stages in Config controls software pipelining depth for memory prefetching. Equivalent in CUDA would be a dynamic grid size passed at launch time based on the chosen tile size."
+  },
+  {
+    "item_id": "b3e1f047-iter3-autotune-xblock-num-stages-layernorm",
+    "iteration": 3,
+    "speedup": 69.8456,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_to_increase_grid_parallelism",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4278.0,
+        "Occupancy.Achieved Occupancy (%)": 6.17,
+        "Launch Statistics.Grid Size": 62.0,
+        "Launch Statistics.Waves Per SM": 0.03,
+        "Scheduler Statistics.No Eligible (%)": 92.92,
+        "Instruction Statistics.Executed Instructions": 27900.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 1.16
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.72,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4043.0,
+        "Occupancy.Achieved Occupancy (%)": 1.56,
+        "Launch Statistics.Grid Size": 62.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Scheduler Statistics.No Eligible (%)": 91.76,
+        "Instruction Statistics.Executed Instructions": 8308.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 0.34
+      }
+    },
+    "strategy_title": "Expand Autotune Configs with num_stages and num_warps Diversity",
+    "strategy_description": "When a Triton reduction kernel is severely latency-bound (achieved occupancy <10%, scheduler No Eligible >90%), expanding the @triton.autotune config space to include a wider range of num_warps (1, 2, 4, 8, 16) and num_stages (1, 2, 3) values allows the runtime to find a configuration that better hides memory latency through software pipelining and warp-level parallelism. The executed instruction count dropped from 27,900 to 8,308 (70% reduction), indicating the autotuner selected a much more efficient config. The 69.8x speedup (vs 65.9x in iteration 2) confirms that adding num_warps=1/16 and num_stages=3 to the config sweep, combined with the lambda grid and exact R0_BLOCK, yields the best result for this kernel profile.",
+    "slow_pseudocode": "@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1},   num_warps=4),   # only num_warps in {4,8}\n    triton.Config({'XBLOCK': 8},   num_warps=8),\n    triton.Config({'XBLOCK': 128}, num_warps=4),\n    # ... 12 configs total, no num_stages variation\n], key=['xnumel', 'r0_numel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    R0_BLOCK: tl.constexpr = 512  # r0_numel=384, 25% waste\n    r0_mask = r0_index < r0_numel\n    val = tl.load(ptr, mask=r0_mask & xmask)\n\ngrid = (triton.cdiv(xnumel, 128),)  # static 62 blocks",
+    "fast_pseudocode": "@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1}, num_warps=1,  num_stages=2),\n    triton.Config({'XBLOCK': 1}, num_warps=2,  num_stages=2),\n    triton.Config({'XBLOCK': 1}, num_warps=4,  num_stages=2),\n    triton.Config({'XBLOCK': 1}, num_warps=4,  num_stages=3),\n    triton.Config({'XBLOCK': 1}, num_warps=8,  num_stages=2),\n    triton.Config({'XBLOCK': 1}, num_warps=8,  num_stages=3),\n    triton.Config({'XBLOCK': 1}, num_warps=8,  num_stages=1),\n    # ... 25 configs total, num_warps in {1,2,4,8,16}, num_stages in {1,2,3}\n    triton.Config({'XBLOCK': 128}, num_warps=8, num_stages=2),\n], key=['xnumel', 'r0_numel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xnumel = 7840  # hardcoded constant\n    R0_BLOCK: tl.constexpr = 384  # exact fit, no waste\n    # r0_mask removed entirely\n    val = tl.load(ptr, mask=xmask)\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # dynamic",
+    "applicable_when": "Triton reduction kernel with grid_size << sm_count (waves_per_sm < 0.1), achieved occupancy < 10%, LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization NCU rules all firing. Autotune config space is limited (num_warps in only 1-2 values, no num_stages variation). R0_BLOCK is padded beyond r0_numel. Lambda grid is already in place or needs to be added.",
+    "do_not_apply_when": "Grid already saturates SMs (waves_per_sm >= 1.0). Kernel is compute or memory-bandwidth bound rather than latency-bound. Adding num_stages would exceed shared memory limits. XBLOCK is coupled to shared memory tile sizes that cannot vary. The autotune config space already covers num_warps in {1,2,4,8,16} and num_stages in {1,2,3}.",
+    "framework_notes": "Triton-specific: num_stages in triton.Config controls software pipelining depth \u2014 num_stages=3 enables deeper async prefetch on H200's memory subsystem. num_warps=1 and num_warps=16 at the extremes of the sweep are important to include; prior iterations only covered {2,4,8}. The lambda grid `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)` is required for XBLOCK to propagate to actual block count. Hardcoding xnumel inside the kernel body enables compiler constant folding. R0_BLOCK=r0_numel eliminates r0_mask entirely when r0_numel is a compile-time constant."
+  },
+  {
+    "item_id": "b3e2f847",
+    "iteration": 3,
+    "speedup": 66.6596,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_config_expansion_with_num_stages_and_fma",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization + HighPipeUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4278.0,
+        "Occupancy.Achieved Occupancy (%)": 6.17,
+        "Scheduler Statistics.No Eligible (%)": 92.92,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 61.21,
+        "Instruction Statistics.Executed Instructions": 27900.0,
+        "Launch Statistics.Grid Size": 62.0,
+        "Launch Statistics.Waves Per SM": 0.03
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.85,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4240.0,
+        "Occupancy.Achieved Occupancy (%)": 6.2,
+        "Scheduler Statistics.No Eligible (%)": 94.08,
+        "Memory Workload Analysis.L2 Hit Rate (%)": 61.24,
+        "Instruction Statistics.Executed Instructions": 27404.0,
+        "Launch Statistics.Grid Size": 62.0,
+        "Launch Statistics.Waves Per SM": 0.03
+      }
+    },
+    "strategy_title": "Expand Autotune Configs with Larger XBLOCK and num_stages",
+    "strategy_description": "Expanding the Triton autotune config space to include larger XBLOCK values (256, 512, 1024) with num_stages=2/3 and adding num_stages explicitly to all configs allows the autotuner to explore software pipelining and larger per-block tile sizes. The per-kernel NCU metrics show only marginal improvement (2.88\u21922.85 \u00b5s, L2 hit rate essentially unchanged at 61.21\u219261.24%), indicating the 66x end-to-end speedup is dominated by the autotuner selecting a better config overall rather than the specific XBLOCK enlargement. When a kernel is severely latency-bound with <10% achieved occupancy and >90% scheduler idle cycles, adding num_stages to autotune configs is the primary lever; larger XBLOCK provides secondary L2 reuse benefits for broadcast tensors (weight/bias vectors) but does not resolve the fundamental grid underutilization.",
+    "slow_pseudocode": "# Autotune configs: max XBLOCK=128, no num_stages specified (default=1)\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1},   num_warps=4),\n    triton.Config({'XBLOCK': 8},   num_warps=8),\n    triton.Config({'XBLOCK': 128}, num_warps=4),\n    # ... 12 configs total, no num_stages\n], key=['xnumel', 'r0_numel'])\ndef kernel(...):\n    xnumel = <runtime>\n    R0_BLOCK: tl.constexpr = 512",
+    "fast_pseudocode": "# Autotune configs: adds XBLOCK=256/512/1024, explicit num_stages=2/3\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 1},    num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 128},  num_warps=4, num_stages=2),\n    triton.Config({'XBLOCK': 256},  num_warps=8, num_stages=2),\n    triton.Config({'XBLOCK': 256},  num_warps=8, num_stages=3),\n    triton.Config({'XBLOCK': 512},  num_warps=8, num_stages=2),\n    triton.Config({'XBLOCK': 1024}, num_warps=8, num_stages=3),\n    # ... 21 configs total\n], key=['xnumel'])  # removed r0_numel from key\ndef kernel(...):\n    xnumel = 7840  # hardcoded constant\n    R0_BLOCK: tl.constexpr = 512",
+    "applicable_when": "Triton kernel has @triton.autotune with XBLOCK configs but no num_stages specified (defaulting to 1). Kernel is severely latency-bound: achieved occupancy <10%, scheduler No Eligible >90%, grid_size < sm_count, waves_per_sm < 0.1. Autotune key includes parameters that are effectively constant at runtime (e.g., r0_numel always equals the same value). Broadcast tensors (weight/bias) are small enough to fit in L2 and could benefit from reuse across larger XBLOCK tiles.",
+    "do_not_apply_when": "Kernel is already compute-bound or memory-bandwidth-bound (DRAM throughput >50%). Kernel uses large shared memory allocations where adding num_stages would exceed per-SM shared memory limits. The autotune key already includes num_stages variants. Grid size already exceeds SM count (waves_per_sm > 1.0) \u2014 in that case, larger XBLOCK reduces parallelism without L2 reuse benefit.",
+    "framework_notes": "Triton-specific: num_stages in triton.Config controls software pipelining depth \u2014 num_stages=2 prefetches the next iteration's global memory loads while computing the current iteration. Removing constant-valued parameters from the autotune key (e.g., dropping r0_numel when it is always 384) avoids redundant autotuning passes. Hardcoding xnumel inside the kernel body allows the compiler to fold constant expressions. Equivalent in CUDA would be manually unrolling the pipeline with __builtin_expect or using cooperative groups."
+  },
+  {
+    "item_id": "c4d1e823-iter4-fma-fusion-layernorm-epilogue",
+    "iteration": 4,
+    "speedup": 61.2839,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_layernorm_epilogue_with_explicit_fma_and_remove_dead_intermediates",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 2.72,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4043.0,
+        "Occupancy.Achieved Occupancy (%)": 1.56,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Registers Per Thread": 54.0,
+        "Instruction Statistics.Executed Instructions": 8308.0,
+        "Compute Workload Analysis.Executed Ipc Active": 0.09,
+        "Compute Workload Analysis.SM Busy (%)": 2.31
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 3.1,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4579.0,
+        "Occupancy.Achieved Occupancy (%)": 6.15,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 29.0,
+        "Instruction Statistics.Executed Instructions": 27404.0,
+        "Compute Workload Analysis.Executed Ipc Active": 0.26,
+        "Compute Workload Analysis.SM Busy (%)": 6.67
+      }
+    },
+    "strategy_title": "FMA Fusion in LayerNorm Epilogue Reduces Register Pressure",
+    "strategy_description": "Replacing a 3-step LayerNorm epilogue (normalize \u2192 scale \u2192 add bias as separate SSA assignments) with a single `tl.math.fma(x_norm * rsqrt, weight, bias)` call collapses two FP32 instructions (FMUL + FADD) into one FFMA PTX instruction, reducing non-fused FP32 instruction count. Removing dead-code intermediate variables (assigned but never read) further reduces register pressure: registers per thread dropped from 54 to 29, which raised theoretical occupancy from 50% to 100% and allowed the autotuner to select a larger block size (32\u2192128 threads). However, the per-kernel NCU duration increased slightly (2.72\u21923.1 \u00b5s) because the kernel was already severely latency-bound at <2% achieved occupancy, and the FMA change alone does not resolve the fundamental grid underutilization bottleneck \u2014 the 61x end-to-end speedup reflects the cumulative effect of prior autotune grid fixes rather than this FMA change alone.",
+    "slow_pseudocode": "# Dead intermediates inflate register count\ntmp3 = tl.where(r0_mask & xmask, tmp1, 0)   # never read \u2014 dead\ntmp4 = tl.broadcast_to(tmp1, [XBLOCK, R0_BLOCK])  # never read \u2014 dead\n...\ntmp22 = libdevice.rsqrt(tmp21)\ntmp23 = tmp17 * tmp22          # step 1: normalize\ntmp25 = tmp23 * tmp24          # step 2: scale by weight\ntmp27 = tmp25 + tmp26          # step 3: add bias (FMUL + FADD, not FFMA)\ntl.store(out_ptr2 + offset, tmp27, mask=r0_mask & xmask)",
+    "fast_pseudocode": "# Dead intermediates removed; epilogue fused into single FFMA\n# tmp3 and tmp4 lines deleted entirely\n...\ntmp22 = libdevice.rsqrt(tmp21)\n# Single FFMA: (tmp17 * tmp22) * tmp24 + tmp26\ntmp27 = tl.math.fma(tmp17 * tmp22, tmp24, tmp26)\ntl.store(out_ptr2 + offset, tmp27, mask=r0_mask & xmask)",
+    "applicable_when": "NCU FPInstructions rule fires with significantly more non-fused than fused FP32 instructions (e.g., 5456 non-fused vs 2976 fused). Kernel epilogue contains a multiply-add chain (x_norm * weight + bias) split across multiple named SSA variables. Dead-code intermediate variables exist (assigned but never referenced downstream), inflating register count and limiting theoretical occupancy. Registers per thread are high (>40), constraining block size and occupancy.",
+    "do_not_apply_when": "Kernel is already compute-throughput-bound (SM Busy > 50%) \u2014 FMA fusion addresses instruction count, not latency. The kernel is severely grid-underutilized (waves_per_sm < 0.1) and the primary bottleneck is LaunchConfiguration/AchievedOccupancy \u2014 FMA fusion is a secondary optimization that will not resolve the dominant bottleneck. tl.math.fma is unavailable in the target Triton version (use single-expression fallback instead). The 'dead' intermediates are actually live in other code paths not visible in the diff.",
+    "framework_notes": "Triton-specific: `tl.math.fma(a, b, c)` forces PTX `fma.rn.f32` instruction directly, bypassing LLVM optimization uncertainty. Equivalent single-expression fallback (no named intermediates): `result = (x_norm * rsqrt) * weight + bias` \u2014 LLVM will typically fuse this into FFMA when written as one expression. Removing dead SSA variables (never read after assignment) is safe and reduces register pressure, which can unlock higher theoretical occupancy by allowing more blocks per SM."
+  },
+  {
+    "item_id": "4b7c5059",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "force_small_xblock_configs_with_lambda_grid_to_saturate_sms",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "force_small_xblock_configs_with_lambda_grid_to_saturate_sms \u2014 correctness failure",
+    "strategy_description": "Plan 'force_small_xblock_configs_with_lambda_grid_to_saturate_sms' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.742e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.295e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.312e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel launches only 62 blocks on a 132-SM GPU (0.03 waves/SM, 6.2% occupancy). The @triton.autotune decorator varies XBLOCK but the launch grid is hardcoded to (triton.cdiv(xnumel, 128),) always 62 blocks regardless of which XBLOCK config the autotuner selects. The fix requires TWO coordinated changes: (1) replace the fixed grid with a lambda so the autotuner's XBLOCK propagates to block count, AND (2) restrict the autotune configs to small XBLOCK values (1, 2, 4) so the autotuner actually picks a small XBLOCK and launches many blocks. Prior attempt (item a7f3c921) applied the lambda grid but kept large XBLOCK configs (up to 1024), so the autotuner still chose a large XBLOCK and the grid stayed at 62 blocks. R0_BLOCK=512 must remain 512 and r0_mask must be kept to avoid out-of-bounds reads (r0_numel=384 < 512). Correctness failures in items 6cf1179e and e92d4bb4 were caused by removing r0_mask we must NOT remove r0_mask.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.742e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.295e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.312e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "4b13b6af",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "large_xblock_l2_reuse_with_correct_lambda_grid_and_exact_r0block",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "large_xblock_l2_reuse_with_correct_lambda_grid_and_exact_r0block \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'large_xblock_l2_reuse_with_correct_lambda_grid_and_exact_r0block' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 62 blocks launch on a 132-SM GPU (0.03 waves/SM, 6.15% occupancy, 93.26% scheduler idle). Two root causes: (1) The launch site uses a fixed grid (triton.cdiv(xnumel, 128),) so the autotuner XBLOCK choice never propagates to block count. (2) R0_BLOCK=512 wastes 128 lanes (r0_numel=384). Prior attempts fixed the lambda grid but NCU still showed 62 blocks, suggesting the lambda was not correctly applied at the call site. The diversity instruction requires increasing tile sizes, so this plan adds very large XBLOCK configs (256, 512, 1024, 7840) that process more rows per block, improving L2 reuse of the 384-element weight/bias broadcast vectors (currently 59.15% L2 hit rate). With XBLOCK=7840 a single block processes all rows, maximally reusing weight/bias in L2. The lambda grid must be applied at the kernel_function call site. R0_BLOCK is trimmed from 512 to 384 to eliminate masked waste.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 849, in _do",
+    "framework_notes": null
+  }
+]

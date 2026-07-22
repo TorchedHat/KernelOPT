@@ -1,0 +1,109 @@
+--- baseline
++++ rebuilt
+@@ -5,6 +5,17 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=2, num_stages=2),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=3),
++    ],
++    key=[],
++    reset_to_zero=['out_ptr0'],
++)
+ @triton.jit
+ def triton_tem_fused_convolution_15(in_ptr0, arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+@@ -16,6 +27,7 @@
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
++    SPLIT_K : tl.constexpr = 2
+     A = arg_A
+     B = arg_B
+ 
+@@ -32,6 +44,7 @@
+ 
+     # based on triton.ops.matmul
+     pid = tl.program_id(0).to(INDEX_DTYPE)
++    pid_k = tl.program_id(2)  # split-K axis (grid z-dim = SPLIT_K)
+     grid_m = (M + BLOCK_M - 1) // BLOCK_M
+     grid_n = (N + BLOCK_N - 1) // BLOCK_N
+ 
+@@ -44,36 +57,39 @@
+     tl.assume(pid_m >= 0)
+     tl.assume(pid_n >= 0)
+ 
+-    # Create block pointers for A and B to handle strided 2D loads efficiently
+-    # A: shape=[M, K]=[7840, 192], strides=[stride_am, stride_ak]=[192, 1]
+-    # order=(1, 0) means innermost dim is K (stride_ak=1, contiguous)
++    # K slice for this split-K block
++    # SPLIT_K=2: each block handles K/2=96 elements (3 tiles of BLOCK_K=32)
++    k_per_split = tl.cdiv(K, SPLIT_K)       # 96
++    k_start = pid_k * k_per_split            # 0 or 96
++    k_tiles = tl.cdiv(k_per_split, BLOCK_K)  # 3
++
++    # Create block pointers for A and B starting at k_start offset
+     a_block_ptr = tl.make_block_ptr(
+         base=A,
+         shape=(M, K),
+         strides=(stride_am, stride_ak),
+-        offsets=(pid_m * BLOCK_M, 0),
++        offsets=(pid_m * BLOCK_M, k_start),
+         block_shape=(BLOCK_M, BLOCK_K),
+         order=(1, 0),
+     )
+-    # B: shape=[K, N]=[192, 32], strides=[stride_bk, stride_bn]=[1, 192]
+-    # order=(0, 1) means innermost dim is K (stride_bk=1, contiguous)
+     b_block_ptr = tl.make_block_ptr(
+         base=B,
+-        shape=(K, N),
+-        strides=(stride_bk, stride_bn),
+-        offsets=(0, pid_n * BLOCK_N),
+-        block_shape=(BLOCK_K, BLOCK_N),
+-        order=(0, 1),
++        shape=(N, K),
++        strides=(stride_bn, stride_bk),
++        offsets=(pid_n * BLOCK_N, k_start),
++        block_shape=(BLOCK_N, BLOCK_K),
++        order=(1, 0),
+     )
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
++    for k_idx in range(0, k_tiles):
+         a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')
+         b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
++        # tl.trans(b) reshapes [BLOCK_N, BLOCK_K] -> [BLOCK_K, BLOCK_N] for correct matmul
++        acc += tl.dot(a, tl.trans(b), allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+         a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+-        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
++        b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_K))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -83,11 +99,14 @@
+     mask = (idx_m < M) & (idx_n < N)
+ 
+     # inductor generates a suffix
+-    xindex = idx_n + 32*idx_m
+-    tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+-    tmp1 = acc + tmp0
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
++    xindex = idx_n + 32 * idx_m
+ 
++    # Split-K epilogue: bias added only by pid_k==0 to avoid multiplying bias by SPLIT_K
++    # out_ptr0 is zero-initialized via reset_to_zero in autotune
++    if pid_k == 0:
++        tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
++        acc = acc + tmp0
++    tl.atomic_add(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask=mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

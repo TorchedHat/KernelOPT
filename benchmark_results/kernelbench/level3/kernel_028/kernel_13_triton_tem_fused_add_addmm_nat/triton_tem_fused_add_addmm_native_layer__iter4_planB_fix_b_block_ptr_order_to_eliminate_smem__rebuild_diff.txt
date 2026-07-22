@@ -1,0 +1,93 @@
+--- baseline
++++ rebuilt
+@@ -5,13 +5,27 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=2, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=2),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_add_addmm_native_layer_norm_select_t_view_13(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+-    BLOCK_M : tl.constexpr = 16
+-    BLOCK_N : tl.constexpr = 32
++    BLOCK_M : tl.constexpr = 2
++    BLOCK_N : tl.constexpr = 256
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+@@ -57,24 +71,33 @@
+     offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # Create TMA block pointers before the k_idx loop
++    # A has shape (M=2, K=512) with strides (stride_am=100864, stride_ak=1)
++    a_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),
++    )
++    # B is accessed as B[k,n] = B + k*1 + n*512, so shape=(K,N), strides=(stride_bk=1, stride_bn=512)
++    # order=(0,1): K-dim (dim 0) is fastest in smem, matching stride_bk=1 physical layout -> conflict-free
++    b_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1),
++    )
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 512*idx_m
+-        a = tl.load(A + ((tl.broadcast_to(idx_n + 100864*idx_m, [BLOCK_M, BLOCK_K])).broadcast_to(xindex.shape)))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 2048*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 512*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-        
++        a = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
++        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
++        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -85,9 +108,7 @@
+ 
+     # inductor generates a suffix
+     xindex = idx_n + 2048*idx_m
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
++    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask, eviction_policy='evict_last')
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

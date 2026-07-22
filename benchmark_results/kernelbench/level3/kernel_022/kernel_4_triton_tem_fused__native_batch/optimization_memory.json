@@ -1,0 +1,172 @@
+[
+  {
+    "item_id": "exp_triton_autotune_register_pressure_regression_001",
+    "iteration": 1,
+    "speedup": 0.8416,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_num_stages_on_register_heavy_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 18.22,
+        "GPU Speed Of Light Throughput.Duration": 1.86,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 38.64,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 90.11,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.3,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.92
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 242.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.48,
+        "GPU Speed Of Light Throughput.Duration": 2.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 32.29,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 79.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.73,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.0
+      }
+    },
+    "strategy_title": "Autotuning num_warps/num_stages increases register pressure, hurts occupancy",
+    "strategy_description": "Adding @triton.autotune with higher num_warps and num_stages configs to a kernel already register-limited (168 registers/thread, 18.75% theoretical occupancy) caused the compiler to allocate even more registers (242/thread), dropping theoretical occupancy from 18.75% to 12.5% and achieved occupancy from 18.22% to 12.48%. The kernel ran 19% slower (1.86ms \u2192 2.21ms) despite fewer warp cycles per instruction (7.3 \u2192 5.73), because the occupancy loss outweighed any latency-hiding benefit. When a kernel is already register-bound and occupancy-limited, adding autotune configs that increase num_warps or num_stages tends to worsen register spilling or allocation, further reducing occupancy rather than improving it.",
+    "slow_pseudocode": "# No autotune decorator\n@triton.jit\ndef kernel(...):\n    ALLOW_TF32: tl.constexpr = False\n    USE_FAST_ACCUM: tl.constexpr = False\n    # 168 registers/thread, 18.75% occupancy\n    acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)",
+    "fast_pseudocode": "# DO NOT DO THIS when kernel is already register-bound\n@triton.autotune(configs=[\n    triton.Config({}, num_warps=4, num_stages=2),\n    triton.Config({}, num_warps=8, num_stages=5),\n    # ... more configs\n], key=[...])\n@triton.jit\ndef kernel(...):\n    ALLOW_TF32: tl.constexpr = False\n    # 242 registers/thread, 12.5% occupancy -> SLOWER",
+    "applicable_when": "Kernel has low register pressure (<64 registers/thread) and is latency-bound rather than register-bound; occupancy is not already at its register-imposed ceiling.",
+    "do_not_apply_when": "Kernel already uses >128 registers/thread and theoretical occupancy is already below 25% due to register limits; adding autotune configs with higher num_warps or num_stages will increase register allocation further, reducing occupancy and causing regression.",
+    "framework_notes": "Triton's @triton.autotune with num_stages > current value forces the compiler to keep more live values in registers for software pipelining, which is especially harmful when the kernel is already register-limited. The Block Limit Registers metric in NCU directly shows how many blocks can co-reside per SM."
+  },
+  {
+    "item_id": "dcb52615",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_fix_shared_memory_bank_conflicts_and_register_pressure",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_m_to_fix_shared_memory_bank_conflicts_and_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_m_to_fix_shared_memory_bank_conflicts_and_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.363e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.407e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.524e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel's tl.dot with BLOCK_M=128, BLOCK_N=64, BLOCK_K=32 causes severe 8-way shared memory bank conflicts (64.7% potential speedup). The A-tile layout [128x32] of float32 means each column of 32 floats spans 128 bytes, creating systematic conflicts when warps load rows. Reducing BLOCK_M from 128 to 64 changes the A-tile to [64x32], halving the shared memory footprint per block. This: (1) directly reduces the bank conflict severity by changing the access stride pattern, (2) reduces register pressure since the accumulator shrinks from [128x64] to [64x64] (8192->4096 elements, freeing ~64 registers/thread), and (3) allows more blocks per SM (currently capped at 3 by both registers AND shared memory). The memory item confirms that adding autotune with higher num_warps/num_stages worsens register pressure, so we must reduce tile size instead.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.363e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.407e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.524e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "204d6a2b",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_size_to_cut_register_pressure_and_bank_conflicts",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts + TheoreticalOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_size_to_cut_register_pressure_and_bank_conflicts \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_size_to_cut_register_pressure_and_bank_conflicts' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.363e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.407e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.524e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has 242 registers/thread \u2014 the highest possible register pressure \u2014 which limits the SM to only 2 blocks (Block Limit Registers=2) and 12.5% theoretical occupancy. The large BLOCK_M=128 accumulator tile (128\u00d764 fp32 = 32KB of register state) is the primary driver. Simultaneously, the B matrix has stride_bn=672 (column-major K\u00d7N layout), causing 8-way shared memory bank conflicts on 69.83% of all shared load requests (221M excessive wavefronts). Reducing BLOCK_M from 128\u219264 halves the accumulator from 8192 to 4096 elements, directly cutting register pressure. This should allow 4 blocks/SM instead of 2, doubling theoretical occupancy from 12.5%\u219225%, and reducing the shared memory footprint that causes bank conflicts. The prior autotune attempt confirmed that adding more num_stages/num_warps configs worsened register allocation (168\u2192242 regs); the correct fix is to shrink the tile, not tune scheduling parameters.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.363e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.407e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.524e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "1467b37e",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tma_loads",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tma_loads \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'tma_loads' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n    triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_4[grid](arg_0, arg_1, arg_2)\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *ar",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is bottlenecked by shared memory bank conflicts (8-way, 64.75% speedup potential) caused by the B-matrix access pattern with stride_bn=672. The current tl.make_block_ptr + tl.load path routes data through the L1/TEX shared memory subsystem which is at 92.62% utilization. On Hopper (H200), TMA uses a dedicated hardware unit that offloads address generation from SMs and performs asynchronous bulk copies via a separate DMA path, bypassing the bank-conflict-prone shared memory load path. Prior attempts to fix bank conflicts by changing tile sizes caused correctness failures; prior autotune attempts increased register pressure. TMA is the correct architectural solution: tl.make_tensor_descriptor + descriptor.load() triggers the TMA hardware path, freeing SM scheduler cycles and eliminating the MIO stall bottleneck (4.3 cycles/warp, 60.3% of total stalls).",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n    triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_4[grid](arg_0, arg_1, arg_2)\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit",
+    "framework_notes": null
+  },
+  {
+    "item_id": "2cbc9d98",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_block_n_to_fix_bank_conflicts_and_register_pressure",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_block_n_to_fix_bank_conflicts_and_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_block_n_to_fix_bank_conflicts_and_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.363e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.407e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.524e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The B-matrix has layout (K=672, N=192) with strides (1, 672). When BLOCK_N=64, the 64 threads in a warp's N-dimension access B[k, n+0..63], which are spaced 672 floats apart in memory. In shared memory, 672 % 32 = 16, so threads 0 and 16 land on the same bank causing 8-way conflicts. Reducing BLOCK_N from 64 to 32 changes the tile shape: the accumulator shrinks from BLOCK_M x BLOCK_N = 128x64 = 8192 fp32 values to 128x32 = 4096 fp32 values, cutting the register footprint for the accumulator roughly in half. This should reduce registers/thread from 168 toward ~100-120, allowing Block Limit Registers to increase from 3 to 4-5, raising theoretical occupancy from 18.75% to 25-31%. The grid must be doubled in the N-dimension (from ceil(192/64)=3 to ceil(192/32)=6 tiles per M-group). All prior attempts targeted BLOCK_M (correctness failures), BLOCK_K (bank conflict persistence), maxnreg (local spill), autotune with num_stages (register explosion), and TMA (crash). BLOCK_N reduction is the one untried axis that directly attacks both the accumulator register count and the B-tile bank conflict pattern simultaneously.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.363e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.407e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.524e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_b_block_ptr_order_flip_regression_004",
+    "iteration": 4,
+    "speedup": 0.7623,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "fix_b_block_ptr_order_to_eliminate_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + SharedMemoryConflicts + UncoalescedSharedAccess",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 49.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 18.21,
+        "Occupancy.Block Limit Registers": 3.0,
+        "GPU Speed Of Light Throughput.Duration": 1.81,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 92.61,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 10.54,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.L2 Hit Rate": 66.64,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.1,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.91,
+        "Instruction Statistics.Executed Instructions": 569478000.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 24.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 24.1,
+        "Occupancy.Block Limit Registers": 4.0,
+        "GPU Speed Of Light Throughput.Duration": 2.44,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 91.4,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 46.7,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 73.04,
+        "Memory Workload Analysis.L2 Hit Rate": 93.08,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.44,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.86,
+        "Instruction Statistics.Executed Instructions": 689241840.0
+      }
+    },
+    "strategy_title": "B block_ptr order flip + maxnreg causes local-memory spill regression",
+    "strategy_description": "Flipping the B matrix tl.make_block_ptr order from (0,1) to (1,0) was bundled with switching from block_ptr to explicit pointer arithmetic for A, reducing BLOCK_K from 32 to 16, and adding maxnreg=128 autotune configs. The combined change reduced registers/thread from 168 to 128 and raised theoretical occupancy from 18.75% to 25%, but triggered a severe local-memory spill: NCU's MemoryCacheAccessPattern rule fired with 85.49% speedup potential, indicating only 1 of 32 bytes per sector were utilized in local loads/stores. This spill increased executed instructions by ~21% (569M to 689M), warp cycles per issued instruction from 7.1 to 10.44, and kernel duration from 1.81ms to 2.44ms (0.76x regression). The shared memory bank conflicts were not resolved (still 8-way, ~70% of loads), while the local-memory spill became the dominant new bottleneck \u2014 the same failure mode as the prior iteration's maxnreg attempt.",
+    "slow_pseudocode": "# BEFORE: block_ptr approach, 168 regs, no local spill, 1.81ms\n@triton.jit\ndef kernel(A, B, out):\n    A_ptr = tl.make_block_ptr(A, shape=(M,K), strides=(672,1),\n                               offsets=(pid_m*BLOCK_M, 0),\n                               block_shape=(BLOCK_M, BLOCK_K),\n                               order=(1, 0))\n    B_ptr = tl.make_block_ptr(B, shape=(K,N), strides=(1,672),\n                               offsets=(0, pid_n*BLOCK_N),\n                               block_shape=(BLOCK_K, BLOCK_N),\n                               order=(0, 1))  # original order\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=fp32)\n    for _ in range(K // BLOCK_K):  # BLOCK_K=32\n        a = tl.load(A_ptr, boundary_check=(0,1))\n        b = tl.load(B_ptr, boundary_check=(0,1))\n        acc += tl.dot(a, b)\n        A_ptr = tl.advance(A_ptr, (0, BLOCK_K))\n        B_ptr = tl.advance(B_ptr, (BLOCK_K, 0))",
+    "fast_pseudocode": "# AFTER: explicit ptrs + maxnreg=128 + order=(1,0) on B, 128 regs, local spill, 2.44ms (SLOWER)\n@triton.autotune(configs=[\n    triton.Config({}, num_warps=4, num_stages=3, maxnreg=128),\n    # ... all configs with maxnreg=128\n], key=[])\n@triton.jit\ndef kernel(A, B, out):\n    # explicit pointer arithmetic for A, BLOCK_K=16\n    offs_k = tl.arange(0, BLOCK_K)  # BLOCK_K=16\n    B_block_ptr = tl.make_block_ptr(B, shape=(K,N), strides=(stride_bk, stride_bn),\n                                     offsets=(0, pid_n*BLOCK_N),\n                                     block_shape=(BLOCK_K, BLOCK_N),\n                                     order=(1, 0))  # flipped order\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=fp32)\n    for k_idx in range(K // BLOCK_K):\n        a = tl.load(A + offs_a_m[:,None]*672 + offs_k[None,:] + k_idx*BLOCK_K)\n        b = tl.load(B_block_ptr, boundary_check=(0,1), padding_option='zero')\n        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))\n        acc += tl.dot(a, b)\n    # Result: local memory spill, 10.44 cycles/inst vs 7.1, 35% slower",
+    "applicable_when": "Never in isolation when bundled with maxnreg capping and explicit pointer arithmetic changes. The order flip on B_block_ptr alone (without other changes) remains untested as an isolated intervention.",
+    "do_not_apply_when": "Do not combine B_block_ptr order flip with maxnreg capping and a switch from tl.make_block_ptr to explicit pointer arithmetic for A. The maxnreg=128 cap on a kernel with a 128x64 fp32 accumulator (requiring ~168 registers naturally) forces local-memory spill, which is far more expensive than the bank-conflict bottleneck it was meant to cure. The L2 Cache Throughput jumping from 10.54% to 46.7% confirms massive new traffic from local memory spill. This is the same failure mode as iteration 3 (item exp_triton_maxnreg_smem_staging_regression_003).",
+    "framework_notes": "This iteration's diff shows the plan was not implemented as specified: instead of only changing B_block_ptr order=(0,1) to order=(1,0), the executor also added maxnreg=128 autotune configs, switched A from tl.make_block_ptr to explicit pointer arithmetic, and reduced BLOCK_K from 32 to 16. The maxnreg=128 cap is the dominant cause of regression (same as iteration 3). The B_block_ptr order flip in isolation remains an untested hypothesis. In Triton, the 'order' field in tl.make_block_ptr is a compiler hint for shared memory staging layout; changing it does not alter mathematical correctness but may affect bank conflict patterns."
+  }
+]

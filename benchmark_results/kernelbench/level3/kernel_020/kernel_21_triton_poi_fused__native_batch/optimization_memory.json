@@ -1,0 +1,206 @@
+[
+  {
+    "item_id": "exp_rsqrt_replaces_sqrt_div_mul_chain",
+    "iteration": 3,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "replace_sqrt_div_mul_chain_with_rsqrt",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "Instruction_Statistics.Executed_Instructions": 333200.0,
+        "Source_Counters.Branch_Efficiency_pct": 83.33,
+        "Source_Counters.Avg_Divergent_Branches": 7.42,
+        "Warp_State_Statistics.Avg_Active_Threads_Per_Warp": 28.18,
+        "GPU_Speed_Of_Light.Duration_us": 3.17,
+        "GPU_Speed_Of_Light.Elapsed_Cycles": 4699.0,
+        "Compute_Workload_Analysis.Issue_Slots_Busy_pct": 33.85,
+        "Occupancy.Achieved_Occupancy_pct": 39.8
+      },
+      "key_metric_after": {
+        "Instruction_Statistics.Executed_Instructions": 243040.0,
+        "Source_Counters.Branch_Efficiency_pct": 100.0,
+        "Source_Counters.Avg_Divergent_Branches": 0.0,
+        "Warp_State_Statistics.Avg_Active_Threads_Per_Warp": 32.0,
+        "GPU_Speed_Of_Light.Duration_us": 3.07,
+        "GPU_Speed_Of_Light.Elapsed_Cycles": 4531.0,
+        "Compute_Workload_Analysis.Issue_Slots_Busy_pct": 27.62,
+        "Occupancy.Achieved_Occupancy_pct": 36.21
+      }
+    },
+    "strategy_title": "Replace sqrt+int-div+mul chain with rsqrt",
+    "strategy_description": "When a kernel computes 1/sqrt(x) via three separate instructions (sqrt_rn, integer-division, multiply-by-1.0), replacing them with a single libdevice.rsqrt call reduces total executed instructions by ~27% (333K\u2192243K) and eliminates warp divergence (branch efficiency 83%\u2192100%, divergent branches 7.4\u21920). The FPInstructions NCU rule (triggered when non-fused FP32 instructions outnumber fused by 3:1) is the key signal; rsqrt collapses the chain into one hardware instruction and allows subsequent multiply-add pairs to be fused as FMAs.",
+    "slow_pseudocode": "tmp6 = tl.sqrt_rn(tmp5)          # sqrt\ntmp7 = tl.full([1], 1, tl.int32)\ntmp8 = (tmp7 / tmp6)              # int / float \u2192 non-fused\ntmp9 = tl.full([1], 1.0, tl.float32)\ntmp10 = tmp8 * tmp9               # dead multiply\ntmp11 = tmp2 * tmp10              # (x-mean) * rsqrt\ntmp13 = tmp11 * tmp12             # * weight\ntmp15 = tmp13 + tmp14             # + bias",
+    "fast_pseudocode": "tmp6  = libdevice.rsqrt(tmp5)     # single hardware rsqrt\ntmp11 = tmp2 * tmp6               # (x-mean) * rsqrt\ntmp13 = tmp11 * tmp12             # * weight  (FMA candidate)\ntmp15 = tmp13 + tmp14             # + bias    (FMA candidate)",
+    "applicable_when": "FPInstructions NCU rule is triggered; non-fused FP32 instruction count is \u22653x fused count; kernel contains a 1/sqrt(x) pattern implemented as sqrt_rn + integer-division + multiply-by-1.0; branch efficiency <100% due to predicated-off threads from the divergent int-div path",
+    "do_not_apply_when": "The kernel is already using libdevice.rsqrt or tl.math.rsqrt; the computation requires double precision (rsqrt is FP32-only in libdevice); the bottleneck is memory bandwidth rather than instruction throughput (DRAM throughput >80%)",
+    "framework_notes": "Triton-specific: use `from triton.language.extra import libdevice` then call `libdevice.rsqrt(x)`. In CUDA C++ the equivalent is `__frsqrt_rn(x)` or `rsqrtf(x)`. The integer-division pattern `tl.full([1],1,tl.int32) / sqrt_result` is a Triton compiler artifact that prevents FMA fusion; replacing it with rsqrt restores FMA eligibility for subsequent multiply-add pairs."
+  },
+  {
+    "item_id": "exp_fma_fusion_bn_pointwise_iter3_triton",
+    "iteration": 3,
+    "speedup": 1.0423,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_fp32_multiply_add_to_fma_in_bn_normalization",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "Instruction Statistics.Executed Instructions": 333200.0,
+        "Source Counters.Branch Instructions": 39200.0,
+        "Source Counters.Branch Efficiency": 83.33,
+        "Source Counters.Avg. Divergent Branches": 7.42,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 28.18,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4699.0,
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "Occupancy.Achieved Occupancy": 39.8,
+        "Scheduler Statistics.Active Warps Per Scheduler": 7.92
+      },
+      "key_metric_after": {
+        "Instruction Statistics.Executed Instructions": 243040.0,
+        "Source Counters.Branch Instructions": 11760.0,
+        "Source Counters.Branch Efficiency": 100.0,
+        "Source Counters.Avg. Divergent Branches": 0.0,
+        "Warp State Statistics.Avg. Active Threads Per Warp": 32.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4542.0,
+        "GPU Speed Of Light Throughput.Duration": 3.07,
+        "Occupancy.Achieved Occupancy": 36.06,
+        "Scheduler Statistics.Active Warps Per Scheduler": 6.06
+      }
+    },
+    "strategy_title": "Replace BN arithmetic chain with rsqrt + FMA pattern",
+    "strategy_description": "Batch-norm normalization expressed as a multi-step chain (subtract mean, add eps, sqrt, int-divide, multiply by 1.0, scale, shift) produces a high ratio of non-fused FP32 instructions and introduces long scoreboard dependency chains. Collapsing the chain to `inv_std = rsqrt(var + eps); result = (x - mean) * inv_std * weight + bias` reduces executed instructions by ~27% (333k \u2192 243k), eliminates divergent branches entirely (branch efficiency 83% \u2192 100%), and improves average active threads per warp (28.2 \u2192 32.0), yielding a ~4% wall-clock speedup. The FPInstructions NCU rule with a high non-fused:fused ratio (3:1) is the reliable trigger for this pattern.",
+    "slow_pseudocode": "tmp2 = x - mean\ntmp5 = var + 1e-5\ntmp6 = tl.sqrt_rn(tmp5)\ntmp7 = tl.full([1], 1, tl.int32)\ntmp8 = tmp7 / tmp6          # int/float division\ntmp9 = tl.full([1], 1.0, tl.float32)\ntmp10 = tmp8 * tmp9         # redundant multiply by 1.0\ntmp11 = tmp2 * tmp10\ntmp13 = tmp11 * weight\ntmp15 = tmp13 + bias\ntl.store(out + idx, tmp15, mask)",
+    "fast_pseudocode": "inv_std = libdevice.rsqrt(var + 1e-05)   # rsqrt.approx.f32\nnormed  = (x - mean) * inv_std            # FMUL\nresult  = normed * weight + bias           # FFMA\ntl.store(out + idx, result, mask)",
+    "applicable_when": "FPInstructions NCU rule fires with non-fused FP32 instruction count \u2265 3\u00d7 fused count; BN normalization arithmetic is expressed as a multi-step chain with intermediate int-to-float conversions or redundant multiply-by-1.0 ops; kernel is latency-bound with L1TEX scoreboard stalls present; branch efficiency < 100% due to predicated boundary checks inside the arithmetic chain.",
+    "do_not_apply_when": "Kernel is already using rsqrt and canonical FMA form; strict IEEE-754 compliance is required (rsqrt.approx has ~2 ULP error vs exact sqrt+divide); the bottleneck is DRAM bandwidth rather than instruction count or dependency chains.",
+    "framework_notes": "Uses `libdevice.rsqrt` from `triton.language.extra`. In CUDA C++ the equivalent is `__frsqrt_rn` or `rsqrtf`. The `normed * weight + bias` expression must appear as a single Python expression (not split across temporaries) to guarantee PTX emits FFMA rather than separate FMUL+FADD."
+  },
+  {
+    "item_id": "exp_persistent_loop_wider_xblock_triton_004",
+    "iteration": 4,
+    "speedup": 1.0738,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_loop_with_wider_xblock_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4399.0,
+        "GPU Speed Of Light Throughput.Duration": 2.98,
+        "Instruction Statistics.Executed Instructions": 199920.0,
+        "Occupancy.Achieved Occupancy": 37.37,
+        "Scheduler Statistics.Active Warps Per Scheduler": 6.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.74,
+        "Scheduler Statistics.No Eligible": 72.13,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.58,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 78.84,
+        "Source Counters.Branch Efficiency": 0.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4412.0,
+        "GPU Speed Of Light Throughput.Duration": 2.98,
+        "Instruction Statistics.Executed Instructions": 109760.0,
+        "Occupancy.Achieved Occupancy": 18.58,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.8,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.19,
+        "Scheduler Statistics.No Eligible": 88.14,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.65,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 68.27,
+        "Source Counters.Branch Efficiency": 100.0
+      }
+    },
+    "strategy_title": "Persistent Loop + Wider XBLOCK Reduces Instruction Count",
+    "strategy_description": "Converting a flat single-pass kernel into a persistent loop (each CTA strides through multiple tiles via `tile_id += num_programs`) combined with widening XBLOCK (e.g., 128\u2192512) halved the executed instruction count (200K\u2192110K) and eliminated branch divergence (branch efficiency 0%\u2192100%). However, the wall-clock duration was unchanged (2.98 us both before and after) because the kernel was already latency-bound with very low occupancy (37%\u219219%), and the persistent loop reduced active warps per scheduler from 6.3 to 2.8, worsening scheduler eligibility (eligible warps 0.74\u21920.19, no-eligible cycles 72%\u219288%). The speedup measured (1.07x) appears to come from the instruction reduction rather than latency hiding, but the occupancy drop is a warning sign that this approach trades warp-level parallelism for per-warp work.",
+    "slow_pseudocode": "# Flat kernel: one tile per CTA, XBLOCK=128\nxoffset = tl.program_id(0) * XBLOCK\nxindex = xoffset + tl.arange(0, XBLOCK)\nxmask = xindex < xnumel\n# ... compute and store",
+    "fast_pseudocode": "# Persistent loop: each CTA strides through multiple tiles, XBLOCK=512\npid = tl.program_id(0)\nnum_programs = tl.num_programs(0)  # == grid size (e.g. 132)\nnum_tiles = tl.cdiv(xnumel, XBLOCK)\ntile_id = pid\nwhile tile_id < num_tiles:\n    xoffset = tile_id * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    # ... compute and store\n    tile_id += num_programs",
+    "applicable_when": "Kernel has very low waves_per_sm (<1.0) and grid_size >> sm_count; CPIStall rule fires with L1TEX scoreboard stalls; executed instruction count is high relative to work done; branch efficiency is low due to boundary masking in many small tiles; kernel is short-lived (<5 us) where launch overhead is significant",
+    "do_not_apply_when": "Kernel already has high occupancy (>60%) \u2014 reducing active warps per scheduler will worsen latency hiding; kernel is memory-bandwidth bound (DRAM throughput >50%) where wider tiles don't help; grid_size is already close to sm_count (persistent loop adds overhead without benefit); occupancy is the primary bottleneck rather than instruction count",
+    "framework_notes": "Triton-specific: use `tl.num_programs(0)` to get the actual grid size at runtime for the stride in the persistent loop. The XBLOCK widening (128\u2192512) enables Triton to emit 128-bit vectorized loads (ld.global.v4.f32) when pointer access is stride-1. Autotune over {256, 512, 1024} with `key=['xnumel']` to find the optimal tile width empirically."
+  },
+  {
+    "item_id": "exp_pid_swizzle_num_stages_pointwise_triton_004",
+    "iteration": 4,
+    "speedup": 1.0526,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "pid_swizzle_and_num_stages_for_l2_balance_pointwise",
+    "profiling_signal": {
+      "ncu_rule_triggered": "WorkloadImbalance",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4399.0,
+        "GPU Speed Of Light Throughput.Duration": 2.98,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Instruction Statistics.Executed Instructions": 199920.0,
+        "Source Counters.Branch Instructions": 7840.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 22.58,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.74,
+        "Occupancy.Achieved Occupancy": 37.37,
+        "Occupancy.Block Limit Registers": 21.0,
+        "GPU and Memory Workload Distribution.Average L2 Active Cycles": 1857.9
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4491.0,
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Instruction Statistics.Executed Instructions": 156800.0,
+        "Source Counters.Branch Instructions": 3920.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 28.46,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.56,
+        "Occupancy.Achieved Occupancy": 36.32,
+        "Occupancy.Block Limit Registers": 32.0,
+        "GPU and Memory Workload Distribution.Average L2 Active Cycles": 1715.34
+      }
+    },
+    "strategy_title": "PID Swizzle + num_stages for L2 Balance in Pointwise Kernels",
+    "strategy_description": "Adding a GROUP_SIZE-based program-ID swizzle and num_stages=2 variants to autotune configs for a small pointwise kernel (980 blocks, 0.46 waves) reduced registers per thread from 18 to 16 (unblocking Block Limit Registers from 21 to 32) and cut executed instructions by ~22% (200K\u2192157K), yielding a 1.05x wall-clock speedup despite the NCU-measured elapsed cycles being slightly higher (4399\u21924491). The register reduction was the dominant causal factor: it lifted the register-imposed block limit, allowing more blocks per SM. The L2 WorkloadImbalance improved modestly (38%\u219225% above average), confirming the swizzle had some effect, but the CPIStall L1TEX stall worsened (9.7\u219215.5 cycles, 43%\u219254% of stall budget), indicating num_stages=2 did not successfully pipeline the loads and instead increased latency exposure.",
+    "slow_pseudocode": "# No swizzle, no num_stages in autotune\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 128}, num_warps=4),\n    triton.Config({'XBLOCK': 256}, num_warps=4),\n    triton.Config({'XBLOCK': 512}, num_warps=8),\n    triton.Config({'XBLOCK': 1024}, num_warps=8),\n], key=['xnumel'])\ndef kernel(...):\n    xoffset = tl.program_id(0) * XBLOCK\n    # registers_per_thread = 18, Block Limit Registers = 21",
+    "fast_pseudocode": "# Add num_stages variants; hardcode GROUP_SIZE=8 swizzle\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=1),\n    triton.Config({'XBLOCK': 128}, num_warps=4, num_stages=2),\n    # ... etc\n], key=['xnumel'])\ndef kernel(...):\n    pid = tl.program_id(0)\n    num_blocks = tl.cdiv(xnumel, XBLOCK)\n    GROUP_SIZE = 8  # hardcoded constant\n    group_id = pid // GROUP_SIZE\n    group_offset = pid % GROUP_SIZE\n    swizzled_pid = group_offset * tl.cdiv(num_blocks, GROUP_SIZE) + group_id\n    swizzled_pid = tl.minimum(swizzled_pid, num_blocks - 1)\n    xoffset = swizzled_pid * XBLOCK\n    # registers_per_thread = 16, Block Limit Registers = 32",
+    "applicable_when": "WorkloadImbalance NCU rule fires with L2 slice imbalance >30% above average; kernel has registers_per_thread near a block-limit boundary (Block Limit Registers < Block Limit Warps); grid is small (<2 waves); adding num_stages variants to autotune allows the compiler to explore register-reducing configurations as a side effect",
+    "do_not_apply_when": "Kernel is already register-limited at a low count (registers_per_thread \u2264 16); CPIStall L1TEX stalls are already high (>40% of stall budget) \u2014 adding num_stages=2 to short pointwise kernels worsens L1TEX stalls rather than hiding them; the swizzle GROUP_SIZE is hardcoded rather than a constexpr autotune parameter, preventing the compiler from optimizing it away when not beneficial",
+    "framework_notes": "In Triton, num_stages in triton.Config controls software pipelining depth for tl.load calls. For very short kernels (<3 us, <5 loads), num_stages=2 may increase register pressure or expose more latency rather than hiding it. The register reduction observed here (18\u219216) was likely a compiler artifact of the changed code structure rather than a direct effect of num_stages. GROUP_SIZE as a hardcoded Python constant (not tl.constexpr) still affects block scheduling but prevents autotune from exploring different values."
+  },
+  {
+    "item_id": "exp_rsqrt_fma_autotune_wider_configs_triton_005",
+    "iteration": 5,
+    "speedup": 1.1111,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fuse_fp32_instructions_with_fma_in_batchnorm_pointwise",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4412.0,
+        "GPU Speed Of Light Throughput.Duration": 2.98,
+        "Instruction Statistics.Executed Instructions": 109760.0,
+        "Occupancy.Achieved Occupancy": 18.58,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.8,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.19,
+        "Scheduler Statistics.No Eligible": 88.14,
+        "Compute Workload Analysis.Issue Slots Busy": 11.66,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 68.27,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 23.65
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4249.0,
+        "GPU Speed Of Light Throughput.Duration": 2.88,
+        "Instruction Statistics.Executed Instructions": 154840.0,
+        "Occupancy.Achieved Occupancy": 26.11,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.59,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.4,
+        "Scheduler Statistics.No Eligible": 78.54,
+        "Compute Workload Analysis.Issue Slots Busy": 19.13,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 78.84,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 21.41
+      }
+    },
+    "strategy_title": "rsqrt+FMA BN Chain with Wider Autotune Configs Improves Occupancy",
+    "strategy_description": "Applying the rsqrt+FMA batch-norm arithmetic fusion (replacing sqrt/div/mul chain with libdevice.rsqrt and tl.math.fma) together with adding wider XBLOCK autotune configs (including XBLOCK=2048, num_warps=16) improved achieved occupancy from 18.6% to 26.1%, active warps per scheduler from 2.8 to 4.59, and L1/TEX hit rate from 68.3% to 78.8%, reducing elapsed cycles by ~4% (4412\u21924249) and yielding a 1.11x speedup. The instruction count increased (110K\u2192155K) because the wider autotune config selected a larger XBLOCK that processes more elements per CTA, but the improved warp-level parallelism and cache reuse more than compensated. The key causal signal is that eligible warps per scheduler doubled (0.19\u21920.40) and no-eligible cycles dropped (88%\u219279%), indicating better latency hiding from higher occupancy.",
+    "slow_pseudocode": "# Persistent loop, XBLOCK autotune {512, 1024, 256}, no XBLOCK=2048\n# BN chain already using rsqrt+FMA but with lower occupancy\npid = tl.program_id(0)\nnum_programs = tl.num_programs(0)\nnum_tiles = tl.cdiv(xnumel, XBLOCK)\ntile_id = pid\nwhile tile_id < num_tiles:\n    # ... loads ...\n    inv_std = libdevice.rsqrt(tmp3 + 1e-05)\n    normed  = (tmp0 - tmp1) * inv_std\n    result  = normed * tmp12 + tmp14   # not tl.math.fma\n    tl.store(out + x2, result, xmask)\n    tile_id += num_programs\n# Achieved occupancy: 18.6%, active warps/scheduler: 2.8",
+    "fast_pseudocode": "# Persistent loop, XBLOCK autotune {256, 512, 1024, 2048}, num_warps up to 16\n@triton.autotune(configs=[\n    triton.Config({'XBLOCK': 256},  num_warps=4,  num_stages=1),\n    triton.Config({'XBLOCK': 512},  num_warps=4,  num_stages=1),\n    triton.Config({'XBLOCK': 1024}, num_warps=8,  num_stages=1),\n    triton.Config({'XBLOCK': 2048}, num_warps=16, num_stages=1),\n], key=['xnumel'])\npid = tl.program_id(0)\nnum_sms = tl.num_programs(0)\nnum_tiles = tl.cdiv(xnumel, XBLOCK)\ntile_id = pid\nwhile tile_id < num_tiles:\n    # ... loads ...\n    tmp2 = tmp0 - tmp1\n    inv_std = libdevice.rsqrt(tmp3 + 1e-05)\n    x_norm = tmp2 * inv_std\n    tmp15 = tl.math.fma(x_norm, tmp12, tmp14)\n    tl.store(out + x2, tmp15, xmask)\n    tile_id += num_sms\n# Achieved occupancy: 26.1%, active warps/scheduler: 4.59",
+    "applicable_when": "FPInstructions NCU rule fires with non-fused FP32 count >= 2x fused count; kernel implements BN/LN affine transform as a multi-step chain; achieved occupancy is low (<30%) with low eligible warps per scheduler (<0.5) and high no-eligible cycles (>75%); persistent loop is already in use but autotune configs do not include the widest XBLOCK options (>=2048)",
+    "do_not_apply_when": "Kernel is already at high occupancy (>50%) where adding wider XBLOCK configs reduces parallelism; kernel is DRAM bandwidth bound (DRAM throughput >50%); strict IEEE-754 precision is required (rsqrt.approx has ~2-4 ULP error); the persistent loop grid is already sized to fill all SMs with multiple waves (waves_per_sm > 2)",
+    "framework_notes": "Triton-specific: use `from triton.language.extra import libdevice` for libdevice.rsqrt (maps to rsqrt.approx.f32 PTX). tl.math.fma(a, b, c) maps to fma.rn.f32 PTX. Adding XBLOCK=2048 with num_warps=16 to autotune configs allows the compiler to select a wider tile that improves L1 cache reuse (hit rate 68%\u219279%) and occupancy in persistent-loop kernels where the grid is fixed at sm_count."
+  }
+]

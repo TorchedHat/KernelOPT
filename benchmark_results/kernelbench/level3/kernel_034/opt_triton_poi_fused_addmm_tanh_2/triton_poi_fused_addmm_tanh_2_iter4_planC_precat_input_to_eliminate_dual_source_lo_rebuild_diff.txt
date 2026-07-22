@@ -1,0 +1,113 @@
+--- baseline
++++ rebuilt
+@@ -4,14 +4,21 @@
+ from triton.language.extra import libdevice
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=2, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32, 'BLOCK_K': 128}, num_warps=2, num_stages=4),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 256}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 128}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 64},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32,  'BLOCK_K': 128}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 256}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 64},  num_warps=8, num_stages=2),
+     ],
+     key=['M', 'N_i2h', 'K_i2h'],
+ )
+@@ -25,8 +32,9 @@
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+ ):
+     # Computes: out = tanh(cat(x, hidden) @ weight.T + bias)
+-    # x: [M, K_x], hidden: [M, K_h], weight: [N_i2h, K_i2h] where K_i2h = K_x + K_h
+-    # out: [M, N_i2h]
++    # x_ptr now points to pre-concatenated [M, K_i2h] tensor (cat(x_t, hidden))
++    # stride_x_batch = cat_input.stride(0), stride_x_feat = cat_input.stride(1)
++    # hidden_ptr, K_x, K_h, stride_h_* are unused (kept for signature compatibility)
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+ 
+@@ -35,35 +43,20 @@
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    # Loop over K dimension (K_x part then K_h part)
+-    # K_i2h = K_x + K_h
+     for k in range(0, tl.cdiv(K_i2h, BLOCK_K)):
+         offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+ 
+-        # Load weight tile [BLOCK_K, BLOCK_N] -> weight is [N_i2h, K_i2h], we need [K_i2h, N_i2h]
+-        # weight[n, k] accessed as weight_ptr + n * stride_w_out + k * stride_w_in
++        # Load weight tile [BLOCK_K, BLOCK_N] -> weight is [N_i2h, K_i2h]
++        # Transposed load: offs_k as outer dim, offs_n as inner dim
+         w_mask = (offs_k[:, None] < K_i2h) & (offs_n[None, :] < N_i2h)
+         w = tl.load(weight_ptr + offs_k[:, None] * stride_w_in + offs_n[None, :] * stride_w_out,
+                     mask=w_mask, other=0.0)
+ 
+-        # Load input tile from cat(x, hidden): [BLOCK_M, BLOCK_K]
+-        # For k < K_x: load from x; for k >= K_x: load from hidden
+-        m_mask = offs_m[:, None] < M
+-        k_mask = offs_k[None, :] < K_i2h
+-
+-        # x part: offs_k < K_x
+-        x_k = offs_k[None, :]  # [1, BLOCK_K]
+-        x_valid = (x_k < K_x) & k_mask & m_mask
+-        x_val = tl.load(x_ptr + offs_m[:, None] * stride_x_batch + x_k * stride_x_feat,
+-                        mask=x_valid, other=0.0)
+-
+-        # hidden part: offs_k >= K_x
+-        h_k = offs_k[None, :] - K_x  # [1, BLOCK_K]
+-        h_valid = (offs_k[None, :] >= K_x) & k_mask & m_mask
+-        h_val = tl.load(hidden_ptr + offs_m[:, None] * stride_h_batch + h_k * stride_h_feat,
+-                        mask=h_valid & (h_k >= 0) & (h_k < K_h), other=0.0)
+-
+-        inp = tl.where(offs_k[None, :] < K_x, x_val, h_val)
++        # Load input tile from pre-concatenated buffer: [BLOCK_M, BLOCK_K]
++        # x_ptr points to cat(x_t, hidden) with stride_x_batch and stride_x_feat
++        cat_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K_i2h)
++        inp = tl.load(x_ptr + offs_m[:, None] * stride_x_batch + offs_k[None, :] * stride_x_feat,
++                      mask=cat_mask, other=0.0)
+ 
+         acc += tl.dot(inp, w, allow_tf32=False)
+ 
+@@ -80,16 +73,23 @@
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=2, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=4, num_stages=3),
+         triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=2, num_stages=4),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 128}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32,  'BLOCK_K': 64},  num_warps=2, num_stages=4),
+         triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 256}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=4, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 128}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 256}, num_warps=4, num_stages=2),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32,  'BLOCK_K': 128}, num_warps=2, num_stages=4),
+     ],
+     key=['M', 'N_h2o', 'K_h2o'],
+ )
+ @triton.jit
++
+ def rnn_h2o_kernel(
+     hidden_ptr, weight_ptr, bias_ptr, out_ptr,
+     M, N_h2o, K_h2o,

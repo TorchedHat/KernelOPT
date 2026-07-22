@@ -1,0 +1,225 @@
+[
+  {
+    "item_id": "exp_001_reduce_register_pressure_tile_size_correction",
+    "iteration": 1,
+    "speedup": 10.4828,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_tile_size_correction",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.08,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.89,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.28,
+        "Scheduler Statistics.No Eligible": 77.64,
+        "GPU Speed Of Light Throughput.Duration": 48.64,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 72634.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 29.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 5.7,
+        "Occupancy.Block Limit Registers": 32.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 0.87,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.07,
+        "Scheduler Statistics.No Eligible": 92.75,
+        "GPU Speed Of Light Throughput.Duration": 4.64,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6892.0
+      }
+    },
+    "strategy_title": "Fix Oversized Reduction Tile to Eliminate Register Spill",
+    "strategy_description": "When a Triton reduction kernel is launched with R0_BLOCK (reduction tile size) larger than the actual reduction dimension (r0_numel), the compiler allocates registers for the full tile even though most elements are masked out. This drives registers/thread to the hardware maximum (255), collapsing Block Limit Registers to 2 and theoretical occupancy to ~12.5%. Correcting R0_BLOCK to match r0_numel exactly (or using autotune to explore valid configs) drops registers/thread from 255 to ~29, raises Block Limit Registers from 2 to 32, and reduces kernel duration by ~10x. The fix is to add @triton.autotune with configs that cap R0_BLOCK at r0_numel and remove the hardcoded oversized tile from the launch call.",
+    "slow_pseudocode": "# R0_BLOCK=512 but r0_numel=128 \u2014 4x oversize\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    r0_numel = 128\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):  # single iteration, 512 regs allocated\n        ...\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)  # hardcoded oversized tile",
+    "fast_pseudocode": "# R0_BLOCK=128 matches r0_numel=128\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 128}, num_warps=2),\n        triton.Config({'XBLOCK': 4,   'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=8),\n        # ... other XBLOCK variants, all with R0_BLOCK=128\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    r0_numel = 128\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):  # correct tile size\n        ...\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']),)\nkernel[grid](...)  # no hardcoded tile params",
+    "applicable_when": "Registers per thread is at or near hardware maximum (255); Block Limit Registers is 2 or very low; Theoretical Occupancy is \u226412.5%; NCU TheoreticalOccupancy rule fires with high speedup_pct (>50%); R0_BLOCK (or equivalent reduction tile constexpr) is hardcoded to a value larger than the actual reduction dimension r0_numel.",
+    "do_not_apply_when": "R0_BLOCK already matches or is smaller than r0_numel; register pressure is not the occupancy bottleneck (Block Limit Registers is not the binding constraint); the kernel is memory-bandwidth bound rather than occupancy/latency bound.",
+    "framework_notes": "Triton-specific: the fix uses @triton.autotune wrapping @triton.jit, with configs exploring XBLOCK values while fixing R0_BLOCK=r0_numel. The grid must be changed from a static tuple to a lambda using META['XBLOCK']. In CUDA, the equivalent is choosing a thread block size that doesn't over-allocate registers for a reduction that is smaller than the block's reduction dimension."
+  },
+  {
+    "item_id": "exp_001_reduce_r0_block_to_match_r0_numel",
+    "iteration": 1,
+    "speedup": 5.4468,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_r0_block_to_match_r0_numel_via_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 255.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Launch.Waves Per SM": 0.97,
+        "Scheduler Statistics.No Eligible": 77.64,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 21.33,
+        "GPU Speed Of Light Throughput.Duration": 48.64,
+        "Instruction Statistics.Executed Instructions": 8189952.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 166.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Block Limit Registers": 3.0,
+        "Launch.Waves Per SM": 0.65,
+        "Scheduler Statistics.No Eligible": 58.61,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 31.07,
+        "GPU Speed Of Light Throughput.Duration": 8.93,
+        "Instruction Statistics.Executed Instructions": 2171904.0
+      }
+    },
+    "strategy_title": "Cap R0_BLOCK to actual reduction dimension via autotune",
+    "strategy_description": "When a Triton reduction kernel's R0_BLOCK compile-time constant exceeds the actual reduction dimension (r0_numel), the kernel allocates accumulator arrays sized [XBLOCK, R0_BLOCK] in registers that are far larger than needed, driving registers/thread to the hardware maximum (255) and collapsing Block Limit Registers to 2, yielding ~12.5% theoretical occupancy. Adding @triton.autotune with R0_BLOCK configs capped at r0_numel eliminates the over-allocation, reducing registers/thread from 255 to 166 and cutting executed instructions by ~73%, producing a 5.4x speedup. The fix is mechanical: inspect r0_numel at kernel launch time and ensure no autotune config sets R0_BLOCK > r0_numel.",
+    "slow_pseudocode": "# R0_BLOCK=512 >> r0_numel=128 \u2192 4x register over-allocation\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)  # 512-wide arrays\n    _acc_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):  # only 1 iteration!\n        ...\n\n# Launch: hardcoded XBLOCK=128, R0_BLOCK=512\ngrid = (triton.cdiv(xnumel, 128),)  # 256 blocks\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# R0_BLOCK configs capped at r0_numel=128\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 64},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 64},  num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 128}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=8, num_stages=2),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _acc_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)  # correctly sized\n    _acc_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        ...\n\n# Launch: autotune selects best config; remove explicit XBLOCK/R0_BLOCK kwargs\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)",
+    "applicable_when": "TheoreticalOccupancy NCU rule fires with speedup_pct > 50%; registers_per_thread is at or near hardware maximum (255); Block Limit Registers is 2 or fewer; the kernel has a tl.range reduction loop where R0_BLOCK (compile-time constant) is larger than the actual r0_numel runtime value; accumulator arrays [XBLOCK, R0_BLOCK] are allocated in registers.",
+    "do_not_apply_when": "R0_BLOCK already matches or is smaller than r0_numel; register pressure is not the occupancy bottleneck (Block Limit Registers > 4); the reduction dimension is dynamic and cannot be bounded at autotune time; changing XBLOCK would break exact divisibility of xnumel.",
+    "framework_notes": "Triton-specific: @triton.autotune injects XBLOCK and R0_BLOCK as tl.constexpr arguments, so the grid lambda must use meta['XBLOCK'] instead of a hardcoded value. The key=['xnumel', 'r0_numel'] ensures autotune re-runs when problem shape changes. In CUDA, the equivalent is choosing the thread block tile size to match the actual work per block, avoiding over-allocation of shared memory or register arrays."
+  },
+  {
+    "item_id": "exp_001_r0block_oversize_register_pressure",
+    "iteration": 1,
+    "speedup": 4.0099,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_r0_block_oversize_to_reduce_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 255.0,
+        "Occupancy.Block Limit Registers": 2.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 12.08,
+        "Launch.Waves Per SM": 0.97,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.22,
+        "Scheduler Statistics.No Eligible": 77.64,
+        "GPU Speed Of Light Throughput.Duration": 48.64,
+        "Source Counters.Avg. Divergent Branches": 1.94,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 2024423.0
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 255.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 6.05,
+        "Launch.Waves Per SM": 0.48,
+        "Scheduler Statistics.Issued Warp Per Scheduler": 0.29,
+        "Scheduler Statistics.No Eligible": 71.12,
+        "GPU Speed Of Light Throughput.Duration": 12.13,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.45,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 268854.0,
+        "Instruction Statistics.Executed Instructions": 2006208.0
+      }
+    },
+    "strategy_title": "Match R0_BLOCK to r0_numel to Eliminate Register Bloat",
+    "strategy_description": "When a Triton reduction kernel sets R0_BLOCK larger than the actual r0_numel, it allocates register arrays (e.g., online-softmax accumulators) of the oversized R0_BLOCK dimension, driving register usage to the hardware maximum (255/thread) and collapsing Block Limit Registers to 2, yielding only 12.5% theoretical occupancy. Reducing R0_BLOCK to exactly match r0_numel eliminates the wasted register allocation, raises Block Limit Registers, and dramatically reduces total instruction count (8.19M \u2192 2.01M), cutting kernel duration by ~4x. Adding @triton.autotune over XBLOCK and num_warps allows the runtime to find the best tile shape after the register pressure is resolved.",
+    "slow_pseudocode": "# R0_BLOCK=512 >> r0_numel=128 \u2192 4x over-allocated register arrays\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _tmp_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)  # 512-wide\n    _tmp_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)       # 512-wide\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):         # 1 iteration\n        ...\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)  # hardcoded, oversized",
+    "fast_pseudocode": "# R0_BLOCK=128 == r0_numel=128 \u2192 correctly sized register arrays\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=2),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    _tmp_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)  # 128-wide\n    _tmp_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)       # 128-wide\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        ...\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # XBLOCK/R0_BLOCK selected by autotune",
+    "applicable_when": "Triton reduction kernel has R0_BLOCK (or RBLOCK) set larger than the actual r0_numel; registers_per_thread is at or near hardware maximum (255); Block Limit Registers is 2 or very low; TheoreticalOccupancy rule fires with occupancy \u2264 12.5%; Issued Warp Per Scheduler is very low (< 0.3); the reduction accumulator arrays are [XBLOCK, R0_BLOCK] shaped register tensors",
+    "do_not_apply_when": "R0_BLOCK already matches r0_numel; register pressure is not the occupancy bottleneck (Block Limit Registers \u2265 8); kernel is memory-bandwidth bound rather than occupancy-bound; r0_numel is not a compile-time constant (autotune key must cover it)",
+    "framework_notes": "Triton-specific: register arrays declared as tl.full([XBLOCK, R0_BLOCK], ...) or tl.zeros([XBLOCK, R0_BLOCK], ...) consume registers proportional to R0_BLOCK, not r0_numel. Setting R0_BLOCK > r0_numel wastes registers on unused elements. The @triton.autotune decorator with key=['xnumel','r0_numel'] and a lambda grid (lambda meta: (cdiv(xnumel, meta['XBLOCK']),)) is the idiomatic fix. Equivalent in CUDA: reducing shared/register array sizes to match actual work dimensions."
+  },
+  {
+    "item_id": "e63b8fd2",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_via_loop_dimension_reorder",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_via_loop_dimension_reorder \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'memory_coalescing_via_loop_dimension_reorder' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The tensor in_out_ptr0 has shape (8, 256, 16, 128) with strides (524288, 1, 32768, 256). The load/store address is `x0 + 256*r0_2 + 32768*x1`, where x0 = xindex % 256 varies across XBLOCK (thread dimension) and r0_2 varies across R0_BLOCK (reduction dimension). With XBLOCK=1 (the currently selected autotune config, giving block_size=64 threads all sharing the same x0), the 32 threads in a warp iterate over different r0 values. r0 maps to the last spatial dimension with stride=256 in the flat address, so 32 consecutive warp threads access addresses 256 floats = 1024 bytes apart \u2014 32 separate cache lines, causing 86% excessive sectors and only 4/32 bytes utilized per sector. With XBLOCK>=32, each warp's 32 threads span different x0 values (consecutive), accessing stride-1 channel elements \u2014 a single 128-byte cache line, fully coalesced. The fix is to remove XBLOCK<32 configs from autotune and fix the grid to be a lambda.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_autotune_xblock_oversized_with_shared_mem_spill",
+    "iteration": 2,
+    "speedup": 0.0765,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_with_corrected_r0_block_to_fix_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + UncoalescedSharedAccess + SharedMemoryConflicts",
+      "key_metric_before": {
+        "Launch.Registers Per Thread": 29.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 5.7,
+        "Launch.Waves Per SM": 0.06,
+        "GPU Speed Of Light Throughput.Duration": 4.64,
+        "Instruction Statistics.Executed Instructions": 124928.0,
+        "Scheduler Statistics.No Eligible": 92.75,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 74.52,
+        "Memory Workload Analysis.L2 Hit Rate": 98.26
+      },
+      "key_metric_after": {
+        "Launch.Registers Per Thread": 32.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 11.18,
+        "Launch.Waves Per SM": 0.12,
+        "GPU Speed Of Light Throughput.Duration": 635.55,
+        "Instruction Statistics.Executed Instructions": 29658624.0,
+        "Scheduler Statistics.No Eligible": 93.77,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 26.65,
+        "Memory Workload Analysis.L2 Hit Rate": 72.66,
+        "Launch.Stack Size": 6720.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK Configs Cause Local Memory Spill and Instruction Explosion",
+    "strategy_description": "Replacing a small, well-tuned autotune config set (XBLOCK in {1..128}) with a restricted set of large XBLOCK values (XBLOCK in {64,128,256}) caused a 13x duration regression despite registers/thread remaining low (29\u219232). The profiling after shows Stack Size jumped from 1024 to 6720 bytes, L1/TEX Hit Rate collapsed from 74.52% to 26.65%, L2 Hit Rate dropped from 98.26% to 72.66%, and executed instructions exploded from 125K to 29.7M \u2014 all signatures of local memory (register-spill-to-stack) thrashing. Additionally, SharedMemoryConflicts rules fired (3.7\u20133.9-way bank conflicts, 62\u201369% excessive wavefronts) and MemoryCacheAccessPattern for local loads/stores showed only 1.0 of 32 bytes utilized per sector, confirming the large XBLOCK configs forced spill to local memory with highly strided access patterns. The correct fix is to use a lambda grid AND keep small XBLOCK configs (XBLOCK\u226432) that avoid spill.",
+    "slow_pseudocode": "# AFTER (broken): large XBLOCK configs cause local memory spill\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=8),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=8),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # XBLOCK=256, R0_BLOCK=128 -> [256,128] register arrays -> spill to local mem\n    _acc_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)\n    _acc_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\n    ...\n\ngrid = (triton.cdiv(xnumel, 128),)  # also still broken: fixed grid",
+    "fast_pseudocode": "# CORRECT: small XBLOCK configs avoid [XBLOCK*R0_BLOCK] register array spill\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 128}, num_warps=2),\n        triton.Config({'XBLOCK': 4,   'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 8,   'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 128}, num_warps=8),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 128}, num_warps=8),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # XBLOCK<=32, R0_BLOCK=128 -> [32,128]=4096 elements -> fits in registers\n    _acc_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)\n    _acc_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\n    ...\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # dynamic lambda",
+    "applicable_when": "Never apply this exact pattern. When a Triton reduction kernel has 2D register accumulator arrays [XBLOCK, R0_BLOCK], large XBLOCK values (\u226564) combined with R0_BLOCK=128 create arrays of 8192+ elements that spill to local memory, causing Stack Size to grow (>4KB), L1/TEX Hit Rate to collapse (<30%), and instruction count to explode (>10x). This is detectable when Stack Size increases dramatically after changing autotune configs.",
+    "do_not_apply_when": "Do not use XBLOCK\u226564 in autotune configs when the kernel has 2D accumulator arrays [XBLOCK, R0_BLOCK] with R0_BLOCK=128 or larger \u2014 the product XBLOCK*R0_BLOCK*sizeof(float) will exceed register file capacity and spill to local memory. Also do not use a fixed grid when XBLOCK is a tunable autotune parameter.",
+    "framework_notes": "Triton-specific: the 2D accumulator pattern `tl.full([XBLOCK, R0_BLOCK], ...)` allocates XBLOCK*R0_BLOCK registers. For R0_BLOCK=128 and XBLOCK=256, this is 32768 float32 values = 128KB per thread block, far exceeding register capacity and forcing local memory spill. Stack Size in NCU launch stats is the key indicator: if Stack Size > 2048 bytes after a config change, local memory spill is occurring. Keep XBLOCK small (\u226432) for kernels with large R0_BLOCK to avoid this."
+  },
+  {
+    "item_id": "exp_003_swap_tile_dim_order_r0_outer_x_inner",
+    "iteration": 3,
+    "speedup": 10.551,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "swap_tile_dimension_order_for_shared_memory_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.96,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 7362.0,
+        "Memory Workload Analysis.L2 Hit Rate": 94.56,
+        "Memory Workload Analysis.Memory Throughput": 28.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.01,
+        "Scheduler Statistics.No Eligible": 92.34,
+        "Occupancy.Achieved Occupancy": 5.7,
+        "Launch.Registers Per Thread": 26.0,
+        "Launch.Waves Per SM": 0.06
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 4.61,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6840.0,
+        "Memory Workload Analysis.L2 Hit Rate": 97.75,
+        "Memory Workload Analysis.Memory Throughput": 31.11,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.39,
+        "Scheduler Statistics.No Eligible": 91.87,
+        "Occupancy.Achieved Occupancy": 5.7,
+        "Launch.Registers Per Thread": 26.0,
+        "Launch.Waves Per SM": 0.06
+      }
+    },
+    "strategy_title": "Swap Tile Dimension Order to Eliminate Shared Memory Bank Conflicts",
+    "strategy_description": "In Triton reduction kernels with 2D accumulator tiles [XBLOCK, R0_BLOCK], placing the non-reduction (x) dimension as the outer (slow) axis and the reduction (r0) dimension as the inner (fast) axis causes threads in a warp to access shared memory with a stride equal to the reduction tile width, producing multi-way bank conflicts. Swapping the tile layout to [R0_BLOCK, XBLOCK] \u2014 making x the fast-varying inner axis \u2014 aligns warp-level shared memory accesses with contiguous bank addresses, improving L2 Hit Rate (94.56% \u2192 97.75%) and reducing elapsed cycles (7362 \u2192 6840). The fix requires updating arange orientations (xindex uses [None, :], r0_base uses [:, None]), accumulator shapes, the online_softmax_reduce axis argument (1\u21920), and post-reduce reshape slices ([:, None]\u2192[None, :]).",
+    "slow_pseudocode": "# x outer, r0 inner \u2014 causes shared memory bank conflicts\nxindex = xoffset + tl.arange(0, XBLOCK)[:, None]   # [XBLOCK, 1]\nr0_base = tl.arange(0, R0_BLOCK)[None, :]           # [1, R0_BLOCK]\n_acc_max = tl.full([XBLOCK, R0_BLOCK], -inf, tl.float32)\n_acc_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    tmp = tl.broadcast_to(val, [XBLOCK, R0_BLOCK])\n    _acc_max, _acc_sum = online_softmax_combine(_acc_max, _acc_sum, tmp)\ntmp_max, tmp_sum = online_softmax_reduce(_acc_max, _acc_sum, 1, False)\ntmp_max = tmp_max[:, None]  # [XBLOCK, 1]\ntmp_sum = tmp_sum[:, None]",
+    "fast_pseudocode": "# r0 outer, x inner \u2014 coalesced shared memory access\nxindex = xoffset + tl.arange(0, XBLOCK)[None, :]   # [1, XBLOCK]\nr0_base = tl.arange(0, R0_BLOCK)[:, None]           # [R0_BLOCK, 1]\n_acc_max = tl.full([R0_BLOCK, XBLOCK], -inf, tl.float32)\n_acc_sum = tl.zeros([R0_BLOCK, XBLOCK], tl.float32)\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    tmp = tl.broadcast_to(val, [R0_BLOCK, XBLOCK])\n    _acc_max, _acc_sum = online_softmax_combine(_acc_max, _acc_sum, tmp)\ntmp_max, tmp_sum = online_softmax_reduce(_acc_max, _acc_sum, 0, False)\ntmp_max = tmp_max[None, :]  # [1, XBLOCK]\ntmp_sum = tmp_sum[None, :]",
+    "applicable_when": "UncoalescedGlobalAccess or UncoalescedSharedAccess NCU rule fires with >50% excessive sectors; the kernel uses a 2D accumulator tile [XBLOCK, R0_BLOCK] where x is the outer axis and r0 is the inner axis; L2 Hit Rate is below 98%; the reduction dimension has a non-unit stride in global memory relative to the x dimension.",
+    "do_not_apply_when": "The kernel does not use shared memory staging for accumulators; bank conflicts are already absent or minimal; the x dimension has a non-unit stride in global memory (swapping would move the strided access to the fast axis instead); the online_softmax_reduce or equivalent helper is not axis-agnostic.",
+    "framework_notes": "Triton-specific: the arange orientation determines how the 2D tile maps to shared memory banks. Changing [:, None] to [None, :] for xindex and [None, :] to [:, None] for r0_base is the mechanical fix. The online_softmax_reduce axis argument must change from 1 (reduce along columns, i.e., r0) to 0 (reduce along rows, i.e., r0 now in axis 0). Post-reduce reshape must use [None, :] instead of [:, None] to maintain broadcast compatibility with the [R0_BLOCK, XBLOCK] tile. In CUDA, the equivalent is transposing the shared memory layout so the warp's fast-varying thread index maps to contiguous bank addresses. Note: this iteration also changed num_stages from 1 to 2 and removed large XBLOCK configs (>=64), which may have contributed to the speedup alongside the dimension swap."
+  }
+]

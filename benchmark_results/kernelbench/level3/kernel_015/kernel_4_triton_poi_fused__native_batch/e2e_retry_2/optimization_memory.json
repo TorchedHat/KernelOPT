@@ -1,0 +1,42 @@
+[
+  {
+    "item_id": "exp_001_autotune_block_size_regression",
+    "iteration": 1,
+    "speedup": 0.3693,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_via_autotune_to_hide_l1tex_latency",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 41.02,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 56.57,
+        "GPU Speed Of Light Throughput.Memory Throughput": 24.58,
+        "Occupancy.Achieved Occupancy": 55.63,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.17,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.53,
+        "Launch Statistics.Registers Per Thread": 17.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Instruction Statistics.Executed Instructions": 18314240.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 111.07,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 87.6,
+        "GPU Speed Of Light Throughput.Memory Throughput": 20.37,
+        "Occupancy.Achieved Occupancy": 83.6,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 7.58,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.9,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Instruction Statistics.Executed Instructions": 76581120.0
+      }
+    },
+    "strategy_title": "Autotune larger block size to hide L1TEX latency",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20131024) improved occupancy (55.6%\u219283.6%) and eligible warps per scheduler (1.17\u21927.58), but caused a severe 2.7x regression. The root cause was a 4.2x explosion in executed instructions (18.3M\u219276.6M) combined with a doubling of registers per thread (17\u219232), which together overwhelmed any latency-hiding benefit. The autotune selected XBLOCK=256 with 32 registers/thread, indicating the larger tile size triggered a more complex code path or register-spill-adjacent behavior that dramatically increased per-element work.",
+    "slow_pseudocode": "# BEFORE: fixed small block, low register pressure\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no masking\n    tmp0 = tl.load(ptr + x, None)\n    ...\n    tl.store(ptr + x, result, None)\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)  # 17 regs/thread, 41us",
+    "fast_pseudocode": "# AFTER: autotune with larger blocks, but 4x more instructions\n@triton.autotune(\n    configs=[Config({'XBLOCK': 1024}, num_warps=8), Config({'XBLOCK': 256}, num_warps=4), ...],\n    key=['xnumel']\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xmask = xindex < xnumel  # added masking\n    tmp0 = tl.load(ptr + x, xmask)\n    ...\n    tl.store(ptr + x, result, xmask)\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # selected XBLOCK=256, 32 regs/thread, 111us",
+    "applicable_when": "Never: this specific combination of autotune + mask change caused a 4x instruction explosion. Do not apply autotune with dynamic masking to kernels where xnumel is exactly divisible by the block size and the original kernel used tl.full([XBLOCK], True) masking.",
+    "do_not_apply_when": "When the kernel already uses tl.full([XBLOCK], True, tl.int1) as a no-op mask (meaning xnumel is divisible by XBLOCK), switching to xmask = xindex < xnumel adds a runtime comparison and changes load/store behavior. When register count doubles after the change (17\u219232 regs/thread), the autotune is selecting a config that triggers heavier register pressure, reducing the number of concurrent blocks per SM despite higher nominal occupancy. When executed instruction count increases by more than 2x, the latency-hiding benefit is negated.",
+    "framework_notes": "In Triton, replacing tl.full([XBLOCK], True, tl.int1) with xindex < xnumel changes the mask from a compile-time constant (no overhead) to a runtime predicate. This can interact with autotune by causing the compiler to generate different (heavier) code paths for larger XBLOCK values. The register doubling (17\u219232) suggests the compiler is doing more work per thread with the runtime mask. Additionally, the grid was not updated to use the lambda form correctly \u2014 it was left as cdiv(xnumel, 128) hardcoded, meaning the autotune's XBLOCK selection was not reflected in the grid, causing 2x more blocks than needed for XBLOCK=256."
+  }
+]

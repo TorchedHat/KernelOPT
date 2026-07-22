@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused__softmax_bmm_exp_slice_sub_transpose_view_2(arg_A, arg_B, out_ptr0):
+@@ -16,8 +17,7 @@
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
+-    A = arg_A
+-    B = arg_B
++    NUM_BATCHES : tl.constexpr = 2048
+ 
+     M = 32
+     N = 512
+@@ -58,35 +58,36 @@
+ 
+     rk = tl.arange(0, BLOCK_K)
+ 
+-    idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q*stride_aq)
+-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q*stride_bq)
+-
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+-    for k in range(K, 0, -BLOCK_K):
+-        if EVEN_K:
+-            a = tl.load(A)
+-            b = tl.load(B)
+-        else:
+-            a = tl.load(A, mask=rk[None, :] < k, other=0.)
+-            b = tl.load(B, mask=rk[:, None] < k, other=0.)
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+-        A += BLOCK_K * stride_ak
+-        B += BLOCK_K * stride_bk
+-
+-    # rematerialize rm and rn to save registers
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+-    idx_m = rm[:, None]
+-    idx_n = rn[None, :]
++    # precompute index arrays for store (outside batch loop)
++    rm2 = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    rn2 = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    idx_m = rm2[:, None]
++    idx_n = rn2[None, :]
+     mask = (idx_m < M) & (idx_n < N)
+ 
+-    # inductor generates a suffix
+-    xindex = idx_n + 512*idx_m + 16384*idx_q
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
++    A_base = arg_A
++    B_base = arg_B
+ 
++    # persistent batch loop: each block processes all NUM_BATCHES batch elements
++    for idx_q in range(NUM_BATCHES):
++        # Recompute A and B pointers from base for each batch element
++        A = A_base + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q * stride_aq)
++        B = B_base + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q * stride_bq)
+ 
++        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
++
++        # K-loop in ascending order with explicit mask on every iteration
++        for ki in range(tl.cdiv(K, BLOCK_K)):
++            k_rem = K - ki * BLOCK_K
++            a = tl.load(A, mask=rk[None, :] < k_rem, other=0.)
++            b = tl.load(B, mask=rk[:, None] < k_rem, other=0.)
++            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
++            A += BLOCK_K * stride_ak
++            B += BLOCK_K * stride_bk
++
++        # inductor generates a suffix
++        xindex = idx_n + 512 * idx_m + 16384 * idx_q
++        tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

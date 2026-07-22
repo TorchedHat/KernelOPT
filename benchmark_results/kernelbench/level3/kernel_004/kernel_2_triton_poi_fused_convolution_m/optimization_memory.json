@@ -1,0 +1,124 @@
+[
+  {
+    "item_id": "b666aa63",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_tile_size_to_increase_grid_parallelism",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_tile_size_to_increase_grid_parallelism \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_tile_size_to_increase_grid_parallelism' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): mel = 96\n    xnumel = 25\n    yoffset = tl.program_id(1) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n                     ",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel operates on only 2,400 elements (96x25). With XBLOCK=128 and xnumel=25, the X dimension produces ceil(25/128)=1 block. With YBLOCK=8 and ynumel=96, the Y dimension produces ceil(96/8)=12 blocks. Total grid = 12 blocks on a 132-SM GPU -> 0.01 waves/SM and 6.2% achieved occupancy. The kernel is dominated by launch overhead (2.37 us). Shrinking tile sizes forces more blocks, spreading work across more SMs. Adding @triton.autotune explores small tile configurations that maximize grid coverage without wasting threads on padding.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): mel = 96\n    xnumel = 25\n    yoffset = tl.program_id(1) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xoffset = ",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_triton_autotune_small_grid_tile_reduction_001",
+    "iteration": 1,
+    "speedup": 1.058,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_size_for_undersized_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 12.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.2,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration": 2.37,
+        "Launch Statistics.Registers Per Thread": 30.0,
+        "Scheduler Statistics.No Eligible": 89.01
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 12.0,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Waves Per SM": 0.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "GPU Speed Of Light Throughput.Duration": 2.24,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Scheduler Statistics.No Eligible": 95.42
+      }
+    },
+    "strategy_title": "Autotune Tile Sizes When Block Threads Vastly Exceed Work",
+    "strategy_description": "When a Triton kernel's XBLOCK or YBLOCK is much larger than the actual problem dimension (e.g., XBLOCK=128 for xnumel=25), most threads are masked out, wasting registers and inflating per-block resource usage. Adding @triton.autotune with smaller tile configs reduces registers per thread (30\u219216) and total thread count (1536\u2192384), lowering kernel duration even when grid size stays the same. The primary gain comes from reduced per-thread register pressure and eliminated wasted masked-out thread work, not from increased grid coverage in this case.",
+    "slow_pseudocode": "# Fixed oversized tile, no autotune\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # xnumel=25, but XBLOCK=128 \u2192 103/128 threads masked\n    xmask = xindex < 25\n    ymask = yindex < 96\n    ...\n\ngrid = (cdiv(25, 128), cdiv(96, 8))  # = (1, 12)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune with smaller tiles matching problem size\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,  'YBLOCK': 1},  num_warps=1),\n        triton.Config({'XBLOCK': 4,  'YBLOCK': 4},  num_warps=1),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 4},  num_warps=1),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 8},  num_warps=2),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 8},  num_warps=2),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 8},  num_warps=4),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    xmask = xindex < 25\n    ymask = yindex < 96\n    ...\n\ngrid = lambda meta: (cdiv(25, meta['XBLOCK']), cdiv(96, meta['YBLOCK']))\nkernel[grid](...)  # XBLOCK/YBLOCK injected by autotune",
+    "applicable_when": "Triton kernel has fixed XBLOCK/YBLOCK tile sizes significantly larger than the actual problem dimension (xnumel or ynumel), causing most threads to be masked out; NCU LaunchConfiguration rule fires; registers_per_thread is high relative to work done; grid_size << sm_count.",
+    "do_not_apply_when": "Problem dimensions are large enough to fill tiles (xnumel >= XBLOCK and ynumel >= YBLOCK with minimal waste); grid is already large relative to SM count; autotune overhead would dominate for very short-lived kernels called frequently with varying shapes.",
+    "framework_notes": "Triton-specific: use @triton.autotune decorator with key=['ynumel','xnumel'] so autotune caches per problem size. Grid must be a lambda referencing meta['XBLOCK'] and meta['YBLOCK'] rather than hardcoded values. XBLOCK and YBLOCK must remain tl.constexpr. Note: in this case the grid size stayed at 12 (same grid_size before and after), so the speedup came primarily from reduced register pressure (30\u219216 regs/thread) and fewer total threads (1536\u2192384), not from increased parallelism."
+  },
+  {
+    "item_id": "exp_triton_autotune_small_grid_block_size_reduction_001",
+    "iteration": 1,
+    "speedup": 1.0441,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_block_size_for_small_grid_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 12.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.2,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3498.0,
+        "GPU Speed Of Light Throughput.Duration": 2.37,
+        "Scheduler Statistics.No Eligible": 89.01,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.16,
+        "Compute Workload Analysis.SM Busy": 10.26
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 12.0,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Waves Per SM": 0.0,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 3346.0,
+        "GPU Speed Of Light Throughput.Duration": 2.27,
+        "Scheduler Statistics.No Eligible": 95.48,
+        "Scheduler Statistics.Active Warps Per Scheduler": 0.91,
+        "Compute Workload Analysis.SM Busy": 1.19
+      }
+    },
+    "strategy_title": "Autotune Block Size for Tiny-Grid Triton Kernels",
+    "strategy_description": "When a Triton kernel's grid is far smaller than the SM count (e.g., 12 blocks on 132 SMs, waves_per_sm \u2248 0.01) and the block size is much larger than the actual work per block (e.g., XBLOCK=128 for only 25 real elements, causing ~80% masked threads), replacing the fixed block size with @triton.autotune over smaller tile configs reduces wasted masked-thread overhead and elapsed cycles. In this case, reducing XBLOCK from 128 to 32 (via autotune) cut elapsed cycles from 3498 to 3346 and duration from 2.37 \u00b5s to 2.27 \u00b5s, yielding a 1.04x speedup. Note that for truly tiny workloads the grid cannot expand beyond the number of output tiles, so occupancy improvements are bounded by the problem size, not the tile choice alone.",
+    "slow_pseudocode": "# Fixed large block size, tiny grid\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # xnumel=25, XBLOCK=128 \u2192 80% threads masked\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel\n    tl.load(..., xmask & ymask)\n    tl.store(..., xmask & ymask)\n\n# Launch: grid=(cdiv(25,128), cdiv(96,8)) = (1, 12) = 12 blocks\ngrid = (triton.cdiv(xnumel, 128), triton.cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune over smaller block sizes\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 1}, num_warps=1),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 2}, num_warps=1),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 4}, num_warps=2),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 1}, num_warps=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 4}, num_warps=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 8}, num_warps=2),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 8}, num_warps=2),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    # Kernel body unchanged; xmask/ymask guards preserved\n    xmask = xindex < xnumel\n    ymask = yindex < ynumel\n    tl.load(..., xmask & ymask)\n    tl.store(..., xmask & ymask)\n\n# Launch: grid uses META to pick tile sizes at runtime\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']), triton.cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "Triton kernel has grid_size << sm_count (waves_per_sm < 0.1), block_size >> actual elements per block dimension (>50% threads masked), LaunchConfiguration NCU rule fires with high estimated speedup, and the kernel body is a simple pointwise/memory-bound operation with xmask/ymask guards already in place.",
+    "do_not_apply_when": "The kernel already has waves_per_sm >= 1 (grid is large enough to saturate SMs), or the block size is already well-matched to the work per block (low masked-thread fraction). Also avoid if the kernel uses shared memory tiling that depends on a specific block size, or if autotune overhead is unacceptable for very short-running kernels called extremely frequently.",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['ynumel','xnumel'] so the best config is cached per problem size. The launch grid must be changed from a static tuple to a lambda META: (...) that reads META['XBLOCK'] and META['YBLOCK']. CUDA equivalent: use __launch_bounds__ and experiment with smaller block sizes; CUDA does not have a built-in autotune decorator but similar exploration can be done via template parameters or runtime tuning loops."
+  },
+  {
+    "item_id": "86fe257c",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_uncoalesced_store_by_swapping_tile_axes",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_uncoalesced_store_by_swapping_tile_axes \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_uncoalesced_store_by_swapping_tile_axes' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=4.724e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.074e+00 > atol=0.001\nseed=1337 output[0]: max_diff=4.905e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel performs a layout transpose: load from in_ptr0[x2 + 25*y3] (row-major, x is fast-varying -> coalesced load) and store to out_ptr0[y0 + 6*x2 + 150*y1] where y0 = yindex % 6 and y1 = yindex // 6. With XBLOCK threads varying in x and YBLOCK threads varying in y, the store address for consecutive x-threads is y0 + 6*x2 + 150*y1: as x2 increments by 1, the address increments by 6 floats (24 bytes). This stride-6 scatter write causes only 4 of 32 bytes per cache sector to be utilized, exactly matching the NCU MemoryCacheAccessPattern metric. The L1TEX stall (45.3% of cycles) is a direct consequence. The fix is to swap which dimension is fast for threads: make y the column dimension (tl.arange in [None, :]) and x the row dimension (tl.arange in [:, None]). In the output index y0 + 6*x2 + 150*y1, y0 = yindex%6 varies with stride 1 as yindex increments, so making y the fast-varying thread axis means consecutive threads write to consecutive output addresses, achieving coalesced stores.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=4.724e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.074e+00 > atol=0.001\nseed=1337 output[0]: max_diff=4.905e+00 > atol=0.001",
+    "framework_notes": null
+  }
+]

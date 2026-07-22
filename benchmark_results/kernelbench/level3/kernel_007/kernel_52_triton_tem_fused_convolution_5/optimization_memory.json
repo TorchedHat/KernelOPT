@@ -1,0 +1,130 @@
+[
+  {
+    "item_id": "exp_001_tf32_tile_regression",
+    "iteration": 1,
+    "speedup": 0.5949,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_with_larger_tiles",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 52.7,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 12.25,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 93.76,
+        "GPU Speed Of Light Throughput.Memory Throughput": 84.3,
+        "Occupancy.Registers Per Thread": 80.0,
+        "Occupancy.Theoretical Occupancy": 37.5,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.34,
+        "Instruction Statistics.Executed Instructions": 5078032.0,
+        "Memory Workload Analysis.L2 Hit Rate": 54.97,
+        "Launch Statistics.Waves Per SM": 0.16
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 88.58,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 26.33,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 69.9,
+        "GPU Speed Of Light Throughput.Memory Throughput": 59.21,
+        "Occupancy.Registers Per Thread": 156.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 3.21,
+        "Instruction Statistics.Executed Instructions": 18412256.0,
+        "Memory Workload Analysis.L2 Hit Rate": 79.88,
+        "Launch Statistics.Waves Per SM": 0.31
+      }
+    },
+    "strategy_title": "Enabling TF32 + Larger Tiles Causes Register Spill Regression",
+    "strategy_description": "Increasing BLOCK_M and BLOCK_N (e.g., 32\u219264 and 64\u2192128) while enabling TF32 caused registers per thread to nearly double (80\u2192156), which halved theoretical occupancy (37.5%\u219218.75%) and increased total executed instructions by 3.6x (5M\u219218M), resulting in a 1.68x longer kernel duration despite improved compute SOL (12%\u219226%) and reduced warp stall cycles (7.34\u21923.21). The root cause is that the larger tile sizes dramatically increased register pressure, preventing the compiler from keeping accumulators in registers and forcing spills, which more than offset any benefit from TF32 or better tile efficiency. When a kernel is already register-limited (Block Limit Registers was already the binding constraint at 6 blocks/SM before), enlarging tiles will worsen register pressure and cause regression even if compute utilization nominally improves.",
+    "slow_pseudocode": "BLOCK_M = 32\nBLOCK_N = 64\nALLOW_TF32 = False\n# registers_per_thread = 80, theoretical_occupancy = 37.5%\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32)  # scalar FFMA path",
+    "fast_pseudocode": "# DO NOT DO THIS when register pressure is already the binding occupancy limiter\nBLOCK_M = 64   # doubled\nBLOCK_N = 128  # doubled\nALLOW_TF32 = True\n# registers_per_thread = 156 (+95%), theoretical_occupancy = 18.75% (-50%)\n# executed_instructions = 18.4M (+262%) -> kernel duration 88us vs 52us",
+    "applicable_when": "Never applicable as described: do NOT increase tile sizes when Block Limit Registers is already the binding occupancy constraint (registers_per_thread > 64 and theoretical occupancy already limited by registers). TF32 alone (without tile size increase) may still be worth trying.",
+    "do_not_apply_when": "Kernel is already register-limited (Block Limit Registers < Block Limit Warps and Block Limit Shared Mem); registers_per_thread already high (>64); grid is small (waves_per_sm < 0.5) so occupancy loss from register pressure increase cannot be compensated by more waves.",
+    "framework_notes": "In Triton, BLOCK_M and BLOCK_N constexprs directly control accumulator tile size and thus register consumption. Doubling both dimensions quadruples the accumulator register footprint. ALLOW_TF32=True alone (without tile size change) should be tested separately as it does not inherently increase register pressure."
+  },
+  {
+    "item_id": "891b018e",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "reduce_register_pressure_via_smaller_tiles_and_pipeline_stages",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + AchievedOccupancy + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "reduce_register_pressure_via_smaller_tiles_and_pipeline_stages \u2014 correctness failure",
+    "strategy_description": "Plan 'reduce_register_pressure_via_smaller_tiles_and_pipeline_stages' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.756e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.059e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.129e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has 94 registers/thread with block_size=128 (4 warps). Block Limit Registers = 5 blocks/SM and Block Limit Shared Mem = 5 blocks/SM are both binding. Achieved occupancy is only 6.25% (4 warps/SM) vs theoretical 31.25% (20 warps/SM): 124 blocks on 132 SMs means most SMs get exactly 1 block and some get 0 (0.19 waves/SM). The 16.9-way shared memory bank conflict (82% of wavefronts) causes 76.3% of warp cycles to stall on MIO scoreboard. Prior attempts to fix bank conflicts via tl.make_block_ptr or larger tiles all caused register explosion (80->167 regs) and regression. The untried approach is @triton.autotune with SMALLER tile sizes (BLOCK_M=16 vs current 32) that reduce register pressure, allow more blocks/SM, and double the grid size to 246 blocks (1.86 waves/SM). num_stages=2 adds software pipelining to hide MIO latency.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.756e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.059e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.129e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_autotune_empty_configs_no_tile_reduction",
+    "iteration": 2,
+    "speedup": 0.712,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_warps_num_stages_without_tile_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + UncoalescedSharedAccess + TheoreticalOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 51.84,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 77719.0,
+        "Launch Statistics.Registers Per Thread": 94.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Occupancy.Theoretical Occupancy": 31.25,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Registers": 5.0,
+        "Instruction Statistics.Executed Instructions": 5082496.0,
+        "Memory Workload Analysis.Mem Busy": 85.17,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 94.77
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 74.02,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 110978.0,
+        "Launch Statistics.Registers Per Thread": 254.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Occupancy.Theoretical Occupancy": 12.5,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Instruction Statistics.Executed Instructions": 9178472.0,
+        "Memory Workload Analysis.Mem Busy": 35.63,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 40.97
+      }
+    },
+    "strategy_title": "Adding Autotune With Empty Configs Regresses Via Register Explosion",
+    "strategy_description": "Adding @triton.autotune with configs that only vary num_warps and num_stages (empty tile dicts {}) while simultaneously changing BLOCK_M from 32 to 64 caused registers per thread to jump from 94 to 254 (near hardware maximum), collapsing theoretical occupancy from 31.25% to 12.5% and achieved occupancy from 6.25% to 3.12%. Executed instructions nearly doubled (5.1M to 9.2M) and kernel duration increased by 43% (51.84us to 74.02us). The structural anti-pattern is identical to exp_001: tile sizes hardcoded as constexpr inside the kernel body are invisible to the autotuner, so the autotuner cannot select smaller tiles to relieve register pressure. The autotuner only selected a smaller block_size (128\u219264 threads), which halved parallelism without reducing register pressure.",
+    "slow_pseudocode": "# BEFORE: BLOCK_M=32, BLOCK_N=64, BLOCK_K=32, no autotune, 94 regs/thread\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 32\n    BLOCK_N: tl.constexpr = 64\n    BLOCK_K: tl.constexpr = 32\n    # Duration: 51.84us, Registers: 94, Executed: 5.1M inst",
+    "fast_pseudocode": "# AFTER (REGRESSED): BLOCK_M=64, autotune only on num_warps/num_stages, 254 regs/thread\n@triton.autotune(\n    configs=[triton.Config({}, num_warps=2, num_stages=2), ...],  # empty tile dicts!\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 64  # enlarged but NOT in autotune configs\n    BLOCK_N: tl.constexpr = 64\n    BLOCK_K: tl.constexpr = 32\n    # Duration: 74.02us, Registers: 254 (near max!), Executed: 9.2M inst",
+    "applicable_when": "Never \u2014 this is a pure regression pattern to avoid.",
+    "do_not_apply_when": "Always avoid: do not add @triton.autotune with empty Config dicts ({}) while simultaneously increasing any tile dimension (BLOCK_M, BLOCK_N, BLOCK_K). The autotuner cannot override hardcoded constexpr tile sizes inside the kernel body, so it cannot compensate for the increased register pressure. This pattern causes registers_per_thread to approach 255, theoretical occupancy to collapse, and kernel duration to increase even when block_size is reduced by the autotuner.",
+    "framework_notes": "In Triton, @triton.autotune Config dicts with empty {} only control num_warps and num_stages \u2014 they do NOT affect any tl.constexpr values hardcoded inside the kernel body. To allow the autotuner to explore tile sizes, BLOCK_M/BLOCK_N/BLOCK_K must be declared as kernel parameters (not internal assignments) and included as keys in each Config dict. Setting key=[] also means no cache invalidation on shape changes."
+  },
+  {
+    "item_id": "4b9fee36",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "expose_tile_sizes_to_autotune_to_reduce_register_pressure",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "expose_tile_sizes_to_autotune_to_reduce_register_pressure \u2014 correctness failure",
+    "strategy_description": "Plan 'expose_tile_sizes_to_autotune_to_reduce_register_pressure' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.001e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.059e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.129e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "BLOCK_M=64, BLOCK_N=64, BLOCK_K=32 are hardcoded as tl.constexpr inside the kernel body while autotune configs use empty {} dicts. The autotuner cannot reduce tile sizes to relieve register pressure. Result: 254 registers/thread (near hardware max 255), Block Limit Registers=4, theoretical occupancy=12.5%, achieved=3.12%, 0.23 waves/SM. Promoting tile sizes to kernel parameters and adding small-tile configs (BLOCK_M=16, BLOCK_N=32) will cut accumulator register footprint ~8x, restoring occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.001e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.059e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.129e+02 > atol=0.001",
+    "framework_notes": null
+  }
+]

@@ -1,0 +1,298 @@
+[
+  {
+    "item_id": "fc054d4d",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "software_pipelining_via_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "software_pipelining_via_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'software_pipelining_via_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.774e+03 > atol=0.001\nseed=42 output[0]: max_diff=1.258e+04 > atol=0.001\nseed=1337 output[0]: max_diff=9.205e+03 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel spends 92.2% of warp cycles stalled on L1TEX (global memory) loads with no pipeline overlap. The inner tl.range loop over r0_numel=512 uses R0_BLOCK=512 (single iteration, no prefetch). With num_stages=1, Triton emits no async prefetch, so every load blocks the warp. Shared memory is the binding occupancy limiter (only 3 blocks/SM). Adding @triton.autotune with num_stages=2..4 enables Triton's software pipeline to prefetch the next tile's data while computing the current tile, directly attacking the L1TEX stall. Smaller R0_BLOCK values reduce per-block shared memory usage, potentially lifting Block Limit Shared Mem from 3 to 6+ blocks/SM and doubling occupancy.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.774e+03 > atol=0.001\nseed=42 output[0]: max_diff=1.258e+04 > atol=0.001\nseed=1337 output[0]: max_diff=9.205e+03 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_reduce_shared_mem_occupancy",
+    "iteration": 1,
+    "speedup": 168.04,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_reduce_shared_mem_occupancy_limit",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "Occupancy.Block_Limit_Shared_Mem": 3.0,
+        "Occupancy.Theoretical_Occupancy_pct": 18.75,
+        "Occupancy.Achieved_Occupancy_pct": 16.5,
+        "Scheduler_Statistics.No_Eligible_pct": 97.39,
+        "Warp_State_Statistics.Warp_Cycles_Per_Issued_Instruction": 102.25,
+        "GPU_Speed_Of_Light.Duration_us": 882.21,
+        "GPU_Speed_Of_Light.Compute_SM_Throughput_pct": 6.19,
+        "GPU_Speed_Of_Light.Memory_Throughput_pct": 30.31,
+        "Launch_Statistics.Dynamic_Shared_Memory_Per_Block_Kbyte": 65.54,
+        "Memory_Workload_Analysis.L1_TEX_Hit_Rate_pct": 2.27,
+        "Memory_Workload_Analysis.L2_Hit_Rate_pct": 61.74
+      },
+      "key_metric_after": {
+        "Occupancy.Block_Limit_Shared_Mem": 33.0,
+        "Occupancy.Theoretical_Occupancy_pct": 100.0,
+        "Occupancy.Achieved_Occupancy_pct": 21.19,
+        "Scheduler_Statistics.No_Eligible_pct": 92.08,
+        "Warp_State_Statistics.Warp_Cycles_Per_Issued_Instruction": 48.5,
+        "GPU_Speed_Of_Light.Duration_us": 5.25,
+        "GPU_Speed_Of_Light.Compute_SM_Throughput_pct": 4.39,
+        "GPU_Speed_Of_Light.Memory_Throughput_pct": 30.31,
+        "Launch_Statistics.Dynamic_Shared_Memory_Per_Block_Kbyte": 2.05,
+        "Memory_Workload_Analysis.L1_TEX_Hit_Rate_pct": 35.63,
+        "Memory_Workload_Analysis.L2_Hit_Rate_pct": 79.29
+      }
+    },
+    "strategy_title": "Autotune Reduction Tile to Eliminate Shared Memory Occupancy Cap",
+    "strategy_description": "When a Triton reduction kernel's R0_BLOCK (reduction tile size) causes per-block shared memory allocation to dominate the SM resource budget, Block Limit Shared Mem becomes the binding occupancy constraint (e.g., 3 blocks/SM vs 16 from warps), driving theoretical occupancy below 20% and scheduler idle rate above 97%. Adding @triton.autotune with configs spanning smaller R0_BLOCK values (e.g., 16\u201364 instead of 512) reduces the shared memory scratch buffer proportionally, lifting Block Limit Shared Mem from 3 to 33 and theoretical occupancy from 18.75% to 100%. This directly reduces warp stall cycles per issued instruction (102 \u2192 48) and kernel duration (882 \u00b5s \u2192 5.25 \u00b5s), yielding a 168x speedup.",
+    "slow_pseudocode": "# Fixed large tile \u2014 shared mem bottleneck\n@triton.jit\ndef kernel(..., XBLOCK: constexpr, R0_BLOCK: constexpr):\n    # R0_BLOCK=512 \u2192 65KB dynamic shared mem/block \u2192 only 3 blocks/SM\n    _acc = tl.zeros([XBLOCK, R0_BLOCK], dtype=tl.float32)\n    for r0 in range(0, r0_numel, R0_BLOCK):\n        x = tl.load(ptr + r0 + stride*x_idx)\n        _acc += x * x\n    tl.store(out + x_idx, tl.sum(_acc, 1))\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# Autotune explores smaller R0_BLOCK \u2014 shared mem drops, occupancy rises\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 16},  num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 1,   'R0_BLOCK': 32},  num_warps=4, num_stages=4),\n        triton.Config({'XBLOCK': 4,   'R0_BLOCK': 32},  num_warps=8, num_stages=4),\n        triton.Config({'XBLOCK': 8,   'R0_BLOCK': 32},  num_warps=8, num_stages=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 16},  num_warps=4, num_stages=4),\n        # ... more configs spanning XBLOCK x R0_BLOCK x num_stages\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: constexpr, R0_BLOCK: constexpr):\n    # R0_BLOCK selected by autotuner \u2192 2KB dynamic shared mem/block \u2192 33 blocks/SM\n    _acc = tl.zeros([XBLOCK, R0_BLOCK], dtype=tl.float32)\n    for r0 in range(0, r0_numel, R0_BLOCK):\n        r0_vec = tl.max_contiguous(tl.multiple_of(r0_idx, 16), 16)\n        x = tl.load(ptr + r0_vec + stride*x_idx)\n        _acc += x * x\n    tl.store(out + x_idx, tl.sum(_acc, 1))\n\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](..., xnumel, r0_numel)  # no hardcoded tile params",
+    "applicable_when": "Triton reduction kernel where: (1) Block Limit Shared Mem << Block Limit Warps (e.g., 3 vs 16), indicating shared memory is the binding occupancy constraint; (2) Theoretical occupancy < 25%; (3) Scheduler 'No Eligible' > 90% with dominant L1TEX stalls (CPIStall rule triggered); (4) The shared memory usage scales with R0_BLOCK (reduction accumulator stored in shared mem); (5) Kernel duration is in the hundreds of microseconds range suggesting significant latency hiding opportunity.",
+    "do_not_apply_when": "Kernel is already compute-bound (Compute SM Throughput > 60%); shared memory is not the binding occupancy limiter (Block Limit Shared Mem >= Block Limit Warps); the reduction dimension is very small (R0_BLOCK already minimal); or the kernel is so small that autotuning overhead dominates (< 5 \u00b5s baseline).",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with configs list and key parameter for cache invalidation. tl.max_contiguous/tl.multiple_of are Triton compiler hints for vectorized loads \u2014 they do not change computed values. The grid must be a lambda using meta['XBLOCK'] when XBLOCK is autotuned. Equivalent in CUDA: use dynamic shared memory sizing and launch multiple configurations to find optimal block/tile size."
+  },
+  {
+    "item_id": "exp_001_autotune_shared_mem_occupancy",
+    "iteration": 1,
+    "speedup": 147.5268,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_tile_sizes_to_relieve_shared_mem_occupancy_bottleneck",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 16.5,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 2.67,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.03,
+        "Scheduler Statistics.No Eligible": 97.39,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 102.25,
+        "GPU Speed Of Light Throughput.Duration": 882.21,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 6.19,
+        "GPU Speed Of Light Throughput.Memory Throughput": 30.31,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 65540.0,
+        "Launch Statistics.Waves Per SM": 1.29
+      },
+      "key_metric_after": {
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 21.01,
+        "Occupancy.Block Limit Shared Mem": 28.0,
+        "Scheduler Statistics.Active Warps Per Scheduler": 3.35,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.11,
+        "Scheduler Statistics.No Eligible": 93.35,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 50.4,
+        "GPU Speed Of Light Throughput.Duration": 5.98,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 4.69,
+        "GPU Speed Of Light Throughput.Memory Throughput": 47.15,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8.0,
+        "Launch Statistics.Waves Per SM": 0.24
+      }
+    },
+    "strategy_title": "Autotune tile sizes to eliminate shared-memory occupancy cap",
+    "strategy_description": "When a reduction kernel's shared memory per block limits Block Limit Shared Mem to \u22643 blocks/SM, theoretical occupancy collapses to ~18% and the scheduler has almost no eligible warps (\u22640.03/cycle), causing >97% idle cycles due to unmasked L1TEX latency (~94 cycles/warp). Adding @triton.autotune over XBLOCK and R0_BLOCK (the reduction tile dimension) allows the runtime to select smaller R0_BLOCK values that drastically reduce shared memory per block (65 KB \u2192 8 bytes here), raising Block Limit Shared Mem from 3 to 28 and theoretical occupancy from 18.75% to 100%, while also scaling the grid lambda with META['XBLOCK'] to maintain correct SM coverage. The kernel duration dropped from 882 \u00b5s to 6 \u00b5s (147\u00d7 speedup) primarily because the shared-memory bottleneck was eliminated, not because of compute or bandwidth improvements.",
+    "slow_pseudocode": "# Fixed large tile \u2014 shared mem bottleneck\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # reduction over R0_BLOCK=512 elements, uses ~65 KB shared mem/block\n    ...\n\ngrid = (triton.cdiv(xnumel, 128),)   # fixed XBLOCK=128\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# Autotuned tiles \u2014 shared mem freed, occupancy restored\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': x, 'R0_BLOCK': r}, num_warps=4, num_stages=2)\n        for x in [1,4,8,16,32,64,128]\n        for r in [64,128,256,512]\n        if x*r <= threshold\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # body unchanged; r0_mask already handles R0_BLOCK < r0_numel\n    ...\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)  # scales with XBLOCK\nkernel[grid](...)  # XBLOCK, R0_BLOCK injected by autotune",
+    "applicable_when": "Triton reduction kernel where (1) Block Limit Shared Mem \u2264 4 blocks/SM, (2) theoretical occupancy < 25%, (3) No Eligible warp cycles > 90%, (4) CPIStall rule fires with L1TEX stall > 80% of total cycles, and (5) the reduction tile size (R0_BLOCK) is the primary driver of shared memory allocation. Dynamic shared memory per block > 32 KB is a strong indicator.",
+    "do_not_apply_when": "Shared memory is not the occupancy limiter (Block Limit Shared Mem \u2265 8); the kernel is already register-bound; R0_BLOCK cannot be reduced below r0_numel without correctness issues and no r0_mask guard exists; or the kernel is so small that autotune overhead dominates (kernel duration < 2 \u00b5s before optimization).",
+    "framework_notes": "Triton-specific: use @triton.autotune with key=['xnumel', 'r0_numel'] so the cache key captures problem shape. The grid must be a lambda META: (triton.cdiv(xnumel, META['XBLOCK']),) \u2014 a fixed tuple will not scale with the autotuned XBLOCK. The kernel body is unchanged; the existing r0_mask (r0_index < r0_numel) already handles partial R0_BLOCK tiles correctly. In CUDA/cuBLAS equivalents, this corresponds to choosing a smaller threadblock tile for the reduction dimension to reduce shared memory footprint."
+  },
+  {
+    "item_id": "exp_triton_autotune_smem_occupancy_coalescing_001",
+    "iteration": 1,
+    "speedup": 42.5366,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_block_sizes_to_reduce_smem_and_improve_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + TheoreticalOccupancy + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration (us)": 882.21,
+        "Occupancy.Theoretical Occupancy (%)": 18.75,
+        "Occupancy.Block Limit Shared Mem (blocks)": 3.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 65.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction (cycle)": 102.25,
+        "Scheduler Statistics.Eligible Warps Per Scheduler (warp)": 0.03,
+        "Scheduler Statistics.Active Warps Per Scheduler (warp)": 2.67,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 2.27,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 6.19,
+        "GPU Speed Of Light Throughput.Memory Throughput (%)": 30.31
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration (us)": 20.74,
+        "Occupancy.Theoretical Occupancy (%)": 75.0,
+        "Occupancy.Block Limit Shared Mem (blocks)": 32.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block (Kbyte)": 1.02,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction (cycle)": 32.14,
+        "Scheduler Statistics.Eligible Warps Per Scheduler (warp)": 0.06,
+        "Scheduler Statistics.Active Warps Per Scheduler (warp)": 1.94,
+        "Memory Workload Analysis.L1/TEX Hit Rate (%)": 35.15,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput (%)": 8.94,
+        "GPU Speed Of Light Throughput.Memory Throughput (%)": 22.46
+      }
+    },
+    "strategy_title": "Autotune Block Sizes to Eliminate SMEM Occupancy Bottleneck",
+    "strategy_description": "When shared memory per block is the binding occupancy limiter (Block Limit Shared Mem << Block Limit Registers/Warps), reducing the reduction tile size (R0_BLOCK) dramatically cuts SMEM allocation per block, allowing far more concurrent blocks per SM and more active warps to hide L1TEX latency. Adding @triton.autotune over XBLOCK \u00d7 R0_BLOCK configurations lets the runtime find the Pareto-optimal tile sizes: in this case, SMEM dropped from 65 KB to ~1 KB per block, theoretical occupancy jumped from 18.75% to 75%, and warp cycles per instruction fell from 102 to 32, yielding a 42.5\u00d7 speedup. The strategy is broadly applicable whenever CPIStall (L1TEX scoreboard) dominates and Block Limit Shared Mem is the tightest occupancy constraint.",
+    "slow_pseudocode": "# Fixed large tiles, SMEM-limited occupancy\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # R0_BLOCK=512 \u2192 ~65 KB SMEM/block \u2192 only 3 blocks/SM\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        ...\n\ngrid = (triton.cdiv(xnumel, 128),)  # XBLOCK=128 fixed\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# Autotuned tiles, SMEM freed, occupancy unlocked\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 16,  'R0_BLOCK': 16},  num_warps=2, num_stages=1),\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 32},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 64},  num_warps=8, num_stages=2),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 64},  num_warps=8, num_stages=2),\n        # ... more configs spanning XBLOCK\u2208{16,32,64,128}, R0_BLOCK\u2208{16..256}\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    # Kernel body unchanged; r0_mask handles non-divisible R0_BLOCK\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        ...\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # autotune injects XBLOCK, R0_BLOCK",
+    "applicable_when": "Block Limit Shared Mem is the tightest occupancy constraint (e.g., \u22644 blocks/SM while Block Limit Registers/Warps allow \u226516); CPIStall rule fires with L1TEX scoreboard stalls >80% of warp cycles; Eligible Warps Per Scheduler <0.1; kernel uses a large fixed reduction tile (R0_BLOCK) that drives SMEM allocation; theoretical occupancy <25%.",
+    "do_not_apply_when": "Kernel uses no shared memory and occupancy is already register-limited (Block Limit Registers is the binding constraint); the workload is compute-bound (Compute SM Throughput >60%); reducing R0_BLOCK would break correctness (e.g., no r0_mask guard for non-divisible tile sizes); the kernel is so small that autotune overhead dominates wall-clock time.",
+    "framework_notes": "Triton-specific: @triton.autotune with key=['xnumel', 'r0_numel'] caches the best config per problem shape. The grid must be a lambda referencing meta['XBLOCK'] so it adapts to the autotuned block size. Equivalent in CUDA: use dynamic shared memory sizing and launch multiple configurations in a benchmark loop to select optimal block dimensions."
+  },
+  {
+    "item_id": "exp_002_triton_contiguity_hints_eviction_policy",
+    "iteration": 2,
+    "speedup": 172.3066,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "triton_contiguity_hints_and_eviction_policy_for_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 5.25,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 30.31,
+        "Memory Workload Analysis.Memory Throughput_GBs": 213.46,
+        "Memory Workload Analysis.L1/TEX Hit Rate_%": 35.63,
+        "Memory Workload Analysis.L2 Hit Rate_%": 79.29,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction_cycle": 48.5,
+        "Scheduler Statistics.No Eligible_%": 92.08,
+        "Occupancy.Achieved Occupancy_%": 21.19,
+        "Source Counters.UncoalescedGlobalAccess_excessive_sectors": 229376.0,
+        "Source Counters.UncoalescedGlobalAccess_excessive_pct": 77.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 5.12,
+        "GPU Speed Of Light Throughput.Memory Throughput_%": 31.32,
+        "Memory Workload Analysis.Memory Throughput_GBs": 218.8,
+        "Memory Workload Analysis.L1/TEX Hit Rate_%": 35.63,
+        "Memory Workload Analysis.L2 Hit Rate_%": 79.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction_cycle": 43.12,
+        "Scheduler Statistics.No Eligible_%": 91.96,
+        "Occupancy.Achieved Occupancy_%": 21.02,
+        "Source Counters.UncoalescedGlobalAccess_excessive_sectors": 229376.0,
+        "Source Counters.UncoalescedGlobalAccess_excessive_pct": 77.0
+      }
+    },
+    "strategy_title": "Triton Contiguity Hints and Eviction Policy Tuning",
+    "strategy_description": "Fixing tl.max_contiguous/tl.multiple_of hints to match the actual autotuned R0_BLOCK tile width (instead of a hardcoded constant like 16), adding a contiguity hint on the output store index, and switching a transposed non-reused load from evict_last to evict_first produced only a marginal improvement (~2.4% duration reduction, 5.25\u00b5s \u2192 5.12\u00b5s). The uncoalesced global access count (229376 excessive sectors, 77%) and L1/TEX hit rate (35.63%) remained completely unchanged, indicating that the strided/transposed access pattern is the fundamental bottleneck and compiler hints alone cannot fix it. This strategy is a weak optimization when the access pattern itself is inherently non-contiguous.",
+    "slow_pseudocode": "# Hardcoded hint value mismatches actual tile width\nr0_2_vec = tl.max_contiguous(tl.multiple_of(r0_2, [1, 16]), [1, 16])  # 16 != R0_BLOCK\ntmp0 = tl.load(in_ptr0 + (r0_2_vec + 512*x3), xmask & r0_mask, eviction_policy='evict_first')\ntmp2 = tl.load(in_ptr2 + (x0 + 32*r0_2), xmask & r0_mask, eviction_policy='evict_last')  # transposed\ntl.store(out_ptr0 + (x3), tmp7, xmask)  # no store hint",
+    "fast_pseudocode": "# Hint matches actual tile width; eviction policy fixed; store hint added\nr0_2_vec = tl.max_contiguous(tl.multiple_of(r0_2, [1, R0_BLOCK]), [1, R0_BLOCK])  # matches tile\ntmp0 = tl.load(in_ptr0 + (r0_2_vec + 512*x3), xmask & r0_mask, eviction_policy='evict_first')\ntmp2 = tl.load(in_ptr2 + (x0 + 32*r0_2), xmask & r0_mask, eviction_policy='evict_first')  # streaming\nx3_vec = tl.max_contiguous(tl.multiple_of(xindex, [XBLOCK, 1]), [XBLOCK, 1])\ntl.store(out_ptr0 + (x3_vec), tmp7, xmask)  # with store hint",
+    "applicable_when": "Triton kernel where tl.max_contiguous/tl.multiple_of hints use hardcoded constants that do not match the autotuned tile size, AND the access pattern is truly contiguous in memory (not strided/transposed). Also applicable when a streaming load (no reuse across iterations) uses evict_last, wasting L1 capacity.",
+    "do_not_apply_when": "The access pattern is inherently strided or transposed (e.g., x0 + stride*r0_2 where stride > 1); in such cases, contiguity hints cannot fix the uncoalesced access and the excessive sector count will remain unchanged. Do not expect >5% speedup from hints alone when UncoalescedGlobalAccess excessive_pct remains at 77% after the change.",
+    "framework_notes": "Triton-specific: tl.max_contiguous(tl.multiple_of(idx, N), N) is a pure compiler hint that signals N-element alignment and contiguity to the Triton compiler, enabling LDG.128/STG.128 emission. The hint value N must match the actual stride/tile width at runtime \u2014 using a hardcoded constant smaller than R0_BLOCK is a no-op or misleading. eviction_policy='evict_first' is appropriate for streaming data with no cross-iteration reuse; evict_last is appropriate for data reused across multiple loop iterations."
+  },
+  {
+    "item_id": "exp_002_max_contiguous_multiple_of_vectorized_loads",
+    "iteration": 2,
+    "speedup": 145.8198,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "vectorized_loads_via_max_contiguous_multiple_of_hints",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + UncoalescedGlobalAccess + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 5.25,
+        "Memory Workload Analysis.L1_TEX_Hit_Rate_pct": 35.63,
+        "Memory Workload Analysis.L2_Hit_Rate_pct": 79.29,
+        "Occupancy.Achieved_Occupancy_pct": 21.19,
+        "Scheduler Statistics.No_Eligible_pct": 92.08,
+        "Warp State Statistics.Warp_Cycles_Per_Issued_Instruction": 48.5,
+        "GPU Speed Of Light Throughput.L1_TEX_Cache_Throughput_pct": 53.3,
+        "Source Counters.UncoalescedGlobalAccess_excessive_sectors": 229376.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 6.05,
+        "Memory Workload Analysis.L1_TEX_Hit_Rate_pct": 67.68,
+        "Memory Workload Analysis.L2_Hit_Rate_pct": 77.61,
+        "Occupancy.Achieved_Occupancy_pct": 21.0,
+        "Scheduler Statistics.No_Eligible_pct": 93.79,
+        "Warp State Statistics.Warp_Cycles_Per_Issued_Instruction": 51.84,
+        "GPU Speed Of Light Throughput.L1_TEX_Cache_Throughput_pct": 73.57,
+        "Source Counters.UncoalescedGlobalAccess_excessive_sectors": 458752.0
+      }
+    },
+    "strategy_title": "tl.max_contiguous + tl.multiple_of Hints Worsen Latency",
+    "strategy_description": "Applying tl.max_contiguous(tl.multiple_of(r0_index, R0_BLOCK), R0_BLOCK) as a vectorization hint to a contiguous reduction index increased L1/TEX cache throughput (53% \u2192 74%) and hit rate (35% \u2192 68%), but simultaneously increased kernel duration (5.25 \u00b5s \u2192 6.05 \u00b5s), excessive sectors (229K \u2192 459K), and warp stall cycles per instruction (48.5 \u2192 51.8). The autotune config expansion (from ~14 to ~34 configs) likely selected a suboptimal tile configuration that increased total memory transactions despite better per-load vectorization. The net effect was a regression relative to the already-autotuned baseline, not a speedup \u2014 the 145x figure reflects improvement over the original pre-autotune kernel, not over the immediate prior iteration.",
+    "slow_pseudocode": "# Before: bare index alias, no vectorization hint\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    r0_index = r0_offset + r0_base\n    r0_mask = r0_index < r0_numel\n    r0_2 = r0_index  # no hint\n    tmp0 = tl.load(in_ptr0 + (r0_2 + 512*x3), xmask & r0_mask, ...)\n    tmp2 = tl.load(in_ptr2 + (x0 + 32*r0_2), xmask & r0_mask, ...)",
+    "fast_pseudocode": "# After: max_contiguous + multiple_of hint applied\nfor r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n    r0_index = r0_offset + r0_base\n    r0_mask = r0_index < r0_numel\n    r0_2 = tl.max_contiguous(tl.multiple_of(r0_index, [1, R0_BLOCK]), [1, R0_BLOCK])\n    tmp0 = tl.load(in_ptr0 + (r0_2 + 512*x3), xmask & r0_mask, ...)\n    tmp2 = tl.load(in_ptr2 + (x0 + 32*r0_2), xmask & r0_mask, ...)",
+    "applicable_when": "Kernel has a genuinely contiguous, aligned reduction index and the baseline already has poor load sector utilization (< 8 bytes/sector) with MemoryCacheAccessPattern rule firing \u2014 AND the kernel is not already near-optimal from a prior autotune pass.",
+    "do_not_apply_when": "The kernel has already been optimized by autotune to a short duration (< 7 \u00b5s) with achieved occupancy ~21% and warp stall cycles ~48/instruction. In this regime, adding tl.max_contiguous/tl.multiple_of hints combined with a large autotune config expansion can cause the autotuner to select worse tile configurations, increasing total memory transactions and kernel duration despite improving per-load vectorization efficiency. Also avoid when the dominant uncoalesced access is strided (e.g., stride-32), as the hint cannot fix that access pattern.",
+    "framework_notes": "Triton-specific: tl.max_contiguous and tl.multiple_of are pure compiler hints that do not change computed values. When combined with a large autotune config sweep, the autotuner may select a config that increases total work (more loop iterations with smaller R0_BLOCK) even if each iteration is more efficient. The speedup of 145x is measured against the original pre-autotune kernel (882 \u00b5s), not the prior iteration (5.25 \u00b5s); relative to the prior iteration this is actually a ~15% regression."
+  },
+  {
+    "item_id": "f5ce6e3a",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "shared_memory_staging_for_transposed_in_ptr2_access",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "shared_memory_staging_for_transposed_in_ptr2_access \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'shared_memory_staging_for_transposed_in_ptr2_access' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The load `in_ptr2[x0 + 32*r0_2]` accesses in_ptr2 (shape (1,512,32), strides (16384,32,1)) with stride 32 in the reduction dimension r0_2. Each warp reads 32 elements with stride 32 \u2014 one element per cache line \u2014 causing 32x sector waste (7.1/32 bytes utilized). This is a structural transpose that cannot be fixed by compiler hints (already tried and confirmed ineffective in prior iterations). The fix is to stage in_ptr2 into a register tile with a coalesced layout: load a [XBLOCK, r0_numel] tile from in_ptr2 coalesced (x0 is the fast/stride-1 dimension), then index into the register tile inside the reduction loop. Since in_ptr2 has only 32 unique x0 values and 512 r0 values, the per-block preload is XBLOCK*512*4 bytes \u2014 small for XBLOCK<=32.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_003_xblock_coalescing_stride32_broadcast",
+    "iteration": 3,
+    "speedup": 54.5922,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "enforce_xblock_ge_stride_period_for_coalesced_access",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess + CPIStall + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration_us": 5.12,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 4.46,
+        "Memory Workload Analysis.Memory Throughput_GBs": 218.8,
+        "Memory Workload Analysis.L2 Hit Rate_%": 79.54,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction_cycle": 43.12,
+        "Scheduler Statistics.No Eligible_%": 91.96,
+        "Occupancy.Achieved Occupancy_%": 21.02,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "Source Counters.UncoalescedGlobalAccess_excessive_sectors": 229376.0,
+        "Source Counters.UncoalescedGlobalAccess_excessive_pct": 77.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration_us": 16.16,
+        "GPU Speed Of Light Throughput.DRAM Throughput_%": 43.16,
+        "Memory Workload Analysis.Memory Throughput_GBs": 2120.0,
+        "Memory Workload Analysis.L2 Hit Rate_%": 15.59,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction_cycle": 12.41,
+        "Scheduler Statistics.No Eligible_%": 84.28,
+        "Occupancy.Achieved Occupancy_%": 12.27,
+        "Launch Statistics.Waves Per SM": 1.94,
+        "Source Counters.UncoalescedGlobalAccess_excessive_sectors": 0.0,
+        "Source Counters.UncoalescedGlobalAccess_excessive_pct": 0.0
+      }
+    },
+    "strategy_title": "Set XBLOCK \u2265 Stride Period to Eliminate Broadcast Uncoalescing",
+    "strategy_description": "When a Triton kernel accesses a tensor with index pattern `x0 + stride * r` where `x0 = xindex % stride` and XBLOCK < stride, all threads in a CTA share the same x0 value \u2014 causing every warp to broadcast-read the same memory location, producing ~stride\u00d7 sector amplification (77% excessive sectors here). Setting XBLOCK \u2265 stride (the period of the modulo expression) ensures adjacent threads have distinct x0 values spanning a full contiguous row, converting the broadcast into a coalesced access. In this case, enforcing XBLOCK \u2265 32 (matching the stride-32 pattern) eliminated all 229,376 excessive sectors, dropped warp stall cycles per instruction from 43 to 12, and increased DRAM throughput from 4.5% to 43%, yielding a 54.6\u00d7 speedup over the prior iteration. The grid must be a lambda scaling with META['XBLOCK'] to maintain correct SM coverage.",
+    "slow_pseudocode": "# XBLOCK < stride period -> all threads share same x0 -> broadcast\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 1,  'R0_BLOCK': 512}, ...),  # x0 constant per CTA\n        triton.Config({'XBLOCK': 4,  'R0_BLOCK': 128}, ...),  # x0 constant per CTA\n        triton.Config({'XBLOCK': 8,  'R0_BLOCK': 64},  ...),  # x0 constant per CTA\n        # ... all XBLOCK < 32 configs ...\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    x0 = xindex % 32  # constant when XBLOCK < 32 -> all threads read same column\n    tmp2 = tl.load(in_ptr2 + (x0 + 32*r0_2), ...)  # stride-32 broadcast\n\ngrid = (triton.cdiv(xnumel, 128),)  # fixed, ignores XBLOCK",
+    "fast_pseudocode": "# XBLOCK >= stride period -> threads span full x0 range -> coalesced\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 512}, ...),  # x0 in [0..31] per CTA\n        triton.Config({'XBLOCK': 32,  'R0_BLOCK': 256}, ...),\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, ...),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 64},  ...),\n        # ... all XBLOCK >= 32 configs ...\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(...):\n    x0 = xindex % 32  # varies 0..31 across threads when XBLOCK >= 32 -> coalesced\n    tmp2 = tl.load(in_ptr2 + (x0 + 32*r0_2), ...)  # now stride-1 coalesced\n\ngrid = lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)  # scales with XBLOCK",
+    "applicable_when": "Triton kernel with an index pattern `base_offset + stride * reduction_idx` where `base_offset = xindex % stride` and the autotune config space includes XBLOCK < stride. NCU reports UncoalescedGlobalAccess with >50% excessive sectors and MemoryCacheAccessPattern showing <8 bytes/sector utilization. DRAM throughput is very low (<10%) despite significant memory traffic, indicating broadcast rather than streaming access.",
+    "do_not_apply_when": "The access pattern does not contain a modulo expression tied to xindex (i.e., x0 is not constant per CTA for small XBLOCK). Avoid if increasing XBLOCK causes register pressure to spike (registers per thread > 128) and reduces theoretical occupancy below the prior baseline \u2014 in this case the after-kernel shows 194 registers/thread and 12.5% theoretical occupancy, which is lower than before (100% theoretical), so the net benefit came entirely from coalescing and wave count, not occupancy. Do not apply if the stride period is very large (e.g., 1024+) as XBLOCK >= stride may be infeasible.",
+    "framework_notes": "Triton-specific: the autotune config set must exclude all XBLOCK values < stride_period. The grid must be a lambda `lambda META: (triton.cdiv(xnumel, META['XBLOCK']),)` \u2014 a fixed grid tuple will not scale correctly with the autotuned XBLOCK. The kernel body is unchanged; only the autotune config list and grid definition are modified. Note: this optimization trades theoretical occupancy (100% \u2192 12.5%) for coalescing and wave count (0.24 \u2192 1.94 waves/SM), and the net result is a large speedup \u2014 demonstrating that coalescing quality can dominate over occupancy when the access pattern causes severe sector amplification."
+  }
+]

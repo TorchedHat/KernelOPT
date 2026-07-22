@@ -1,0 +1,59 @@
+[
+  {
+    "item_id": "d36920f9",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_autotune_fix_xblock_yblock_tile_sizes",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + SOLBottleneck + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_autotune_fix_xblock_yblock_tile_sizes \u2014 correctness failure",
+    "strategy_description": "Plan 'add_autotune_fix_xblock_yblock_tile_sizes' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has xnumel=9 (only 9 valid x-elements) but XBLOCK=128, meaning 119 out of 128 threads per block are masked/idle on every CTA \u2014 a massive waste of thread slots. The grid is (1, 1792), giving only 0.85 waves/SM on a 132-SM GPU. YBLOCK=8 is very small, limiting the amount of work per block and reducing L1 reuse. The correct fix is to set XBLOCK=16 (covers xnumel=9 with minimal waste) and increase YBLOCK substantially (32, 64, 128, 256) to pack more work per CTA, increase waves/SM, and improve occupancy. Adding @triton.autotune lets the runtime find the best combination.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_reduce_xblock_for_small_xnumel_transpose",
+    "iteration": 1,
+    "speedup": 1.1131,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_xblock_to_match_small_xnumel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "Launch.WavesPerSM": 0.85,
+        "Occupancy.AchievedOccupancy": 58.42,
+        "Scheduler.NoEligible": 48.31,
+        "WarpState.WarpCyclesPerIssuedInstruction": 16.62,
+        "MemoryWorkload.MemoryCacheAccessPattern_BytesUsed": 18.0,
+        "GPU_SOL.Duration_us": 3.74,
+        "Launch.BlockSize": 128.0
+      },
+      "key_metric_after": {
+        "Launch.WavesPerSM": 0.42,
+        "Occupancy.AchievedOccupancy": 31.61,
+        "Scheduler.NoEligible": 54.13,
+        "WarpState.WarpCyclesPerIssuedInstruction": 9.57,
+        "MemoryWorkload.MemoryCacheAccessPattern_BytesUsed": 24.0,
+        "GPU_SOL.Duration_us": 3.36,
+        "Launch.BlockSize": 64.0
+      }
+    },
+    "strategy_title": "Shrink XBLOCK to match actual xnumel, use autotune",
+    "strategy_description": "When a Triton kernel's XBLOCK is much larger than xnumel (e.g., XBLOCK=128 for xnumel=9), the vast majority of X-dimension threads are masked out, wasting thread slots, inflating register pressure, and producing uncoalesced memory accesses (low bytes-used-per-sector). Reducing XBLOCK to the next power-of-2 at or above xnumel (e.g., 16 for xnumel=9) eliminates wasted threads and improves memory access efficiency. Adding @triton.autotune over YBLOCK and num_warps allows the runtime to compensate for the reduced block size and find the best occupancy/throughput tradeoff, yielding measurable latency reduction even when overall occupancy drops.",
+    "slow_pseudocode": "# XBLOCK=128 >> xnumel=9: 93% of X-threads masked out\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    yindex = pid_y * YBLOCK + arange(YBLOCK)[:, None]\n    ymask = full([YBLOCK], True)  # no bounds check\n    xindex = pid_x * XBLOCK + arange(XBLOCK)[None, :]\n    xmask = xindex < xnumel  # xnumel=9, XBLOCK=128\n    tmp = load(ptr + x + stride*y, xmask)\n    store(out + ..., tmp, xmask)\n\ngrid = (cdiv(9, 128), cdiv(14336, 8))  # (1, 1792)\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=16 ~= xnumel=9: minimal wasted threads\n@triton.autotune(configs=[\n    Config({'XBLOCK': 16, 'YBLOCK': 32},  num_warps=2),\n    Config({'XBLOCK': 16, 'YBLOCK': 64},  num_warps=4),\n    Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=4),\n    Config({'XBLOCK': 16, 'YBLOCK': 128}, num_warps=8),\n    Config({'XBLOCK': 16, 'YBLOCK': 256}, num_warps=8),\n], key=['ynumel', 'xnumel'])\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    yindex = pid_y * YBLOCK + arange(YBLOCK)[:, None]\n    ymask = yindex < ynumel  # proper bounds check\n    xindex = pid_x * XBLOCK + arange(XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    tmp = load(ptr + x + stride*y, xmask & ymask)\n    store(out + ..., tmp, xmask & ymask)\n\ngrid = lambda META: (cdiv(xnumel, META['XBLOCK']), cdiv(ynumel, META['YBLOCK']))\nkernel[grid](...)  # autotune injects XBLOCK, YBLOCK",
+    "applicable_when": "XBLOCK >> xnumel (e.g., XBLOCK >= 4x xnumel), causing >50% of X-dimension threads to be masked; IssueSlotUtilization rule fires with >40% no-eligible cycles; MemoryCacheAccessPattern shows <20 bytes used per 32-byte sector; kernel is a simple pointwise or transpose with small spatial dimension (xnumel < 32)",
+    "do_not_apply_when": "xnumel is close to or larger than XBLOCK (waste is minimal); kernel is already autotuned; reducing XBLOCK would drop waves_per_sm below 0.5 without YBLOCK compensation; kernel has complex inter-thread dependencies that require a minimum XBLOCK for correctness",
+    "framework_notes": "Triton-specific: @triton.autotune decorator with key=['ynumel','xnumel'] triggers re-tuning when problem dimensions change. The grid must be a lambda using META dict to pick up autotuned XBLOCK/YBLOCK. ymask must be added as a proper bounds check (yindex < ynumel) when YBLOCK may exceed ynumel. In CUDA, the equivalent is choosing a smaller threadblock X-dimension and using cudaOccupancyMaxPotentialBlockSize or manual tuning."
+  }
+]

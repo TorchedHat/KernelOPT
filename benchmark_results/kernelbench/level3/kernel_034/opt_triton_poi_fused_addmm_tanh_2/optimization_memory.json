@@ -1,0 +1,105 @@
+[
+  {
+    "item_id": "5a424c5f",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization + SOLFPRoofline",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.967e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.031e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.059e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "Both kernels call tl.dot(..., allow_tf32=False), which forces FP32 FFMA and completely bypasses the H200's Tensor Cores. The H200 delivers 989 TFLOPS via TF32 Tensor Cores vs only 67 TFLOPS via FP32 FFMA \u2014 a ~14.8\u00d7 peak throughput ratio. With Compute SOL at 0.34% and the kernel already underutilized (4 blocks across 132 SMs), enabling TF32 is the single highest-leverage change: it unlocks Tensor Core execution paths in the PTX compiler, dramatically increasing instruction throughput per warp and reducing the number of cycles needed to complete the dot products.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.967e+01 > atol=0.001\nseed=42 output[0]: max_diff=4.031e+01 > atol=0.001\nseed=1337 output[0]: max_diff=4.059e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_rnn_i2h_small_grid_tile_expansion_regression_001",
+    "iteration": 1,
+    "speedup": 0.5931,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "expand_grid_via_smaller_block_m_for_small_batch_matmul",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 4.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Occupancy.Theoretical Occupancy": 15.62,
+        "Launch Statistics.Registers Per Thread": 114.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 43.01,
+        "Occupancy.Block Limit Shared Mem": 5.0,
+        "GPU Speed Of Light Throughput.Duration": 47.01,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.28
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 8.0,
+        "Launch Statistics.Waves Per SM": 0.06,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 132.35,
+        "Occupancy.Block Limit Shared Mem": 1.0,
+        "GPU Speed Of Light Throughput.Duration": 79.26,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.5
+      }
+    },
+    "strategy_title": "Smaller BLOCK_M Tiles Worsen Register/SMEM Pressure on Tiny Grids",
+    "strategy_description": "Reducing BLOCK_M in Triton autotune configs to expand grid size for small-batch GEMMs backfired: the new configs selected by autotuner used larger BLOCK_N and BLOCK_K, which caused registers per thread to jump from 114 to 255 (hitting the hardware maximum) and dynamic shared memory per block to triple from 43 KB to 132 KB. This collapsed Block Limit Shared Mem from 5 to 1 block per SM, dropping theoretical occupancy from 15.6% to 6.25%, and Warp Cycles Per Issued Instruction more than doubled from 4.28 to 9.5 cycles. The net effect was a 68% increase in kernel duration (47 \u00b5s \u2192 79 \u00b5s) despite the grid doubling from 4 to 8 blocks, because the resource pressure penalty far outweighed the parallelism gain on a problem this small.",
+    "slow_pseudocode": "# BEFORE: fixed BLOCK_M=8, small shared mem, low register pressure\n@triton.autotune(configs=[\n    Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=2, num_stages=3),\n    Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=4, num_stages=3),\n    ...  # all BLOCK_M=8\n], key=[...])\n# Result: grid=4, regs=114, smem=43KB, duration=47us",
+    "fast_pseudocode": "# AFTER (regressed): small BLOCK_M to expand grid, but larger BLOCK_N/BLOCK_K\n@triton.autotune(configs=[\n    Config({'BLOCK_M': 1, 'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=3),\n    Config({'BLOCK_M': 2, 'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=3),\n    ...  # autotuner picks high-BLOCK_N/K config\n], key=[...])\n# Result: grid=8, regs=255, smem=132KB, Block Limit Shared Mem=1, duration=79us",
+    "applicable_when": "Never apply this pattern as described; it is an anti-pattern. The lesson is: when expanding grid parallelism by reducing one tile dimension, do NOT simultaneously increase other tile dimensions (BLOCK_N, BLOCK_K) or num_warps, as this compounds register and shared memory pressure.",
+    "do_not_apply_when": "Do not add large BLOCK_N/BLOCK_K configs alongside small BLOCK_M configs when the kernel already has high register usage (>100 regs/thread) or shared memory usage near the per-SM limit. On small problems (grid < 16 blocks, M \u2264 8), the autotuner may select the largest tile config, causing registers to hit 255 and shared memory to exceed 100 KB/block, collapsing occupancy below the original.",
+    "framework_notes": "Triton autotune selects the fastest config during warmup; if large-tile configs are included alongside small-BLOCK_M configs, the autotuner may pick a large-tile config that maximizes register and shared memory usage, negating the grid-expansion benefit. Always bound the search space: when adding small-BLOCK_M configs, keep BLOCK_N and BLOCK_K at or below the original values to avoid register spill and shared memory bottlenecks."
+  },
+  {
+    "item_id": "b747dbda",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fuse_concat_buffer_to_eliminate_tl_where_branch_divergence",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fuse_concat_buffer_to_eliminate_tl_where_branch_divergence \u2014 correctness failure",
+    "strategy_description": "Plan 'fuse_concat_buffer_to_eliminate_tl_where_branch_divergence' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.507e+01 > atol=0.001\nseed=42 output[0]: max_diff=6.428e+01 > atol=0.001\nseed=1337 output[0]: max_diff=6.914e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The rnn_i2h_kernel performs two conditional tl.load calls (x_val and h_val) plus a tl.where inside every K-loop iteration to virtually concatenate x and hidden. This generates: (1) extra predicated loads with negative-index guards (h_k >= 0), (2) a tl.where selection that forces both load results to be live simultaneously in registers, inflating register pressure to 114/thread and limiting Block Limit Shared Mem to 5. The dual-load + tl.where pattern also creates irregular shared memory access patterns that cause the observed 11.7-way bank conflicts. By pre-materializing cat(x_t, hidden) into a contiguous [M, K_i2h] buffer on the Python side (one torch.cat call per timestep) and passing it as a single pointer, the kernel inner loop becomes a simple single-source tl.load identical to the clean rnn_h2o_kernel pattern. This eliminates the tl.where, the h_k negative-index guard, and the dual conditional loads, reducing register pressure and simplifying the shared memory access pattern to reduce bank conflicts. TF32 was ruled out (correctness failure, max_diff~40). Smaller BLOCK_M was ruled out (register explosion to 255, 68% slowdown). This is the next highest-leverage untried direction.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.507e+01 > atol=0.001\nseed=42 output[0]: max_diff=6.428e+01 > atol=0.001\nseed=1337 output[0]: max_diff=6.914e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "b9d44724",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "precat_input_to_eliminate_dual_source_load_branch_in_i2h_kernel",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SharedMemoryConflicts + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "precat_input_to_eliminate_dual_source_load_branch_in_i2h_kernel \u2014 correctness failure",
+    "strategy_description": "Plan 'precat_input_to_eliminate_dual_source_load_branch_in_i2h_kernel' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=6.507e+01 > atol=0.001\nseed=42 output[0]: max_diff=6.428e+01 > atol=0.001\nseed=1337 output[0]: max_diff=6.914e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The rnn_i2h_kernel inner K-loop performs two separate masked tl.load calls (one for x, one for hidden) plus a tl.where to merge them. This triple-operation pattern drives 114 registers/thread, limiting Block Limit Shared Mem to 5 and theoretical occupancy to 15.6%. The MIO stall (57% of cycles) is caused by shared memory traffic from these complex loads. Pre-concatenating x_t and hidden into a single [M, K_i2h] buffer on the host before launching the kernel reduces the inner loop to a single clean tl.load, eliminating the tl.where, dual masked loads, and all index arithmetic (x_k, h_k, x_valid, h_valid). This should reduce register pressure, lower SMEM usage, and reduce the MIO stall rate.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=6.507e+01 > atol=0.001\nseed=42 output[0]: max_diff=6.428e+01 > atol=0.001\nseed=1337 output[0]: max_diff=6.914e+01 > atol=0.001",
+    "framework_notes": null
+  }
+]

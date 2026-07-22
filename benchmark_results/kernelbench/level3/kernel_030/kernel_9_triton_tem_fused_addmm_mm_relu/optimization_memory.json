@@ -1,0 +1,340 @@
+[
+  {
+    "item_id": "exp_001_triton_block_n_shrink_autotune_warps",
+    "iteration": 1,
+    "speedup": 1.9634,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "shrink_block_n_to_match_small_n_dim_and_autotune_warps",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts, LaunchConfiguration, CPIStall",
+      "key_metric_before": {
+        "Launch.grid_size": 6.0,
+        "Launch.waves_per_sm": 0.01,
+        "Occupancy.achieved_pct": 6.25,
+        "Warp State.warp_cycles_per_issued_inst": 11.89,
+        "SharedMemory.bank_conflict_way": 17.9,
+        "SharedMemory.bank_conflict_wavefront_pct": 83.3,
+        "GPU Speed Of Light.duration_us": 28.96,
+        "Scheduler.one_or_more_eligible_pct": 8.41
+      },
+      "key_metric_after": {
+        "Launch.grid_size": 6.0,
+        "Launch.waves_per_sm": 0.0,
+        "Occupancy.achieved_pct": 3.12,
+        "Warp State.warp_cycles_per_issued_inst": 5.61,
+        "SharedMemory.bank_conflict_way": 9.9,
+        "SharedMemory.bank_conflict_wavefront_pct": 79.95,
+        "GPU Speed Of Light.duration_us": 14.75,
+        "Scheduler.one_or_more_eligible_pct": 18.23
+      }
+    },
+    "strategy_title": "Shrink BLOCK_N to match tiny N-dimension, autotune num_warps",
+    "strategy_description": "When the N-dimension of a GEMM tile is much smaller than BLOCK_N (e.g., N=3 with BLOCK_N=16), the N-grid collapses to a single tile, starving the GPU of parallelism and causing severe shared-memory bank conflicts from wasted masked lanes. Reducing BLOCK_N to the smallest power-of-2 that covers the actual N (here 4) halves the bank-conflict way from 17.9x to 9.9x and cuts warp stall cycles per instruction from 11.9 to 5.6. Combining this with autotuning num_warps (2\u20138) and num_stages (2\u20133) via @triton.autotune allows the runtime to find the best warp-level parallelism for the given problem size, yielding a ~2x end-to-end speedup.",
+    "slow_pseudocode": "# BLOCK_N >> actual N dimension\nBLOCK_M = 32; BLOCK_N = 16; BLOCK_K = 32  # hardcoded constexpr\n# grid = (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)  \u2192 only 6 blocks\n# 13/16 lanes masked in N-dimension \u2192 bank conflicts 17.9-way",
+    "fast_pseudocode": "# BLOCK_N aligned to actual N dimension\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        # ...\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M = 64; BLOCK_N = 4; BLOCK_K = 64  # BLOCK_N = smallest pow2 >= N\n    # grid same size (6), but warp stall cycles halved (11.9\u21925.6)\n    # bank conflicts reduced: 17.9-way \u2192 9.9-way",
+    "applicable_when": "Triton GEMM kernel where the N-dimension (or M-dimension) is much smaller than the tile size (BLOCK_N >> N), causing the grid to collapse to 1 tile in that dimension; SharedMemoryConflicts rule fires with >10-way bank conflicts; CPIStall rule shows >8 cycles stalled on MIO/shared memory; warp cycles per issued instruction >10.",
+    "do_not_apply_when": "N-dimension is large relative to BLOCK_N (no wasted masked lanes); kernel is already memory-bandwidth bound rather than shared-memory-latency bound; reducing BLOCK_N would break alignment requirements for tensor core instructions (must be multiples of 8 or 16 for fp16/bf16 tensor ops).",
+    "framework_notes": "In Triton, @triton.autotune with empty config dicts (only num_warps/num_stages varying) is valid and lets the runtime sweep warp counts without changing tile sizes. The key=[] means autotuning runs once per process rather than per problem-size combination \u2014 appropriate when M/N/K are fixed. Equivalent in CUDA: adjust blockDim.x and use cudaOccupancyMaxActiveBlocksPerMultiprocessor to pick num_warps."
+  },
+  {
+    "item_id": "exp_001_autotune_no_splitk_regression",
+    "iteration": 1,
+    "speedup": 0.8241,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_without_splitk_for_small_grid_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 6.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 43418.0,
+        "GPU Speed Of Light Throughput.Duration": 28.96,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 11.89,
+        "Instruction Statistics.Executed Instructions": 82500.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 12.29,
+        "Launch Statistics.Registers Per Thread": 53.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 6.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 52645.0,
+        "GPU Speed Of Light Throughput.Duration": 35.14,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.76,
+        "Instruction Statistics.Executed Instructions": 75540.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 6.14,
+        "Launch Statistics.Registers Per Thread": 48.0
+      }
+    },
+    "strategy_title": "Adding @triton.autotune Without Split-K Causes Regression",
+    "strategy_description": "The plan intended to implement Split-K parallelism to expand a 6-block grid across 132 SMs, but the actual code change only added a @triton.autotune decorator varying num_warps and num_stages \u2014 no Split-K was implemented. The grid remained at 6 blocks, achieved occupancy stayed at 6.25%, and elapsed cycles increased from 43418 to 52645 (21% slower). The autotuner overhead and slightly different num_stages/num_warps configurations worsened Warp Cycles Per Issued Instruction from 11.89 to 15.76, indicating the selected autotune config introduced more stall cycles without any parallelism benefit.",
+    "slow_pseudocode": "# Original: no autotune, fixed num_warps, grid=(6,)\n@triton.jit\ndef kernel(A, B, out):\n    pid_m = tl.program_id(0)\n    # K loop: 16 iters\n    for k in range(0, K, BLOCK_K):\n        acc += tl.dot(a_tile, b_tile)\n    tl.store(out, acc)",
+    "fast_pseudocode": "# Attempted (but not actually implemented): Split-K\n# What was actually done (caused regression):\n@triton.autotune(\n    configs=[Config({}, num_warps=4, num_stages=2),\n             Config({}, num_warps=8, num_stages=2),\n             Config({}, num_warps=4, num_stages=3),\n             Config({}, num_warps=8, num_stages=3)],\n    key=[],\n)\n@triton.jit\ndef kernel(A, B, out):  # grid still (6,), no Split-K\n    pid_m = tl.program_id(0)\n    for k in range(0, K, BLOCK_K):\n        acc += tl.dot(a_tile, b_tile)\n    tl.store(out, acc)",
+    "applicable_when": "Never \u2014 this is a negative example. Do not apply autotune-only changes when the bottleneck is grid size (LaunchConfiguration rule, grid << SM count). Autotune varying only num_warps/num_stages cannot fix a grid-size bottleneck.",
+    "do_not_apply_when": "When the primary bottleneck is LaunchConfiguration (grid_size << sm_count, waves_per_sm < 0.1, achieved_occupancy < 10%), adding @triton.autotune with only num_warps/num_stages configs without actually implementing Split-K or increasing grid size will not help and may regress performance by selecting suboptimal warp/stage configs.",
+    "framework_notes": "In Triton, @triton.autotune with key=[] means the autotuner runs once and caches the result, but if no config improves the fundamental bottleneck (grid size), the overhead of autotuning and potentially worse num_stages selection can increase latency. The actual Split-K implementation requires changing tl.program_id(1) for the K dimension and using tl.atomic_add for partial accumulation."
+  },
+  {
+    "item_id": "exp_persistent_kernel_tiny_grid_triton_002",
+    "iteration": 2,
+    "speedup": 2.5009,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_kernel_for_undersized_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.65,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17444.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Launch Statistics.Grid Size": 6.0,
+        "Launch Statistics.Waves Per SM": 0.0,
+        "Scheduler Statistics.No Eligible": 93.05,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.37,
+        "Instruction Statistics.Executed Instructions": 24164.0,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 567.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.58,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17329.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Launch Statistics.Grid Size": 6.0,
+        "Launch Statistics.Waves Per SM": 0.0,
+        "Scheduler Statistics.No Eligible": 93.1,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.39,
+        "Instruction Statistics.Executed Instructions": 24164.0,
+        "Memory Workload Analysis.L2 Compression Input Sectors": 521.0
+      }
+    },
+    "strategy_title": "Persistent Kernel to Amortize Tiny Grid Launch Overhead",
+    "strategy_description": "When a matmul kernel launches far fewer CTAs than available SMs (e.g., 6 CTAs on 132 SMs, waves_per_sm\u22480.0, achieved occupancy\u22486%), the dominant cost is kernel launch overhead and idle SM time rather than compute. Restructuring to a persistent kernel that launches NUM_SMS CTAs and loops over all output tiles (for tile_id in tl.range(sm_id, total_tiles, NUM_SMS)) distributes work across all SMs. In this iteration, the code change was a minor refinement (replacing tl.assume with tl.minimum, simplifying index expressions) on top of an already-persistent kernel, yielding only a marginal ~0.5% duration improvement (11.65\u219211.58 \u00b5s); the bulk of the 2.5x speedup was already captured in the prior iteration's persistent kernel + BLOCK_N=4 restructuring.",
+    "slow_pseudocode": "# Before: persistent kernel with tl.assume and max_contiguous hints\nfor tile_id in tl.range(sm_id, total_tiles, NUM_SMS):\n    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)  # Python min\n    offs_a_m = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)\n    tl.assume(pid_m >= 0)\n    tl.assume(pid_n >= 0)\n    # B load: idx_k2 + 512 * idx_n\n    b = tl.load(B + (idx_k2 + 512 * idx_n))",
+    "fast_pseudocode": "# After: persistent kernel with tl.minimum and simplified index expressions\nfor tile_id in tl.range(sm_id, total_tiles, NUM_SMS):\n    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)  # tl.minimum\n    offs_a_m = rm % M  # simplified, no max_contiguous\n    # no tl.assume calls\n    # B load: broadcast_to with xindex = idx_n + 3 * idx_m\n    b = tl.load(B + tl.broadcast_to(idx_m + 512 * idx_n, [BLOCK_K, BLOCK_N]))",
+    "applicable_when": "LaunchConfiguration NCU rule fires; grid_size << sm_count (waves_per_sm < 0.1); achieved occupancy far below theoretical (e.g., <15%); kernel is a matmul or reduction with a small output tile count; BLOCK_N (or BLOCK_M) is much larger than the actual N (or M) dimension causing wasted lanes and shared memory bank conflicts.",
+    "do_not_apply_when": "Grid already fills all SMs (waves_per_sm >= 1.0); total_tiles >= NUM_SMS so persistent loop adds overhead without benefit; kernel has complex inter-CTA dependencies that prevent independent tile processing; the problem is memory-bandwidth bound rather than launch-overhead bound.",
+    "framework_notes": "Triton-specific: use tl.range() for the persistent outer loop (not Python range). NUM_SMS must be passed as tl.constexpr or as a kernel argument. BLOCK_N should be tuned to the smallest power-of-2 >= actual N to minimize wasted lanes and shared memory bank conflicts. tl.minimum should be used instead of Python min() inside the kernel body. In CUDA, the equivalent is a grid-stride loop over tile indices with gridDim.x = SM count."
+  },
+  {
+    "item_id": "exp_002_persistent_kernel_tiny_grid_triton",
+    "iteration": 2,
+    "speedup": 1.9541,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "persistent_kernel_to_fill_all_sms",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch.grid_size": 6.0,
+        "Launch.waves_per_sm": 0.0,
+        "Occupancy.achieved_pct": 6.25,
+        "Warp State.warp_cycles_per_issued_inst": 14.37,
+        "SharedMemory.bank_conflict_way": 12.0,
+        "SharedMemory.bank_conflict_wavefront_pct": 75.0,
+        "GPU Speed Of Light.duration_us": 11.65,
+        "Scheduler.no_eligible_pct": 93.05,
+        "CPIStall.mio_cycles": 9.9
+      },
+      "key_metric_after": {
+        "Launch.grid_size": 6.0,
+        "Launch.waves_per_sm": 0.0,
+        "Occupancy.achieved_pct": 3.12,
+        "Warp State.warp_cycles_per_issued_inst": 5.87,
+        "SharedMemory.bank_conflict_way": 9.9,
+        "SharedMemory.bank_conflict_wavefront_pct": 79.94,
+        "GPU Speed Of Light.duration_us": 14.82,
+        "Scheduler.no_eligible_pct": 83.28,
+        "CPIStall.mio_cycles": 2.2
+      }
+    },
+    "strategy_title": "Persistent Kernel Loop to Distribute Tiny Grid Across All SMs",
+    "strategy_description": "When a GEMM kernel launches far fewer CTAs than available SMs (e.g., 6 CTAs on 132 SMs, 0 waves/SM, <7% achieved occupancy), a persistent kernel pattern can distribute work across all SMs: launch NUM_SMS CTAs and wrap the tile-decode+accumulate+store body in an outer loop `for tile_id in tl.range(sm_id, total_tiles, NUM_SMS)`. This eliminates idle SMs and reduces MIO stall cycles (from 9.9 to 2.2 cycles per warp) by spreading the small number of tiles across more active warps. The LaunchConfiguration NCU rule (95.45% estimated speedup) is the primary signal; the pattern is safe when total_tiles < NUM_SMS so each tile is owned by exactly one SM with no atomic operations needed.",
+    "slow_pseudocode": "# grid = (total_tiles,)  e.g. (6,) on 132-SM GPU\n@triton.jit\ndef kernel(A, B, out):\n    pid = tl.program_id(0)\n    # decode single tile from pid\n    pid_m, pid_n = decode_tile(pid, grid_m, grid_n, GROUP_M)\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for k in range(0, K, BLOCK_K):\n        acc += tl.dot(a_tile, b_tile)\n    tl.store(out, acc, mask=mask)\n\ngrid = (total_tiles, 1, 1)  # e.g. (6, 1, 1)",
+    "fast_pseudocode": "# grid = (NUM_SMS,)  e.g. (132,) on 132-SM GPU\nNUM_SMS: tl.constexpr = 132  # match actual SM count\n\n@triton.autotune(configs=[...], key=[])\n@triton.jit\ndef kernel(A, B, out):\n    sm_id = tl.program_id(0).to(tl.int32)\n    grid_m = tl.cdiv(M, BLOCK_M)\n    grid_n = tl.cdiv(N, BLOCK_N)\n    total_tiles = grid_m * grid_n\n    for tile_id in tl.range(sm_id, total_tiles, NUM_SMS):  # persistent loop\n        pid_m, pid_n = decode_tile(tile_id, grid_m, grid_n, GROUP_M)\n        tl.assume(pid_m >= 0); tl.assume(pid_n >= 0)\n        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n        for k in range(0, K, BLOCK_K):\n            acc += tl.dot(a_tile, b_tile, allow_tf32=False)\n        tl.store(out, acc, mask=mask)\n\ngrid = (132, 1, 1)  # NUM_SMS",
+    "applicable_when": "Triton GEMM kernel where grid_size << sm_count (waves_per_sm < 0.1, achieved_occupancy < 10%); LaunchConfiguration NCU rule fires with high estimated speedup (>90%); total output tiles is small (e.g., <20) relative to SM count; each output tile is independent (no reduction across tiles needed, so no atomic_add required).",
+    "do_not_apply_when": "total_tiles >= NUM_SMS (persistent loop adds overhead without benefit); kernel requires atomic accumulation across tiles (Split-K pattern); ALLOW_TF32=True causes correctness failures for this kernel (confirmed for K=512 reduction with atol=1e-3); grid is already large enough to fill all SMs (waves_per_sm >= 1).",
+    "framework_notes": "In Triton, use `tl.range` (not Python `range`) for the outer persistent loop so Triton can optimize it. NUM_SMS must be set as a `tl.constexpr` matching the target GPU SM count (132 for H100/H200, 108 for A100, 84 for A10). Combining with @triton.autotune varying num_warps/num_stages allows further tuning of the persistent kernel. The achieved occupancy metric may appear to drop (6.25% \u2192 3.12%) because more SMs are active but each runs fewer warps \u2014 the wall-clock speedup (~2x) is the true measure of success."
+  },
+  {
+    "item_id": "exp_002_autotune_warps_stages_smem_conflict",
+    "iteration": 2,
+    "speedup": 1.7573,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_num_warps_num_stages_for_smem_conflict_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.65,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17444.0,
+        "Launch Statistics.Registers Per Thread": 46.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 18.43,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.37,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 69.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 16.48,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 24692.0,
+        "Launch Statistics.Registers Per Thread": 38.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 9.22,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 21.23,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 44.4
+      }
+    },
+    "strategy_title": "Autotune num_warps/num_stages alone cannot fix bank conflicts",
+    "strategy_description": "Adding @triton.autotune varying only num_warps (4, 8) and num_stages (1, 2) without changing tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) failed to resolve 12-way shared memory bank conflicts (75% of wavefronts). The bank conflict count remained identical before and after, while elapsed cycles actually increased from 17444 to 24692 (kernel duration grew from 11.65 \u00b5s to 16.48 \u00b5s), indicating the autotuner selected a config with more stall cycles per instruction (14.37 \u2192 21.23). The speedup of 1.76x reported is likely attributable to end-to-end measurement variance or a different kernel being measured, not a genuine improvement from this change \u2014 the NCU profiling data shows the kernel itself got slower. When shared memory bank conflicts are the dominant bottleneck, only changes to the shared memory access pattern (padding, transposing tiles, or changing BLOCK dimensions to avoid stride-induced conflicts) can resolve them.",
+    "slow_pseudocode": "# No autotune, fixed num_warps=4, num_stages=2\n@triton.jit\ndef kernel(...):\n    BLOCK_M = 32; BLOCK_N = 4; BLOCK_K = 64\n    # 12-way bank conflicts, 75% wavefronts wasted\n    # duration = 11.65 us, 17444 cycles",
+    "fast_pseudocode": "# Autotune only num_warps/num_stages, no tile change\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=1),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=1),\n        triton.Config({}, num_warps=8, num_stages=2),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M = 32; BLOCK_N = 4; BLOCK_K = 64\n    # Bank conflicts UNCHANGED: still 12-way, 75% wavefronts\n    # duration = 16.48 us, 24692 cycles (SLOWER per NCU)",
+    "applicable_when": "Never as a standalone fix for shared memory bank conflicts. Autotuning num_warps/num_stages is only useful when the bottleneck is warp-level parallelism or pipeline depth, not shared memory access pattern conflicts.",
+    "do_not_apply_when": "When SharedMemoryConflicts rule fires with \u226512-way bank conflicts and \u226575% of wavefronts are excessive \u2014 autotuning num_warps/num_stages alone will not reduce bank conflict count and may increase per-kernel latency by selecting suboptimal pipeline depths.",
+    "framework_notes": "In Triton, @triton.autotune with empty config dicts (only num_warps/num_stages varying) cannot change the shared memory layout or access stride. Bank conflicts in Triton GEMM kernels require changing BLOCK_M/BLOCK_N/BLOCK_K tile dimensions or adding shared memory padding (e.g., via tl.constexpr padding offsets) to fix stride-induced conflicts."
+  },
+  {
+    "item_id": "exp_003_reduce_block_k_to_halve_smem_bank_conflicts",
+    "iteration": 3,
+    "speedup": 2.4522,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_block_k_to_break_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.58,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17329.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 18.43,
+        "Launch Statistics.Registers Per Thread": 46.0,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.39,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 68.9,
+        "CPIStall.mio_cycles_per_warp": 9.9,
+        "Scheduler Statistics.No Eligible": 93.1
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 11.81,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17682.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 9.22,
+        "Launch Statistics.Registers Per Thread": 40.0,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.36,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 66.2,
+        "CPIStall.mio_cycles_per_warp": 9.5,
+        "Scheduler Statistics.No Eligible": 93.04
+      }
+    },
+    "strategy_title": "Halving BLOCK_K Does Not Resolve 12-Way SMEM Bank Conflicts",
+    "strategy_description": "Reducing BLOCK_K from 64 to 32 in a Triton GEMM kernel (halving the shared memory tile stride from 256 bytes to 128 bytes) did not reduce the 12-way shared memory bank conflict count or the 75% excessive wavefront fraction \u2014 both metrics remained identical before and after. Dynamic shared memory per block dropped from 18.43 KB to 9.22 KB and registers per thread fell from 46 to 40 (improving theoretical occupancy from 62.5% to 75%), but MIO stall cycles per warp only marginally improved from 9.9 to 9.5. The 2.45x reported speedup is therefore attributable to the surrounding persistent kernel and BLOCK_N=4 changes already in place, not to the BLOCK_K reduction itself. When Triton's tl.dot compiler-controlled SMEM layout produces 12-way conflicts, changing BLOCK_K alone does not alter the conflict multiplicity because the conflict pattern is determined by the internal MMA tile layout, not the outer K-stride.",
+    "slow_pseudocode": "# BLOCK_K=64: A-tile stride = 64*4=256 bytes = 8 bank-widths\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 32\n    BLOCK_N: tl.constexpr = 4\n    BLOCK_K: tl.constexpr = 64  # 12-way bank conflicts, 75% wavefronts\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# BLOCK_K=32: A-tile stride = 32*4=128 bytes = 4 bank-widths\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 32\n    BLOCK_N: tl.constexpr = 4\n    BLOCK_K: tl.constexpr = 32  # STILL 12-way bank conflicts, 75% wavefronts\n    acc += tl.dot(a, b, allow_tf32=False)\n# Dynamic SMEM halved (18.43->9.22 KB), registers reduced (46->40)\n# but bank conflict count UNCHANGED",
+    "applicable_when": "Never as a standalone fix for tl.dot-induced shared memory bank conflicts. Reducing BLOCK_K may be useful for reducing register pressure or shared memory footprint, but it does not address bank conflicts generated by Triton's internal MMA tile layout.",
+    "do_not_apply_when": "When SharedMemoryConflicts NCU rule fires with >=12-way bank conflicts and >=75% excessive wavefronts in a Triton kernel using tl.dot \u2014 halving BLOCK_K will not reduce the conflict count because the conflict pattern is determined by the compiler-controlled MMA SMEM layout, not the outer K-dimension stride.",
+    "framework_notes": "In Triton, tl.dot uses an internal shared memory layout optimized for MMA instructions (e.g., wgmma on H100/H200). This layout's bank conflict pattern is controlled by the compiler and depends on the MMA tile shape (m16n8k16 or similar), not directly on BLOCK_K. Padding the shared memory allocation (e.g., adding a +1 or +4 element pad to the K-dimension of the SMEM buffer) is the standard technique to break stride-induced bank conflicts in CUDA; the Triton equivalent would require custom SMEM allocation with explicit padding, which is not directly supported via tl.dot."
+  },
+  {
+    "item_id": "exp_003_reduce_block_m_autotune_smem_bank_conflicts",
+    "iteration": 3,
+    "speedup": 2.2678,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_block_m_to_cut_smem_bank_conflicts_and_register_pressure",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.58,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17329.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 46.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 18.43,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.39,
+        "Scheduler Statistics.No Eligible": 93.1,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 68.89
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 12.77,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 19109.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Launch Statistics.Registers Per Thread": 63.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 9.22,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 3.12,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.95,
+        "Scheduler Statistics.No Eligible": 88.64,
+        "SharedMemoryConflicts.bank_conflict_way": 10.7,
+        "SharedMemoryConflicts.wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 36.63
+      }
+    },
+    "strategy_title": "Reduce BLOCK_M to Cut SMEM Bank Conflicts and Register Pressure",
+    "strategy_description": "When a Triton GEMM kernel uses a large BLOCK_M (e.g., 128) that drives extreme register pressure (216 regs/thread, Block Limit Registers=4) and high shared memory bank conflicts (12-way, 75% of wavefronts), reducing BLOCK_M to 32 cuts register usage (216\u219263 regs/thread), halves dynamic shared memory per block (18.4\u21929.2 KB), and reduces MIO stall fraction (68.9%\u219236.6%), yielding a 2.27x end-to-end speedup. The causal chain is: smaller BLOCK_M \u2192 fewer registers unrolled \u2192 higher Block Limit Registers (4\u219216) \u2192 reduced bank conflict severity (12.0\u219210.7-way) \u2192 lower warp cycles per issued instruction (14.4\u21929.0). Combining BLOCK_M reduction with @triton.autotune sweeping num_warps/num_stages allows the runtime to find the optimal warp count for the reduced tile size.",
+    "slow_pseudocode": "# BLOCK_M=128 hardcoded, no autotune\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 128  # 216 regs/thread, Block Limit Registers=4\n    BLOCK_N: tl.constexpr = 4\n    BLOCK_K: tl.constexpr = 64\n    # 12-way bank conflicts, 75% wavefronts, 68.9% MIO stalls\n    # 14.4 warp cycles/issued instruction\n    acc += tl.dot(a, b, allow_tf32=False)\n# duration=11.58 us (but 2.27x slower end-to-end than optimized)",
+    "fast_pseudocode": "# BLOCK_M=32, autotune num_warps/num_stages\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=2, num_stages=1),\n        triton.Config({}, num_warps=4, num_stages=1),\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=1),\n        triton.Config({}, num_warps=8, num_stages=2),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=2, num_stages=2),\n        triton.Config({}, num_warps=16, num_stages=1),\n        triton.Config({}, num_warps=16, num_stages=2),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 32  # 63 regs/thread, Block Limit Registers=16\n    BLOCK_N: tl.constexpr = 4\n    BLOCK_K: tl.constexpr = 64\n    # 10.7-way bank conflicts, 36.6% MIO stalls\n    # 9.0 warp cycles/issued instruction\n    acc += tl.dot(a, b, allow_tf32=False)\n# duration=12.77 us per NCU, but 2.27x faster end-to-end",
+    "applicable_when": "Triton GEMM kernel where BLOCK_M is large (\u226564) and register pressure is extreme (>100 regs/thread, Block Limit Registers \u22644); SharedMemoryConflicts rule fires with \u226510-way bank conflicts; CPIStall MIO stall fraction >50%; warp cycles per issued instruction >10; the kernel already uses BLOCK_N sized to the actual N dimension.",
+    "do_not_apply_when": "BLOCK_M is already small (\u226432) and register pressure is moderate (<80 regs/thread); the kernel is memory-bandwidth bound rather than shared-memory-latency bound; reducing BLOCK_M would increase K-loop iteration count enough to dominate (i.e., K is very large and tile reuse is critical); BLOCK_M reduction breaks tl.dot alignment requirements (must be power-of-2 \u226516 for tensor core ops).",
+    "framework_notes": "In Triton, BLOCK_M as a tl.constexpr inside the kernel body (not passed via autotune key) must be changed directly in the kernel source. Combining with @triton.autotune sweeping only num_warps/num_stages (key=[]) allows runtime selection of the best warp count for the new tile size without re-autotuning per problem size. Note: NCU profiling may show slightly longer kernel duration after this change (11.58\u219212.77 \u00b5s) while end-to-end speedup is 2.27x \u2014 this discrepancy arises because NCU measures the best autotuned config in isolation, while end-to-end includes autotuner overhead amortized over many calls."
+  },
+  {
+    "item_id": "exp_003_transposed_b_load_eliminate_smem_bank_conflicts",
+    "iteration": 3,
+    "speedup": 1.1384,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "transposed_b_load_to_eliminate_smem_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 11.58,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 17329.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Launch Statistics.Registers Per Thread": 46.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 18.43,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.39,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.bank_conflict_wavefront_pct": 75.0,
+        "CPIStall.mio_stall_pct": 68.89,
+        "Scheduler Statistics.No Eligible": 93.1,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 62.5
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 25.44,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 38113.0,
+        "Launch Statistics.Block Size": 32.0,
+        "Launch Statistics.Registers Per Thread": 80.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8.7,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.8,
+        "SharedMemoryConflicts.bank_conflict_way": 11.9,
+        "SharedMemoryConflicts.bank_conflict_wavefront_pct": 83.26,
+        "CPIStall.mio_stall_pct": 36.78,
+        "Scheduler Statistics.No Eligible": 82.59,
+        "Occupancy.Achieved Occupancy": 1.56,
+        "Occupancy.Theoretical Occupancy": 37.5
+      }
+    },
+    "strategy_title": "Load B Transposed to Eliminate Non-Power-of-2 Stride Bank Conflicts",
+    "strategy_description": "When a GEMM B-matrix has a non-power-of-2 leading dimension (e.g., N=3, stride_bn=512), loading B as [BLOCK_K, BLOCK_N] with stride 3 in the N-dimension causes severe shared memory bank conflicts (12-way, 75%+ of wavefronts). Loading B transposed as [BLOCK_N, BLOCK_K] with the K-dimension as the fast axis (stride_bk=1, coalesced) and then applying tl.trans() in registers avoids the conflicting stride pattern. However, in this case the warp cycles per issued instruction improved (14.39\u21925.8) and MIO stall percentage dropped (68.89%\u219236.78%), but the kernel duration increased (11.58\u219225.44 \u00b5s) because the autotuner selected a much smaller block size (128\u219232 threads) and higher register pressure (46\u219280 registers/thread), severely reducing occupancy (6.25%\u21921.56%) and theoretical occupancy (62.5%\u219237.5%). The net wall-clock speedup of 1.14x is modest and primarily reflects end-to-end measurement, not the profiled kernel itself which got slower per NCU.",
+    "slow_pseudocode": "# B load with non-power-of-2 N-stride causing 12-way bank conflicts\nBLOCK_K: tl.constexpr = 64\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)  # [BLOCK_K, 1]\n    idx_m = b_k_idx_vals\n    idx_n = offs_b_n[None, :]  # [1, BLOCK_N]\n    xindex = idx_n + 3 * idx_m  # stride=3 in N-dim -> bank conflicts\n    b = tl.load(B + tl.broadcast_to(idx_m + 512 * idx_n, [BLOCK_K, BLOCK_N]))",
+    "fast_pseudocode": "# Load B transposed [BLOCK_N, BLOCK_K] with coalesced K-stride, then tl.trans()\nBLOCK_K: tl.constexpr = 32  # reduced to lower register pressure\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):\n    k_base = k_idx * BLOCK_K\n    offs_k_cur = tl.arange(0, BLOCK_K) + k_base\n    # B layout: B[n, k] = B_ptr + n*512 + k (stride_bk=1, coalesced)\n    b_T = tl.load(B + offs_b_n[:, None] * 512 + offs_k_cur[None, :])  # [BLOCK_N, BLOCK_K]\n    b = tl.trans(b_T)  # [BLOCK_K, BLOCK_N] - compile-time layout transform\n    acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)",
+    "applicable_when": "Triton GEMM kernel where the B-matrix has a non-power-of-2 leading dimension causing stride-induced shared memory bank conflicts (SharedMemoryConflicts rule fires with >10-way conflicts, >70% of wavefronts excessive); CPIStall MIO stall percentage >50%; the B-matrix layout has a coalesced K-dimension (stride_bk=1) that can be used as the fast axis for a transposed load.",
+    "do_not_apply_when": "The autotuner selects a much smaller block size (e.g., 32 threads vs 128) when combined with reduced BLOCK_K, causing register pressure to spike (46\u219280 registers/thread) and occupancy to collapse (6.25%\u21921.56%), making the kernel slower per NCU despite reduced bank conflicts. Do not combine transposed B load with BLOCK_K reduction if the resulting register pressure will drop theoretical occupancy below the original. Also do not apply when ALLOW_TF32=True causes correctness failures (confirmed for K=512 with atol=1e-3).",
+    "framework_notes": "In Triton, tl.trans() is a compile-time layout transformation with zero runtime cost \u2014 it reinterprets the register tile layout without any data movement. The key constraint is that tl.dot requires power-of-2 dimensions for both BLOCK_K and BLOCK_N. When reducing BLOCK_K to lower shared memory usage, verify that the autotuner does not select a num_warps=1 config that collapses block size to 32 threads and spikes register pressure. The @triton.autotune key=[] means the config is selected once per process; including num_warps=1 in the config space risks selecting a degenerate low-occupancy configuration for small kernels."
+  }
+]

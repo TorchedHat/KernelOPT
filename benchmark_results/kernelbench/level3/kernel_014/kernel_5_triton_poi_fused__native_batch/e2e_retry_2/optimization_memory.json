@@ -1,0 +1,44 @@
+[
+  {
+    "item_id": "exp_triton_autotune_xblock_regression_001",
+    "iteration": 1,
+    "speedup": 0.7307,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 12.32,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 47.52,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 13.33,
+        "Occupancy.Achieved Occupancy": 56.04,
+        "Scheduler Statistics.No Eligible": 42.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.23,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.02,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 83.04,
+        "Launch Statistics.Registers Per Thread": 17.0,
+        "Instruction Statistics.Executed Instructions": 4578560.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 16.86,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 76.32,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 9.71,
+        "Occupancy.Achieved Occupancy": 85.22,
+        "Scheduler Statistics.No Eligible": 13.51,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 7.02,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.87,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 74.45,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 10050880.0
+      }
+    },
+    "strategy_title": "Autotune Larger XBLOCK Regresses Due to Instruction Explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK values (512\u20132048) caused a 2.19x increase in executed instructions (4.58M \u2192 10.05M) and doubled registers per thread (17 \u2192 32), despite improving occupancy (56% \u2192 85%) and eligible warps (1.23 \u2192 7.02). The instruction count explosion\u2014likely from unrolled loop bodies at larger tile sizes combined with the xmask guard introduced for non-power-of-2 boundary safety\u2014dominated any latency-hiding benefit, increasing duration from 12.32 \u00b5s to 16.86 \u00b5s. When the original kernel already has high L1 hit rate (83%) and the bottleneck is L1TEX scoreboard stalls, increasing tile size can backfire if it causes instruction count to grow faster than latency is hidden.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 autotune with larger XBLOCK\n@triton.autotune(configs=[XBLOCK=512/1024/2048 x num_warps=4/8/16], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel  # boundary guard added\n    tmp0 = tl.load(in_out_ptr0 + xindex, xmask)\n    tmp1 = tl.load(in_ptr0 + (xindex % 64), xmask, eviction_policy='evict_last')\n    # ... batch norm + relu ...\n    tl.store(in_out_ptr0 + xindex, result, xmask)\n\ngrid = (triton.cdiv(xnumel, 128),)  # BUG: grid not updated to use meta['XBLOCK']\nkernel[grid](..., xnumel)  # XBLOCK not passed, autotune selects it",
+    "fast_pseudocode": "# BEFORE (faster) \u2014 fixed XBLOCK=128, no mask\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no boundary check needed\n    tmp0 = tl.load(in_out_ptr0 + xindex, None)\n    tmp1 = tl.load(in_ptr0 + (xindex % 64), None, eviction_policy='evict_last')\n    # ... batch norm + relu ...\n    tl.store(in_out_ptr0 + xindex, result, None)\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., xnumel, XBLOCK=128)",
+    "applicable_when": "Kernel has L1TEX scoreboard stalls >40% of cycles, low eligible warps (<2 per scheduler), and small tile sizes with repeated broadcast loads over a small channel dimension. Registers per thread are low (<20) leaving headroom for larger tiles.",
+    "do_not_apply_when": "The kernel already has high L1 hit rate (>80%) and the xnumel is exactly divisible by the current XBLOCK (making xmask=True valid). Adding xmask guards and larger XBLOCK causes instruction count to explode (>2x) without proportional latency hiding. Also avoid when the grid lambda is not updated to match the autotuned XBLOCK\u2014this is an implementation flaw that causes the grid to remain fixed at the old tile size while the kernel uses a different XBLOCK.",
+    "framework_notes": "Critical implementation flaw: the grid was left as `(triton.cdiv(xnumel, 128),)` (hardcoded XBLOCK=128) instead of being updated to `lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. This means the autotuner selects a larger XBLOCK but the grid does not shrink accordingly, causing incorrect coverage or redundant work. Additionally, changing `xmask = tl.full([XBLOCK], True, tl.int1)` to `xmask = xindex < xnumel` adds predication overhead that increases instruction count significantly when xnumel is already divisible by the original XBLOCK."
+  }
+]

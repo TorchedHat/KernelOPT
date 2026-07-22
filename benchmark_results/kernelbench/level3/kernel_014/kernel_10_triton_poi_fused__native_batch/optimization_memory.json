@@ -1,0 +1,330 @@
+[
+  {
+    "item_id": "exp_001_triton_autotune_register_spill_regression",
+    "iteration": 1,
+    "speedup": 0.7394,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_2d_grid_with_large_tile_blocks",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 42.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.02,
+        "Occupancy.Theoretical Occupancy": 62.5,
+        "Occupancy.Achieved Occupancy": 6.23,
+        "Occupancy.Block Limit Registers": 10.0,
+        "GPU Speed Of Light Throughput.Duration": 4.0,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5945.0,
+        "Instruction Statistics.Executed Instructions": 30736.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 140.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.06,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 6.2,
+        "Occupancy.Block Limit Registers": 3.0,
+        "GPU Speed Of Light Throughput.Duration": 5.41,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8060.0,
+        "Instruction Statistics.Executed Instructions": 91108.0
+      }
+    },
+    "strategy_title": "Autotune 2D Grid Causes Register Spill Regression",
+    "strategy_description": "Adding @triton.autotune to a kernel that was previously launched with fixed XBLOCK/YBLOCK constants caused registers per thread to explode from 42 to 140, collapsing theoretical occupancy from 62.5% to 18.75% and Block Limit Registers from 10 to 3. The autotuner's exploration of multiple tile configurations forces the compiler to allocate registers for the worst-case config, causing severe register pressure even when the best config is selected at runtime. Additionally, the grid remained at 24 blocks (the 1D launch was not actually fixed to 2D), so the Y dimension was still not parallelized, and the instruction count tripled (30K\u219291K) with no throughput benefit.",
+    "slow_pseudocode": "# BEFORE: fixed constants, 42 registers/thread\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\ngrid = (cdiv(xnumel, 8),)  # 1D, 24 blocks\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# ATTEMPTED (regressed): autotune with multiple configs\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 512},  num_warps=4),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 1024}, num_warps=4),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 256},  num_warps=4),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 128},  num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    ...\n# Grid was NOT updated to 2D \u2014 still 1D with 24 blocks\ngrid = (cdiv(xnumel, 8),)\nkernel[grid](...)  # no YBLOCK/XBLOCK passed \u2014 autotuner picks",
+    "applicable_when": "Never: this specific combination of autotune + unchanged 1D grid is always wrong. The autotune pattern itself is risky when the kernel has many constexpr tile parameters that force the compiler to allocate registers for worst-case configs.",
+    "do_not_apply_when": "Do not add @triton.autotune to a kernel without simultaneously fixing the launch grid to match the autotuned tile dimensions. Do not use autotune when the kernel already has high register usage (>40 registers/thread) \u2014 the compiler must accommodate all configs simultaneously, causing register explosion. Do not use autotune when the grid is 1D but the kernel body uses tl.program_id(1) \u2014 the grid must be updated to 2D.",
+    "framework_notes": "Triton-specific: @triton.autotune forces the compiler to compile for all configs simultaneously when constexpr tile sizes vary, which can cause register pressure to be dominated by the largest tile config. The correct fix for a 1D\u21922D grid parallelization is to update the grid lambda to use META['XBLOCK'] and META['YBLOCK'], not just add the decorator. Alternatively, use a single fixed 2D grid with manually chosen tile sizes to avoid register pressure from autotune."
+  },
+  {
+    "item_id": "triton_fix_1d_grid_bug_2d_kernel_002",
+    "iteration": 2,
+    "speedup": 1.3029,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_1d_grid_bug_for_2d_indexed_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.19,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4707.0,
+        "Scheduler Statistics.No Eligible": 87.29,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 0.22
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.18,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "GPU Speed Of Light Throughput.Duration": 3.07,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4538.0,
+        "Scheduler Statistics.No Eligible": 86.95,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 0.23
+      }
+    },
+    "strategy_title": "Fix 1D Grid Bug for 2D-Indexed Triton Kernel",
+    "strategy_description": "When a Triton kernel uses tl.program_id(1) and tl.program_id(2) for Y-axis indexing but is launched with a 1D grid, all Y-dimension program IDs are always 0, silently processing only the first YBLOCK rows of the output. The fix is to launch with a 2D grid lambda covering both X and Y dimensions, letting the autotuner select optimal tile sizes via conservative configs (YBLOCK <= 64) to avoid register explosion. This iteration confirmed the fix yields 1.30x speedup with registers staying at 32/thread and elapsed cycles dropping from 4707 to 4538.",
+    "slow_pseudocode": "# BUG: 1D grid, program_id(1) and program_id(2) always 0\ngrid = (triton.cdiv(xnumel, 8),)  # = 24 blocks\nkernel[grid](..., ynumel=501760, xnumel=192)\n\n@triton.jit\ndef kernel(..., YBLOCK, XBLOCK):\n    yoffset = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)) * YBLOCK\n    # program_id(1)==0, program_id(2)==0 always -> only first YBLOCK rows processed",
+    "fast_pseudocode": "# FIX: 2D grid lambda + autotune with conservative tile sizes\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 64}, num_warps=8),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=8),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=8),\n        # YBLOCK <= 64 to avoid register explosion\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)) * YBLOCK\n    # kernel body unchanged\n\ngrid = lambda meta: (\n    triton.cdiv(xnumel, meta['XBLOCK']),\n    triton.cdiv(ynumel, meta['YBLOCK']),\n)\nkernel[grid](..., ynumel=501760, xnumel=192)  # XBLOCK/YBLOCK from autotune",
+    "applicable_when": "Triton kernel uses tl.program_id(1) or tl.program_id(2) for multi-dimensional indexing but is launched with a 1D grid tuple; NCU LaunchConfiguration rule fires with grid_size << sm_count and waves_per_sm < 0.1; achieved occupancy << theoretical occupancy; DRAM throughput near 0%.",
+    "do_not_apply_when": "Kernel genuinely uses only tl.program_id(0) (truly 1D kernel); grid size already matches or exceeds SM count; the low grid size is intentional (e.g., reduction kernel with single block); do not use YBLOCK >= 128 in autotune configs as this causes register explosion (42->140 registers/thread) and regression.",
+    "framework_notes": "Triton-specific: the autotune decorator must be placed above @triton.jit. The grid lambda receives meta dict with autotuned config values. Keep YBLOCK <= 64 in autotune configs to avoid register pressure. Do NOT pass XBLOCK/YBLOCK as explicit kwargs in the kernel call \u2014 the autotune decorator injects them. Equivalent in CUDA would be fixing the gridDim.y/z parameters in the kernel launch call."
+  },
+  {
+    "item_id": "triton_fix_missing_y_grid_dimension_002",
+    "iteration": 2,
+    "speedup": 1.2739,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_missing_y_grid_dimension",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.19,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "GPU Speed Of Light Throughput.Duration": 3.17,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4707.0,
+        "Instruction Statistics.Executed Instructions": 21996.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.19,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4622.0,
+        "Instruction Statistics.Executed Instructions": 22036.0
+      }
+    },
+    "strategy_title": "Fix Missing Y-Dimension in Triton 2D Grid Launch",
+    "strategy_description": "When a Triton kernel uses tl.program_id(1) for a Y dimension but the grid is launched as a 1D tuple, the Y dimension always returns 0 and only the first YBLOCK rows are processed. Changing the grid from a 1D tuple to a 2D lambda (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK'])) and tuning autotune configs to smaller tile sizes (avoiding large YBLOCK values like 64/128 that inflate register pressure) yields a modest but real latency reduction. The profiling metrics here show only marginal improvement in elapsed cycles (4707\u21924622) because the grid size remained at 24 blocks \u2014 indicating the 2D grid fix was not fully effective at this problem scale, but autotune config reshaping (removing large YBLOCK=64/128 configs, adding num_stages=1) contributed to the measured 1.27x speedup.",
+    "slow_pseudocode": "# BUG: 1D grid, Y dimension never fully iterated; large YBLOCK configs cause register pressure\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 32},  num_warps=4),\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 64},  num_warps=4),\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 32},  num_warps=4),\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 64},  num_warps=8),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 16},  num_warps=4),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32},  num_warps=8),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 16},  num_warps=8),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},   num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr): ...\ngrid = (triton.cdiv(xnumel, 8),)  # 1D, 24 blocks\nkernel[grid](..., ynumel, xnumel)",
+    "fast_pseudocode": "# FIX: 2D lambda grid + trimmed autotune configs with num_stages=1\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 32},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 64},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 32},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 16, 'YBLOCK': 16},  num_warps=8, num_stages=1),\n        triton.Config({'XBLOCK': 32, 'YBLOCK': 16},  num_warps=4, num_stages=1),\n        triton.Config({'XBLOCK': 8,  'YBLOCK': 128}, num_warps=8, num_stages=1),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr): ...\ngrid = lambda meta: (\n    triton.cdiv(xnumel, meta['XBLOCK']),\n    triton.cdiv(ynumel, meta['YBLOCK']),\n)\nkernel[grid](..., ynumel, xnumel)  # no hardcoded XBLOCK/YBLOCK",
+    "applicable_when": "Triton kernel uses tl.program_id(1) or tl.program_id(2) for a Y/Z dimension but the grid tuple has fewer dimensions than the kernel expects; NCU LaunchConfiguration rule fires with grid_size << sm_count; waves_per_sm < 0.1; achieved_occupancy << theoretical_occupancy due to too few blocks launched; registers_per_thread is at or below 32",
+    "do_not_apply_when": "Kernel is genuinely 1D (only uses tl.program_id(0)); grid is already multi-dimensional and correctly covers all problem dimensions; problem size is small enough that a 1D grid suffices; registers_per_thread is already high (>40) \u2014 adding autotune configs with large tile sizes will cause register explosion",
+    "framework_notes": "Triton-specific: the grid must be a callable lambda receiving the autotuned meta dict when using @triton.autotune with variable tile sizes. Setting num_stages=1 in each Config can help reduce register pressure for pointwise kernels that do not benefit from software pipelining. Avoid XBLOCK values larger than the xnumel dimension (e.g., XBLOCK=128 when xnumel=192 is borderline acceptable but XBLOCK=64 with YBLOCK=16 may waste threads). The grid lambda must use meta['XBLOCK'] and meta['YBLOCK'] matching the exact key names in the autotune configs."
+  },
+  {
+    "item_id": "triton_remove_debug_barrier_pointwise_003",
+    "iteration": 3,
+    "speedup": 1.3158,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "remove_unnecessary_debug_barrier_in_pointwise_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.07,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4538.0,
+        "Instruction Statistics.Issued Instructions": 22804.0,
+        "Instruction Statistics.Executed Instructions": 22036.0,
+        "Scheduler Statistics.No Eligible": 86.95,
+        "Scheduler Statistics.Active Warps Per Scheduler": 0.97,
+        "Occupancy.Achieved Occupancy": 6.18,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.44
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4512.0,
+        "Instruction Statistics.Issued Instructions": 22628.0,
+        "Instruction Statistics.Executed Instructions": 21860.0,
+        "Scheduler Statistics.No Eligible": 88.45,
+        "Scheduler Statistics.Active Warps Per Scheduler": 0.88,
+        "Occupancy.Achieved Occupancy": 6.09,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.61
+      }
+    },
+    "strategy_title": "Remove tl.debug_barrier() From Pointwise Triton Kernel",
+    "strategy_description": "In a pointwise Triton kernel with no shared memory (static_smem=0), no inter-thread dependencies, and no reductions, a tl.debug_barrier() call before the final tl.store() adds a warp-level synchronization fence that contributes to issued-but-not-executed instruction overhead (22804 issued vs 22036 executed before removal). Removing the barrier eliminates this overhead, reduces issued instruction count, and allows the compiler backend to freely schedule the final ALU op and store without an artificial fence. The speedup is modest (1.32x) because the kernel remains severely launch-bound (24 blocks vs 132 SMs), but the barrier removal is always safe and correct for purely pointwise kernels with no shared state between threads.",
+    "slow_pseudocode": "# BEFORE: debug_barrier before store in pointwise kernel\n@triton.jit\ndef pointwise_kernel(...):\n    # ... compute tmp51 from loads and arithmetic ...\n    tmp51 = tl.maximum(tmp50, tmp49)\n    tl.debug_barrier()  # unnecessary: no shared memory, no inter-thread deps\n    tl.store(out_ptr + offset, tmp51, mask=mask)",
+    "fast_pseudocode": "# AFTER: remove debug_barrier, store directly\n@triton.jit\ndef pointwise_kernel(...):\n    # ... compute tmp51 from loads and arithmetic ...\n    tmp51 = tl.maximum(tmp50, tmp49)\n    tl.store(out_ptr + offset, tmp51, mask=mask)  # barrier deleted",
+    "applicable_when": "Triton pointwise kernel (no tl.shared memory allocations, static_smem=0) contains tl.debug_barrier() before a tl.store(); issued instructions significantly exceed executed instructions (gap > 500); IssueSlotUtilization NCU rule fires; kernel has no inter-thread data dependencies or reductions.",
+    "do_not_apply_when": "Kernel uses tl.shared memory (static_smem > 0) where the barrier may guard a shared-memory write-then-read hazard; kernel performs reductions where barrier enforces ordering; kernel has explicit inter-warp synchronization patterns; the barrier was intentionally inserted for correctness in a fused kernel with shared state.",
+    "framework_notes": "Triton-specific: tl.debug_barrier() is a warp-level synchronization fence. It is sometimes auto-inserted by the Inductor compiler in fused kernels for safety but is semantically unnecessary in purely pointwise kernels. Removing it does not affect numerical correctness when there is no shared memory or inter-thread dependency. Equivalent in CUDA would be removing an unnecessary __syncwarp() or __syncthreads() in a purely independent-thread kernel."
+  },
+  {
+    "item_id": "exp_003_triton_autotune_expand_configs_larger_tiles",
+    "iteration": 3,
+    "speedup": 1.2903,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_expand_configs_conservative_tiles",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.18,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration": 3.07,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4538.0,
+        "Instruction Statistics.Executed Instructions": 22036.0,
+        "Memory Workload Analysis.L2 Hit Rate": 63.03,
+        "Scheduler Statistics.No Eligible": 86.95
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.18,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "GPU Speed Of Light Throughput.Duration": 3.1,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4608.0,
+        "Instruction Statistics.Executed Instructions": 21816.0,
+        "Memory Workload Analysis.L2 Hit Rate": 58.71,
+        "Scheduler Statistics.No Eligible": 88.05
+      }
+    },
+    "strategy_title": "Expand Autotune Configs With Larger Conservative Tiles",
+    "strategy_description": "Adding 6 new autotune configs with larger tile sizes (XBLOCK 128\u20131024, YBLOCK 8\u201332, num_warps 4\u20138) to an existing autotune decorator kept registers per thread stable at 32 and achieved a 1.29x speedup. The profiling metrics remain nearly identical before and after (same grid size, occupancy, register count), indicating the speedup comes from the autotuner selecting a better tile configuration at runtime rather than any structural kernel change. When registers are already low and autotune infrastructure is in place, expanding the config search space with larger but still conservative tiles is safe and can yield meaningful gains without register spill risk.",
+    "slow_pseudocode": "# BEFORE: 8 configs, XBLOCK up to 128, YBLOCK up to 64\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 16,  'YBLOCK': 64}, num_warps=8),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 16}, num_warps=4),\n        triton.Config({'XBLOCK': 32,  'YBLOCK': 32}, num_warps=8),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(...): ...",
+    "fast_pseudocode": "# AFTER: 12 configs, added XBLOCK 128\u20131024, YBLOCK 8\u201332 variants\n@triton.autotune(\n    configs=[\n        # ... existing 6 configs ...\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8},  num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=8),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 8},  num_warps=8),\n        triton.Config({'XBLOCK': 1024,'YBLOCK': 8},  num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(...): ...",
+    "applicable_when": "Kernel already has @triton.autotune with a limited config set; registers per thread are low (<40); the kernel is latency-bound with very low occupancy (waves_per_sm < 0.1) and the grid is already undersized relative to SM count. Adding more configs with larger XBLOCK values (up to 1024) while keeping YBLOCK small (<=32) is safe when register count is already low.",
+    "do_not_apply_when": "Registers per thread are already high (>40); the kernel does not have autotune infrastructure; the grid is 1D but the kernel body uses tl.program_id(1) without a corresponding 2D grid fix; YBLOCK values in new configs are large (>=64) as this risks register explosion.",
+    "framework_notes": "Triton-specific: expanding the autotune config list only adds compilation overhead at first run; at inference time the best config is cached. Larger XBLOCK values (256\u20131024) with small YBLOCK (8) are safe when registers are already low. The speedup here (1.29x) is higher than the previous iteration's config expansion (1.19x), suggesting that larger XBLOCK values found a better tile for this kernel's memory access pattern. The kernel remains severely launch-bound (24 blocks vs 132 SMs) so structural improvements would yield larger gains."
+  },
+  {
+    "item_id": "triton_fix_1d_grid_to_1d_y_indexed_kernel_004",
+    "iteration": 4,
+    "speedup": 1.227,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_1d_grid_bug_for_2d_indexed_kernel_v2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4512.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.09,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 21860.0,
+        "Scheduler Statistics.No Eligible": 88.45,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 15.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.26,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4869.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 5.63,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 19560.0,
+        "Scheduler Statistics.No Eligible": 90.76,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      }
+    },
+    "strategy_title": "Collapse 2D Y-indexed Kernel to 1D Grid via program_id(0)",
+    "strategy_description": "When a Triton kernel uses tl.program_id(1) and tl.program_id(2) for Y-axis indexing but xnumel is small enough that XBLOCK >= xnumel (i.e., the X dimension fits in a single tile), the X dimension does not need its own grid axis. Replacing the 2D grid with a 1D grid driven by program_id(0) for the Y offset, and using tl.arange(0,XBLOCK) directly without an xoffset, eliminates the X grid dimension entirely. This reduces instruction count (21860\u219219560 executed instructions) and simplifies the autotune search space to YBLOCK-only configs. Despite the profiling metrics showing slightly longer elapsed cycles (4512\u21924869), the end-to-end speedup of 1.23x indicates the reduction in instruction overhead and autotune config simplification benefit the overall workload.",
+    "slow_pseudocode": "# BEFORE: 2D grid, program_id(1)/program_id(2) for Y, program_id(0) for X\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 16}, num_warps=8),\n        # ... many configs varying both XBLOCK and YBLOCK ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel  # xnumel=192\n    ...\ngrid = (triton.cdiv(xnumel, 8),)  # 1D, 24 blocks \u2014 Y never iterated",
+    "fast_pseudocode": "# AFTER: 1D grid, program_id(0) drives Y; X fits in single tile (XBLOCK=256 >= xnumel=192)\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 1,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 2,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 4,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 8,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 16, 'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 32, 'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 64, 'XBLOCK': 256}, num_warps=8, num_stages=1),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = tl.program_id(0) * YBLOCK  # program_id(0) drives Y\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xindex = tl.arange(0, XBLOCK)[None, :]  # no xoffset: single tile covers all X\n    xmask = xindex < xnumel  # xnumel=192, XBLOCK=256 covers all\n    ...\ngrid = lambda meta: (triton.cdiv(ynumel, meta['YBLOCK']),)  # 1D, Y-driven",
+    "applicable_when": "Triton kernel has a 2D problem (ynumel large, xnumel small) where xnumel fits within a single XBLOCK tile (xnumel <= max_XBLOCK in configs); the kernel was previously using program_id(1)/program_id(2) for Y but the grid was 1D (bug); xnumel is small enough that a fixed XBLOCK=256 (or similar power-of-2 >= xnumel) covers all X elements with a mask; NCU LaunchConfiguration fires with grid_size << sm_count.",
+    "do_not_apply_when": "xnumel is large and requires multiple X tiles (xnumel >> XBLOCK); the kernel genuinely needs both X and Y grid dimensions; the kernel uses program_id(0) for X and program_id(1) for Y in a correctly-launched 2D grid; registers per thread are already high (>40) as XBLOCK=256 with large YBLOCK may cause register pressure.",
+    "framework_notes": "Triton-specific: when xnumel fits in a single tile (xnumel <= XBLOCK), the X dimension can be collapsed to tl.arange(0, XBLOCK) without a program_id-driven xoffset, reducing the grid to 1D driven entirely by program_id(0) for Y. This simplifies the autotune search space to YBLOCK-only variation with fixed XBLOCK. Setting num_stages=1 in all configs is appropriate for pointwise kernels with no software pipelining benefit. The L1/TEX hit rate dropped from 15% to 0% after this change, suggesting the access pattern changed \u2014 this is acceptable for a launch-bound kernel where the primary bottleneck is grid size, not cache efficiency."
+  },
+  {
+    "item_id": "triton_restructure_2d_kernel_to_1d_grid_with_y_in_pid0_004",
+    "iteration": 4,
+    "speedup": 1.1799,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "restructure_2d_kernel_indexing_to_use_pid0_for_y",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4512.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.09,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 21860.0,
+        "Scheduler Statistics.No Eligible": 88.45,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.61,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 15.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 3.39,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5047.0,
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 6.22,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 19656.0,
+        "Scheduler Statistics.No Eligible": 91.86,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0
+      }
+    },
+    "strategy_title": "Restructure 2D Kernel to Use pid(0) for Y, Fixed XBLOCK",
+    "strategy_description": "This iteration restructured a 2D Triton kernel by collapsing the Y dimension into tl.program_id(0) (replacing the previous pid(1)+pid(2) scheme) and hardcoding XBLOCK=256 so xindex uses tl.arange(0, XBLOCK) without a pid(0) offset. The autotune configs were narrowed to vary only YBLOCK (1\u201364) with fixed XBLOCK=256. Despite reducing executed instructions from 21860 to 19656, the kernel duration increased from 3.04\u00b5s to 3.39\u00b5s, warp cycles per issued instruction nearly doubled (7.61\u219214.0), and L1/TEX hit rate dropped from 15% to 0%. The grid remained at 24 blocks, so the fundamental launch-bound bottleneck was not resolved. The CPIStall rule shifted from L1TEX dependency stalls to CTA barrier stalls (34% of cycles), suggesting the restructuring introduced new synchronization overhead. The net result was a 1.18x speedup measured externally, but the profiling metrics show kernel duration regression, indicating the speedup may come from reduced autotuning overhead or other non-kernel factors.",
+    "slow_pseudocode": "# BEFORE: Y indexed via pid(1)+pid(2), X via pid(0); 14 autotune configs\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 8,   'YBLOCK': 32}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8},  num_warps=8),\n        # ... 12 more configs varying both XBLOCK and YBLOCK ...\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = (tl.program_id(1) + tl.program_id(2) * tl.num_programs(1)) * YBLOCK\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    # ...\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))",
+    "fast_pseudocode": "# AFTER: Y indexed via pid(0), X hardcoded to XBLOCK=256 with no pid offset\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 1,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 2,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 4,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 8,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 16, 'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 32, 'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 64, 'XBLOCK': 256}, num_warps=8, num_stages=1),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = tl.program_id(0) * YBLOCK\n    xindex = tl.arange(0, XBLOCK)[None, :]  # no pid(0) offset for X\n    # ...\n    tl.debug_barrier()  # re-added\n    tl.store(...)\ngrid = lambda meta: (cdiv(ynumel, meta['YBLOCK']),)  # 1D grid over Y only",
+    "applicable_when": "Never recommended as a primary strategy: collapsing a 2D kernel to use pid(0) for Y only while hardcoding XBLOCK does not increase grid size and introduces CTA barrier stalls. Only consider if xnumel fits entirely within a single tile (xnumel <= XBLOCK) so no X-dimension parallelism is lost.",
+    "do_not_apply_when": "The kernel is already launch-bound (grid_size << sm_count, waves_per_sm < 0.1); the restructuring does not increase the number of launched blocks; warp cycles per issued instruction are already low (<10); L1/TEX hit rate is non-zero (restructuring may destroy cache locality); the kernel previously had tl.debug_barrier() removed for speedup \u2014 re-adding it causes CTA barrier stalls.",
+    "framework_notes": "Triton-specific: when xnumel is small enough to fit in a single XBLOCK tile (e.g., xnumel=192, XBLOCK=256), collapsing X into a fixed arange without a pid offset is valid for correctness but eliminates X-dimension parallelism. The resulting 1D grid over Y only has the same block count as before if YBLOCK is chosen to match the original Y-grid size. Re-introducing tl.debug_barrier() after it was previously removed for speedup is counterproductive \u2014 the CPIStall rule shifted from L1TEX stalls to CTA barrier stalls (34% of cycles at 14.0 warp cycles/instruction vs 7.61 before)."
+  },
+  {
+    "item_id": "triton_fix_flat_1d_grid_launch_to_cover_total_elements_005",
+    "iteration": 5,
+    "speedup": 1.087,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "fix_flat_1d_grid_launch_to_cover_total_elements",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration",
+      "key_metric_before": {
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.01,
+        "Occupancy.Achieved Occupancy": 5.63,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "GPU Speed Of Light Throughput.Duration": 3.26,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4869.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.0,
+        "Memory Workload Analysis.Memory Throughput": 8.63,
+        "Instruction Statistics.Executed Instructions": 19560.0,
+        "Scheduler Statistics.No Eligible": 90.76
+      },
+      "key_metric_after": {
+        "Launch Statistics.Grid Size": 24.0,
+        "Launch Statistics.Waves Per SM": 0.02,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Theoretical Occupancy": 75.0,
+        "Launch Statistics.Registers Per Thread": 34.0,
+        "GPU Speed Of Light Throughput.Duration": 3.68,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5469.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 46.51,
+        "Memory Workload Analysis.Memory Throughput": 16.21,
+        "Instruction Statistics.Executed Instructions": 30912.0,
+        "Scheduler Statistics.No Eligible": 87.62
+      }
+    },
+    "strategy_title": "Fix Flat 1D Grid Launch to Cover All Total Elements",
+    "strategy_description": "When a Triton kernel uses a flat 1D linear index (offsets = pid * YBLOCK + arange, x2 = offsets % xnumel, y3 = offsets // xnumel) but the grid is hardcoded to cdiv(xnumel, 8) instead of cdiv(total_elements, YBLOCK), only a tiny fraction of elements are processed. The correct fix is to set grid = lambda meta: (triton.cdiv(ynumel * xnumel, meta['YBLOCK']),) so all elements are covered. In this iteration the grid remained at 24 blocks despite the kernel body being correctly rewritten to flat 1D \u2014 the grid lambda was not updated to use total elements, so the fundamental launch-bound bottleneck persisted. The L1/TEX hit rate improved from 0% to 46.5% and memory throughput nearly doubled (8.63\u219216.21 GB/s) due to the flat access pattern, but elapsed cycles increased (4869\u21925469) because the grid was still only 24 blocks with 132 SMs available.",
+    "slow_pseudocode": "# BEFORE: flat 1D kernel body, grid hardcoded to cdiv(xnumel, 8) = 24 blocks\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 1,  'XBLOCK': 256}, num_warps=4, num_stages=1),\n        triton.Config({'YBLOCK': 64, 'XBLOCK': 256}, num_warps=8, num_stages=1),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yoffset = tl.program_id(0) * YBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    ymask = yindex < ynumel\n    xindex = tl.arange(0, XBLOCK)[None, :]\n    xmask = xindex < xnumel\n    x2 = xindex; y3 = yindex\n    tl.store(out + (x2 + 192*y3), result, mask=xmask & ymask)\ngrid = (triton.cdiv(xnumel, 8),)  # BUG: 24 blocks, ignores ynumel",
+    "fast_pseudocode": "# AFTER: flat 1D kernel body, grid = lambda meta: (cdiv(total, meta['YBLOCK']),)\n@triton.autotune(\n    configs=[\n        triton.Config({'YBLOCK': 512,  'XBLOCK': 1}, num_warps=4),\n        triton.Config({'YBLOCK': 1024, 'XBLOCK': 1}, num_warps=4),\n        triton.Config({'YBLOCK': 2048, 'XBLOCK': 1}, num_warps=8),\n        triton.Config({'YBLOCK': 4096, 'XBLOCK': 1}, num_warps=8),\n    ],\n    key=['ynumel', 'xnumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    total = ynumel * xnumel\n    pid = tl.program_id(0)\n    offsets = pid * YBLOCK + tl.arange(0, YBLOCK)  # flat 1D\n    mask = offsets < total\n    x2 = offsets % xnumel\n    y3 = offsets // xnumel\n    tl.store(out + offsets, result, mask=mask)\ntotal = ynumel * xnumel\ngrid = lambda meta: (triton.cdiv(total, meta['YBLOCK']),)  # covers all elements",
+    "applicable_when": "Triton pointwise kernel with flat 1D linear index (offsets = pid*BLOCK + arange, x = offsets % xnumel, y = offsets // xnumel) where the grid is hardcoded to a small value (e.g., cdiv(xnumel, 8)) that does not cover total_elements; NCU LaunchConfiguration fires with grid_size << sm_count; waves_per_sm < 0.1; achieved_occupancy << theoretical_occupancy.",
+    "do_not_apply_when": "The grid is already correctly set to cdiv(total_elements, BLOCK_SIZE); the kernel is not a flat 1D indexed kernel (uses separate 2D XBLOCK/YBLOCK grid dimensions); the problem is small enough that 24 blocks suffice to cover all elements; registers per thread are already high (>40) as large YBLOCK configs may cause register pressure.",
+    "framework_notes": "Triton-specific: when rewriting from 2D (XBLOCK/YBLOCK) to flat 1D, the autotune configs should use XBLOCK=1 and vary only YBLOCK (the flat tile size), and the grid lambda must be lambda meta: (triton.cdiv(ynumel * xnumel, meta['YBLOCK']),). The kernel body uses tl.full([YBLOCK], ...) instead of tl.full([1,1], ...) for scalar constants. Note: in this iteration the grid was NOT successfully expanded (still 24 blocks), so the 1.087x speedup reflects only the flat index cache locality improvement (L1/TEX hit rate 0%\u219246.5%), not the grid saturation benefit. The full fix requires both the kernel body rewrite AND the grid lambda update."
+  }
+]

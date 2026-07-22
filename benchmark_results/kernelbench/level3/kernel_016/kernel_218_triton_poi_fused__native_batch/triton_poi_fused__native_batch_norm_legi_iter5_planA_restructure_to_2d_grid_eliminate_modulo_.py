@@ -1,0 +1,80 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_relu_218(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    # C=1696 channels, S=490 spatial positions, xnumel=831040=490*1696
+    # Use 2D decomposition within the 1D grid:
+    # program_id(0) maps to a (s_block, c_block) pair
+    # CBLOCK=128 channels per block, num_c_blocks=1696//128=13 (with last block having 1696%128=96 channels)
+    # Actually 1696/128 = 13.25, so we need 14 c_blocks
+    # We'll use XBLOCK as CBLOCK (=128), and decompose program_id into (s_pid, c_pid)
+    C = 1696
+    S = 490
+    CBLOCK: tl.constexpr = XBLOCK  # CBLOCK = XBLOCK = 128
+    num_c_blocks = tl.cdiv(C, CBLOCK)  # = 14
+    
+    pid = tl.program_id(0)
+    s_pid = pid // num_c_blocks
+    c_pid = pid % num_c_blocks
+    
+    c_offset = c_pid * CBLOCK
+    s_offset = s_pid  # SBLOCK=1, one spatial position per block
+    
+    c_idx = c_offset + tl.arange(0, XBLOCK)
+    c_mask = c_idx < C
+    s_mask = s_offset < S
+    mask = s_mask & c_mask
+    
+    flat_idx = s_offset * C + c_idx
+    
+    tmp0 = tl.load(in_ptr0 + flat_idx, mask, eviction_policy='evict_first')
+    tmp1 = tl.load(in_ptr1 + c_idx, mask, eviction_policy='evict_last')
+    tmp3 = tl.load(in_ptr2 + c_idx, mask, eviction_policy='evict_last')
+    tmp12 = tl.load(in_ptr3 + c_idx, mask, eviction_policy='evict_last')
+    tmp14 = tl.load(in_ptr4 + c_idx, mask, eviction_policy='evict_last')
+    tmp2 = tmp0 - tmp1
+    tmp4 = tl.full([1], 1e-05, tl.float32)
+    tmp5 = tmp3 + tmp4
+    tmp_rsqrt = libdevice.rsqrt(tmp5)
+    tmp11 = tmp2 * tmp_rsqrt
+    tmp15 = tl.math.fma(tmp11, tmp12, tmp14)
+    tmp17 = tl.maximum(tl.full([1], 0.0, tl.float32), tmp15)
+    tl.store(out_ptr0 + flat_idx, tmp17, mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    arg_5 = inputs[5]
+    xnumel = 831040
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_relu_218[grid](arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, 831040, XBLOCK=128)
+    return arg_5
+
+def get_inputs():
+    arg_0 = rand_strided((10, 1696, 7, 7), (83104, 1, 11872, 1696), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_5 = rand_strided((10, 1696, 7, 7), (83104, 1, 11872, 1696), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4, arg_5]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

@@ -1,0 +1,69 @@
+[
+  {
+    "item_id": "5432ade6",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_with_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLFPRoofline + SharedMemoryConflicts + IssueSlotUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tf32_tensor_cores_with_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'tf32_tensor_cores_with_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.133e-01 > atol=0.001\nseed=42 output[0]: max_diff=5.455e-01 > atol=0.001\nseed=1337 output[0]: max_diff=5.057e-01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel uses scalar FP32 FFMA (ALLOW_TF32=False, USE_FAST_ACCUM=False), completely bypassing Tensor Cores which offer ~8x throughput over scalar FP32. The FMA pipeline is only at 34.8% utilization. The L1/TEX cache is saturated at 87.49% due to 8-way shared memory bank conflicts caused by the small BLOCK_K=32 tile \u2014 512 K-loop iterations each hammering shared memory. With 168 registers/thread, occupancy is crushed to 18.75% theoretical. Enabling TF32 (ALLOW_TF32=True) routes tl.dot through Tensor Core MMA instructions, dramatically reducing the number of FMA cycles needed and alleviating the shared memory pressure per unit of compute. Increasing BLOCK_K (e.g. to 64 or 128) reduces K-loop iterations and amortizes shared memory loads. Adding @triton.autotune lets the runtime find the optimal (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) combination.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.133e-01 > atol=0.001\nseed=42 output[0]: max_diff=5.455e-01 > atol=0.001\nseed=1337 output[0]: max_diff=5.057e-01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_tma_block_ptr_regression_001",
+    "iteration": 1,
+    "speedup": 0.1179,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_block_ptr_gemm_without_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 4.03,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 6050040.0,
+        "Occupancy.Theoretical Occupancy": 18.75,
+        "Occupancy.Achieved Occupancy": 12.26,
+        "Occupancy.Block Limit Shared Mem": 3.0,
+        "Launch Statistics.Registers Per Thread": 168.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 49.15,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.53,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.13,
+        "Memory Workload Analysis.L2 Hit Rate": 51.74,
+        "Compute Workload Analysis.Executed Ipc Active": 1.55,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.06
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 34.18,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 51229364.0,
+        "Occupancy.Theoretical Occupancy": 6.25,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 1.0,
+        "Launch Statistics.Registers Per Thread": 255.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 131.07,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.11,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 28.62,
+        "Memory Workload Analysis.L2 Hit Rate": 92.47,
+        "Compute Workload Analysis.Executed Ipc Active": 0.43,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 8.99
+      }
+    },
+    "strategy_title": "tl.make_block_ptr Without Autotune Causes Severe Regression",
+    "strategy_description": "Switching from scalar pointer arithmetic to tl.make_block_ptr in a Triton GEMM kernel without autotune caused an 8.5x slowdown. The block pointer approach with larger tile sizes (BLOCK_N 64\u2192128, BLOCK_K 32\u219264) dramatically increased shared memory per block from 49 KB to 131 KB, collapsing Block Limit Shared Mem from 3 to 1 and theoretical occupancy from 18.75% to 6.25%. Simultaneously, registers per thread jumped from 168 to 255 (hitting the hardware maximum), further crushing occupancy and causing eligible warps per scheduler to drop from 0.53 to 0.11, making the kernel 8.5x slower despite improved L2 hit rate (51%\u219292%).",
+    "slow_pseudocode": "# BEFORE: scalar pointer arithmetic, BLOCK_N=64, BLOCK_K=32, smem=49KB\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = tl.load(A + (offs_k[None,:] + k_idx*BLOCK_K) + 16384*offs_a_m[:,None])\n    b = tl.load(B + (offs_k[:,None] + k_idx*BLOCK_K) + 16384*offs_b_n[None,:])\n    acc += tl.dot(a, b, allow_tf32=False)",
+    "fast_pseudocode": "# AFTER (regressed): block_ptr, BLOCK_N=128, BLOCK_K=64, smem=131KB, regs=255\nA_ptr = tl.make_block_ptr(arg_A, shape=(M,K), strides=(stride_am,stride_ak),\n    offsets=(pid_m*BLOCK_M, 0), block_shape=(BLOCK_M,BLOCK_K), order=(1,0))\nB_ptr = tl.make_block_ptr(arg_B, shape=(K,N), strides=(stride_bk,stride_bn),\n    offsets=(0, pid_n*BLOCK_N), block_shape=(BLOCK_K,BLOCK_N), order=(1,0))\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = tl.load(A_ptr, boundary_check=(0,1))\n    b = tl.load(B_ptr, boundary_check=(0,1))\n    acc = tl.dot(a, b, acc, allow_tf32=False)\n    A_ptr = tl.advance(A_ptr, (0, BLOCK_K))\n    B_ptr = tl.advance(B_ptr, (BLOCK_K, 0))",
+    "applicable_when": "Never apply this exact pattern (block_ptr with manually enlarged tile sizes and no autotune). The anti-pattern is: simultaneously switching to block_ptr AND increasing tile sizes without verifying that shared memory and register budgets remain within occupancy limits.",
+    "do_not_apply_when": "Do not increase BLOCK_N and BLOCK_K simultaneously when switching to tl.make_block_ptr without autotune. If registers per thread are already near 168+ and smem per block is near 49KB, doubling tile sizes will push smem to 131KB+ and registers to 255, reducing Block Limit Shared Mem to 1 and theoretical occupancy below 10%, causing severe regression. Always pair tile size changes with autotune or explicit register/smem budget verification.",
+    "framework_notes": "In Triton on Hopper (SM90), tl.make_block_ptr activates TMA hardware but the tile sizes encoded in block_shape directly determine shared memory allocation. With BLOCK_M=128, BLOCK_N=128, BLOCK_K=64 and fp32 accumulation, smem = 128*64*4 + 64*128*4 = 65536 bytes per operand tile, far exceeding the ~49KB budget that allowed 3 blocks/SM. The register explosion (168\u2192255) is likely caused by boundary_check=(0,1) generating additional predicate/index registers for each load. When using block_ptr, keep tile sizes small enough that smem_per_block * max_blocks_per_sm <= SM shared memory capacity."
+  }
+]

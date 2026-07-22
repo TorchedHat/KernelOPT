@@ -1,0 +1,70 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_relu_218(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    # 2D grid: dim0 = spatial tiles (SBLOCK=1 per block), dim1 = channel tiles (XBLOCK=128 per block)
+    # C=1696 channels, S=490 spatial positions (10*7*7), S*C=831040=xnumel
+    C = 1696
+    S = 490
+    s_offset = tl.program_id(0)  # SBLOCK=1, so each block handles exactly 1 spatial position
+    c_offset = tl.program_id(1) * XBLOCK
+
+    s_idx = s_offset  # scalar spatial index
+    c_idx = c_offset + tl.arange(0, XBLOCK)  # [XBLOCK] channel indices
+
+    c_mask = c_idx < C
+    # s_idx is always < S since grid dim0 = S = 490
+
+    flat_idx = s_idx * C + c_idx  # [XBLOCK] flat indices into in_ptr0 / out_ptr0
+
+    tmp0 = tl.load(in_ptr0 + flat_idx, c_mask, other=0.0)
+    tmp1 = tl.load(in_ptr1 + c_idx, c_mask, other=0.0, eviction_policy='evict_last')
+    tmp3 = tl.load(in_ptr2 + c_idx, c_mask, other=0.0, eviction_policy='evict_last')
+    tmp12 = tl.load(in_ptr3 + c_idx, c_mask, other=0.0, eviction_policy='evict_last')
+    tmp14 = tl.load(in_ptr4 + c_idx, c_mask, other=0.0, eviction_policy='evict_last')
+    tmp2 = tmp0 - tmp1
+    tmp4 = tl.full([1], 1e-05, tl.float32)
+    tmp5 = tmp3 + tmp4
+    tmp_rsqrt = libdevice.rsqrt(tmp5)
+    tmp11 = tmp2 * tmp_rsqrt
+    tmp15 = tl.math.fma(tmp11, tmp12, tmp14)
+    tmp17 = tl.maximum(tl.full([1], 0.0, tl.float32), tmp15)
+    tl.store(out_ptr0 + flat_idx, tmp17, c_mask)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    arg_5 = inputs[5]
+    xnumel = 831040
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_relu_218[grid](arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, 831040, XBLOCK=128)
+    return arg_5
+
+def get_inputs():
+    arg_0 = rand_strided((10, 1696, 7, 7), (83104, 1, 11872, 1696), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((1696,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_5 = rand_strided((10, 1696, 7, 7), (83104, 1, 11872, 1696), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4, arg_5]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

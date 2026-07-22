@@ -1,0 +1,216 @@
+[
+  {
+    "item_id": "c130151f",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "tma_loads_with_tile_size_rebalance",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "tma_loads_with_tile_size_rebalance \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'tma_loads_with_tile_size_rebalance' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 229, in <d",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel computes a tiny GEMM (M=10, N=1000, K=1280). The current tile configuration BLOCK_M=16, BLOCK_N=32, BLOCK_K=128 allocates large shared memory tiles that limit occupancy to 4 blocks/SM (Block Limit Shared Mem=4). With only 32 total blocks on 132 SMs, most SMs are idle (0.06 waves). The B matrix is accessed with stride_bn=1280 (column-major layout), causing the transposed load into shared memory to produce severe 17-way bank conflicts that consume 82% of all shared load wavefronts as replays. CPIStall shows 83.4% of stall cycles are MIO/shared-memory scoreboard waits. On Hopper (H200), TMA descriptors replace scalar pointer arithmetic with hardware-accelerated address generation and enable asynchronous bulk copies via cp.async.bulk, which bypasses the shared memory bank-conflict path for the initial load from global memory. Additionally, reducing BLOCK_K from 128 to 32 and increasing BLOCK_N from 32 to 64 rebalances the tile to reduce shared memory pressure, raise occupancy, and produce more blocks to better fill the 132 SMs.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  Fi",
+    "framework_notes": null
+  },
+  {
+    "item_id": "d7f2a891",
+    "iteration": 2,
+    "speedup": 0.8652,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "software_pipeline_to_hide_shared_memory_mio_stalls",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 63.49,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 95160.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.12,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 49.15,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Instruction Statistics.Executed Instructions": 973120.0,
+        "Memory Workload Analysis.L2 Hit Rate": 17.57
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 73.38,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 110008.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.5,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 7.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 20.48,
+        "Launch Statistics.Registers Per Thread": 72.0,
+        "Instruction Statistics.Executed Instructions": 1819040.0,
+        "Memory Workload Analysis.L2 Hit Rate": 44.81
+      }
+    },
+    "strategy_title": "Reducing BLOCK_K + num_stages Hurts When Grid Too Small",
+    "strategy_description": "Reducing BLOCK_K (128\u219232) and adding num_stages=3 to tl.range successfully reduced shared memory per block (49\u219220 KB) and improved theoretical occupancy (25%\u219243.75%), and even reduced warp cycles per instruction (12.1\u21927.5). However, the total executed instruction count nearly doubled (973K\u21921819K) because the smaller BLOCK_K tile requires 4x more k-loop iterations, and the register count increased (66\u219272), causing the kernel duration to increase from 63.49 \u00b5s to 73.38 \u00b5s (0.87x speedup). When the grid is already severely undersized (32 blocks on 132 SMs, achieved occupancy ~6%), the extra instruction overhead from more loop iterations dominates over the latency-hiding benefit of software pipelining, and the achieved occupancy does not improve despite better theoretical occupancy.",
+    "slow_pseudocode": "BLOCK_K = 128\nBLOCK_N = 32\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):  # 10 iters\n    a = tl.load(A + ...)\n    b = tl.load(B + ...)\n    acc += tl.dot(a, b, ...)",
+    "fast_pseudocode": "BLOCK_K = 32\nBLOCK_N = 64\nfor k_idx in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=3):  # 40 iters\n    a = tl.load(A + ...)\n    b = tl.load(B + ...)\n    acc += tl.dot(a, b, ...)",
+    "applicable_when": "Never: this specific combination caused regression. In general, reducing BLOCK_K with num_stages pipelining is beneficial when the grid is large enough to fill SMs and the instruction overhead from more iterations is amortized by higher occupancy.",
+    "do_not_apply_when": "Grid is severely undersized (waves_per_sm < 0.1, grid_size << sm_count). In this regime, shrinking BLOCK_K multiplies loop iteration count and total instructions without improving achieved occupancy (which stays near 6% regardless of theoretical occupancy improvement). The extra register pressure from num_stages further limits blocks per SM. The net effect is more work per SM with no latency hiding benefit, causing regression.",
+    "framework_notes": "In Triton, tl.range(..., num_stages=N) enables software pipelining (cp.async + wgmma on Hopper). However, it increases register pressure per thread and multiplies instruction count when BLOCK_K is reduced. The achieved occupancy did not improve (6.24%\u21926.25%) despite theoretical occupancy nearly doubling, confirming the bottleneck is workload size, not occupancy."
+  },
+  {
+    "item_id": "63a6cf9c",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_grid_parallelism_via_smaller_block_m",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_grid_parallelism_via_smaller_block_m \u2014 correctness failure",
+    "strategy_description": "Plan 'increase_grid_parallelism_via_smaller_block_m' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.367e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.335e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.321e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel computes a tiny GEMM (M=10, N=1000, K=1280). With BLOCK_M=16, BLOCK_N=32, the grid is ceil(10/16)*ceil(1000/32)=1*32=32 blocks \u2014 only 24% of the 132 SMs get any work at all (0.06 waves). The primary bottleneck is the severely undersized grid. Reducing BLOCK_M from 16 to 8 doubles grid_m from 1 to 2, giving 64 total blocks (48% SM coverage vs 24%). BLOCK_K stays at 128 \u2014 reducing it was proven to regress performance (item d7f2a891) by multiplying loop iterations without improving achieved occupancy. The B-matrix bank conflict (17-way) persists but each block does half the M-work, halving the absolute bank-conflict stall cycles per SM visit.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.367e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.335e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.321e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a4f7e2b9",
+    "iteration": 3,
+    "speedup": 0.8555,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_block_ptr_without_autotuner",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 63.33,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 94938.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.12,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 49.15,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Instruction Statistics.Executed Instructions": 973120.0,
+        "SharedMemoryConflicts.bank_conflict_way": 17.0,
+        "SharedMemoryConflicts.conflict_wavefront_pct": 82.35
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 74.21,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 111294.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.28,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 7.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 20.48,
+        "Launch Statistics.Registers Per Thread": 72.0,
+        "Instruction Statistics.Executed Instructions": 1895200.0,
+        "SharedMemoryConflicts.bank_conflict_way": 12.0,
+        "SharedMemoryConflicts.conflict_wavefront_pct": 77.78
+      }
+    },
+    "strategy_title": "tl.make_block_ptr TMA Fails When Grid Too Small",
+    "strategy_description": "Replacing scalar pointer arithmetic loads with tl.make_block_ptr descriptors (TMA) combined with BLOCK_K reduction (128\u219232) and BLOCK_N increase (32\u219264) reduced warp cycles per instruction (12.1\u21927.3) and shared memory bank conflict severity (17-way\u219212-way), but nearly doubled executed instruction count (973K\u21921895K) due to 4x more k-loop iterations. The achieved occupancy remained unchanged at ~6.25% despite theoretical occupancy improving from 25% to 43.75%, confirming the bottleneck is grid undersizing (32 blocks on 132 SMs), not latency. When the grid is severely undersized, the instruction overhead from more loop iterations dominates any per-iteration latency improvement, causing regression (63.33 \u00b5s \u2192 74.21 \u00b5s, 0.86x).",
+    "slow_pseudocode": "BLOCK_K = 128; BLOCK_N = 32\nfor k_idx in range(0, K//BLOCK_K):  # 10 iters\n    a = tl.load(A + scalar_ptr_arith)\n    b = tl.load(B + scalar_ptr_arith)\n    acc += tl.dot(a, b)",
+    "fast_pseudocode": "BLOCK_K = 32; BLOCK_N = 64\na_block_ptr = tl.make_block_ptr(A, shape=(M,K), strides=(stride_am,stride_ak), ...)\nb_block_ptr = tl.make_block_ptr(B, shape=(K,N), strides=(stride_bk,stride_bn), ...)\nfor k_idx in tl.range(0, K//BLOCK_K, num_stages=3):  # 40 iters\n    a = tl.load(a_block_ptr, boundary_check=(0,1), padding_option='zero')\n    b = tl.load(b_block_ptr, boundary_check=(0,1), padding_option='zero')\n    acc += tl.dot(a, b)\n    a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))\n    b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))",
+    "applicable_when": "Never beneficial in this form. In general, tl.make_block_ptr TMA is beneficial when: (1) the grid is large enough to fill SMs (waves_per_sm >= 0.5), (2) BLOCK_K is not simultaneously reduced (keeping iteration count stable), and (3) the bank conflict is the dominant bottleneck without a compensating instruction count explosion.",
+    "do_not_apply_when": "Grid is severely undersized (waves_per_sm < 0.1, grid_size << sm_count). When BLOCK_K is simultaneously reduced to use TMA, the 4x increase in loop iterations nearly doubles total instruction count. The achieved occupancy does not improve despite better theoretical occupancy, so the extra instructions are not hidden. The combination of tl.make_block_ptr + BLOCK_K reduction + num_stages in a tiny-grid kernel consistently causes regression (this is the third iteration showing this pattern).",
+    "framework_notes": "In Triton on Hopper, tl.make_block_ptr compiles to cp.async.bulk TMA instructions. However, if BLOCK_K is reduced simultaneously to fit TMA tile constraints, the k-loop iteration count multiplies proportionally, negating the per-iteration latency benefit. The bank conflict severity did decrease (17-way\u219212-way) but was not eliminated, and the instruction count increase dominated. Registers per thread also increased (66\u219272) due to block_ptr state tracking."
+  },
+  {
+    "item_id": "e4b2c7d9",
+    "iteration": 3,
+    "speedup": 0.8676,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "load_b_transposed_in_registers_to_eliminate_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 63.33,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 94938.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.12,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.24,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 49.15,
+        "Launch Statistics.Registers Per Thread": 66.0,
+        "Instruction Statistics.Executed Instructions": 973120.0,
+        "Memory Workload Analysis.L2 Hit Rate": 15.78,
+        "Memory Workload Analysis.Memory Throughput": 85.95
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 73.18,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 109752.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.49,
+        "Occupancy.Theoretical Occupancy": 43.75,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Shared Mem": 7.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 20.48,
+        "Launch Statistics.Registers Per Thread": 72.0,
+        "Instruction Statistics.Executed Instructions": 1819552.0,
+        "Memory Workload Analysis.L2 Hit Rate": 44.04,
+        "Memory Workload Analysis.Memory Throughput": 108.21
+      }
+    },
+    "strategy_title": "Register-Transpose B Load Does Not Help Undersized Grids",
+    "strategy_description": "Loading the B matrix as [BLOCK_N, BLOCK_K] (K in fast dim) followed by tl.trans() to get [BLOCK_K, BLOCK_N] for tl.dot was intended to eliminate 12-way shared memory bank conflicts. While warp cycles per instruction improved (12.1\u21927.5) and shared memory usage dropped (49\u219220 KB), the change was bundled with a BLOCK_K reduction (128\u219232) and num_stages=3 pipelining, which nearly doubled the executed instruction count (973K\u21921820K) and increased register pressure (66\u219272 registers/thread). The achieved occupancy remained stuck at ~6.25% (grid of 32 blocks on 132 SMs), so the extra instruction overhead dominated and duration increased from 63.33 \u00b5s to 73.18 \u00b5s (0.87x). When the grid is severely undersized, reducing BLOCK_K to enable register-transpose loads multiplies loop iterations without improving SM utilization, causing net regression regardless of bank-conflict reduction.",
+    "slow_pseudocode": "BLOCK_K = 128\nBLOCK_N = 32\nfor k_idx in range(0, tl.cdiv(K, BLOCK_K)):  # 10 iters\n    a = tl.load(A + a_k_vals + 1280*offs_a_m[:,None])  # [BLOCK_M, BLOCK_K]\n    b = tl.load(B + b_k_vals + offs_b_n[None,:]*1280)  # [BLOCK_K, BLOCK_N] bank-conflicting\n    acc += tl.dot(a, b, ...)",
+    "fast_pseudocode": "BLOCK_K = 32\nBLOCK_N = 64\nfor k_idx in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=3):  # 40 iters\n    a = tl.load(A + a_k_vals + 1280*offs_a_m[:,None])  # [BLOCK_M, BLOCK_K]\n    b_T = tl.load(B + offs_bn*1280 + offs_bk, mask=mask_b)  # [BLOCK_N, BLOCK_K] coalesced\n    b = tl.trans(b_T)  # [BLOCK_K, BLOCK_N] register shuffle\n    acc += tl.dot(a, b, ...)",
+    "applicable_when": "Never effective in this form. In general, register-transpose (load [N,K] then tl.trans) is beneficial when: (1) BLOCK_K is already small (so loop iteration count is not multiplied), (2) the grid is large enough to fill SMs (waves_per_sm >= 1), and (3) bank conflicts are the dominant bottleneck without a co-dependent BLOCK_K change.",
+    "do_not_apply_when": "Grid is severely undersized (waves_per_sm < 0.1, grid_size << sm_count). Combining register-transpose with BLOCK_K reduction multiplies loop iterations (e.g., 128\u219232 means 4x more k-loop iterations) and total instruction count without improving achieved occupancy. The register pressure increase from num_stages pipelining further compounds the regression. Even if bank conflicts are reduced, the instruction-count overhead dominates when SMs are starved of work.",
+    "framework_notes": "In Triton, tl.trans() on a register tile is a warp-level register shuffle with no shared memory involvement. However, it requires the tile to be loaded in the transposed shape, which in this case forced a BLOCK_K reduction to keep shared memory within bounds. The combination of BLOCK_K=32 + num_stages=3 + tl.trans() increased executed instructions from 973K to 1820K (1.87x) while achieved occupancy was unchanged at 6.25%, confirming the bottleneck is grid size, not memory access pattern."
+  },
+  {
+    "item_id": "e9c33ac8",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "increase_grid_parallelism_via_smaller_block_n",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + SharedMemoryConflicts + AchievedOccupancy",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "increase_grid_parallelism_via_smaller_block_n \u2014 correctness failure",
+    "strategy_description": "Plan 'increase_grid_parallelism_via_smaller_block_n' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.367e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.335e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.321e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel is severely underutilized: only 32 blocks on 132 SMs (0.06 waves). The grid is entirely determined by ceil(M/BLOCK_M)*ceil(N/BLOCK_N) = 1*32. The M dimension is already at its minimum (ceil(10/16)=1), so BLOCK_M cannot be reduced to add grid_m blocks without correctness risk (prior attempt item 63a6cf9c failed). The only safe way to nearly double the grid is to halve BLOCK_N from 32 to 16, which doubles grid_n from 32 to 63. Critically, BLOCK_K stays at 128 \u2014 reducing it was proven to regress performance (items d7f2a891, a4f7e2b9) by multiplying k-loop iterations without improving achieved occupancy. With BLOCK_N=16: (1) grid grows from 32 to 63 blocks, covering 48% of SMs vs 24%; (2) shared memory per block shrinks \u2014 B tile goes from 128x32x4=16KB to 128x16x4=8KB, A tile stays 16x128x4=8KB, total drops from ~32KB to ~24KB, allowing more blocks/SM; (3) k-loop stays at 10 iterations, so instruction count is unchanged; (4) BLOCK_N=16 satisfies tl.dot minimum dimension requirement (16x16 minimum).",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.367e+02 > atol=0.001\nseed=42 output[0]: max_diff=1.335e+02 > atol=0.001\nseed=1337 output[0]: max_diff=1.321e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "7b1e3572",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "split_k_to_expand_grid_and_fill_sms",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + IssueSlotUtilization + HighPipeUtilization",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "split_k_to_expand_grid_and_fill_sms \u2014 correctness failure",
+    "strategy_description": "Plan 'split_k_to_expand_grid_and_fill_sms' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): ange(0, BLOCK_K)\n\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)\n\n    # Iterate over the K split: k_per_split / BLOCK_K = 160 / 32 = 5 iterations\n    for k_idx in tl.static_range(0, k_per_split // BLOCK_K):\n    ^\nAssertionError('int32[] used as tl.stat",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The GEMM is M=10, N=1000, K=1280. With BLOCK_M=16, BLOCK_N=64, the grid is only 32 blocks on 132 SMs (0.03 waves). Only 4 active warps/scheduler vs 16 maximum \u2014 86.67% of cycles have no eligible warp. All prior attempts to fix bank conflicts or pipeline depth regressed because the root cause is grid starvation, not memory access pattern. The canonical Triton solution for tiny-M GEMMs is SPLIT_K: partition the K dimension across SPLIT_K extra blocks, each computing a partial accumulation over K/SPLIT_K elements, then atomically accumulate into the output. With SPLIT_K=8, the grid becomes 32x8=256 blocks \u2014 nearly 2 full waves on 132 SMs (vs 0.03 waves). Each block does K/8=160 K-elements with BLOCK_K=32 (5 iterations), keeping instruction count low. This direction has NOT been tried before and directly addresses the diagnosed bottleneck.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): ange(0, BLOCK_K)\n\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)\n\n    # Iterate over the K split: k_per_split / BLOCK_K = 160 / 32 = 5 iterations\n    fo",
+    "framework_notes": null
+  }
+]

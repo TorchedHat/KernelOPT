@@ -1,0 +1,105 @@
+[
+  {
+    "item_id": "1eb05790",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "autotune_xblock_num_warps_for_occupancy",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "autotune_xblock_num_warps_for_occupancy \u2014 correctness failure",
+    "strategy_description": "Plan 'autotune_xblock_num_warps_for_occupancy' was applied but failed correctness. Error: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel processes 200,704 elements with XBLOCK=128, producing a grid of 1,568 CTAs across 132 SMs \u2014 only 0.74 waves. This leaves ~35% of SMs idle in the last wave and drives achieved occupancy to 53% (vs 100% theoretical). The scheduler reports 54% of cycles with no eligible warp, primarily due to L1TEX scoreboard stalls (42.7% of CPI). With only 22 registers/thread, register pressure is not the bottleneck \u2014 the block limit is warps (16/SM). Increasing XBLOCK to 512 reduces the grid to 392 CTAs but allows each CTA to issue more independent memory requests in flight, hiding L1TEX latency. Autotuning across XBLOCK in {256, 512, 1024} and num_warps in {4, 8} finds the configuration that best balances wave count, occupancy, and memory latency hiding.",
+    "do_not_apply_when": "Previous implementation failed: Correctness subprocess failed (exit 1): time-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below mig",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_autotune_xblock_register_spill_regression",
+    "iteration": 1,
+    "speedup": 0.4565,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_for_pointwise_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 22.0,
+        "Occupancy.Theoretical_Occupancy_pct": 100.0,
+        "Occupancy.Achieved_Occupancy_pct": 52.98,
+        "Launch.waves_per_sm": 0.74,
+        "GPU_SOL.Duration_us": 3.52,
+        "GPU_SOL.Compute_SM_Throughput_pct": 17.36,
+        "GPU_SOL.Memory_Throughput_pct": 9.32,
+        "Scheduler.No_Eligible_pct": 54.08,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 19.62,
+        "Instruction_Statistics.Executed_Instructions": 482944.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 58.0,
+        "Occupancy.Theoretical_Occupancy_pct": 50.0,
+        "Occupancy.Achieved_Occupancy_pct": 41.63,
+        "Launch.waves_per_sm": 2.97,
+        "GPU_SOL.Duration_us": 7.71,
+        "GPU_SOL.Compute_SM_Throughput_pct": 59.4,
+        "GPU_SOL.Memory_Throughput_pct": 13.67,
+        "Scheduler.No_Eligible_pct": 18.71,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 8.16,
+        "Instruction_Statistics.Executed_Instructions": 3626000.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK increase causes register spill and instruction explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20132048) caused the compiler to select a configuration that ballooned registers per thread from 22 to 58, cutting theoretical occupancy from 100% to 50% and achieved occupancy from 53% to 42%. Simultaneously, executed instructions exploded from ~483K to ~3.6M (7.5x), indicating the autotuner selected a configuration that unrolled far more work per thread than beneficial. Despite improving scheduler eligibility (No Eligible dropped from 54% to 19%), the net effect was a 2.2x longer kernel duration because the instruction count increase and occupancy loss outweighed the latency-hiding benefit.",
+    "slow_pseudocode": "# BEFORE: fixed small tile, low register pressure\n@triton.jit\ndef kernel(... XBLOCK: tl.constexpr):  # XBLOCK=128, 22 regs/thread\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no bounds check\n    tmp0 = tl.load(ptr + xindex, None)\n    # ... BN + residual + ReLU ...\n    tl.store(ptr + xindex, result, None)\ngrid = (cdiv(N, 128),)  # 1568 CTAs, 0.74 waves/SM",
+    "fast_pseudocode": "# AFTER (regressed): autotuned larger tile, high register pressure\n@triton.autotune(configs=[Config({'XBLOCK': 2048}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(... XBLOCK: tl.constexpr):  # selected XBLOCK=256, 58 regs/thread\n    xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel  # bounds check added\n    tmp0 = tl.load(ptr + xindex, xmask)\n    # ... BN + residual + ReLU ...\n    tl.store(ptr + xindex, result, xmask)\ngrid = lambda meta: (cdiv(N, meta['XBLOCK']),)  # dynamic grid",
+    "applicable_when": "Never apply this specific pattern when the baseline kernel already has low register pressure (<=24 regs/thread) and 100% theoretical occupancy \u2014 increasing XBLOCK via autotune risks the compiler selecting a config that causes register pressure to spike (>48 regs/thread), halving theoretical occupancy and multiplying instruction count.",
+    "do_not_apply_when": "Do not add @triton.autotune with large XBLOCK configs to pointwise kernels where: (1) baseline registers/thread is already low (<30), (2) theoretical occupancy is already at 100%, and (3) the kernel body contains many intermediate temporaries (BN normalization has ~10+ tmps). The autotune overhead and compiler register allocation for large tiles will cause instruction explosion and occupancy collapse. Also avoid when the grid is already small (<2000 CTAs) and the kernel is short (<5us) \u2014 autotune calibration cost dominates.",
+    "framework_notes": "Triton-specific: @triton.autotune with large XBLOCK forces the JIT compiler to allocate registers for all XBLOCK elements simultaneously. For kernels with many intermediate values (e.g., batch norm: ~10 temporaries), XBLOCK=2048 requires 2048*10 virtual registers, causing spilling. The winning autotune config (XBLOCK=256, 58 regs) still doubled register pressure vs baseline (XBLOCK=128, 22 regs). In CUDA, the equivalent anti-pattern is increasing thread-level loop unroll factor beyond register file capacity."
+  },
+  {
+    "item_id": "exp_001_autotune_register_pressure_regression",
+    "iteration": 1,
+    "speedup": 0.4718,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_causes_register_spill_regression",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + SOLBottleneck",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 22.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Occupancy.Theoretical Occupancy": 100.0,
+        "Occupancy.Achieved Occupancy": 52.98,
+        "Launch Statistics.Waves Per SM": 0.74,
+        "Scheduler Statistics.No Eligible": 54.08,
+        "GPU Speed Of Light Throughput.Duration": 3.52,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 17.36,
+        "Instruction Statistics.Executed Instructions": 482944.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 58.0,
+        "Launch Statistics.Block Size": 256.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 41.33,
+        "Launch Statistics.Waves Per SM": 2.97,
+        "Scheduler Statistics.No Eligible": 17.46,
+        "GPU Speed Of Light Throughput.Duration": 7.46,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 60.31,
+        "Instruction Statistics.Executed Instructions": 3588368.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK increase causes register spill and 7x instruction explosion",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20132048) caused the compiler to select XBLOCK=256 with 58 registers/thread (up from 22), cutting theoretical occupancy from 100% to 50% and achieved occupancy from 53% to 41%. More critically, executed instructions exploded from 482K to 3.6M (7.4x), indicating the larger tile triggered significant register pressure and likely loop unrolling overhead that dwarfed any latency-hiding benefit. The waves/SM improved from 0.74 to 2.97 and scheduler idle cycles dropped from 54% to 17%, but the 7x instruction count increase dominated, causing a 2.1x slowdown in wall time.",
+    "slow_pseudocode": "# Before: fixed XBLOCK=128, 22 registers/thread, 100% theoretical occupancy\n@triton.jit\ndef kernel(... XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no bounds check\n    # 5 loads + BN math + residual add + ReLU + store\n\ngrid = (triton.cdiv(xnumel, 128),)  # 1568 blocks\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# After (REGRESSED): autotune selected XBLOCK=256, 58 registers/thread, 50% theoretical occupancy\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 512},  num_warps=8),\n        triton.Config({'XBLOCK': 256},  num_warps=4),  # selected\n        triton.Config({'XBLOCK': 128},  num_warps=4),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(... XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel  # bounds check added\n    # same math but 7.4x more instructions executed\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)  # autotune picks worst config",
+    "applicable_when": "Never apply this pattern when the kernel already has low register usage (\u226424 registers/thread) and 100% theoretical occupancy \u2014 increasing XBLOCK will cause register pressure that destroys occupancy.",
+    "do_not_apply_when": "Do not add @triton.autotune with large XBLOCK configs to kernels where: (1) registers/thread is already near the limit for full occupancy (Block Limit Registers is the binding constraint), (2) the kernel body is compute-heavy enough that larger tiles cause register spill, (3) the bottleneck is low waves/SM but the kernel is already register-efficient at the current block size. The instruction count explosion (7x here) is a strong signal that the autotune selected a config that triggered unrolling/spill overhead.",
+    "framework_notes": "In Triton, @triton.autotune with large XBLOCK values causes the compiler to unroll loops and allocate more registers. When registers/thread jumps from 22 to 58, Block Limit Registers drops from 21 to 4 blocks/SM, halving theoretical occupancy. The xmask bounds-check change (from tl.full True to xindex < xnumel) also adds predication overhead across all loads/stores when XBLOCK does not evenly divide the problem size \u2014 though in this case all configs divided evenly, so this was not the cause."
+  }
+]

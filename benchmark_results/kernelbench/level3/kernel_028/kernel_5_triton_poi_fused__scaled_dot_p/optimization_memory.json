@@ -1,0 +1,168 @@
+[
+  {
+    "item_id": "exp_001_autotune_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.774,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_increase_tile_size",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.75,
+        "Occupancy.achieved_occupancy_pct": 53.15,
+        "GPU_SOL.compute_throughput_pct": 10.05,
+        "GPU_SOL.memory_throughput_pct": 7.21,
+        "GPU_SOL.duration_us": 3.39,
+        "Scheduler.no_eligible_pct": 68.16,
+        "Launch.block_size": 128.0,
+        "Launch.registers_per_thread": 16.0,
+        "Instruction.executed_instructions": 277376.0
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 1.49,
+        "Occupancy.achieved_occupancy_pct": 69.01,
+        "GPU_SOL.compute_throughput_pct": 41.65,
+        "GPU_SOL.memory_throughput_pct": 20.71,
+        "GPU_SOL.duration_us": 4.38,
+        "Scheduler.no_eligible_pct": 26.16,
+        "Launch.block_size": 256.0,
+        "Launch.registers_per_thread": 30.0,
+        "Instruction.executed_instructions": 1464096.0
+      }
+    },
+    "strategy_title": "Increasing tile size via autotune caused register spill regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (256\u20132048) selected a 256-thread block that nearly doubled register usage (16\u219230 registers/thread), which constrained occupancy and caused the Block Limit Registers and Block Limit Warps to drop from 32 to 8 blocks/SM. Although scheduler idle cycles improved (68%\u219226%) and compute SOL rose (10%\u219242%), the executed instruction count exploded 5.3x (277K\u21921.46M) due to uncoalesced global accesses (50% excessive sectors flagged by UncoalescedGlobalAccess rule) introduced by the larger tile stride pattern, and the kernel duration increased from 3.39\u00b5s to 4.38\u00b5s. When the original kernel is already register-efficient (16 regs/thread) and the bottleneck is grid size rather than per-CTA work, increasing XBLOCK can cause the autotuner to select a config that trades register pressure for throughput in a way that is net-negative due to uncoalesced access patterns at larger strides.",
+    "slow_pseudocode": "# BEFORE: fixed small tile, low register pressure\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK  # XBLOCK=128\n    xindex = xoffset + tl.arange(0, XBLOCK)\n    xmask = xindex < xnumel\n    # complex strided index arithmetic for x0, x1, x2, x4\n    tmp0 = tl.load(in_ptr0 + (512 + x0), xmask, eviction_policy='evict_last')\n    tmp1 = tl.load(in_ptr1 + (512 + x0 + 1536*x1 + 302592*x2 + ...), xmask)\n    tl.store(out_ptr0 + x4, tmp0 + tmp1, xmask)\n\ngrid = (triton.cdiv(xnumel, 128),)  # 1576 CTAs",
+    "fast_pseudocode": "# AFTER: autotune selected XBLOCK=256, doubled registers, uncoalesced accesses\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 512},  num_warps=8),\n        triton.Config({'XBLOCK': 256},  num_warps=4),  # <-- selected\n        triton.Config({'XBLOCK': 128},  num_warps=4),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    # same body, but XBLOCK=256 \u2192 30 regs/thread, block_limit_regs=8\n    ...\n\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)  # 788 CTAs at XBLOCK=256",
+    "applicable_when": "Never: this specific strategy caused regression. In general, autotune over XBLOCK is applicable when the kernel has low register usage (<20 regs/thread), the grid is small (<1 wave), and the memory access pattern is coalesced so larger tiles don't introduce stride-induced uncoalesced accesses.",
+    "do_not_apply_when": "The kernel uses complex multi-dimensional strided index arithmetic (e.g., x0 + stride*x1 + large_stride*x2) where increasing XBLOCK causes threads within a warp to access non-contiguous memory addresses, triggering UncoalescedGlobalAccess. Also avoid when the kernel already has low register count (\u226416 regs/thread) and increasing block size would push registers/thread above ~24, reducing Block Limit Registers and capping occupancy. Do not apply when the instruction count increase from larger tiles outweighs the latency-hiding benefit.",
+    "framework_notes": "In Triton, @triton.autotune explores configs at first call, adding overhead. The autotuner selected XBLOCK=256 (not the largest), suggesting the tuning signal itself was misleading for this kernel shape. The Block Limit Registers dropped from 32 to 8 at XBLOCK=256 with 30 regs/thread, indicating the register file became the binding occupancy constraint."
+  },
+  {
+    "item_id": "exp_001_autotune_xblock_pointwise",
+    "iteration": 1,
+    "speedup": 1.0796,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_for_small_grid_pointwise_kernels",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + IssueSlotUtilization + CPIStall",
+      "key_metric_before": {
+        "Launch.waves_per_sm": 0.75,
+        "Occupancy.Achieved Occupancy": 53.15,
+        "Scheduler Statistics.One or More Eligible": 31.84,
+        "Scheduler Statistics.No Eligible": 68.16,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 26.96,
+        "GPU Speed Of Light Throughput.Duration": 3.39,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5037.0,
+        "Compute Workload Analysis.Executed Ipc Active": 1.15,
+        "Compute Workload Analysis.Issue Slots Busy": 31.17
+      },
+      "key_metric_after": {
+        "Launch.waves_per_sm": 0.75,
+        "Occupancy.Achieved Occupancy": 45.66,
+        "Scheduler Statistics.One or More Eligible": 43.43,
+        "Scheduler Statistics.No Eligible": 56.57,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.12,
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4650.0,
+        "Compute Workload Analysis.Executed Ipc Active": 1.55,
+        "Compute Workload Analysis.Issue Slots Busy": 41.57
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Reduce L1TEX Stalls in Pointwise Kernels",
+    "strategy_description": "For small-grid pointwise Triton kernels where the scheduler shows high 'No Eligible' warp percentage (>60%) and significant L1TEX stall cycles (CPIStall rule triggered), adding @triton.autotune over larger XBLOCK values (512, 1024, 2048) with varying num_warps allows the runtime to select a tile size that improves instruction-level parallelism and hides memory latency. The key improvement is in Warp Cycles Per Issued Instruction (27.0 \u2192 17.1) and Issue Slots Busy (31% \u2192 42%), reflecting better latency hiding within each CTA even though waves_per_sm and achieved occupancy did not improve as predicted. The grid size and launch configuration remain unchanged at the call site; autotune injects the optimal XBLOCK automatically.",
+    "slow_pseudocode": "@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # load, compute, store\n    ...\n\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., xnumel, XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512},  num_warps=4),\n        triton.Config({'XBLOCK': 512},  num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=4),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=16),\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 2048}, num_warps=16),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # load, compute, store (UNCHANGED)\n    ...\n\n# Call site: no XBLOCK kwarg; autotune injects it\ngrid = (triton.cdiv(xnumel, 128),)  # grid lambda not strictly needed; autotune handles\nkernel[grid](..., xnumel)  # XBLOCK omitted",
+    "applicable_when": "Triton pointwise kernel with: (1) waves_per_sm < 1.0, (2) No Eligible warp % > 50%, (3) CPIStall rule triggered with L1TEX stall > 30% of cycles, (4) Issue Slots Busy < 40%, (5) kernel body is simple elementwise ops with no shared memory. The autotune benefit comes from larger XBLOCK increasing ILP to hide memory latency.",
+    "do_not_apply_when": "Kernel uses shared memory sized to XBLOCK (larger XBLOCK would exceed smem limits); kernel has complex control flow or data-dependent branching that makes larger tiles inefficient; grid is already large (waves_per_sm > 2) so occupancy is not the bottleneck; XBLOCK increase would cause register spilling that hurts performance more than ILP helps.",
+    "framework_notes": "Triton-specific: @triton.autotune must be placed above @triton.jit. The key=['xnumel'] ensures autotune re-runs when problem size changes. When autotune is used, XBLOCK must NOT be passed as a kwarg at the call site \u2014 autotune injects it. The grid lambda should use meta['XBLOCK'] for correctness: lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),). Note: in this case the call site still used the old fixed grid=(triton.cdiv(xnumel,128),) which is a minor implementation flaw but autotune still selected a valid config."
+  },
+  {
+    "item_id": "exp_autotune_xblock_pointwise_underutilized_001",
+    "iteration": 1,
+    "speedup": 1.0796,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_xblock_for_underutilized_pointwise_kernel",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + SOLBottleneck",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 5037.0,
+        "GPU Speed Of Light Throughput.Duration": 3.39,
+        "Scheduler Statistics.No Eligible": 68.16,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.32,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 26.96,
+        "Compute Workload Analysis.Issue Slots Busy": 31.17,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Occupancy.Achieved Occupancy": 53.15
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4647.0,
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "Scheduler Statistics.No Eligible": 57.76,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.74,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.32,
+        "Compute Workload Analysis.Issue Slots Busy": 41.04,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Occupancy.Achieved Occupancy": 45.77
+      }
+    },
+    "strategy_title": "Autotune XBLOCK to Reduce Scheduler Idle Cycles",
+    "strategy_description": "For small pointwise Triton kernels where the scheduler No-Eligible rate exceeds ~60% and Warp Cycles Per Issued Instruction is high (>20), the dominant bottleneck is insufficient independent memory operations per CTA to hide L1TEX latency. Adding @triton.autotune with larger XBLOCK configs (512\u20132048) and varied num_warps allows the runtime to select a tile size that gives each CTA more independent loads, reducing warp stall cycles and raising Issue Slots Busy. In this case, elapsed cycles dropped from 5037 to 4647 (~8%) and Warp Cycles Per Issued Instruction fell from 27.0 to 17.3, with Issue Slots Busy rising from 31% to 41%, despite waves_per_sm remaining at 0.75 (grid-size-limited).",
+    "slow_pseudocode": "@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # load, compute, store\n    ...\n\n# launch\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 512},  num_warps=4),\n        triton.Config({'XBLOCK': 512},  num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=4),\n        triton.Config({'XBLOCK': 1024}, num_warps=8),\n        triton.Config({'XBLOCK': 1024}, num_warps=16),\n        triton.Config({'XBLOCK': 2048}, num_warps=8),\n        triton.Config({'XBLOCK': 2048}, num_warps=16),\n    ],\n    key=['xnumel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # load, compute, store \u2014 UNCHANGED\n    ...\n\n# launch (grid uses autotuned meta)\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](...)",
+    "applicable_when": "Triton pointwise kernel with: waves_per_sm < 1.5, Scheduler No-Eligible > 50%, Warp Cycles Per Issued Instruction > 20, CPIStall dominated by L1TEX latency, and XBLOCK fixed at a small value (e.g. 128) relative to total elements (>100K). The kernel body is purely elementwise with no shared memory or inter-warp dependencies.",
+    "do_not_apply_when": "Kernel is already memory-bandwidth-bound (Memory SOL > 60%) or compute-bound (Compute SOL > 60%); increasing XBLOCK would not help and may hurt occupancy. Also avoid if the kernel uses shared memory sized to XBLOCK, as larger tiles would exhaust SMEM and reduce occupancy. Do not apply if the grid is already large (waves_per_sm > 2) \u2014 the bottleneck is elsewhere.",
+    "framework_notes": "Triton-specific: @triton.autotune must wrap @triton.jit; the grid must be a lambda using meta['XBLOCK'] rather than a fixed tuple. The kernel body and xmask guard (xindex < xnumel) must remain unchanged. In CUDA, the equivalent is launching with larger block sizes and using cudaOccupancyMaxPotentialBlockSize or manual tuning."
+  },
+  {
+    "item_id": "exp_002_persistent_tile_scheduling_regression",
+    "iteration": 2,
+    "speedup": 0.5825,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.14,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4650.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Launch Statistics.Registers Per Thread": 18.0,
+        "Occupancy.Achieved Occupancy": 45.66,
+        "Scheduler Statistics.No Eligible": 56.57,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.79,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 17.12,
+        "Compute Workload Analysis.Issue Slots Busy": 41.57,
+        "Instruction Statistics.Executed Instructions": 312048.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 22.17,
+        "Memory Workload Analysis.L2 Hit Rate": 55.07
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 5.82,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 8635.0,
+        "Launch Statistics.Waves Per SM": 0.75,
+        "Launch Statistics.Grid Size": 1576.0,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Occupancy.Achieved Occupancy": 52.49,
+        "Scheduler Statistics.No Eligible": 40.8,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 2.15,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.99,
+        "Compute Workload Analysis.Issue Slots Busy": 57.74,
+        "Instruction Statistics.Executed Instructions": 1359712.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 67.48,
+        "Memory Workload Analysis.L2 Hit Rate": 76.26
+      }
+    },
+    "strategy_title": "Persistent while-loop scheduling caused 4.4x instruction explosion",
+    "strategy_description": "Converting a single-tile-per-CTA Triton kernel to a persistent while-loop (grid=132 SMs, each CTA iterates over ~12 tiles) caused a severe regression: executed instructions exploded 4.4x (312K \u2192 1.36M) and kernel duration nearly doubled (3.14\u00b5s \u2192 5.82\u00b5s). Despite improved L1 hit rate (22% \u2192 67%) and L2 hit rate (55% \u2192 76%) from better cache reuse across persistent iterations, the while-loop branch overhead and serialized tile processing within each CTA dominated. The grid size remained at 1576 (the call site was not updated to 132), meaning the persistent loop ran on top of the original grid rather than replacing it, compounding the instruction count. Even if the grid had been corrected, the kernel body is too short (3.14\u00b5s, ~4650 cycles) for persistent scheduling to amortize its overhead \u2014 the per-tile loop control cost exceeds the latency-hiding benefit for such small, fast kernels.",
+    "slow_pseudocode": "# BEFORE: one tile per CTA, simple dispatch\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    xmask = xindex < xnumel\n    # index arithmetic, 2 loads, 1 add, 1 store\n    tl.store(out_ptr0 + x4, tmp0 + tmp1, xmask)\n\ngrid = (triton.cdiv(xnumel, 128),)  # 1576 CTAs",
+    "fast_pseudocode": "# AFTER: persistent while-loop (REGRESSED)\n@triton.jit\ndef kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):\n    total_tiles = tl.cdiv(xnumel, XBLOCK)\n    tile_id = tl.program_id(0)\n    while tile_id < total_tiles:  # each CTA processes ~12 tiles\n        xoffset = tile_id * XBLOCK\n        xindex = xoffset + tl.arange(0, XBLOCK)[:]\n        xmask = xindex < xnumel\n        # same index arithmetic, 2 loads, 1 add, 1 store\n        tl.store(out_ptr0 + x4, tmp0 + tmp1, xmask)\n        tile_id += 132  # stride by NUM_SM\n\ngrid = (triton.cdiv(xnumel, 128),)  # BUG: grid not reduced to 132",
+    "applicable_when": "Never for this kernel. In general, persistent scheduling is applicable when: (1) the kernel duration is long (>50\u00b5s) so loop overhead is amortized, (2) there is significant inter-tile shared state (e.g., reduction accumulators, shared memory reuse) that benefits from keeping data in registers/L1 across tiles, and (3) the grid is large enough that wave fragmentation wastes >20% of SM time.",
+    "do_not_apply_when": "The kernel is a short-duration elementwise pointwise kernel (<10\u00b5s). The while-loop branch overhead and serialized tile execution within each CTA will dominate over any wave-tail savings. Also avoid when the call site grid is not simultaneously reduced to match the persistent CTA count \u2014 leaving the original grid size causes each CTA to redundantly iterate over all tiles, multiplying instruction count by the tile-per-CTA count. Do not apply when the kernel has no inter-tile shared state (no shared memory, no register-resident accumulators) since there is no reuse benefit to justify the loop overhead.",
+    "framework_notes": "In Triton, persistent scheduling requires: (1) grid reduced to exactly NUM_SM CTAs, (2) tile_id initialized to tl.program_id(0) and incremented by NUM_SM each iteration, (3) the call site must pass XBLOCK explicitly since @triton.autotune is removed. A critical implementation flaw in this attempt: the call site grid was NOT changed from (triton.cdiv(xnumel, 128),) = 1576 to (132,), so 1576 CTAs each ran the while-loop, causing massive redundant work. Even with a correct grid=132, the kernel is too short for persistent scheduling to be beneficial."
+  }
+]

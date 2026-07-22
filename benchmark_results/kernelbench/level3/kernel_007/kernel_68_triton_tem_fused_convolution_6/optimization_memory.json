@@ -1,0 +1,202 @@
+[
+  {
+    "item_id": "exp_001_autotune_num_stages_only_regression",
+    "iteration": 1,
+    "speedup": 0.8266,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_num_stages_only_without_tile_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 33.41,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 50078.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.58,
+        "Compute Workload Analysis.Executed Ipc Active": 0.53,
+        "Memory Workload Analysis.Memory Throughput": 126.29,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Instruction Statistics.Executed Instructions": 1535856.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 40.42,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 60584.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.55,
+        "Compute Workload Analysis.Executed Ipc Active": 0.42,
+        "Memory Workload Analysis.Memory Throughput": 104.36,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Instruction Statistics.Executed Instructions": 1457240.0
+      }
+    },
+    "strategy_title": "Autotuning num_stages alone without tile changes causes regression",
+    "strategy_description": "Adding @triton.autotune that only varies num_warps and num_stages (without changing BLOCK_M/BLOCK_N/BLOCK_K tile sizes) caused a 21% slowdown: elapsed cycles increased from 50078 to 60584, warp cycles per issued instruction worsened from 7.58 to 9.55, and achieved occupancy remained unchanged at 6.25%. The bank conflict count (SharedMemoryConflicts) was also unchanged because the B-matrix index fix in the diff (removing the broadcast_to indirection) did not actually eliminate the underlying strided access pattern \u2014 the mathematical index idx_m + 528*idx_n still strides by 528 in the n-dimension, so bank conflicts persisted. The autotune overhead and potentially suboptimal num_stages selection added latency without any compensating benefit.",
+    "slow_pseudocode": "# Before: hardcoded block sizes, no autotune\n@triton.jit\ndef kernel(...):\n    BLOCK_M = 32  # constexpr\n    BLOCK_N = 32  # constexpr\n    BLOCK_K = 32  # constexpr\n    b = tl.load(B + tl.broadcast_to(idx_m + 528*idx_n, [BLOCK_K, BLOCK_N]), mask=b_mask)",
+    "fast_pseudocode": "# Attempted: autotune num_stages/num_warps only, remove broadcast_to\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=4),\n        triton.Config({}, num_warps=4, num_stages=5),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    # BLOCK_M/N/K still hardcoded at 32 inside kernel\n    b = tl.load(B + (idx_m + 528 * idx_n), mask=b_mask)  # same math, different syntax",
+    "applicable_when": "Never \u2014 this specific combination (autotune only num_stages/num_warps with fixed small tiles, no actual access pattern fix) is always a regression when the kernel is already latency-bound with low occupancy.",
+    "do_not_apply_when": "When the kernel has low achieved occupancy (<<10%) and small grid (waves_per_sm << 0.5): autotuning num_stages alone cannot increase occupancy or fix bank conflicts. Do not apply when BLOCK sizes are not included in the autotune config keys \u2014 the autotune overhead is paid without any tile-size benefit. Do not apply when the B-matrix bank conflict root cause is a stride-528 access pattern: removing broadcast_to without changing the underlying stride does not fix the conflict.",
+    "framework_notes": "In Triton, @triton.autotune with empty config dicts (only num_warps/num_stages varying) does not change tile sizes. The key=[] means autotune runs once and caches \u2014 but the selected config may be worse than the original if the kernel is not pipelineable. The broadcast_to removal was a no-op for bank conflicts because the mathematical index idx_m + 528*idx_n still produces the same strided access pattern; the conflict comes from the stride value (528), not the broadcast syntax."
+  },
+  {
+    "item_id": "755afb1e",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "promote_tile_sizes_to_constexpr_args_and_autotune_with_tile_variation",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + AchievedOccupancy + LaunchConfiguration + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "promote_tile_sizes_to_constexpr_args_and_autotune_with_tile_variation \u2014 correctness failure",
+    "strategy_description": "Plan 'promote_tile_sizes_to_constexpr_args_and_autotune_with_tile_variation' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.092e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.011e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has two compounding problems: (1) Only 62 blocks for 132 SMs means most SMs are idle (0.06 waves/SM). (2) The B-matrix is loaded with a stride-528 access pattern (K=528, non-power-of-2) causing 12-way shared memory bank conflicts that account for 58.6% of all stall cycles. All prior optimization attempts failed because they used @triton.autotune with empty config dicts ({}) \u2014 BLOCK_M/BLOCK_N/BLOCK_K remained hard-coded as constants inside the kernel body, so the autotune could not actually vary tile sizes. The fix requires: (a) promoting BLOCK_M, BLOCK_N, BLOCK_K to tl.constexpr kernel arguments, (b) including them in the autotune config dicts, and (c) exploring larger BLOCK_K values (64, 128) to change the shared memory access pattern and reduce bank conflicts, plus smaller BLOCK_M/BLOCK_N to increase grid parallelism.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.092e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.011e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_002_transposed_b_load_with_autotune_stages_regression",
+    "iteration": 2,
+    "speedup": 0.7616,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "transposed_b_load_tl_trans_with_autotune_stages_only",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 33.47,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 50149.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.6,
+        "Scheduler Statistics.No Eligible": 86.86,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Memory Workload Analysis.Memory Throughput": 126.04,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Launch Statistics.Registers Per Thread": 64.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 43.87,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 65764.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 10.27,
+        "Scheduler Statistics.No Eligible": 90.23,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Memory Workload Analysis.Memory Throughput": 96.16,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8.19,
+        "Launch Statistics.Registers Per Thread": 62.0
+      }
+    },
+    "strategy_title": "Transposed B load via tl.trans() with autotune stages regresses",
+    "strategy_description": "Replacing the strided B-matrix load with a transposed load ([BLOCK_N, BLOCK_K] shape followed by tl.trans()) while simultaneously adding @triton.autotune varying only num_warps/num_stages (empty config dicts, no tile size changes) caused a 24% slowdown: elapsed cycles increased from 50149 to 65764 and warp cycles per issued instruction worsened from 7.6 to 10.27. Critically, the SharedMemoryConflicts rule still fired with the same 12-way bank conflict count and 77.78% of shared load wavefronts as conflicts \u2014 meaning the tl.trans() approach did NOT eliminate the bank conflicts as intended. The autotune overhead (empty config dicts, no BLOCK_M in dict) compounded the regression without providing any tile-size benefit, mirroring the pattern from prior failed iterations.",
+    "slow_pseudocode": "# BEFORE: strided B load, no autotune\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 32\n    # B load: [BLOCK_K, BLOCK_N] strided in N-dim (stride=528, 528 mod 32=16 -> 16-way conflict)\n    idx_m = offs_k[:, None] + (k_idx * BLOCK_K)  # [BLOCK_K, 1]\n    idx_n = offs_b_n[None, :]                      # [1, BLOCK_N]\n    b = tl.load(B + (idx_m + 528 * idx_n), mask=b_mask, other=0.0)",
+    "fast_pseudocode": "# ATTEMPTED (caused regression): transposed B load + autotune stages only\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=2),\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=3),\n        triton.Config({}, num_warps=4, num_stages=4),\n        triton.Config({}, num_warps=8, num_stages=4),\n        triton.Config({}, num_warps=4, num_stages=5),\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    BLOCK_M: tl.constexpr = 32  # still hard-coded!\n    # Transposed B load: [BLOCK_N, BLOCK_K] then tl.trans()\n    rn_col = offs_b_n[:, None]                      # [BLOCK_N, 1]\n    rk_row = offs_k[None, :] + (k_idx * BLOCK_K)   # [1, BLOCK_K]\n    b_mask_T = rk_row < K\n    b_T = tl.load(B + (rk_row + 528 * rn_col),     # [BLOCK_N, BLOCK_K]\n                  mask=b_mask_T, other=0.0)\n    b = tl.trans(b_T)                               # [BLOCK_K, BLOCK_N]",
+    "applicable_when": "Never \u2014 this specific combination (tl.trans() transposed load + autotune only num_warps/num_stages with empty config dicts + BLOCK_M still hard-coded) is always a regression when the kernel is already latency-bound with low occupancy and persistent bank conflicts.",
+    "do_not_apply_when": "Do not apply tl.trans() as a bank-conflict fix when: (1) the bank conflict count in NCU remains unchanged after the transformation (verify SharedMemoryConflicts wavefront counts before concluding the fix worked), (2) autotune config dicts are empty (no tile sizes included), and (3) BLOCK_M is still hard-coded inside the kernel body. The tl.trans() approach may not eliminate shared memory bank conflicts if the transposed layout still maps to conflicting banks \u2014 the mathematical index rk_row + 528*rn_col still strides by 528 in the N-dimension during the global load, and the resulting shared memory layout after tl.trans() may still conflict.",
+    "framework_notes": "In Triton, tl.trans() transposes a tensor in registers, but the bank conflict behavior depends on how the data is laid out in shared memory after the load, not just the global memory access pattern. If the transposed load (rk_row + 528*rn_col) still results in a strided shared memory layout with the same conflict-inducing stride, tl.trans() alone will not fix the bank conflicts. NCU confirmed: SharedMemoryConflicts still showed 12-way conflicts and 77.78% of wavefronts as conflicts after the tl.trans() change. The autotune with empty config dicts (no BLOCK_M in dict) is the same anti-pattern as exp_001."
+  },
+  {
+    "item_id": "0797ea5b",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "promote_tile_sizes_to_constexpr_args_and_autotune_correctly",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + SharedMemoryConflicts + AchievedOccupancy + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "promote_tile_sizes_to_constexpr_args_and_autotune_correctly \u2014 correctness failure",
+    "strategy_description": "Plan 'promote_tile_sizes_to_constexpr_args_and_autotune_correctly' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.092e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.011e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "Two compounding problems: (1) Only 62 blocks for 132 SMs -> 0.06 waves/SM, most SMs idle. (2) B-matrix loaded with stride-528 (non-power-of-2) causing 12-way shared memory bank conflicts that dominate 74.3% of stall cycles. The fix requires: (a) promoting BLOCK_M, BLOCK_N, BLOCK_K to tl.constexpr kernel arguments so autotune can vary them, (b) including them in autotune config dicts, (c) exploring smaller BLOCK_M (e.g. 16) to increase grid size from 62 to ~123 blocks, and (d) exploring BLOCK_K values (16, 32, 64) to change the shared memory access stride and reduce bank conflicts. Prior autotune attempts failed because config dicts were empty (tiles stayed hard-coded at 32). The correctness failure in item 755afb1e was an implementation flaw - the grid computation and index arithmetic must be updated consistently when tile sizes become runtime constexpr args.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.092e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.011e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "79ec0751",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "promote_tile_sizes_to_constexpr_args_fix_dynamic_grid_and_autotune",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "LaunchConfiguration + AchievedOccupancy + SharedMemoryConflicts + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "promote_tile_sizes_to_constexpr_args_fix_dynamic_grid_and_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'promote_tile_sizes_to_constexpr_args_fix_dynamic_grid_and_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.303e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.022e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel has two compounding problems: (1) Only 62 blocks for 132 SMs yields 0.06 waves/SM, leaving most SMs idle. (2) 12-way shared memory bank conflicts (K=528, non-power-of-2 stride) cause 59.5% of all stall cycles. All prior autotune attempts failed because BLOCK_M/BLOCK_N/BLOCK_K are hard-coded constants inside the kernel body \u2014 autotune configs with empty dicts ({}) cannot change them. The previous tile-promotion attempt (item 755afb1e) failed correctness because the grid launch remained hard-coded at (62, 1, 1) while tile sizes changed, causing out-of-bounds writes and wrong results. The fix requires: (a) promoting BLOCK_M, BLOCK_N, BLOCK_K to tl.constexpr kernel arguments, (b) including them in autotune config dicts, (c) making the grid launch DYNAMIC via a lambda based on BLOCK_M and BLOCK_N, and (d) exploring smaller tiles (16x16, 16x32) to increase grid parallelism.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.303e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.022e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "41295b47",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "promote_tile_sizes_to_constexpr_args_with_dynamic_grid_lambda_and_correct_autotune",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + LaunchConfiguration + AchievedOccupancy + CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "promote_tile_sizes_to_constexpr_args_with_dynamic_grid_lambda_and_correct_autotune \u2014 correctness failure",
+    "strategy_description": "Plan 'promote_tile_sizes_to_constexpr_args_with_dynamic_grid_lambda_and_correct_autotune' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=9.092e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.011e+02 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "Two compounding bottlenecks: (1) Only 62 blocks for 132 SMs -> 0.06 waves/SM, most SMs idle. (2) 12-way shared memory bank conflicts from the B-matrix stride of 528 (non-power-of-2: 528=16x33) causing 74.3% of all stall cycles. All prior autotune attempts failed because BLOCK_M/BLOCK_N/BLOCK_K are hard-coded constants inside the kernel body -- autotune configs with empty dicts ({}) cannot change them. Prior tile-promotion attempts (items 755afb1e, 0797ea5b, 79ec0751) failed correctness because the grid launch remained hard-coded at (62, 1, 1) while tile sizes changed, causing out-of-bounds writes. The fix requires: (a) promoting BLOCK_M, BLOCK_N, BLOCK_K to tl.constexpr kernel arguments, (b) including them in autotune config dicts, (c) making the grid launch DYNAMIC via a lambda that recomputes ceil(M/BLOCK_M)*ceil(N/BLOCK_N) at runtime, and (d) exploring BLOCK_K=16 to reduce bank conflicts.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=9.092e+01 > atol=0.001\nseed=42 output[0]: max_diff=9.517e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.011e+02 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_004_maxnreg_only_regression",
+    "iteration": 4,
+    "speedup": 0.8564,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_maxnreg_only_without_tile_changes",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 32.83,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 49215.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 0.63,
+        "Memory Workload Analysis.L2 Hit Rate": 25.02,
+        "Instruction Statistics.Executed Instructions": 1497168.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.65
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 39.01,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 58504.0,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Theoretical Occupancy": 81.25,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Block Limit Registers": 16.0,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 66.64,
+        "Memory Workload Analysis.L2 Hit Rate": 70.36,
+        "Instruction Statistics.Executed Instructions": 1778896.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.72
+      }
+    },
+    "strategy_title": "maxnreg register cap alone regresses when grid is undersized",
+    "strategy_description": "Adding maxnreg=32 to autotune configs successfully reduced registers per thread from 64 to 32 and improved theoretical occupancy from 50% to 81.25% (Block Limit Registers doubled from 8 to 16), but achieved occupancy remained stuck at 6.25% because the grid (62 blocks, 0.04 waves/SM) is still far too small to fill 132 SMs. The register reduction caused register spilling to local memory, evidenced by new MemoryCacheAccessPattern rules firing for uncoalesced local loads/stores (33.45% speedup potential each) and a 19% increase in executed instructions (1.497M to 1.779M). The L1 hit rate jumped from 0.63% to 66.64% and L2 hit rate from 25% to 70%, indicating the spilled registers are being served from cache rather than DRAM, but the extra instruction overhead still increased elapsed cycles from 49215 to 58504 (+19%). Reducing maxnreg below the compiler's natural register usage causes spilling that outweighs any occupancy benefit when the kernel is already grid-bound.",
+    "slow_pseudocode": "# BEFORE: 64 registers/thread, no maxnreg\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3),\n        triton.Config({}, num_warps=8, num_stages=3),\n        # ... 8 configs, no maxnreg\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    # registers_per_thread=64, Block Limit Registers=8, theoretical_occupancy=50%",
+    "fast_pseudocode": "# ATTEMPTED (caused regression): maxnreg=32 to reduce register pressure\n@triton.autotune(\n    configs=[\n        triton.Config({}, num_warps=4, num_stages=3, maxnreg=32),\n        triton.Config({}, num_warps=2, num_stages=3, maxnreg=32),\n        triton.Config({}, num_warps=4, num_stages=3, maxnreg=48),\n        # ... 10 configs with maxnreg=32 or maxnreg=48\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(...):\n    # registers_per_thread=32 (spilling!), Block Limit Registers=16\n    # theoretical_occupancy=81.25%, but achieved_occupancy still=6.25%\n    # executed_instructions increased 19% due to spill loads/stores",
+    "applicable_when": "Never as a standalone fix when the kernel is grid-bound (waves_per_sm < 0.1, grid_size << sm_count). maxnreg may help when: (1) the kernel has sufficient grid coverage (waves_per_sm >= 1.0), (2) register pressure is the primary occupancy limiter (Block Limit Registers < Block Limit Warps), and (3) the compiler's natural register count is only slightly above the cap (so spilling is minimal).",
+    "do_not_apply_when": "Do not apply maxnreg when: (1) the kernel is grid-bound (grid_size < sm_count, waves_per_sm < 0.5) \u2014 increasing theoretical occupancy cannot help if there are not enough blocks to fill SMs; (2) the natural register count is significantly above the cap (64 vs 32 = 2x reduction) \u2014 this will cause heavy register spilling; (3) new MemoryCacheAccessPattern NCU rules appear after applying maxnreg \u2014 this confirms spilling is occurring and the change is counterproductive; (4) tile sizes are still hard-coded (not in autotune config dicts) \u2014 the grid size cannot be increased without tile size changes.",
+    "framework_notes": "In Triton, maxnreg is a per-Config parameter in @triton.autotune that caps the maximum registers per thread. Setting it below the compiler's natural register usage forces register spilling to local memory (L1/L2 cache). NCU's MemoryCacheAccessPattern rule firing for local loads/stores is the diagnostic signal that spilling is occurring. The L1 hit rate increase (0.63% -> 66.64%) confirms spilled registers are hitting L1 cache, but the extra load/store instructions still add overhead."
+  }
+]

@@ -1,0 +1,94 @@
+--- baseline
++++ rebuilt
+@@ -5,12 +5,26 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=5),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=5),
++        triton.Config({}, num_warps=16, num_stages=3),
++        triton.Config({}, num_warps=16, num_stages=4),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused_convolution_35(in_ptr0, arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = True
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+-    BLOCK_M : tl.constexpr = 32
++    BLOCK_M : tl.constexpr = 64
+     BLOCK_N : tl.constexpr = 16
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+@@ -54,27 +68,37 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
++
++    # Create TMA block pointers BEFORE the k-loop
++    # A: shape [M, K], row-major (stride_am=480, stride_ak=1), order=(1,0)
++    A_block_ptr = tl.make_block_ptr(
++        base=A,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),   # (480, 1)
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0)                      # row-major: last dim contiguous
++    )
++    # B stored as [N=16, K=480] with strides (480, 1),
++    # reinterpreted as [K=480, N=16] for GEMM via strides=(stride_bk=1, stride_bn=480)
++    # order=(0,1): K-dim (dim 0) is contiguous in memory -- no transpose needed
++    B_block_ptr = tl.make_block_ptr(
++        base=B,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),   # (1, 480)
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1)                      # col-major in [K,N] view: K dim contiguous
++    )
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+-
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 480*idx_m
+-        a = tl.load(A + (xindex))
+-
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 16*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 480*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+-
+-        
++        a = tl.load(A_block_ptr, boundary_check=(0, 1), padding_option='zero')  # [BLOCK_M, BLOCK_K]
++        b = tl.load(B_block_ptr, boundary_check=(0, 1), padding_option='zero')  # [BLOCK_K, BLOCK_N]
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
++        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
++        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -88,8 +112,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

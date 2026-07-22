@@ -1,0 +1,82 @@
+--- baseline
++++ rebuilt
+@@ -3,14 +3,20 @@
+ import triton.language as tl
+ 
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        # grid_m=1 for M=128, grid_n=128 -> 128 blocks (~1 full wave on 132 SMs)
+         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=8),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        # grid=2*128=256 blocks (1.94 waves, cleaner than 7.76 partial waves)
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=4),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+     ],
+     key=['M', 'N', 'K'],
+ )
+@@ -37,24 +43,33 @@
+     
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    offs_k = tl.arange(0, BLOCK_K)
+     
+-    A_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+-    B_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
++    # Use tl.make_block_ptr with explicit order for conflict-free shared memory swizzle
++    A_block_ptr = tl.make_block_ptr(
++        base=A_ptr,
++        shape=(M, K),
++        strides=(stride_am, stride_ak),
++        offsets=(pid_m * BLOCK_M, 0),
++        block_shape=(BLOCK_M, BLOCK_K),
++        order=(1, 0),  # row-major: innermost dim is K-axis, enables conflict-free SMEM swizzle
++    )
++    B_block_ptr = tl.make_block_ptr(
++        base=B_ptr,
++        shape=(K, N),
++        strides=(stride_bk, stride_bn),
++        offsets=(0, pid_n * BLOCK_N),
++        block_shape=(BLOCK_K, BLOCK_N),
++        order=(0, 1),  # col-major for B: innermost dim is N-axis, conflict-free SMEM layout
++    )
+     
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+     
+     for k in range(0, tl.cdiv(K, BLOCK_K)):
+-        k_remaining = K - k * BLOCK_K
+-        mask_k = offs_k < k_remaining
+-        
+-        a = tl.load(A_ptrs, mask=(offs_m[:, None] < M) & (mask_k[None, :]), other=0.0)
+-        b = tl.load(B_ptrs, mask=(mask_k[:, None]) & (offs_n[None, :] < N), other=0.0)
+-        
++        a = tl.load(A_block_ptr, boundary_check=(0, 1), padding_option='zero')
++        b = tl.load(B_block_ptr, boundary_check=(0, 1), padding_option='zero')
+         acc = tl.dot(a, b, acc, allow_tf32=False)
+-        
+-        A_ptrs += BLOCK_K * stride_ak
+-        B_ptrs += BLOCK_K * stride_bk
++        A_block_ptr = tl.advance(A_block_ptr, (0, BLOCK_K))
++        B_block_ptr = tl.advance(B_block_ptr, (BLOCK_K, 0))
+     
+     # Load bias and add
+     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+@@ -67,7 +82,6 @@
+     C_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+     tl.store(C_ptrs, acc.to(tl.float32), mask=mask)
+-
+ 
+ def kernel_function(w0, b0, w1, b1, w2, b2, x):
+     M = x.shape[0]  # 128

@@ -1,0 +1,85 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused_addmm_gelu_t_15(in_ptr0, arg_A, arg_B, out_ptr0):
+@@ -16,6 +17,7 @@
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+     INDEX_DTYPE : tl.constexpr = tl.int32
++    SPLIT_K : tl.constexpr = 16
+     A = arg_A
+     B = arg_B
+ 
+@@ -31,9 +33,14 @@
+     stride_bn = 2048
+ 
+     # based on triton.ops.matmul
+-    pid = tl.program_id(0).to(INDEX_DTYPE)
++    pid_full = tl.program_id(0).to(INDEX_DTYPE)
+     grid_m = (M + BLOCK_M - 1) // BLOCK_M
+     grid_n = (N + BLOCK_N - 1) // BLOCK_N
++    grid_mn = grid_m * grid_n
++
++    # split-K: decode pid
++    pid = pid_full % grid_mn
++    pid_k = pid_full // grid_mn
+ 
+     # re-order program ID for better L2 performance
+     width = GROUP_M * grid_n
+@@ -57,24 +64,26 @@
+     offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
+-    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
++    # split-K: each block handles K/SPLIT_K elements
++    k_per_split = K // SPLIT_K
++    k_start = pid_k * k_per_split
++    k_end = k_start + k_per_split
++
++    for k_idx in range(k_start // BLOCK_K, k_end // BLOCK_K):
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+         b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+-        xindex = idx_n + 2048*idx_m
++        xindex = idx_n + 2048 * idx_m
+         a = tl.load(A + (xindex))
+ 
+         idx_m = b_k_idx_vals
+         idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 10*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 2048*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++        xindex = idx_n + 10 * idx_m
++        b = tl.load(B + ((tl.broadcast_to(idx_m + 2048 * idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
+ 
+-        
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -84,12 +93,11 @@
+     mask = (idx_m < M) & (idx_n < N)
+ 
+     # inductor generates a suffix
+-    xindex = idx_n + 10*idx_m
+-    tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+-    tmp1 = acc + tmp0
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
++    xindex = idx_n + 10 * idx_m
+ 
+-
++    # For SPLIT_K > 1: use atomic_add to accumulate partial sums
++    # Bias (in_ptr0) is added in kernel_function after all splits complete
++    tl.atomic_add(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask=mask)
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

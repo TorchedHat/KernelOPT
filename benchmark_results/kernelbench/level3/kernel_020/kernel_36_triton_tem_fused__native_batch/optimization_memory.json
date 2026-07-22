@@ -1,0 +1,258 @@
+[
+  {
+    "item_id": "exp_001_triton_autotune_tile_size_regression",
+    "iteration": 1,
+    "speedup": 0.4117,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_tile_sizes_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "HighPipeUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 38.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 58382.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 88.29,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Instruction Statistics.Executed Instructions": 2927568.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.28
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 94.59,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 141788.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 74.8,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Instruction Statistics.Executed Instructions": 9978492.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 5.26
+      }
+    },
+    "strategy_title": "Increasing Tile Sizes Doubles Register Pressure, Causes Regression",
+    "strategy_description": "Increasing BLOCK_M/BLOCK_N/BLOCK_K from 32 to 64 caused registers per thread to double from 64 to 128, which halved theoretical occupancy from 50% to 25% and doubled shared memory per block from 16 to 33 KB. Despite the grid and launch config remaining the same (96 blocks, 132 SMs), achieved occupancy stayed at 6.25% while elapsed cycles nearly tripled (58K to 142K) and executed instructions increased 3.4x (2.9M to 9.9M), indicating the larger tiles did far more redundant work without improving SM utilization. The autotune decorator was applied only over num_warps/num_stages without varying tile sizes as constexprs, so the tile size increase was unconditional and the register blowup was unavoidable.",
+    "slow_pseudocode": "# Before: small tiles, 64 regs/thread, 50% theoretical occupancy\nBLOCK_M = 32; BLOCK_N = 32; BLOCK_K = 32\n@triton.jit\ndef kernel(...):\n    # 21 K-loop iterations, 12-way shared mem bank conflicts\n    for k in range(0, K, BLOCK_K): ...\ngrid = (96, 1, 1)  # fixed",
+    "fast_pseudocode": "# After (WORSE): larger tiles, 128 regs/thread, 25% theoretical occupancy\nBLOCK_M = 64; BLOCK_N = 64; BLOCK_K = 64\n@triton.autotune(configs=[Config({}, num_warps=4..16, num_stages=2..4)], key=[])\n@triton.jit\ndef kernel(...):\n    # 11 K-loop iterations but 3.4x more instructions total\n    for k in range(0, K, BLOCK_K): ...\ngrid = (96, 1, 1)  # unchanged \u2014 grid not updated to reflect larger tiles",
+    "applicable_when": "Never \u2014 this specific pattern (increasing tile sizes as hard-coded constexprs without making them autotune keys, while autotune only varies num_warps/num_stages) is always harmful when register pressure is already near the limit.",
+    "do_not_apply_when": "When registers per thread are already at or near 64 on a device where block limit is register-bound (Block Limit Registers = 8 blocks/SM at 64 regs/thread). Doubling tile sizes in this regime doubles register usage, halves theoretical occupancy, and increases total instruction count without improving SM utilization. Also avoid when the grid is not updated to reflect larger tiles \u2014 the same 96-block grid with 64x64 tiles covers less of the problem space per block, causing redundant boundary masking overhead.",
+    "framework_notes": "In Triton, @triton.autotune configs must include tile size parameters (BLOCK_M, BLOCK_N, BLOCK_K) as keys in the Config dict AND as tl.constexpr kernel arguments for autotune to actually vary them. Passing only num_warps/num_stages with key=[] means the tile sizes are fixed at whatever is hard-coded in the kernel body \u2014 autotune provides no benefit in this case. The launch grid lambda must also be updated to use META['BLOCK_M'] etc. when tile sizes are autotuned."
+  },
+  {
+    "item_id": "exp_tma_block_ptr_regression_001",
+    "iteration": 1,
+    "speedup": 0.4905,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tma_block_ptr_to_fix_shared_memory_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 38.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 58382.0,
+        "Instruction Statistics.Executed Instructions": 2927568.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Occupancy.Block Limit Shared Mem": 9.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.28
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 79.39,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 119057.0,
+        "Instruction Statistics.Executed Instructions": 9762300.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.56
+      }
+    },
+    "strategy_title": "TMA block_ptr with larger tiles caused register/smem regression",
+    "strategy_description": "Switching from manual pointer arithmetic to tl.make_block_ptr with doubled tile sizes (32\u219264 for BLOCK_M and BLOCK_N) caused registers per thread to double from 64 to 128 and dynamic shared memory per block to double from 16 KB to 33 KB. This halved the theoretical occupancy from 50% to 25% (Block Limit Registers dropped from 8 to 4, Block Limit Shared Mem from 9 to 4), while achieved occupancy remained stuck at 6.25% \u2014 meaning the larger tiles provided no occupancy benefit. The instruction count ballooned 3.3x (2.9M \u2192 9.8M), causing elapsed cycles to more than double and kernel duration to increase from 38.94 \u00b5s to 79.39 \u00b5s despite the bank conflict stall cycles per instruction improving (7.28 \u2192 4.56 cycles/instruction). The root cause of the regression is that the larger tile sizes dramatically increased register pressure and shared memory usage, crushing theoretical occupancy without any compensating throughput gain on this small problem (M=490, N=192, K=672 with only 96 blocks on 132 SMs).",
+    "slow_pseudocode": "# BEFORE: manual pointer arithmetic, BLOCK_M=BLOCK_N=32, 64 regs/thread, 16KB smem\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = load(A + idx_n + 672*idx_m, mask=...)\n    b_T = load(B + idx_k_T + 672*idx_n_T, mask=...)  # [BLOCK_N, BLOCK_K]\n    acc += dot(a, trans(b_T))  # 12-way bank conflict on b_T",
+    "fast_pseudocode": "# AFTER (SLOWER): tl.make_block_ptr, BLOCK_M=BLOCK_N=64, 128 regs/thread, 33KB smem\na_ptr = make_block_ptr(A, shape=(M,K), strides=(672,1), block_shape=(64,32))\nb_ptr = make_block_ptr(B, shape=(K,N), strides=(1,672), block_shape=(32,64))\nfor k_idx in range(cdiv(K, BLOCK_K)):\n    a = load(a_ptr, boundary_check=(0,1))\n    b = load(b_ptr, boundary_check=(0,1))  # no trans needed\n    acc = dot(a, b, acc)\n    a_ptr = advance(a_ptr, (0, BLOCK_K))\n    b_ptr = advance(b_ptr, (BLOCK_K, 0))\n# Result: 3.3x more instructions, 2x duration, same achieved occupancy",
+    "applicable_when": "Never apply this specific combination (tl.make_block_ptr + tile size doubling) when the kernel is already register-pressure-limited (registers_per_thread >= 64, Block Limit Registers <= 8) and the problem is small (waves_per_sm < 0.2). The tile size increase will double register usage and halve theoretical occupancy.",
+    "do_not_apply_when": "Do not double tile sizes (e.g. 32\u219264 for both BLOCK_M and BLOCK_N simultaneously) when registers_per_thread is already at 64 and theoretical occupancy is already limited by registers (Block Limit Registers < Block Limit Warps). Do not apply tl.make_block_ptr migration when the primary bottleneck is low occupancy from small grid size \u2014 the fix must address grid size, not tile size. Do not apply when the autotune configs do not actually vary tile sizes (configs with empty dicts {} do not explore BLOCK_M/BLOCK_N space).",
+    "framework_notes": "In Triton, @triton.autotune configs with empty dicts {} do not vary any constexpr tile parameters \u2014 they only vary num_warps and num_stages. To actually autotune tile sizes, the configs must include the tile size keys (e.g. {'BLOCK_M': 64, 'BLOCK_N': 64}) and those parameters must be declared as tl.constexpr in the kernel signature. The applied diff used empty configs {} while hardcoding BLOCK_M=BLOCK_N=64 as constexpr inside the kernel body, so autotune had no effect on tile selection."
+  },
+  {
+    "item_id": "exp_001_autotune_no_tile_params_regression",
+    "iteration": 1,
+    "speedup": 0.5191,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_without_tile_size_params_causes_regression",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 38.94,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 58382.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Instruction Statistics.Executed Instructions": 2927568.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.28,
+        "Compute Workload Analysis.Executed Ipc Active": 0.55
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 75.01,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 112435.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Instruction Statistics.Executed Instructions": 9715836.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.28,
+        "Compute Workload Analysis.Executed Ipc Active": 0.94
+      }
+    },
+    "strategy_title": "Autotune Only num_warps/num_stages Without Changing Tile Sizes Causes Regression",
+    "strategy_description": "Adding @triton.autotune with configs that only vary num_warps and num_stages, while hardcoding larger tile sizes (BLOCK_M=64, BLOCK_N=64 vs original 32x32), doubled register pressure (64\u2192128 registers/thread) and doubled shared memory per block (16\u219232 KB). This halved theoretical occupancy (50%\u219225%) and doubled instruction count (2.9M\u21929.7M), increasing kernel duration from 38.94 \u00b5s to 75.01 \u00b5s despite slightly better IPC. The root cause is that the autotune configs did not include BLOCK_M/BLOCK_N as tunable parameters \u2014 the tile size increase was hardcoded in the kernel body, not explored by the autotuner, so the autotuner only selected among num_warps/num_stages variants of the already-regressed larger-tile kernel.",
+    "slow_pseudocode": "# WRONG: autotune only varies num_warps/num_stages, tile sizes hardcoded larger\n@triton.autotune(\n    configs=[triton.Config({}, num_warps=4, num_stages=3), ...],  # no BLOCK_M/N in configs\n    key=[],\n)\n@triton.jit\ndef kernel(A, B, out):\n    BLOCK_M: tl.constexpr = 64  # hardcoded larger, not tunable\n    BLOCK_N: tl.constexpr = 64  # hardcoded larger, not tunable\n    BLOCK_K: tl.constexpr = 32\n    ...",
+    "fast_pseudocode": "# CORRECT: tile sizes must be kernel parameters driven by autotune configs\n@triton.autotune(\n    configs=[\n        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=3),\n        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),\n        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=4),\n        ...\n    ],\n    key=[],\n)\n@triton.jit\ndef kernel(A, B, out,\n           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n    # Remove hardcoded constexpr assignments for tile sizes\n    ...\n# Grid must use meta dict:\ngrid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),)",
+    "applicable_when": "Kernel has hardcoded tile size constexprs (BLOCK_M, BLOCK_N, BLOCK_K) inside the kernel body and the plan calls for adding @triton.autotune to explore tile sizes.",
+    "do_not_apply_when": "Tile sizes are already kernel parameters (tl.constexpr arguments); autotune configs already include BLOCK_M/BLOCK_N/BLOCK_K as dict keys.",
+    "framework_notes": "In Triton, @triton.autotune configs must include tile size parameters (BLOCK_M, BLOCK_N, BLOCK_K) as dict keys AND the kernel signature must accept them as tl.constexpr arguments. Hardcoding tile sizes inside the kernel body while only autotuning num_warps/num_stages will not explore tile size space and may regress performance if the hardcoded sizes increase register pressure or shared memory beyond the original. The grid lambda must also reference meta['BLOCK_M'] and meta['BLOCK_N'] to correctly compute grid dimensions for each config."
+  },
+  {
+    "item_id": "exp_tf32_block_size_regression_001",
+    "iteration": 1,
+    "speedup": 0.5225,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "tf32_tensor_cores_with_larger_blocks",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts, UncoalescedSharedAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 58382.0,
+        "GPU Speed Of Light Throughput.Duration": 38.94,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 9.46,
+        "GPU Speed Of Light Throughput.Memory Throughput": 60.89,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Launch Statistics.Registers Per Thread": 64.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 16.38,
+        "Instruction Statistics.Executed Instructions": 2927568.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 7.28,
+        "Memory Workload Analysis.Memory Throughput": 47.39,
+        "Memory Workload Analysis.L2 Hit Rate": 70.48
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 111738.0,
+        "GPU Speed Of Light Throughput.Duration": 74.53,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 16.43,
+        "GPU Speed Of Light Throughput.Memory Throughput": 63.66,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32.77,
+        "Instruction Statistics.Executed Instructions": 9715836.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.28,
+        "Memory Workload Analysis.Memory Throughput": 24.98,
+        "Memory Workload Analysis.L2 Hit Rate": 86.67
+      }
+    },
+    "strategy_title": "Larger Tile Sizes Hurt When Register/SMEM Pressure Kills Occupancy",
+    "strategy_description": "Increasing BLOCK_M and BLOCK_N from 32 to 64 (while also attempting to enable TF32) caused registers per thread to double from 64 to 128 and dynamic shared memory per block to double from 16 to 33 KB. This halved theoretical occupancy from 50% to 25% and reduced Block Limit Registers from 8 to 4, while the instruction count tripled (2.9M to 9.7M), causing kernel duration to nearly double (38.94\u00b5s to 74.53\u00b5s). Critically, the diff shows ALLOW_TF32 was NOT actually changed to True in the applied code (it remains False), meaning the only effective change was the tile size increase \u2014 which purely added overhead without any Tensor Core benefit. When a kernel is already register-limited (Block Limit Registers is the binding occupancy constraint), enlarging tile sizes compounds register pressure and causes severe regression.",
+    "slow_pseudocode": "BLOCK_M = 32\nBLOCK_N = 32\nBLOCK_K = 32\nALLOW_TF32 = False\ngrid = (96, 1, 1)  # ceil(490/32)*ceil(192/32) = 16*6 = 96\nacc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=tl.float32)",
+    "fast_pseudocode": "# What was INTENDED but NOT correctly applied:\nBLOCK_M = 64\nBLOCK_N = 64\nBLOCK_K = 32\nALLOW_TF32 = True  # <-- this was NOT changed in the actual diff\ngrid = (24, 1, 1)  # ceil(490/64)*ceil(192/64) = 8*3 = 24\nacc += tl.dot(a, b, allow_tf32=True, out_dtype=tl.float32)\n# Result: registers doubled (64->128), SMEM doubled, occupancy halved, 1.91x slower",
+    "applicable_when": "Never apply this specific combination: increasing tile sizes alone (without successfully enabling TF32/Tensor Cores) when the kernel is already register-limited (Block Limit Registers < Block Limit Warps).",
+    "do_not_apply_when": "Do not increase BLOCK_M/BLOCK_N when registers_per_thread >= 64 and Block Limit Registers is already the binding occupancy constraint. Larger tiles will double register usage, halve theoretical occupancy, and cause regression even if the intent is to enable Tensor Cores. Always verify that ALLOW_TF32=True is actually present in the emitted code before attributing any benefit to Tensor Cores.",
+    "framework_notes": "In Triton, ALLOW_TF32 must be explicitly set as a tl.constexpr AND passed to tl.dot(allow_tf32=ALLOW_TF32). A diff that changes the constexpr declaration but leaves the tl.dot call unchanged will NOT enable TF32. Always verify both the constexpr definition and the tl.dot call site are updated. Registers per thread in Triton scales with tile size; BLOCK_M=64, BLOCK_N=64 with complex kernels can easily push registers from 64 to 128, halving occupancy on H100/A100."
+  },
+  {
+    "item_id": "exp_002_reduce_tile_sizes_restore_occupancy_regression",
+    "iteration": 2,
+    "speedup": 0.8006,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_restore_occupancy_and_grid_coverage",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 74.53,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 111738.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 90.55,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32768.0,
+        "Instruction Statistics.Executed Instructions": 9715836.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.28,
+        "Scheduler Statistics.No Eligible": 76.62,
+        "Occupancy.Block Limit Registers": 4.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 48.64,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 72917.0,
+        "GPU Speed Of Light Throughput.L1/TEX Cache Throughput": 70.28,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 62.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8192.0,
+        "Instruction Statistics.Executed Instructions": 2782032.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.64,
+        "Scheduler Statistics.No Eligible": 89.64,
+        "Occupancy.Block Limit Registers": 8.0
+      }
+    },
+    "strategy_title": "Reducing Tile Sizes Improved Registers But Worsened Stalls",
+    "strategy_description": "Reducing BLOCK_M/BLOCK_N from 64 to 32 successfully cut registers per thread from 128 to 62 and doubled theoretical occupancy from 25% to 50%, and reduced instruction count from 9.7M to 2.8M. However, achieved occupancy remained stuck at 6.25% (same as before), and warp cycles per issued instruction worsened from 4.28 to 9.64 \u2014 the scheduler idle rate increased from 76.6% to 89.6%. The kernel ran faster in absolute terms (74.53\u00b5s \u2192 48.64\u00b5s) but still slower than the original baseline (38.94\u00b5s), yielding a 0.8x speedup relative to the immediately prior iteration. The persistent 12-way shared memory bank conflicts (77-78% excessive wavefronts) and MIO stalls (5.6 cycles/warp) remain the dominant bottleneck regardless of tile size, and the small grid (96 blocks on 132 SMs, 0.09 waves/SM) means the GPU cannot hide latency through parallelism.",
+    "slow_pseudocode": "# BEFORE (regressed state with 128 regs/thread):\nBLOCK_M: tl.constexpr = 64\nBLOCK_N: tl.constexpr = 64\nBLOCK_K: tl.constexpr = 32\n@triton.autotune(configs=[Config({}, num_warps=4..16, num_stages=2..4)], key=[])\n@triton.jit\ndef kernel(...):\n    # 128 regs/thread, 33KB smem, 9.7M instructions, 4.28 cycles/inst stall",
+    "fast_pseudocode": "# AFTER (partial recovery, still slower than original baseline):\nBLOCK_M: tl.constexpr = 32\nBLOCK_N: tl.constexpr = 32\nBLOCK_K: tl.constexpr = 32\n@triton.autotune(configs=[Config({}, num_warps=4..16, num_stages=2..4)], key=[])\n@triton.jit\ndef kernel(...):\n    # 62 regs/thread, 8KB smem, 2.8M instructions, 9.64 cycles/inst stall\n    # achieved occupancy still 6.25%, bank conflicts still 12-way, 77% excessive wavefronts",
+    "applicable_when": "When registers_per_thread is very high (>=128) due to large tile sizes and Block Limit Registers is the binding occupancy constraint \u2014 reducing tile sizes will lower register pressure and improve theoretical occupancy. However, this alone is insufficient when shared memory bank conflicts (12-way, >75% excessive wavefronts) and MIO stalls dominate, and when the grid is too small to fill the GPU (waves_per_sm < 0.2).",
+    "do_not_apply_when": "Do not expect tile size reduction alone to fully recover performance when the kernel has persistent 12-way shared memory bank conflicts (UncoalescedSharedAccess >75% excessive wavefronts) and the grid is too small to fill the GPU (96 blocks on 132 SMs). The bank conflict stalls will dominate regardless of tile size, and achieved occupancy will remain low. The autotune decorator with empty configs {} (no tile size keys) provides no benefit and adds overhead.",
+    "framework_notes": "In Triton, adding @triton.autotune with configs that only vary num_warps/num_stages (empty dict {}) while hardcoding tile sizes as constexprs inside the kernel body does not explore tile size space. The autotuner overhead is incurred without any tile size exploration benefit. When the primary bottleneck is shared memory bank conflicts (SharedMemoryConflicts rule, 12-way conflicts, >75% excessive wavefronts), the fix must address the access pattern (e.g. padding shared memory, swizzling, or restructuring the load pattern) rather than tile size alone."
+  },
+  {
+    "item_id": "exp_reduce_tile_sizes_restore_occupancy_regression_002",
+    "iteration": 2,
+    "speedup": 0.8075,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "reduce_tile_sizes_to_restore_register_occupancy_and_fix_bank_conflicts",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SharedMemoryConflicts + CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 74.53,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 111738.0,
+        "Occupancy.Theoretical Occupancy": 25.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 128.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 32768.0,
+        "Instruction Statistics.Executed Instructions": 9715836.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 4.28,
+        "Occupancy.Block Limit Registers": 4.0,
+        "Occupancy.Block Limit Shared Mem": 4.0,
+        "Launch Statistics.Waves Per SM": 0.18
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 48.22,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 72262.0,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 6.25,
+        "Launch Statistics.Registers Per Thread": 62.0,
+        "Launch Statistics.Dynamic Shared Memory Per Block": 8192.0,
+        "Instruction Statistics.Executed Instructions": 2798928.0,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 9.51,
+        "Occupancy.Block Limit Registers": 8.0,
+        "Occupancy.Block Limit Shared Mem": 14.0,
+        "Launch Statistics.Waves Per SM": 0.09
+      }
+    },
+    "strategy_title": "Reducing Tile Sizes Improves Registers But Worsens Stall Cycles",
+    "strategy_description": "Reducing BLOCK_M/BLOCK_N from 64 to 32 and replacing the transposed B load with a standard [BLOCK_K, BLOCK_N] load successfully halved registers per thread (128\u219262), doubled theoretical occupancy (25%\u219250%), and reduced instruction count 3.5x (9.7M\u21922.8M). However, the kernel still regressed vs. the original baseline (0.81x speedup) because warp cycles per issued instruction nearly doubled (4.28\u21929.51 cycles), waves per SM halved (0.18\u21920.09), and achieved occupancy remained stuck at 6.25% \u2014 the grid of 96 blocks on 132 SMs is too small to fill the GPU regardless of tile size. The shared memory bank conflict rate remained at ~78% (12-way conflicts), indicating the B-load rewrite did not eliminate the root cause of MIO stalls. The net effect was fewer total instructions but each instruction took longer to issue, resulting in only a modest wall-time improvement that still fell short of the original kernel.",
+    "slow_pseudocode": "# BEFORE (already regressed state): BLOCK_M=64, BLOCK_N=64, transposed B load\nBLOCK_M: tl.constexpr = 64\nBLOCK_N: tl.constexpr = 64\nBLOCK_K: tl.constexpr = 32\n# 128 regs/thread, 32KB smem, 25% theoretical occupancy\nb_T = tl.load(B + idx_k_T + 672*idx_n_T, mask=b_mask_T)  # [BLOCK_N, BLOCK_K]\nacc += tl.dot(a, tl.trans(b_T), allow_tf32=False)",
+    "fast_pseudocode": "# AFTER (still regressed vs original): BLOCK_M=32, BLOCK_N=32, standard B load\n@triton.autotune(configs=[Config({}, num_warps=4, num_stages=2), ...], key=[])\nBLOCK_M: tl.constexpr = 32\nBLOCK_N: tl.constexpr = 32\nBLOCK_K: tl.constexpr = 32\n# 62 regs/thread, 8KB smem, 50% theoretical occupancy\nb = tl.load(B + rk[:,None]*stride_bk + offs_b_n[None,:]*stride_bn, mask=b_mask)  # [BLOCK_K, BLOCK_N]\nacc += tl.dot(a, b, allow_tf32=False)\n# Result: 0.81x vs original \u2014 warp stall cycles doubled (4.28\u21929.51), waves/SM halved",
+    "applicable_when": "Never \u2014 this specific combination (reducing tile sizes from 64\u219232 while adding autotune over num_warps/num_stages only, with key=[]) on a kernel with grid=96 and 132 SMs does not recover the original baseline performance. The grid is too small to benefit from occupancy improvements.",
+    "do_not_apply_when": "Do not apply tile size reduction as the primary optimization when the kernel's grid size is already smaller than the SM count (waves_per_sm < 0.2) and achieved occupancy is stuck at 6.25% regardless of theoretical occupancy. In this regime, reducing tile sizes reduces total work per block without increasing parallelism, and the autotune overhead (key=[]) adds latency without exploring meaningful configurations. Also do not expect that switching from transposed B load to standard B load eliminates bank conflicts when the conflict rate remains at ~78% after the change.",
+    "framework_notes": "In Triton, adding @triton.autotune with configs={} (empty dicts) and key=[] means the autotuner runs multiple kernel variants (varying only num_warps/num_stages) but the tile sizes remain fixed at the hardcoded constexpr values. This adds autotuning overhead without exploring tile size space. The waves_per_sm metric is a reliable indicator of whether occupancy improvements will translate to speedup: if waves_per_sm < 0.2 before and after, the GPU is underutilized regardless of theoretical occupancy changes."
+  }
+]

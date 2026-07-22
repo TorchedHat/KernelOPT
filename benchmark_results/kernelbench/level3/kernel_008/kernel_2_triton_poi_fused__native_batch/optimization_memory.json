@@ -1,0 +1,192 @@
+[
+  {
+    "item_id": "exp_001_autotune_xblock_regression",
+    "iteration": 1,
+    "speedup": 0.6989,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "autotune_xblock_tile_size_without_fixing_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + IssueSlotUtilization",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 17.0,
+        "GPU Speed Of Light Throughput.Duration": 17.18,
+        "Occupancy.Achieved Occupancy": 56.08,
+        "Scheduler Statistics.No Eligible": 40.67,
+        "Instruction Statistics.Executed Instructions": 6773760.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 50.98,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 79.9
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "GPU Speed Of Light Throughput.Duration": 24.58,
+        "Occupancy.Achieved Occupancy": 87.05,
+        "Scheduler Statistics.No Eligible": 14.01,
+        "Instruction Statistics.Executed Instructions": 15076320.0,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 78.69,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 63.09
+      }
+    },
+    "strategy_title": "Adding autotune without fixing grid causes instruction bloat",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (512\u20132048) while leaving the launch grid hardcoded to cdiv(xnumel, 128) caused the autotuner to select a larger tile but still launch with the original small-tile grid, resulting in ~2.2x more executed instructions (6.77M \u2192 15.08M) and 43% longer duration (17.18 \u2192 24.58 \u00b5s). Although occupancy improved (56% \u2192 87%) and no-eligible-warp cycles dropped (40.67% \u2192 14.01%), the instruction count explosion dominated, indicating the grid was not updated to match the selected XBLOCK. The fix requires making the grid a lambda that reads meta['XBLOCK'] so it scales correctly with the autotuned tile size.",
+    "slow_pseudocode": "@triton.autotune(configs=[Config({'XBLOCK': 512}), ...], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    ...\n\n# BUG: grid still hardcoded to small tile size\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., xnumel)",
+    "fast_pseudocode": "@triton.autotune(configs=[Config({'XBLOCK': 512}), ...], key=['xnumel'])\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    xindex = xoffset + tl.arange(0, XBLOCK)[:]\n    ...\n\n# CORRECT: grid must be a lambda that uses meta['XBLOCK']\ngrid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)\nkernel[grid](..., xnumel)",
+    "applicable_when": "Any Triton kernel where @triton.autotune is added to tune XBLOCK/tile size and the grid size must scale inversely with the tile size.",
+    "do_not_apply_when": "Grid is already a lambda using meta['XBLOCK']; or the grid size is intentionally fixed regardless of tile size (e.g., persistent kernels).",
+    "framework_notes": "In Triton, when using @triton.autotune with XBLOCK as a tunable config key, the launch grid MUST be a lambda: `grid = lambda meta: (triton.cdiv(xnumel, meta['XBLOCK']),)`. A hardcoded grid like `(triton.cdiv(xnumel, 128),)` will not adapt to the selected config, causing each thread block to process far more elements than intended and massively inflating instruction count."
+  },
+  {
+    "item_id": "exp_001_triton_autotune_register_pressure_regression",
+    "iteration": 1,
+    "speedup": 0.7018,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_with_autotune_for_latency_hiding",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "Launch Statistics.Registers Per Thread": 17.0,
+        "Occupancy.Achieved Occupancy": 56.08,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 1.21,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.91,
+        "GPU Speed Of Light Throughput.Duration": 17.18,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 50.98,
+        "Instruction Statistics.Executed Instructions": 6773760.0
+      },
+      "key_metric_after": {
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Occupancy.Achieved Occupancy": 86.64,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 7.07,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.02,
+        "GPU Speed Of Light Throughput.Duration": 24.48,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 79.0,
+        "Instruction Statistics.Executed Instructions": 14982240.0
+      }
+    },
+    "strategy_title": "Autotune XBLOCK Increase Causes Register Pressure Regression",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (512\u20132048) caused the compiler to allocate more registers per thread (17\u219232), which halved the block limit from registers (21\u219216 blocks/SM) and more than doubled the total executed instruction count (6.77M\u219214.98M). Although achieved occupancy improved (56%\u219287%) and eligible warps per scheduler increased (1.21\u21927.07), the kernel duration increased by 42% (17.18\u219224.48 \u00b5s) because the instruction count explosion from the autotuner selecting a larger tile size dominated. The anti-pattern is introducing autotune when the kernel's register count is already near the boundary where doubling XBLOCK doubles register pressure and instruction count without proportional memory latency hiding benefit.",
+    "slow_pseudocode": "# XBLOCK=128, registers=17/thread, 23520 CTAs\n@triton.jit\ndef kernel(in_out_ptr0, ..., XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no bounds check\n    tmp0 = tl.load(in_out_ptr0 + x2, None)\n    # ... batch norm + relu ...\n    tl.store(in_out_ptr0 + x2, result, None)\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "fast_pseudocode": "# XBLOCK=128, registers=17/thread, 23520 CTAs (original - faster)\n# Do NOT add autotune with larger XBLOCK configs here\n@triton.jit\ndef kernel(in_out_ptr0, ..., XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)\n    tmp0 = tl.load(in_out_ptr0 + x2, None)\n    # ... batch norm + relu ...\n    tl.store(in_out_ptr0 + x2, result, None)\n\ngrid = (cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)",
+    "applicable_when": "Never applicable as described \u2014 this is a negative result. Avoid this pattern when: registers/thread are already at 17+ and autotune configs include XBLOCK values that would double or quadruple register usage; when the kernel is a simple pointwise op where larger tiles increase instruction count without meaningful memory latency hiding.",
+    "do_not_apply_when": "Do not add @triton.autotune with large XBLOCK configs (512\u20132048) to pointwise kernels where: (1) register count per thread is already \u226517 and will grow with larger tiles, (2) the kernel is already achieving reasonable occupancy (>50%), (3) the bottleneck is L1TEX stall but the kernel has low arithmetic intensity \u2014 larger tiles will increase instruction count proportionally without hiding the stall latency.",
+    "framework_notes": "In Triton, @triton.autotune can cause the compiler to allocate more registers when larger XBLOCK configs are selected, because more loop iterations or wider vector operations require more live values. The register increase from 17\u219232 reduced Block Limit Registers from 21\u219216, which combined with the instruction count doubling caused the regression. The grid was also not updated to match the autotuner's chosen XBLOCK (grid was still cdiv(xnumel, 128) instead of being autotune-controlled), which may have caused incorrect behavior or forced the smallest config."
+  },
+  {
+    "item_id": "exp_triton_autotune_xblock_register_spill_regression_001",
+    "iteration": 1,
+    "speedup": 0.7035,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "increase_xblock_tile_size_with_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization / CPIStall / AchievedOccupancy",
+      "key_metric_before": {
+        "Launch.registers_per_thread": 17.0,
+        "Occupancy.Achieved_Occupancy_pct": 56.08,
+        "GPU_SOL.Duration_us": 17.18,
+        "GPU_SOL.Compute_SM_Throughput_pct": 50.98,
+        "Scheduler.No_Eligible_pct": 40.67,
+        "Scheduler.Eligible_Warps_Per_Scheduler": 1.21,
+        "Instruction_Statistics.Executed_Instructions": 6773760.0,
+        "Occupancy.Block_Limit_Registers": 21.0
+      },
+      "key_metric_after": {
+        "Launch.registers_per_thread": 32.0,
+        "Occupancy.Achieved_Occupancy_pct": 86.52,
+        "GPU_SOL.Duration_us": 24.42,
+        "GPU_SOL.Compute_SM_Throughput_pct": 78.98,
+        "Scheduler.No_Eligible_pct": 13.72,
+        "Scheduler.Eligible_Warps_Per_Scheduler": 7.09,
+        "Instruction_Statistics.Executed_Instructions": 14982240.0,
+        "Occupancy.Block_Limit_Registers": 16.0
+      }
+    },
+    "strategy_title": "Autotune larger XBLOCK caused register spill and 2.2x instruction bloat",
+    "strategy_description": "Adding @triton.autotune with larger XBLOCK configs (512\u20132048) nearly doubled registers per thread (17\u219232) and more than doubled executed instructions (6.77M\u219214.98M), causing a 42% latency regression despite occupancy improving from 56% to 87%. The instruction explosion indicates the autotune selected a config that forced the compiler to spill or unroll more aggressively, overwhelming the compute pipeline. When the original kernel is already register-efficient (\u226417 registers/thread) and the bottleneck is L1TEX latency rather than occupancy, adding autotune with large tile configs can backfire by increasing register pressure and instruction count faster than the latency hiding benefit accrues.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 autotune with large XBLOCK\n@triton.autotune(configs=[Config({'XBLOCK':512}, num_warps=4), Config({'XBLOCK':1024}, num_warps=8), ...], key=['xnumel'])\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xmask = xindex < xnumel  # added masking\n    tmp0 = tl.load(in_out_ptr0 + x2, xmask)\n    ...\n    tl.store(in_out_ptr0 + x2, result, xmask)\n# registers_per_thread=32, executed_instructions=14.98M, duration=24.42us",
+    "fast_pseudocode": "# BEFORE (faster) \u2014 fixed XBLOCK=128, no autotune\n@triton.jit\ndef kernel(in_out_ptr0, in_ptr0, ..., xnumel, XBLOCK: tl.constexpr):\n    xmask = tl.full([XBLOCK], True, tl.int1)  # no masking needed\n    tmp0 = tl.load(in_out_ptr0 + x2, None)\n    ...\n    tl.store(in_out_ptr0 + x2, result, None)\ngrid = (triton.cdiv(xnumel, 128),)\nkernel[grid](..., XBLOCK=128)\n# registers_per_thread=17, executed_instructions=6.77M, duration=17.18us",
+    "applicable_when": "Never apply this specific pattern (autotune with XBLOCK 512\u20132048 on a kernel that was originally register-efficient at XBLOCK=128). The anti-pattern is: adding autotune with large tile configs to a low-register kernel where xnumel is divisible by the original tile size.",
+    "do_not_apply_when": "Do not add @triton.autotune with large XBLOCK configs when: (1) the original kernel uses \u226420 registers/thread, (2) xnumel is already evenly divisible by the current XBLOCK (no masking needed), and (3) the bottleneck is L1TEX latency stalls rather than insufficient occupancy. The autotune overhead and compiler register pressure increase can cause 2x+ instruction bloat and net regression even when occupancy improves.",
+    "framework_notes": "Triton-specific: switching from xmask=tl.full([XBLOCK], True) to xmask=xindex<xnumel adds predication overhead and may interact with the compiler's register allocation. The autotune itself adds warm-up overhead. The grid was not updated to use a lambda (still hardcoded to cdiv(xnumel,128)), meaning the autotune selected configs were run with a mismatched grid \u2014 this is likely the primary cause of the instruction explosion and regression."
+  },
+  {
+    "item_id": "exp_002_fma_fusion_register_pressure_regression",
+    "iteration": 2,
+    "speedup": 0.7055,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "replace_non_fused_fp32_arithmetic_with_explicit_fma",
+    "profiling_signal": {
+      "ncu_rule_triggered": "FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 18.82,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 70.53,
+        "Launch Statistics.Registers Per Thread": 24.0,
+        "Instruction Statistics.Executed Instructions": 10348800.0,
+        "Occupancy.Achieved Occupancy": 69.23,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.11,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 71.2,
+        "Occupancy.Block Limit Registers": 21.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 24.35,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 79.04,
+        "Launch Statistics.Registers Per Thread": 32.0,
+        "Instruction Statistics.Executed Instructions": 14982240.0,
+        "Occupancy.Achieved Occupancy": 86.68,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 16.14,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 63.12,
+        "Occupancy.Block Limit Registers": 16.0
+      }
+    },
+    "strategy_title": "Explicit FMA + autotune config change caused instruction bloat",
+    "strategy_description": "Rewriting the batch-norm arithmetic chain to use tl.math.fma and eliminating int32 intermediates was paired with a change to the autotune config list (adding larger XBLOCK configs: 512, 1024, 2048), which caused the compiler to select a larger tile and increase registers per thread from 24 to 32. This reduced Block Limit Registers from 21 to 16, and more than doubled executed instructions (10.35M \u2192 14.98M), increasing duration by 29% (18.82 \u2192 24.35 \u00b5s) despite occupancy improving from 69% to 87%. The FMA rewrite itself did not reduce instruction count as expected \u2014 the NCU FPInstructions rule still flagged the kernel after the change (fused: 1.13M, non-fused: 3.39M vs before: fused 0.56M, non-fused 1.69M), indicating the autotune config change drove instruction count up, not down. When the autotune config list is modified alongside arithmetic rewrites, the autotuner may select a larger tile that overwhelms any arithmetic savings.",
+    "slow_pseudocode": "# AFTER (regressed) \u2014 autotune configs changed + FMA rewrite\n@triton.autotune(configs=[\n    Config({'XBLOCK': 512}, num_warps=4, num_stages=2),\n    Config({'XBLOCK': 1024}, num_warps=8, num_stages=2),\n    Config({'XBLOCK': 1024}, num_warps=4, num_stages=2),\n    Config({'XBLOCK': 2048}, num_warps=8, num_stages=2),\n    Config({'XBLOCK': 256}, num_warps=4, num_stages=2),\n], key=['xnumel'])\n@triton.jit\ndef kernel(...):\n    tmp5 = tmp3 + tl.full([1], 1e-05, tl.float32)\n    tmp6 = tl.sqrt_rn(tmp5)\n    tmp10 = tl.full([1], 1.0, tl.float32) / tmp6\n    tmp11 = tmp2 * tmp10\n    tmp15 = tl.math.fma(tmp11, tmp12, tmp14)  # FMA\n    tmp17 = tl.maximum(tl.full([1], 0.0, tl.float32), tmp15)\n# registers=32, executed_instructions=14.98M, duration=24.35us",
+    "fast_pseudocode": "# BEFORE (faster) \u2014 original autotune configs + non-fused arithmetic\n@triton.autotune(configs=[\n    Config({'XBLOCK': 256}, num_warps=4, num_stages=2),\n    Config({'XBLOCK': 512}, num_warps=4, num_stages=2),\n    Config({'XBLOCK': 512}, num_warps=8, num_stages=2),\n    Config({'XBLOCK': 1024}, num_warps=8, num_stages=2),\n    Config({'XBLOCK': 1024}, num_warps=16, num_stages=2),\n], key=['xnumel'])\n@triton.jit\ndef kernel(...):\n    tmp4 = tl.full([1], 1e-05, tl.float32)\n    tmp5 = tmp3 + tmp4\n    tmp6 = tl.sqrt_rn(tmp5)\n    tmp7 = tl.full([1], 1, tl.int32)\n    tmp8 = (tmp7 / tmp6)\n    tmp9 = tl.full([1], 1.0, tl.float32)\n    tmp10 = tmp8 * tmp9\n    tmp11 = tmp2 * tmp10\n    tmp13 = tmp11 * tmp12\n    tmp15 = tmp13 + tmp14\n    tmp16 = tl.full([1], 0, tl.int32)\n    tmp17 = tl.maximum(tmp16, tmp15)\n# registers=24, executed_instructions=10.35M, duration=18.82us",
+    "applicable_when": "Never apply this pattern as described. This is a negative result. The FPInstructions NCU rule flagged non-fused FP32 arithmetic, but the attempted fix (tl.math.fma + autotune config changes) caused regression.",
+    "do_not_apply_when": "Do not simultaneously change autotune config lists and arithmetic rewrite strategies. Do not add larger XBLOCK configs (1024, 2048) when the kernel already uses 24+ registers/thread \u2014 this pushes Block Limit Registers down (21\u219216) and causes instruction count to grow faster than any FMA savings. Do not use tl.math.fma as a standalone optimization when the kernel's bottleneck is instruction count driven by tile size selection, not arithmetic fusion.",
+    "framework_notes": "In Triton, tl.math.fma may not reduce instruction count if the autotuner simultaneously selects a larger XBLOCK that increases total work per thread. The autotune config list change (removing num_warps=16 configs, adding XBLOCK=2048) was the dominant cause of regression: registers grew from 24 to 32, Block Limit Registers dropped from 21 to 16, and executed instructions grew by 44% (10.35M\u219214.98M). The FMA rewrite itself cannot be isolated from the config change in this diff \u2014 both happened together. Future attempts should isolate arithmetic rewrites from autotune config changes."
+  },
+  {
+    "item_id": "exp_004_2d_grid_restructure_uncoalesced_access_regression",
+    "iteration": 4,
+    "speedup": 0.0278,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "restructure_to_2d_grid_to_eliminate_modulo_and_improve_coalescing",
+    "profiling_signal": {
+      "ncu_rule_triggered": "UncoalescedGlobalAccess",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 16.86,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 35.65,
+        "Memory Workload Analysis.Memory Throughput": 714.52,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 79.91,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 15.65,
+        "Scheduler Statistics.No Eligible": 57.5,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.76,
+        "Instruction Statistics.Executed Instructions": 4798080.0,
+        "Occupancy.Achieved Occupancy": 42.07,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 25256.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 617.38,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 1.06,
+        "Memory Workload Analysis.Memory Throughput": 352.87,
+        "Memory Workload Analysis.L1/TEX Hit Rate": 72.9,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 1949.12,
+        "Scheduler Statistics.No Eligible": 99.29,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.01,
+        "Instruction Statistics.Executed Instructions": 3386880.0,
+        "Occupancy.Achieved Occupancy": 85.8,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 925994.0
+      }
+    },
+    "strategy_title": "2D Grid Restructure Causes Catastrophic Uncoalesced Access",
+    "strategy_description": "Restructuring a 1D pointwise kernel into a 2D grid (channel \u00d7 spatial) to eliminate a non-power-of-2 modulo operation caused a 36x latency regression (16.86 \u00b5s \u2192 617.38 \u00b5s). The new index pattern `flat_idx = c0 + sindex * 24` (channel-last layout with stride-24 access) introduced severe uncoalesced global memory accesses: 82% of all sectors were excessive (5.27M of 6.40M total), and memory throughput collapsed from 714 GB/s to 352 MB/s. Warp cycles per issued instruction exploded from 15.65 to 1949.12, and eligible warps per scheduler dropped from 0.76 to 0.01, indicating the GPU was almost entirely stalled on memory. The original 1D flat index with modulo, despite the modulo cost, produced coalesced access patterns that were far superior to the strided channel-last access introduced by the 2D restructure.",
+    "slow_pseudocode": "# AFTER (catastrophically regressed) \u2014 2D grid, channel-last strided access\nc0 = tl.program_id(0)          # channel index 0..23\nsoffset = tl.program_id(1) * XBLOCK\nsindex = soffset + tl.arange(0, XBLOCK)[:]\nsmask = sindex < xnumel\nflat_idx = c0 + sindex * 24    # STRIDE-24 access: uncoalesced!\ntmp0 = tl.load(in_out_ptr0 + flat_idx, smask)\n# ... batch norm + relu ...\ntl.store(in_out_ptr0 + flat_idx, tmp17, smask)\n# grid = (24, cdiv(125440, XBLOCK))\n# Duration=617us, Memory Throughput=352 MB/s, Warp Cycles/Inst=1949",
+    "fast_pseudocode": "# BEFORE (faster) \u2014 1D flat index with modulo, coalesced access\nxoffset = tl.program_id(0) * XBLOCK\nxindex = xoffset + tl.arange(0, XBLOCK)[:]\nxmask = xindex < xnumel\nx2 = xindex                    # flat contiguous index: coalesced!\nx0 = (xindex % 24)             # expensive but access is coalesced\ntmp0 = tl.load(in_out_ptr0 + x2, xmask)\n# ... batch norm + relu ...\ntl.store(in_out_ptr0 + x2, tmp17, xmask)\n# grid = (cdiv(3010560, 128),)\n# Duration=16.86us, Memory Throughput=714 GB/s, Warp Cycles/Inst=15.65",
+    "applicable_when": "Never apply this pattern. This is a negative result. Do not restructure a 1D flat-index kernel to a 2D channel\u00d7spatial grid when the tensor layout is channel-last (NHWC), as threads within a warp will access memory with stride equal to the channel count, causing severe uncoalescing.",
+    "do_not_apply_when": "Do not use a 2D grid with channel as program_id(0) and spatial as program_id(1) when the tensor is stored in channel-last (NHWC/interleaved) layout. The resulting access pattern `flat_idx = channel + spatial * C` gives each thread in a warp a different spatial index but the same channel, producing stride-C accesses that are maximally uncoalesced. This anti-pattern applies regardless of whether the goal is to eliminate a modulo operation \u2014 the coalescing cost dominates any modulo savings by orders of magnitude.",
+    "framework_notes": "In Triton, threads within a warp execute with consecutive tl.arange() indices. For a channel-last tensor with C channels, the pattern `flat_idx = c0 + sindex * C` means consecutive threads access addresses separated by C*sizeof(float) bytes. With C=24 and float32, consecutive threads are 96 bytes apart \u2014 far exceeding the 32-byte sector size, causing 82% excessive sectors. The original 1D flat index `x2 = xindex` gives consecutive threads consecutive addresses (stride-1), which is perfectly coalesced. The modulo `x0 = xindex % 24` only affects the small per-channel parameter loads (24 elements), not the main tensor access, so eliminating it via 2D grid restructure is not worth the coalescing penalty on the main tensor."
+  }
+]

@@ -1,0 +1,126 @@
+--- baseline
++++ rebuilt
+@@ -8,12 +8,13 @@
+ # b_i2h: [hidden] = [256]
+ # output hidden: [batch, hidden] = [8, 256]
+ 
++
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=2, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 128}, num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=4, num_stages=3),
+     ],
+     key=['HIDDEN_SIZE', 'COMBINED_SIZE'],
+ )
+@@ -34,28 +35,33 @@
+     BLOCK_N: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+ ):
+-    # pid_m: batch tile, pid_n: hidden tile
++    # pid_m: batch tile, pid_n: hidden tile, pid_k: K-split tile
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
++    pid_k = tl.program_id(2)
++    # Number of K-splits is the grid z-dimension
++    num_k_splits = tl.num_programs(2)
+ 
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+ 
++    # Compute K range for this split
++    k_per_split = tl.cdiv(COMBINED_SIZE, num_k_splits)
++    k_start = pid_k * k_per_split
++    k_end = tl.minimum(k_start + k_per_split, COMBINED_SIZE)
++
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+ 
+-    # Loop over combined dimension in BLOCK_K chunks
+-    for k in range(0, tl.cdiv(COMBINED_SIZE, BLOCK_K)):
+-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+-
+-        # Load from combined = [x[t] | hidden], shape [batch, combined_size]
+-        # First INPUT_SIZE cols come from x_ptr, next HIDDEN_SIZE from hidden_ptr
++    # Loop over this split's K slice in BLOCK_K chunks
++    for k in range(0, tl.cdiv(k_per_split, BLOCK_K)):
++        offs_k = k_start + k * BLOCK_K + tl.arange(0, BLOCK_K)
++
+         k_vals = offs_k  # [BLOCK_K]
+ 
+-        # Mask for valid k
+-        k_mask = offs_k < COMBINED_SIZE
++        # Mask for valid k within this split's range
++        k_mask = offs_k < k_end
+ 
+         # Build combined tile [BLOCK_M, BLOCK_K]
+-        # For each k: if k < INPUT_SIZE, load from x_ptr, else from hidden_ptr
+         m_mask = offs_m < BATCH
+ 
+         # Load x part
+@@ -67,16 +73,15 @@
+ 
+         # Load hidden part
+         h_k = k_vals - INPUT_SIZE  # offset into hidden
+-        h_k_mask = (k_vals >= INPUT_SIZE) & (k_vals < COMBINED_SIZE)
++        h_k_mask = (k_vals >= INPUT_SIZE) & k_mask
+         h_ptrs = hidden_ptr + offs_m[:, None] * HIDDEN_SIZE + h_k[None, :]
+         h_tile = tl.load(h_ptrs,
+                          mask=m_mask[:, None] & h_k_mask[None, :],
+                          other=0.0)
+ 
+-        combined_tile = tl.where(x_k_mask[None, :], x_tile, h_tile)  # [BLOCK_M, BLOCK_K]
++        combined_tile = tl.where(x_k_mask[None, :] & k_mask[None, :], x_tile, h_tile)  # [BLOCK_M, BLOCK_K]
+ 
+         # Load weight tile [BLOCK_K, BLOCK_N] from w_i2h [HIDDEN_SIZE, COMBINED_SIZE]
+-        # w_i2h[n, k] -> we need w^T so we load w[offs_n, offs_k]
+         n_mask = offs_n < HIDDEN_SIZE
+         w_ptrs = w_i2h_ptr + offs_n[None, :] * COMBINED_SIZE + offs_k[:, None]
+         w_tile = tl.load(w_ptrs,
+@@ -85,33 +90,24 @@
+ 
+         acc = tl.dot(combined_tile, w_tile, acc=acc)
+ 
+-    # Add bias and apply tanh
+-    offs_n_final = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    n_mask = offs_n_final < HIDDEN_SIZE
+-    bias = tl.load(b_i2h_ptr + offs_n_final, mask=n_mask, other=0.0)  # [BLOCK_N]
+-
+-    acc = acc + bias[None, :]
+-
+-    # Apply tanh
+-    acc = tl.extra.libdevice.tanh(acc)
+-
+-    # Store result
++    # Atomic accumulate partial result — bias+tanh applied by caller after all splits
+     m_mask = offs_m < BATCH
+-    out_ptrs = out_hidden_ptr + offs_m[:, None] * HIDDEN_SIZE + offs_n_final[None, :]
+-    tl.store(out_ptrs, acc.to(tl.float32),
+-             mask=m_mask[:, None] & n_mask[None, :])
++    n_mask = offs_n < HIDDEN_SIZE
++    out_ptrs = out_hidden_ptr + offs_m[:, None] * HIDDEN_SIZE + offs_n[None, :]
++    tl.atomic_add(out_ptrs, acc.to(tl.float32), mask=m_mask[:, None] & n_mask[None, :])
+ 
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=2, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=2, num_stages=4),
+-        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32, 'BLOCK_K': 128}, num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 128}, num_warps=2, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128, 'BLOCK_K': 64},  num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64,  'BLOCK_K': 64},  num_warps=2, num_stages=4),
++        triton.Config({'BLOCK_M': 8, 'BLOCK_N': 32,  'BLOCK_K': 128}, num_warps=2, num_stages=3),
+     ],
+     key=['HIDDEN_SIZE', 'OUTPUT_SIZE'],
+ )
+ @triton.jit
++
+ def rnn_h2o_kernel(
+     hidden_ptr,
+     w_h2o_ptr, b_h2o_ptr,

@@ -1,0 +1,103 @@
+[
+  {
+    "item_id": "a8cc9b1c",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "kernel_fusion_eliminate_layout_permutation_roundtrip",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "IssueSlotUtilization + AchievedOccupancy + UncoalescedGlobalAccess",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "kernel_fusion_eliminate_layout_permutation_roundtrip \u2014 correctness failure",
+    "strategy_description": "Plan 'kernel_fusion_eliminate_layout_permutation_roundtrip' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=5.912e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.748e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "This kernel is a pure weight layout-permutation (transpose): reads (32,128,3,3) with strides (1152,9,3,1) and writes with strides (1152,1,384,128). Zero arithmetic \u2014 only strided load and strided store. Grid is only 512 blocks on 132 SMs (0.24 waves), causing severe underutilization (18.9% occupancy). Additionally 78% of all global memory sectors are excessive due to the non-contiguous store pattern. The kernel name reveals this is a weight-reformatting step feeding a conv+BN+ReLU pipeline. The optimal fix is to replace the 2D tiny-grid kernel with a 1D flattened kernel that produces more CTAs (>1 wave) and uses autotune to find the best block size, while also improving memory access coalescing.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=5.912e+00 > atol=0.001\nseed=42 output[0]: max_diff=5.748e+00 > atol=0.001\nseed=1337 output[0]: max_diff=6.733e+00 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_persistent_tile_scheduling_impl_flaw_001",
+    "iteration": 2,
+    "speedup": 0.0101,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4540.0,
+        "Occupancy.Achieved Occupancy": 8.88,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Block Size": 64.0,
+        "Compute Workload Analysis.Executed Ipc Active": 0.76,
+        "Instruction Statistics.Executed Instructions": 119040.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 277.98,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 416902.0,
+        "Occupancy.Achieved Occupancy": 24.24,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "Launch Statistics.Grid Size": 512.0,
+        "Launch Statistics.Block Size": 128.0,
+        "Compute Workload Analysis.Executed Ipc Active": 1.67,
+        "Instruction Statistics.Executed Instructions": 91297792.0
+      }
+    },
+    "strategy_title": "Persistent Grid-Stride Loop Causes Massive Instruction Blowup",
+    "strategy_description": "Applying a persistent grid-stride while-loop to a sub-wave kernel caused a 99x regression. The implementation kept the original grid (512 CTAs) unchanged instead of reducing it to NUM_SMS (132) CTAs, so each of the 512 CTAs still ran the while-loop, iterating over all tiles and executing ~767x more instructions (91M vs 119K). The strategy is sound in principle but requires the grid to be set to exactly NUM_SMS CTAs; if the grid is not reduced, the persistent loop multiplies work instead of redistributing it.",
+    "slow_pseudocode": "# BEFORE: 512 CTAs, each handles one tile\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # = (1, 512)\n@triton.autotune(...)\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = program_id(1) * YBLOCK\n    xoffset = program_id(0) * XBLOCK\n    # load/store one tile",
+    "fast_pseudocode": "# INTENDED AFTER: 132 CTAs, each iterates over multiple tiles\ngrid = (NUM_SMS,)  # = (132,)\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    pid = program_id(0)\n    num_sms = num_programs(0)  # must equal NUM_SMS=132\n    total_tiles = cdiv(ynumel, YBLOCK) * cdiv(xnumel, XBLOCK)\n    tile_id = pid\n    while tile_id < total_tiles:\n        # compute offsets from tile_id\n        # load/store one tile\n        tile_id += num_sms\n\n# ACTUAL (BROKEN) AFTER: grid unchanged at 512, loop runs on all 512 CTAs\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # still (1, 512)!\nkernel[grid](..., YBLOCK=8, XBLOCK=128)  # each CTA loops over ALL tiles",
+    "applicable_when": "Kernel has waves_per_sm < 0.5, achieved occupancy < 25%, grid_size < 2*sm_count, and duration is dominated by launch overhead / instruction-cache cold-start (CPIStall rule triggered, kernel duration < 10us).",
+    "do_not_apply_when": "The grid is not simultaneously reduced to NUM_SMS CTAs \u2014 if the original grid is kept while adding the while-loop, every CTA will iterate over all tiles, causing O(grid_size/NUM_SMS) instruction blowup. Also avoid when the kernel already has high occupancy or is memory-bandwidth bound.",
+    "framework_notes": "In Triton, the persistent grid must be launched as grid=(NUM_SMS,) with a 1D program_id(0). Using tl.num_programs(0) to get num_sms only works correctly if the grid is actually set to NUM_SMS. The diff shows the grid was left as (cdiv(xnumel,128), cdiv(ynumel,8))=(1,512) while the kernel body was rewritten to use program_id(0) and a while-loop \u2014 this is the implementation flaw."
+  },
+  {
+    "item_id": "exp_persistent_tile_scheduling_implementation_flaw_001",
+    "iteration": 2,
+    "speedup": 0.0104,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "persistent_tile_scheduling_small_grid",
+    "profiling_signal": {
+      "ncu_rule_triggered": "SOLBottleneck + AchievedOccupancy + IssueSlotUtilization",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 3.04,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 4540.0,
+        "Occupancy.Achieved Occupancy": 8.88,
+        "Launch Statistics.Waves Per SM": 0.12,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 5.52,
+        "GPU Speed Of Light Throughput.Memory Throughput": 5.09,
+        "Scheduler Statistics.Active Warps Per Scheduler": 1.6,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.28,
+        "Scheduler Statistics.No Eligible": 77.58,
+        "Instruction Statistics.Executed Instructions": 119040.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 270.88,
+        "GPU Speed Of Light Throughput.Elapsed Cycles": 406230.0,
+        "Occupancy.Achieved Occupancy": 24.24,
+        "Launch Statistics.Waves Per SM": 0.24,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 41.0,
+        "GPU Speed Of Light Throughput.Memory Throughput": 47.97,
+        "Scheduler Statistics.Active Warps Per Scheduler": 4.01,
+        "Scheduler Statistics.Eligible Warps Per Scheduler": 0.91,
+        "Scheduler Statistics.No Eligible": 58.55,
+        "Instruction Statistics.Executed Instructions": 84998144.0
+      }
+    },
+    "strategy_title": "Persistent Tile Loop Broken by Mismatched Grid Launch",
+    "strategy_description": "The persistent kernel body was correctly rewritten to use a while-loop over tile_id, but the launcher was not updated to match: it still used the old 2D grid formula (cdiv(xnumel,128), cdiv(ynumel,8)) and passed YBLOCK=8, XBLOCK=128 instead of the intended YBLOCK=32, XBLOCK=16. This caused the kernel to launch 512 blocks each iterating over a vastly larger number of tiles than intended, inflating executed instructions from ~119K to ~85M and duration from 3 \u00b5s to 271 \u00b5s \u2014 a 96x regression. The strategy of persistent tile scheduling is sound for sub-wave kernels, but the grid size and block tile parameters in the launcher must be consistent with the tile decomposition inside the kernel body.",
+    "slow_pseudocode": "# BEFORE: autotune 2D grid, direct program_id indexing\n@triton.autotune(configs=[...])\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK, XBLOCK):\n    yoffset = tl.program_id(1) * YBLOCK\n    xoffset = tl.program_id(0) * XBLOCK\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    ...\n    tl.store(...)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))  # 512 blocks\nkernel[grid](arg_0, arg_1, 4096, 9)",
+    "fast_pseudocode": "# CORRECT persistent version (strategy is right, launcher must match)\n@triton.jit\ndef kernel(in_ptr0, out_ptr0, ynumel, xnumel, YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    grid_size = tl.num_programs(0)\n    num_xtiles = tl.cdiv(xnumel, XBLOCK)   # e.g. cdiv(9,16)=1\n    num_ytiles = tl.cdiv(ynumel, YBLOCK)   # e.g. cdiv(4096,32)=128\n    num_tiles = num_xtiles * num_ytiles     # 128\n    tile_id = pid\n    while tile_id < num_tiles:\n        ytile = tile_id // num_xtiles\n        xtile = tile_id % num_xtiles\n        yindex = ytile*YBLOCK + tl.arange(0, YBLOCK)[:, None]\n        xindex = xtile*XBLOCK + tl.arange(0, XBLOCK)[None, :]\n        ...\n        tl.store(...)\n        tile_id += grid_size\n\n# LAUNCHER must match kernel tile params:\nXBLOCK, YBLOCK = 16, 32\nnum_xtiles = cdiv(xnumel, XBLOCK)   # 1\nnum_ytiles = cdiv(ynumel, YBLOCK)   # 128\nnum_tiles = num_xtiles * num_ytiles  # 128\ngrid_size = min(NUM_SMS, num_tiles)  # 128\nkernel[grid_size,](arg_0, arg_1, ynumel, xnumel, YBLOCK=YBLOCK, XBLOCK=XBLOCK)",
+    "applicable_when": "Kernel has sub-wave grid (waves_per_sm < 0.5), very low achieved occupancy (<15%), both compute and memory SOL <10%, and SOLBottleneck + AchievedOccupancy rules triggered. Total tile count is small (< 2x SM count).",
+    "do_not_apply_when": "The launcher grid and kernel tile parameters are not updated atomically together \u2014 mismatching them causes catastrophic instruction count explosion. Do not apply when the kernel already has waves_per_sm > 1 or when the total work is large enough to fill the GPU without a persistent loop.",
+    "framework_notes": "In Triton, the persistent loop uses tl.program_id(0) and tl.num_programs(0) for 1D grid. The launcher must pass a 1D grid tuple (grid_size,) and explicit XBLOCK/YBLOCK constexpr values matching the tile decomposition inside the kernel. Mismatching XBLOCK/YBLOCK between launcher and kernel body causes the while-loop to iterate far more times than intended, multiplying instruction count by (wrong_tiles / correct_tiles)."
+  }
+]

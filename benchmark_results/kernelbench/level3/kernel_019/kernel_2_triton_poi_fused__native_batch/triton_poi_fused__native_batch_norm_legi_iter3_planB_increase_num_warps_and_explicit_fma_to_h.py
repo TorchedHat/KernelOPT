@@ -1,0 +1,57 @@
+import torch
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+from torch._dynamo.testing import rand_strided
+from torch._inductor.runtime import triton_helpers
+
+
+@triton.jit
+def triton_poi_fused__native_batch_norm_legit_no_training_relu_2(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, xnumel, XBLOCK : tl.constexpr):
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    # xnumel=3010560 is exactly divisible by XBLOCK=128 (3010560/128=23520) — no mask needed
+    x2 = xindex
+    x0 = (xindex % 24)
+    tmp0 = tl.load(in_out_ptr0 + (x2), None)
+    tmp1 = tl.load(in_ptr0 + (x0), None, eviction_policy='evict_last')
+    tmp3 = tl.load(in_ptr1 + (x0), None, eviction_policy='evict_last')
+    tmp12 = tl.load(in_ptr2 + (x0), None, eviction_policy='evict_last')
+    tmp14 = tl.load(in_ptr3 + (x0), None, eviction_policy='evict_last')
+    # FMA-friendly BN normalization
+    inv_std = tl.rsqrt(tmp3 + 1e-5)
+    # tl.math.fma(a,b,c) = a*b+c as single FFMA PTX instruction
+    norm   = tl.math.fma(-tmp1, inv_std, tmp0 * inv_std)  # (tmp0-tmp1)*inv_std
+    out    = tl.math.fma(norm, tmp12, tmp14)               # norm*tmp12+tmp14
+    result = tl.maximum(0.0, out)                          # ReLU
+    tl.store(in_out_ptr0 + (x2), result, None)
+
+def kernel_function(*inputs):
+    arg_0 = inputs[0]
+    arg_1 = inputs[1]
+    arg_2 = inputs[2]
+    arg_3 = inputs[3]
+    arg_4 = inputs[4]
+    xnumel = 3010560
+    grid = (triton.cdiv(xnumel, 128),)
+    triton_poi_fused__native_batch_norm_legit_no_training_relu_2[grid](arg_0, arg_1, arg_2, arg_3, arg_4, 3010560, XBLOCK=128)
+    return arg_4
+
+def get_inputs():
+    arg_0 = rand_strided((10, 24, 112, 112), (301056, 1, 2688, 24), device='cuda:0', dtype=torch.float32)
+    arg_1 = rand_strided((24,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_2 = rand_strided((24,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_3 = rand_strided((24,), (1,), device='cuda:0', dtype=torch.float32)
+    arg_4 = rand_strided((24,), (1,), device='cuda:0', dtype=torch.float32)
+    return [arg_0, arg_1, arg_2, arg_3, arg_4]
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile-only", action="store_true")
+    args = parser.parse_args()
+    inputs = get_inputs()
+    kernel_function(*inputs)
+    torch.cuda.synchronize()
+    if not args.profile_only:
+        print("Kernel executed successfully.")

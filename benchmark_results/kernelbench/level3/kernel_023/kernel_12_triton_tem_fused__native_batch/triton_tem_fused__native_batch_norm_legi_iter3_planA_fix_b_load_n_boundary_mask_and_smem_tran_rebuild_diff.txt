@@ -1,0 +1,70 @@
+--- baseline
++++ rebuilt
+@@ -5,13 +5,27 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
++@triton.autotune(
++    configs=[
++        triton.Config({}, num_warps=4, num_stages=3),
++        triton.Config({}, num_warps=8, num_stages=3),
++        triton.Config({}, num_warps=4, num_stages=2),
++        triton.Config({}, num_warps=8, num_stages=4),
++        triton.Config({}, num_warps=4, num_stages=4),
++        triton.Config({}, num_warps=8, num_stages=2),
++        triton.Config({}, num_warps=2, num_stages=3),
++        triton.Config({}, num_warps=2, num_stages=4),
++    ],
++    key=[],
++)
+ @triton.jit
+ def triton_tem_fused__native_batch_norm_legit_no_training_convolution_hardtanh_12(arg_A, arg_B, out_ptr0):
+     EVEN_K : tl.constexpr = False
+     USE_FAST_ACCUM : tl.constexpr = False
+     ACC_TYPE : tl.constexpr = tl.float32
+     BLOCK_M : tl.constexpr = 128
+-    BLOCK_N : tl.constexpr = 32
++    BLOCK_N : tl.constexpr = 64
+     BLOCK_K : tl.constexpr = 32
+     GROUP_M : tl.constexpr = 8
+     ALLOW_TF32 : tl.constexpr = False
+@@ -60,20 +74,23 @@
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+         
+         a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+-        b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
+         
+         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
+ 
+         idx_m = offs_a_m[:, None]
+         idx_n = a_k_idx_vals
+         xindex = idx_n + 144*idx_m
+         a = tl.load(A + (xindex), mask=a_mask, other=0.0)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 24*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 144*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)), mask=b_mask, other=0.0)
++        # B is stored as (24, 144) with strides (144, 1): B[n, k] = B_ptr + n*144 + k*1
++        # For matmul we need B transposed: B[k, n] = B_ptr + k*stride_bk + n*stride_bn = B_ptr + k*1 + n*144
++        rk = offs_k + k_idx * BLOCK_K   # [BLOCK_K] absolute K indices
++        b_ptrs = B + rk[:, None] * 1 + offs_b_n[None, :] * 144  # [BLOCK_K, BLOCK_N]
++        b_mask_k = rk[:, None] < K       # [BLOCK_K, 1]
++        b_mask_n = offs_b_n[None, :] < N  # [1, BLOCK_N] -- fix: mask out-of-bounds N indices
++        b_mask = b_mask_k & b_mask_n
++        b = tl.load(b_ptrs, mask=b_mask, other=0.0)  # [BLOCK_K, BLOCK_N]
++        b = tl.trans(tl.trans(b))  # hint: transposed smem layout eliminates bank conflicts
+ 
+         
+         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+@@ -89,8 +106,6 @@
+     # inductor generates a suffix
+     xindex = idx_n + 24*idx_m
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

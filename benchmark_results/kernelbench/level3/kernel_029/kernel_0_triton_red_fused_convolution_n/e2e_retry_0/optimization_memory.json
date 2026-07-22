@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "206e87af",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "fix_r0_block_oversize_to_eliminate_register_spill_and_uncoalesced_local_memory",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "fix_r0_block_oversize_to_eliminate_register_spill_and_uncoalesced_local_memory \u2014 correctness failure",
+    "strategy_description": "Plan 'fix_r0_block_oversize_to_eliminate_register_spill_and_uncoalesced_local_memory' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.062e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.296e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.274e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "R0_BLOCK=512 is 5.3x larger than the actual reduction dimension (r0_numel=96). Triton allocates Welford accumulator arrays of shape [XBLOCK=128, R0_BLOCK=512] = 65536 elements each (three arrays: tmp4_mean, tmp4_m2, tmp4_weight). This massively exceeds register file capacity (32 registers/thread x 128 threads = 4096 registers per block), forcing Triton to spill these arrays to local memory. Local memory accesses are strided across threads (each thread accesses a different row of the [128,512] accumulator), producing exactly the observed 1-of-32-bytes sector utilization. Setting R0_BLOCK=96 (matching r0_numel exactly) reduces accumulator size to [XBLOCK, 96], eliminating spill entirely. Adding @triton.autotune explores XBLOCK values to find the best occupancy/parallelism tradeoff.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.062e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.296e+01 > atol=0.001\nseed=1337 output[0]: max_diff=1.274e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_r0block_overallocation_smem_occupancy",
+    "iteration": 1,
+    "speedup": 69.8,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "reduce_r0_block_to_match_r0_numel_for_smem_occupancy",
+    "profiling_signal": {
+      "ncu_rule_triggered": "TheoreticalOccupancy + CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {
+        "Occupancy.Block_Limit_Shared_Mem": 3.0,
+        "Occupancy.Theoretical_Occupancy_pct": 18.75,
+        "Occupancy.Achieved_Occupancy_pct": 11.36,
+        "Launch.Dynamic_Shared_Memory_Per_Block_Kbyte": 65.54,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 35.85,
+        "Scheduler.Eligible_Warps_Per_Scheduler": 0.05,
+        "GPU_SOL.Duration_us": 781.76,
+        "GPU_SOL.Compute_SM_Throughput_pct": 13.09,
+        "Memory_Workload.L1_TEX_Hit_Rate_pct": 4.34
+      },
+      "key_metric_after": {
+        "Occupancy.Block_Limit_Shared_Mem": 4.0,
+        "Occupancy.Theoretical_Occupancy_pct": 12.5,
+        "Occupancy.Achieved_Occupancy_pct": 11.64,
+        "Launch.Dynamic_Shared_Memory_Per_Block_Kbyte": 32.77,
+        "Warp_State.Warp_Cycles_Per_Issued_Instruction": 5.76,
+        "Scheduler.Eligible_Warps_Per_Scheduler": 0.46,
+        "GPU_SOL.Duration_us": 11.2,
+        "GPU_SOL.Compute_SM_Throughput_pct": 24.79,
+        "Memory_Workload.L1_TEX_Hit_Rate_pct": 62.46
+      }
+    },
+    "strategy_title": "Right-size R0_BLOCK to eliminate shared memory waste",
+    "strategy_description": "When R0_BLOCK is set to a power-of-2 far larger than r0_numel (e.g., R0_BLOCK=512 for r0_numel=96), the kernel allocates ~5x more shared memory per block than needed, directly capping Block Limit Shared Mem at 3 and theoretical occupancy at 18.75%. Reducing R0_BLOCK to the smallest power-of-2 >= r0_numel (128 in this case) cuts dynamic shared memory per block by ~2x, freeing SM resources and collapsing warp stall cycles from 35.85 to 5.76 cycles/instruction. The L1/TEX hit rate jumped from 4.34% to 62.46% and kernel duration dropped from 781 us to 11.2 us (69.8x speedup), confirming that the shared memory overallocation was the dominant bottleneck.",
+    "slow_pseudocode": "# R0_BLOCK massively oversized relative to r0_numel\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    r0_base = tl.arange(0, R0_BLOCK)[None, :]  # R0_BLOCK=512, r0_numel=96\n    tmp4_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)  # wastes 5x smem\n    tmp4_m2   = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\n    tmp4_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)\n    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):\n        ...\n# Launch: fixed XBLOCK=128, R0_BLOCK=512\nkernel[grid](..., XBLOCK=128, R0_BLOCK=512)",
+    "fast_pseudocode": "# R0_BLOCK right-sized to smallest power-of-2 >= r0_numel\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 64,  'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4),\n        triton.Config({'XBLOCK': 128, 'R0_BLOCK': 128}, num_warps=8),\n        triton.Config({'XBLOCK': 256, 'R0_BLOCK': 128}, num_warps=8),\n    ],\n    key=['xnumel', 'r0_numel'],\n)\n@triton.jit\ndef kernel(..., XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):\n    r0_base = tl.arange(0, R0_BLOCK)[None, :]  # R0_BLOCK=128, matches r0_numel=96\n    tmp4_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)  # 4x less smem\n    ...\n# Launch: autotune selects best config\nkernel[grid](...)  # no hardcoded XBLOCK/R0_BLOCK",
+    "applicable_when": "Block Limit Shared Mem is very low (<=3) while Block Limit Registers and Block Limit Warps are much higher; Dynamic Shared Memory Per Block is large relative to actual reduction dimension size; R0_BLOCK (or equivalent tile size) is a power-of-2 significantly larger than the actual reduction dimension (r0_numel); Warp Cycles Per Issued Instruction is high (>20) with CPIStall pointing to L1TEX scoreboard stalls; TheoreticalOccupancy rule fires citing shared memory as the limiter.",
+    "do_not_apply_when": "R0_BLOCK is already at or near the smallest valid power-of-2 >= r0_numel; the kernel is register-limited (Block Limit Registers is the binding constraint); the reduction dimension is large and a smaller tile would cause excessive loop iterations with poor ILP; occupancy is already near theoretical maximum.",
+    "framework_notes": "In Triton, R0_BLOCK controls the tile size for the reduction dimension and directly determines the size of accumulator arrays allocated in shared memory (e.g., tl.zeros([XBLOCK, R0_BLOCK])). The minimum valid R0_BLOCK is the smallest power-of-2 >= r0_numel. Using @triton.autotune with key=['xnumel', 'r0_numel'] allows runtime selection of the best config. In CUDA, the equivalent is choosing the reduction tile size in shared memory allocation. The vectorization hints (tl.max_contiguous, tl.multiple_of) were also added but the dominant effect was the R0_BLOCK reduction."
+  }
+]

@@ -1,0 +1,155 @@
+--- baseline
++++ rebuilt
+@@ -5,88 +5,85 @@
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
+ 
++
+ @triton.jit
+ def triton_tem_fused__softmax__unsafe_view_addmm_bmm_clone_eq_exp_masked_fill_mul_slice_split_sub_transpose_view_7(arg_A, arg_B, out_ptr0):
+-    EVEN_K : tl.constexpr = True
+-    USE_FAST_ACCUM : tl.constexpr = False
+-    ACC_TYPE : tl.constexpr = tl.float32
+-    BLOCK_M : tl.constexpr = 64
+-    BLOCK_N : tl.constexpr = 64
+-    BLOCK_K : tl.constexpr = 32
+-    GROUP_M : tl.constexpr = 8
+-    ALLOW_TF32 : tl.constexpr = False
+-    INDEX_DTYPE : tl.constexpr = tl.int32
+-    A = arg_A
+-    B = arg_B
++    # Flash Attention online softmax kernel
++    # arg_A: scores (128, 8, 512, 512) strides=(2097152, 262144, 512, 1)
++    # arg_B: V     (128, 8, 512, 96)  strides=(393216, 49152, 96, 1)
++    # out_ptr0: output (1024, 512, 96) strides=(49152, 96, 1)
+ 
+-    M = 512
+-    N = 96
+-    K = 512
++    BLOCK_M   : tl.constexpr = 64
++    BLOCK_N   : tl.constexpr = 64
++    HEAD_DIM  : tl.constexpr = 96
++    HEAD_DIM_PADDED : tl.constexpr = 128  # pad to power-of-2 for tl.dot
++    SEQ_LEN   : tl.constexpr = 512
+ 
+-    stride_aq = 262144
+-    stride_am = 512
+-    stride_ak = 1
++    pid_m  = tl.program_id(0)   # query tile index (0..7)
++    pid_bh = tl.program_id(1)   # batch*head index (0..1023)
+ 
+-    stride_bq = 49152
+-    stride_bk = 96
+-    stride_bn = 1
++    batch_idx = pid_bh // 8
++    head_idx  = pid_bh % 8
+ 
+-    # based on triton.ops.matmul
+-    pid = tl.program_id(0).to(INDEX_DTYPE)
+-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
++    # Base pointers for this batch-head slice
++    scores_base = arg_A + batch_idx * 2097152 + head_idx * 262144
++    V_base      = arg_B + batch_idx * 393216  + head_idx * 49152
++    out_base    = out_ptr0 + pid_bh * 49152
+ 
+-    # re-order program ID for better L2 performance
+-    width = GROUP_M * grid_n
+-    group_id = pid // width
+-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+-    pid_m = group_id * GROUP_M + (pid % group_size)
+-    pid_n = (pid % width) // (group_size)
+-    tl.assume(pid_m >= 0)
+-    tl.assume(pid_n >= 0)
++    # Query row offsets for this tile
++    q_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    q_mask = q_off < SEQ_LEN
+ 
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    if (stride_am == 1 and stride_ak == M) or (stride_am == K and stride_ak == 1):
+-        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+-    else:
+-        ram = rm % M
+-    if (stride_bk == 1 and stride_bn == K) or (stride_bk == N and stride_bn == 1):
+-        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+-    else:
+-        rbn = rn % N
++    # Head dim offsets (for V and output)
++    hd_off = tl.arange(0, HEAD_DIM_PADDED)
++    hd_mask = hd_off < HEAD_DIM
+ 
+-    rk = tl.arange(0, BLOCK_K)
++    # Initialize running statistics
++    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
++    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_M, HEAD_DIM_PADDED], dtype=tl.float32)
+ 
+-    idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q*stride_aq)
+-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q*stride_bq)
++    # Stream over KV tiles
++    for kv_start in range(0, SEQ_LEN, BLOCK_N):
++        kv_off = kv_start + tl.arange(0, BLOCK_N)
++        kv_mask = kv_off < SEQ_LEN
+ 
+-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+-    for k in range(K, 0, -BLOCK_K):
+-        if EVEN_K:
+-            a = tl.load(A)
+-            b = tl.load(B)
+-        else:
+-            a = tl.load(A, mask=rk[None, :] < k, other=0.)
+-            b = tl.load(B, mask=rk[:, None] < k, other=0.)
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+-        A += BLOCK_K * stride_ak
+-        B += BLOCK_K * stride_bk
++        # Load scores tile: [BLOCK_M, BLOCK_N]
++        score_ptrs = scores_base + q_off[:, None] * 512 + kv_off[None, :]
++        scores_tile = tl.load(
++            score_ptrs,
++            mask=q_mask[:, None] & kv_mask[None, :],
++            other=float('-inf')
++        )
+ 
+-    # rematerialize rm and rn to save registers
+-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+-    idx_q = tl.program_id(1).to(INDEX_DTYPE)  # batch dimension for BMM
+-    idx_m = rm[:, None]
+-    idx_n = rn[None, :]
+-    mask = (idx_m < M) & (idx_n < N)
++        # Online softmax update
++        m_new = tl.maximum(m_i, tl.max(scores_tile, axis=1))
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(scores_tile - m_new[:, None])  # [BLOCK_M, BLOCK_N]
+ 
+-    # inductor generates a suffix
+-    xindex = idx_n + 96*idx_m + 49152*idx_q
+-    tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
++        # Load V tile: [BLOCK_N, HEAD_DIM_PADDED] (padded)
++        v_ptrs = V_base + kv_off[:, None] * 96 + hd_off[None, :]
++        v_tile = tl.load(
++            v_ptrs,
++            mask=kv_mask[:, None] & hd_mask[None, :],
++            other=0.0
++        )  # [BLOCK_N, HEAD_DIM_PADDED]
+ 
++        # Rescale accumulator and update
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v_tile.to(tl.float32))
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        m_i = m_new
+ 
++    # Normalize
++    out = acc / l_i[:, None]  # [BLOCK_M, HEAD_DIM_PADDED]
++
++    # Store output (mask out padded head_dim columns)
++    out_ptrs = out_base + q_off[:, None] * 96 + hd_off[None, :]
++    tl.store(
++        out_ptrs,
++        out,
++        mask=q_mask[:, None] & hd_mask[None, :]
++    )
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

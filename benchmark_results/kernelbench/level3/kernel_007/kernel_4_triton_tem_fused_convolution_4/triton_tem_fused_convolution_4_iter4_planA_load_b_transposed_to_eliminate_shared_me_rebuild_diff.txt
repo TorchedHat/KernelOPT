@@ -1,0 +1,63 @@
+--- baseline
++++ rebuilt
+@@ -4,6 +4,7 @@
+ from triton.language.extra import libdevice
+ from torch._dynamo.testing import rand_strided
+ from torch._inductor.runtime import triton_helpers
++
+ 
+ @triton.jit
+ def triton_tem_fused_convolution_4(in_ptr0, arg_A, arg_B, out_ptr0):
+@@ -54,27 +55,28 @@
+         offs_b_n = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+     else:
+         offs_b_n = rn % N
+-    offs_k = tl.arange(0, BLOCK_K)
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+ 
++    # rn_b: N-dimension indices for B tile
++    rn_b = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++
+     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+-        
+-        a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
+-        b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
++        rk = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+ 
+-        idx_m = offs_a_m[:, None]
+-        idx_n = a_k_idx_vals
+-        xindex = idx_n + 480*idx_m
+-        a = tl.load(A + (xindex))
++        # Load A: [BLOCK_M, BLOCK_K] — K is fast dim (stride_ak=1), coalesced
++        a_ptrs = A + offs_a_m[:, None] * stride_am + rk[None, :] * stride_ak
++        a_mask = (rm[:, None] < M) & (rk[None, :] < K)
++        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+ 
+-        idx_m = b_k_idx_vals
+-        idx_n = offs_b_n[None, :]
+-        xindex = idx_n + 64*idx_m
+-        b = tl.load(B + ((tl.broadcast_to(idx_m + 480*idx_n, [BLOCK_K, BLOCK_N])).broadcast_to(xindex.shape)))
++        # Load B transposed: [BLOCK_N, BLOCK_K] — K is fast dim (stride_bk=1), zero bank conflicts
++        # rk in the column dimension means each warp accesses 32 consecutive K-elements (coalesced)
++        # In shared memory, [BLOCK_N, BLOCK_K] with K as fast dim = row-major, zero bank conflicts
++        b_ptrs = B + rn_b[:, None] * stride_bn + rk[None, :] * stride_bk  # [BLOCK_N, BLOCK_K]
++        b_mask = (rn_b[:, None] < N) & (rk[None, :] < K)
++        b_T = tl.load(b_ptrs, mask=b_mask, other=0.0)  # [BLOCK_N, BLOCK_K]
+ 
+-        
+-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+-        
++        # tl.trans(b_T) gives [BLOCK_K, BLOCK_N] — dot receives [BLOCK_M,BLOCK_K] x [BLOCK_K,BLOCK_N]
++        acc += tl.dot(a, tl.trans(b_T), allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+ 
+     # rematerialize rm and rn to save registers
+     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+@@ -88,8 +90,6 @@
+     tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last')
+     tmp1 = acc + tmp0
+     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), tmp1, mask)
+-
+-
+ 
+ def kernel_function(*inputs):
+     arg_0 = inputs[0]

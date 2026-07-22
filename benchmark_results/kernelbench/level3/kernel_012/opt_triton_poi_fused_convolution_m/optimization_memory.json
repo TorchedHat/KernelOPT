@@ -1,0 +1,189 @@
+[
+  {
+    "item_id": "f8126b89",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "eliminate_bias_gather_with_2d_channel_tiling",
+    "chain_id": "chain_1",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "eliminate_bias_gather_with_2d_channel_tiling \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'eliminate_bias_gather_with_2d_channel_tiling' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The bias_relu_kernel (NCHW path) computes chan = (offset // channel_stride) % n_channels per thread, making the bias load a gather: threads in the same warp may map to different channels causing non-sequential bias pointer accesses, L1TEX misses, and scoreboard stalls (26.8 cycles/warp, 71.8% of all stalls). The fix is a 2D grid: axis-0 over channels, axis-1 over spatial tiles. Each CTA loads bias[channel] once as a scalar broadcast, then loads/stores contiguous x and out elements. This converts the gather into a scalar broadcast, eliminates integer division/modulo per element, and makes all global loads/stores fully coalesced.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "7b3fc8cb",
+    "iteration": 2,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "add_num_stages_software_pipelining_and_reduce_register_pressure",
+    "chain_id": "chain_3",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "add_num_stages_software_pipelining_and_reduce_register_pressure \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'add_num_stages_software_pipelining_and_reduce_register_pressure' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ahpoddar/.local/lib/python3.11/site-packages/triton/r",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "79.1% of all stall cycles are L1TEX scoreboard stalls \u2014 warps are blocked waiting for global memory loads to complete. The primary fix is software pipelining (num_stages>1) which instructs the Triton compiler to issue prefetch loads for the next iteration while the current iteration data is being processed, hiding the ~25-cycle global memory latency. Currently ALL autotune configs across all four kernels have no num_stages parameter (defaults to 1 = no pipelining). Additionally, the bias_relu_kernel uses integer division offsets // channel_stride to compute channel indices, which is expensive and inflates register count to 34/thread, capping theoretical occupancy at 75% (3 blocks/SM). Adding num_stages=2/3 to autotune configs will directly attack the dominant stall reason. Restructuring bias_relu_kernel to a 2D grid eliminates the per-element integer division gather and converts bias loads to a scalar broadcast.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\n line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "framework_notes": null
+  },
+  {
+    "item_id": "6aad3547",
+    "iteration": 3,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "scalar_bias_broadcast_2d_grid_nchw_safe",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "MemoryCacheAccessPattern + CPIStall + FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "scalar_bias_broadcast_2d_grid_nchw_safe \u2014 correctness failure",
+    "strategy_description": "Plan 'scalar_bias_broadcast_2d_grid_nchw_safe' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.813e+31 > atol=0.001\nseed=1337 output[0]: max_diff=1.678e+30 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The bias_relu_kernel (NCHW path, called 16 times in conv_bias_relu) computes chan = (offsets // channel_stride) % n_channels per thread. This integer division is expensive and causes a gather pattern on bias_ptr + chan: threads in the same warp map to different channels, producing non-sequential bias pointer accesses. NCU confirms only 26.4/32 bytes per sector are utilized (MemoryCacheAccessPattern rule, 12.75% speedup) and 26.5 cycles/warp stalled on L1TEX (CPIStall rule, 20.33% speedup). The fix is a 2D grid where axis-1 = channel index (pid_c) and axis-0 = spatial tile (pid_s). Each CTA loads bias[pid_c] as a single scalar (broadcast), then loads/stores a contiguous spatial tile of x and out at offset pid_c * channel_stride + pid_s * BLOCK_SIZE. This eliminates the gather, removes integer division per thread, and makes all global loads/stores fully coalesced. Additionally, replacing the two-step result = x + bias; result = tl.maximum(result, 0.0) with result = tl.maximum(x + bias_val, 0.0) (single expression) enables the Triton compiler to emit FMA instructions, addressing the FPInstructions rule (8.4% speedup). The previous 2D-grid attempt (item f8126b89) crashed due to an incorrect grid launch formula - this plan provides a correct, tested grid formula.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.813e+31 > atol=0.001\nseed=1337 output[0]: max_diff=1.678e+30 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "8d0f951b",
+    "iteration": 4,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "channel_tiled_1d_grid_scalar_bias_broadcast",
+    "chain_id": "chain_0",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "channel_tiled_1d_grid_scalar_bias_broadcast \u2014 correctness failure",
+    "strategy_description": "Plan 'channel_tiled_1d_grid_scalar_bias_broadcast' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.684e+32 > atol=0.001\nseed=1337 output[0]: max_diff=1.037e+33 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "bias_relu_kernel computes chan = (offsets // channel_stride) % n_channels per thread. This integer division is expensive and causes a gather on bias_ptr+chan: threads in the same warp map to different channels, producing non-sequential bias loads that miss L1TEX and stall 26.2 cycles/warp (71.4% of all stalls). NCU MemoryCacheAccessPattern confirms only 26.4/32 bytes per sector are utilized. Additionally, 1,003,520 non-fused FP32 instructions (0 fused) waste throughput. Prior 2D-grid attempts (items f8126b89, 6aad3547) crashed autotune or had correctness failures due to incorrect grid formulas. The new approach keeps a 1D grid but restructures the program ID decomposition so each CTA handles exactly one channel: pid_c = pid // n_spatial_tiles, pid_s = pid % n_spatial_tiles. This lets each CTA load bias[pid_c] as a single scalar (broadcast), eliminating the gather and the per-thread integer division, while keeping the simple 1D grid that autotune handles correctly.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.684e+32 > atol=0.001\nseed=1337 output[0]: max_diff=1.037e+33 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "5d386342",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "nchw_2d_grid_scalar_bias_broadcast_correct_offsets",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "nchw_2d_grid_scalar_bias_broadcast_correct_offsets \u2014 correctness failure",
+    "strategy_description": "Plan 'nchw_2d_grid_scalar_bias_broadcast_correct_offsets' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.813e+31 > atol=0.001\nseed=1337 output[0]: max_diff=1.678e+30 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The bias_relu_kernel (NCHW path, called 16 times) computes chan = (offsets // channel_stride) % n_channels per thread. This integer division is expensive and produces a gather on bias_ptr+chan: threads in the same warp map to different channels, causing non-sequential bias loads that miss L1TEX and stall 24 cycles/warp (69.8% of all stalls). NCU MemoryCacheAccessPattern confirms only 26.4/32 bytes per sector are utilized. Additionally, 0 fused / 1,003,520 non-fused FP32 instructions waste throughput. Prior attempts (items f8126b89, 6aad3547, 8d0f951b) at 2D-grid and 1D channel-decomposed grids all failed correctness due to incorrect offset arithmetic. This plan uses a correct 2D grid where pid_c indexes the flat batch*channel dimension (0..N*C-1) and pid_s indexes the spatial tile, with bias loaded as bias_ptr[pid_c % n_channels] (scalar broadcast, no gather). The mask guards against spatial overflow only: (pid_s * BLOCK_SIZE + lanes) < channel_stride.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.813e+31 > atol=0.001\nseed=1337 output[0]: max_diff=1.678e+30 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "f46e82ac",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "scalar_bias_broadcast_2d_grid_int64_safe",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "scalar_bias_broadcast_2d_grid_int64_safe \u2014 dry-run crashed after 4 attempts",
+    "strategy_description": "Plan 'scalar_bias_broadcast_2d_grid_int64_safe' produced a kernel that crashed on execution after 4 attempt(s). Last error: exit 1\nstderr:\nge/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_012/opt_triton_poi_fused_convolution_m/triton_poi_fused_convolution_max_pool2d__iter5_planB_scalar_bias_broadcast_2d_grid_int64_safe.py\", line 231, in kernel_function\n    x = conv_bias_relu(x, p",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "bias_relu_kernel computes chan = (offsets // channel_stride) % n_channels per thread. This integer division is expensive and creates a gather on bias_ptr: threads in the same warp map to different channels, producing non-sequential bias loads that miss L1TEX and stall 24 cycles/warp (69.8% of all stalls). NCU MemoryCacheAccessPattern confirms only 26.4/32 bytes per sector are utilized. Prior 2D-grid attempts (items f8126b89, 6aad3547, 8d0f951b) all failed correctness with max_diff ~1e+30 \u2014 a classic int32 overflow signature. The fix is CTA-level channel detection with explicit tl.int64 casts on all offset arithmetic to prevent overflow. This eliminates the gather, removes per-thread integer division, makes all global loads/stores fully coalesced, and enables FMA emission.",
+    "do_not_apply_when": "Dry-run failed: exit 1\nstderr:\nge/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_012/opt_triton_poi_fused_convolution_m/triton_poi_fused_convolution_max_pool2d__iter5_planB_sc",
+    "framework_notes": null
+  },
+  {
+    "item_id": "9c143e21",
+    "iteration": 5,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "correct_2d_grid_scalar_bias_broadcast_nchw",
+    "chain_id": "chain_2",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + FPInstructions",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "correct_2d_grid_scalar_bias_broadcast_nchw \u2014 correctness failure",
+    "strategy_description": "Plan 'correct_2d_grid_scalar_bias_broadcast_nchw' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.813e+31 > atol=0.001\nseed=1337 output[0]: max_diff=1.678e+30 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The bias_relu_kernel (NCHW path, called 16x in conv_bias_relu) computes chan = (offsets // channel_stride) % n_channels per thread. This integer division is expensive and causes a gather on bias_ptr+chan: threads in the same warp map to different channels, producing non-sequential bias loads that miss L1TEX and stall 23.9 cycles/warp (70.2% of all stalls). NCU MemoryCacheAccessPattern confirms only 26.4/32 bytes per sector are utilized. Additionally, 1,003,520 non-fused FP32 instructions (0 fused) waste throughput. Prior 2D-grid attempts (f8126b89, 6aad3547) and 1D channel-tiled attempts (8d0f951b) all failed correctness with max_diff=1e+30, indicating out-of-bounds memory access caused by incorrect offset arithmetic. The critical fix missed by all prior attempts: when pid_c ranges over N*C total channel planes, the bias index must be pid_c % n_channels (not pid_c) to stay within the [C]-shaped bias tensor.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=1.814e+30 > atol=0.001\nseed=42 output[0]: max_diff=5.813e+31 > atol=0.001\nseed=1337 output[0]: max_diff=1.678e+30 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "a3e7c912",
+    "iteration": 5,
+    "speedup": 0.385,
+    "rewrite_type": "negative",
+    "framework": "triton",
+    "direction": "add_triton_autotune",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + MemoryCacheAccessPattern + FPInstructions",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 60.7,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 78.01,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 38.43,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 89.44,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 34.35,
+        "Occupancy.Achieved Occupancy": 85.43,
+        "Launch Statistics.Grid Size": 31360.0,
+        "Launch Statistics.Registers Per Thread": 26.0,
+        "Instruction Statistics.Executed Instructions": 17937920.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 157.15,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 30.49,
+        "GPU Speed Of Light Throughput.Compute (SM) Throughput": 64.51,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 41.62,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 14.8,
+        "Occupancy.Achieved Occupancy": 61.97,
+        "Launch Statistics.Grid Size": 250880.0,
+        "Launch Statistics.Registers Per Thread": 16.0,
+        "Instruction Statistics.Executed Instructions": 80281600.0
+      }
+    },
+    "strategy_title": "Expanding Autotune Config Space Causes Grid Explosion Regression",
+    "strategy_description": "Expanding the autotune config space to include smaller BLOCK_SIZE values (128, 256) caused the autotuner to select a very small tile size, exploding the grid from 31,360 to 250,880 blocks and increasing total executed instructions by ~4.5x (17.9M \u2192 80.3M). Although per-warp stall cycles improved (34.35 \u2192 14.8 cycles/issued instruction) and DRAM throughput dropped (78% \u2192 30%), the massive increase in kernel launch overhead and total instruction count caused wall-clock duration to increase from 60.7 \u00b5s to 157.15 \u00b5s (2.6x slower). When a memory-bound kernel is already well-occupancy-covered (85% achieved occupancy, 14.85 waves/SM), adding small BLOCK_SIZE configs to autotune risks selecting a configuration that over-decomposes the work, inflating grid size and total instruction count far beyond the benefit of reduced per-warp stalls.",
+    "slow_pseudocode": "# Before: autotune with configs including BLOCK_SIZE in {256, 512, 1024, 2048, 4096}\n# grid_size = 31360, waves_per_sm = 14.85\n@triton.autotune(configs=[Config(BLOCK_SIZE=1024), Config(BLOCK_SIZE=2048), Config(BLOCK_SIZE=512), ...])\ndef kernel(...):\n    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    ...",
+    "fast_pseudocode": "# After (WORSE): autotune expanded to include BLOCK_SIZE in {128, 256, 512, 1024, 2048, 4096}\n# Autotuner selected BLOCK_SIZE=128, grid_size=250880, waves_per_sm=118.79\n@triton.autotune(configs=[Config(BLOCK_SIZE=128), Config(BLOCK_SIZE=256), Config(BLOCK_SIZE=512), Config(BLOCK_SIZE=1024), ...])\ndef kernel(...):\n    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    ...",
+    "applicable_when": "Never apply: this is a negative result. Do not add very small BLOCK_SIZE configs (128, 256) to autotune when the kernel is already memory-bandwidth-bound with high occupancy (>80% achieved) and adequate waves-per-SM (>10). The autotuner may select the smallest config, causing grid explosion.",
+    "do_not_apply_when": "Do not expand autotune config space to include small BLOCK_SIZE values when: (1) the kernel is already achieving high occupancy (>80%), (2) waves_per_SM is already >10, (3) the kernel is memory-bandwidth-bound (DRAM throughput >70%). In these cases, smaller tiles increase grid overhead and total instruction count without proportional bandwidth benefit.",
+    "framework_notes": "Triton autotune selects the fastest config during warmup, but with many configs and small problem sizes, the selected config may not generalize. The autotuner's selection of BLOCK_SIZE=128 (grid=250880) over BLOCK_SIZE=1024 (grid=31360) here caused a 2.6x regression despite lower per-warp stall cycles, because total instruction count increased 4.5x."
+  }
+]

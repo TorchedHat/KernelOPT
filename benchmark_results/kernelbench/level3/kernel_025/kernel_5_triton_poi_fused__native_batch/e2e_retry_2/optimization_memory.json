@@ -1,0 +1,63 @@
+[
+  {
+    "item_id": "5aba2c54",
+    "iteration": 1,
+    "speedup": 0.0,
+    "rewrite_type": "implementation_flaw",
+    "framework": "triton",
+    "direction": "memory_coalescing_swap_xblock_yblock_dimensions",
+    "chain_id": "",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall + SOLBottleneck",
+      "key_metric_before": {},
+      "key_metric_after": {}
+    },
+    "strategy_title": "memory_coalescing_swap_xblock_yblock_dimensions \u2014 correctness failure",
+    "strategy_description": "Plan 'memory_coalescing_swap_xblock_yblock_dimensions' was applied but failed correctness. Error: Correctness FAILED:\nseed=0 output[0]: max_diff=3.755e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.513e+01 > atol=0.001\nseed=1337 output[0]: max_diff=3.279e+01 > atol=0.001",
+    "slow_pseudocode": "",
+    "fast_pseudocode": "",
+    "applicable_when": "The kernel fuses batch-norm + add + ReLU over a tensor with NHWC input layout (in_out_ptr0 stride=(3211264,1,14336,64)). In NHWC, consecutive elements along the channel dimension (y0) are contiguous in memory (stride=1), while consecutive spatial positions (x2) are separated by 64 channels. The current tiling assigns XBLOCK=128 threads to the spatial (x) dimension and YBLOCK=8 to the channel/batch (y) dimension. This means the 128 threads in a warp step through x2 values that are 64 floats apart in memory, causing each warp to issue 128 separate cache-line requests instead of 1 \u2014 severe uncoalesced access. Swapping so that XBLOCK covers the channel dimension (y0, stride=1) and YBLOCK covers the spatial dimension (x2) will make the innermost warp access contiguous, collapsing 128 transactions into 1 per warp. The L1 hit rate of 7.04% and L2 saturation at 93.71% confirm this is the dominant bottleneck.",
+    "do_not_apply_when": "Previous implementation failed: Correctness FAILED:\nseed=0 output[0]: max_diff=3.755e+01 > atol=0.001\nseed=42 output[0]: max_diff=1.513e+01 > atol=0.001\nseed=1337 output[0]: max_diff=3.279e+01 > atol=0.001",
+    "framework_notes": null
+  },
+  {
+    "item_id": "exp_001_triton_autotune_contiguous_hints",
+    "iteration": 1,
+    "speedup": 1.2535,
+    "rewrite_type": "positive",
+    "framework": "triton",
+    "direction": "autotune_with_contiguous_hints_for_vectorized_loads",
+    "profiling_signal": {
+      "ncu_rule_triggered": "CPIStall",
+      "key_metric_before": {
+        "GPU Speed Of Light Throughput.Duration": 124.99,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 93.71,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 61.04,
+        "Memory Workload Analysis.L2 Hit Rate": 55.37,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 12.48,
+        "Occupancy.Theoretical Occupancy": 50.0,
+        "Occupancy.Achieved Occupancy": 47.58,
+        "Launch Statistics.Registers Per Thread": 62.0,
+        "Instruction Statistics.Executed Instructions": 56353920.0
+      },
+      "key_metric_after": {
+        "GPU Speed Of Light Throughput.Duration": 99.71,
+        "GPU Speed Of Light Throughput.L2 Cache Throughput": 74.9,
+        "GPU Speed Of Light Throughput.DRAM Throughput": 37.68,
+        "Memory Workload Analysis.L2 Hit Rate": 66.99,
+        "Warp State Statistics.Warp Cycles Per Issued Instruction": 13.3,
+        "Occupancy.Theoretical Occupancy": 56.25,
+        "Occupancy.Achieved Occupancy": 53.35,
+        "Launch Statistics.Registers Per Thread": 56.0,
+        "Instruction Statistics.Executed Instructions": 47863200.0
+      }
+    },
+    "strategy_title": "Autotune + tl.max_contiguous hints enable vectorized loads",
+    "strategy_description": "When a Triton kernel shows high L2 cache throughput (>90%) and significant L1TEX stall cycles (>40% of warp cycles), adding tl.max_contiguous and tl.multiple_of hints on the index arrays tells the compiler that accesses are aligned and contiguous within a tile, enabling 128-bit (LDG.128) vectorized loads instead of scalar LDG.32. Pairing this with @triton.autotune over XBLOCK/YBLOCK/num_warps configurations allows the runtime to select the tile shape that best balances register pressure and occupancy, reducing both L2 pressure (93.71%\u219274.9%) and DRAM throughput (61.04%\u219237.68%) while improving theoretical occupancy (50%\u219256.25%) through lower register count (62\u219256 registers/thread).",
+    "slow_pseudocode": "# Fixed tile, no contiguous hints\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    yindex = yoffset + tl.arange(0, YBLOCK)[:, None]\n    xindex = xoffset + tl.arange(0, XBLOCK)[None, :]\n    tmp0 = tl.load(ptr + (y0 + stride*x2 + ...), xmask & ymask)\n    tl.store(out_ptr + (x2 + out_stride*y3), result, xmask & ymask)\n\ngrid = (cdiv(xnumel, 128), cdiv(ynumel, 8))\nkernel[grid](..., YBLOCK=8, XBLOCK=128)",
+    "fast_pseudocode": "# Autotune + contiguous hints for vectorized loads\n@triton.autotune(\n    configs=[\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 4}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 8}, num_warps=4, num_stages=3),\n        triton.Config({'XBLOCK': 512, 'YBLOCK': 2}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 128, 'YBLOCK': 4}, num_warps=4, num_stages=2),\n        triton.Config({'XBLOCK': 256, 'YBLOCK': 8}, num_warps=8, num_stages=3),\n        triton.Config({'XBLOCK': 64,  'YBLOCK': 8}, num_warps=2, num_stages=2),\n    ],\n    key=['xnumel', 'ynumel'],\n)\n@triton.jit\ndef kernel(..., YBLOCK: tl.constexpr, XBLOCK: tl.constexpr):\n    _yrange = tl.arange(0, YBLOCK)\n    _yrange = tl.max_contiguous(tl.multiple_of(_yrange, YBLOCK), YBLOCK)\n    yindex = yoffset + _yrange[:, None]\n    _xrange = tl.arange(0, XBLOCK)\n    _xrange = tl.max_contiguous(tl.multiple_of(_xrange, XBLOCK), XBLOCK)\n    xindex = xoffset + _xrange[None, :]\n    tmp0 = tl.load(ptr + (y0 + stride*x2 + ...), mask=xmask & ymask)\n    tl.store(out_ptr + (x2 + out_stride*y3), result, mask=xmask & ymask)\n\n# Launch without explicit XBLOCK/YBLOCK; autotuner injects them\ngrid = lambda meta: (cdiv(xnumel, meta['XBLOCK']), cdiv(ynumel, meta['YBLOCK']))\nkernel[grid](...)",
+    "applicable_when": "L2 Cache Throughput >85%, L1TEX stall cycles >35% of warp cycles (CPIStall rule triggered), kernel uses 2D tiling with contiguous access in at least one dimension, registers_per_thread >50 limiting occupancy, fixed tile sizes are used without autotuning",
+    "do_not_apply_when": "Access pattern is genuinely strided/non-contiguous (hints would be semantically incorrect and could cause wrong results), kernel already uses autotune, register count is already low (<40) and occupancy is not register-limited, tile sizes are already optimal",
+    "framework_notes": "tl.max_contiguous(tl.multiple_of(index, BLOCK), BLOCK) is Triton-specific syntax. The hint value for tl.multiple_of must match the actual BLOCK constexpr to be semantically correct. YBLOCK values must be chosen to avoid crossing logical dimension boundaries (e.g., if y0 = yindex % 64, YBLOCK must divide 64). In CUDA, the equivalent is using __ldg() or __builtin_assume_aligned() to hint vectorized loads."
+  }
+]
