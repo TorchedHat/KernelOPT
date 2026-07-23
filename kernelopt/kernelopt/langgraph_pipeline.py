@@ -150,6 +150,107 @@ def profile_baseline(state: GraphState) -> dict:
     auto_kernel_id = (kernel_id == 0 and not cfg.kernel_name)
     _target_triton_name = None  # may be set in the multi-kernel branch below
 
+    # Ablation: skip NCU profiling entirely
+    if getattr(cfg, "skip_ncu", False):
+        from kernelopt.functions.benchmark import benchmark_kernel
+        pipe_print("[dim]NCU profiling skipped (--skip-ncu ablation)[/]")
+        wall_result = benchmark_kernel(kernel_path)
+        wall_ms = wall_result.get("median_ms", 1.0) if isinstance(wall_result, dict) else 1.0
+        wall_ns = wall_ms * 1e6
+        return {
+            "baseline_profiling_context": {},
+            "best_latency_ns": wall_ns,
+            "best_wall_ms": wall_ms,
+            "ncu_config": None,
+            "active_kernels": [{
+                "chain_id": "chain_0",
+                "kernel_source": state.get("kernel_source", ""),
+                "latency_ns": wall_ns,
+                "wall_ms": wall_ms,
+                "speedup": 1.0,
+                "profiling_context": {},
+                "history": [],
+                "depth": 0,
+                "alive": True,
+            }],
+        }
+
+    # Replay: load baseline profiling context from a prior run directory
+    if getattr(cfg, "replay_profiles", ""):
+        import json as _rp_json
+        from kernelopt.functions.benchmark import benchmark_kernel
+        replay_dir = Path(cfg.replay_profiles)
+        bl_ctx_path = replay_dir / "baseline_profiling_context.json"
+        if not bl_ctx_path.exists():
+            raise RuntimeError(
+                f"--replay-profiles: baseline_profiling_context.json not found in {replay_dir}"
+            )
+        pipe_print(f"[dim]Replaying baseline profile from {bl_ctx_path}[/]")
+        baseline_ctx = _rp_json.loads(bl_ctx_path.read_text())
+
+        # Load ncu_config from checkpoint if available
+        ncu_config = None
+        ckpt_path = replay_dir / "pipeline_checkpoint.json"
+        if ckpt_path.exists():
+            try:
+                ckpt_data = _rp_json.loads(ckpt_path.read_text())
+                gs = ckpt_data.get("graph_state", {})
+                ncu_config = gs.get("ncu_config") if isinstance(gs, dict) else None
+            except Exception:
+                pass
+
+        latency = get_latency_ns(baseline_ctx)
+
+        # Wall-clock benchmark on the current machine
+        _baseline_wall_ms = float("inf")
+        try:
+            _wc = benchmark_kernel(kernel_path)
+            if _wc.get("median_ms", -1) > 0:
+                _baseline_wall_ms = _wc["median_ms"]
+        except Exception:
+            pass
+
+        # Save a copy into the current output dir for downstream consumers
+        _ctx_copy = output_dir / "baseline_profiling_context.json"
+        _ctx_copy.write_text(_rp_json.dumps(baseline_ctx, indent=2))
+
+        _wall_str = f"  Wall: {_baseline_wall_ms:.3f} ms" if _baseline_wall_ms < float("inf") else ""
+        pipe_print(
+            f"  Baseline (replayed): [cyan]{latency:.0f} ns[/] (NCU){_wall_str}"
+        )
+
+        framework = state["framework"]
+        if framework == "auto":
+            framework = baseline_ctx.get("framework_hint", "triton")
+
+        return {
+            "baseline_profiling_context": baseline_ctx,
+            "baseline_csv": str(replay_dir / "baseline.csv"),
+            "baseline_ncu_rep": str(replay_dir / "baseline.ncu-rep"),
+            "baseline_latency_ns": latency,
+            "baseline_wall_ms": _baseline_wall_ms,
+            "best_latency_ns": latency,
+            "best_wall_ms": _baseline_wall_ms,
+            "current_profiling_context": baseline_ctx,
+            "framework": framework,
+            "ncu_config": ncu_config,
+            "kernel_id": kernel_id,
+            "active_kernels": [{
+                "chain_id": "chain_0",
+                "kernel_source": _get_primary_kernel(state),
+                "latency_ns": latency,
+                "wall_ms": _baseline_wall_ms,
+                "speedup": 1.0,
+                "profiling_context": baseline_ctx,
+                "ncu_summary": _build_ncu_summary(baseline_ctx),
+                "history": [],
+                "depth": 0,
+                "alive": True,
+            }],
+            "global_best_kernel": state.get("best_kernel", ""),
+            "global_best_latency_ns": latency,
+        }
+
     ui = get_pipeline_ui()
     if ui:
         ui.set_phase("Baseline profiling", Path(kernel_path).name)
@@ -1546,6 +1647,10 @@ def profile_candidates(state: GraphState) -> dict:
     if ui:
         ui.set_phase("Profiling (NCU)", f"{len(candidates)} candidates")
 
+    _replay_dir = Path(cfg.replay_profiles) if getattr(cfg, "replay_profiles", "") else None
+    _use_replay = _replay_dir is not None
+    _skip_ncu = getattr(cfg, "skip_ncu", False)
+
     pipe_print(f"  Profiling {len(candidates)} valid candidates...")
 
     for c in candidates:
@@ -1557,6 +1662,62 @@ def profile_candidates(state: GraphState) -> dict:
         output_base = str(output_dir / file_stem)
         kernel_file = f"{output_base}{ext}"
         Path(kernel_file).write_text(c.optimized_kernel)
+
+        # Replay/skip-ncu mode: wall-clock timing only, carry forward baseline NCU context
+        if _use_replay or _skip_ncu:
+            try:
+                from kernelopt.functions.benchmark import benchmark_kernel
+                _wc = benchmark_kernel(kernel_file)
+                c.wall_ms = _wc.get("median_ms", float("inf"))
+            except Exception:
+                c.wall_ms = float("inf")
+
+            # Use baseline profiling context so downstream planner has NCU data
+            c.profiling_context = dict(state.get("baseline_profiling_context", {}))
+            _bl_wall = state.get("baseline_wall_ms", float("inf"))
+            c.wall_speedup = (
+                round(_bl_wall / c.wall_ms, 4)
+                if c.wall_ms > 0 and c.wall_ms < float("inf") and _bl_wall < float("inf")
+                else 0.0
+            )
+            # Use wall-clock as the primary latency metric when replaying
+            c.latency_ns = c.wall_ms * 1e6 if c.wall_ms < float("inf") else float("inf")
+            baseline_latency_ns = state["baseline_latency_ns"]
+            c.speedup = c.wall_speedup
+
+            _wall_str = f"{c.wall_ms:.3f} ms wall ({c.wall_speedup:.2f}x)" if c.wall_ms < float("inf") else "N/A"
+            _mode_tag = "replay" if _use_replay else "skip-ncu"
+            pipe_print(
+                f"    Plan {c.plan_letter} ({c.direction}): {_wall_str} [dim]({_mode_tag})[/]"
+            )
+
+            _opt_mem = _get_opt_memory(state)
+            _bl_ns = state.get("baseline_latency_ns", 0)
+            _real_speedup = c.wall_speedup
+            if _opt_mem and _real_speedup > 0 and _real_speedup < 1000:
+                _kt = _get_kernel_type(state)
+                _opt_mem.record(
+                    kernel_type=_kt,
+                    strategy=c.direction,
+                    speedup=_real_speedup,
+                    passed=c.correctness_passed and _real_speedup > 1.0,
+                    before_kernel=_get_primary_kernel(state)[:2000],
+                    after_kernel=c.optimized_kernel[:2000],
+                    change_summary=c.execution_result.get("change_summary", c.direction),
+                )
+
+            from kernelopt.search_tree import SearchTree
+            _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+            _tree.add_candidate(
+                parent_id=_tree.get_best().id if _tree.get_best() else "root",
+                kernel_source=c.optimized_kernel,
+                latency_ns=c.latency_ns,
+                direction=c.direction,
+                iteration=iteration + 1,
+                correctness=c.correctness_passed,
+                plan_letter=c.plan_letter,
+            )
+            continue
 
         try:
             _prof_label = f"plan {c.plan_letter} — {c.direction[:30]}"
@@ -2461,6 +2622,10 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
     from kernelopt.agents.profiler import get_latency_ns
 
     cfg = state.config
+
+    # Ablation overrides
+    if getattr(cfg, "no_memory", False):
+        cfg.q_cap = 0
     ext = Path(state.kernel_path).suffix
 
     graph = build_graph()

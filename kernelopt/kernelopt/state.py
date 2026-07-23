@@ -148,6 +148,12 @@ class PipelineConfig:
     # modules require longer autotuning. Scale with model complexity.
     trace_timeout: int = 1800
 
+    # Ablation flags
+    no_memory: bool = False          # disable experience accumulation (q_cap=0)
+    skip_ncu: bool = False           # skip NCU profiling, planner gets no bottleneck context
+    optimize_all_kernels: bool = False  # disable Inductor-aware synthesis (optimize extern too)
+    replay_profiles: str = ""        # replay NCU profiles from a prior run directory
+
     # Synthesis options (PyTorch → Triton)
     entry_point: str | None = None
     input_shapes: list[tuple[int, ...]] | None = None
