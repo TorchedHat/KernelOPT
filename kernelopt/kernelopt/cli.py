@@ -700,6 +700,18 @@ def run(
                     kernel_output_dir = Path(resolved_output) / f"opt_{gk['kernel_name'][:30]}"
                     kernel_output_dir.mkdir(parents=True, exist_ok=True)
 
+                    # Resolve per-sub-kernel replay directory
+                    _sub_replay = cfg.replay_profiles
+                    if _sub_replay:
+                        _kn = gk['kernel_name'][:30]
+                        _sub_rp = Path(_sub_replay) / f"opt_{_kn}"
+                        if not _sub_rp.exists():
+                            for _sd in Path(_sub_replay).iterdir():
+                                if _sd.is_dir() and _kn in _sd.name and (_sd / "baseline_profiling_context.json").exists():
+                                    _sub_rp = _sd
+                                    break
+                        _sub_replay = str(_sub_rp) if _sub_rp.exists() else ""
+
                     kernel_cfg = PipelineConfig(
                         T=cfg.T, N=cfg.N, K=cfg.K, keep_n=cfg.keep_n,
                         model=cfg.model, api_key=cfg.api_key,
@@ -717,7 +729,7 @@ def run(
                         search_policy=cfg.search_policy,
                         beam_width=cfg.beam_width,
                         replay_mode=cfg.replay_mode,
-                        replay_profiles=cfg.replay_profiles,
+                        replay_profiles=_sub_replay,
                         skip_ncu=cfg.skip_ncu,
                         no_memory=cfg.no_memory,
                         debug=cfg.debug, verbose=cfg.verbose,

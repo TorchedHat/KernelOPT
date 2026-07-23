@@ -1672,8 +1672,19 @@ def profile_candidates(state: GraphState) -> dict:
             except Exception:
                 c.wall_ms = float("inf")
 
-            # Use baseline profiling context so downstream planner has NCU data
-            c.profiling_context = dict(state.get("baseline_profiling_context", {}))
+            # Try to load matching pre-computed profiling context from replay dir
+            _matched_ctx = False
+            if _use_replay:
+                import json as _rp_json
+                _ctx_path = _replay_dir / f"{file_stem}_profiling_context.json"
+                if _ctx_path.exists():
+                    try:
+                        c.profiling_context = _rp_json.loads(_ctx_path.read_text())
+                        _matched_ctx = True
+                    except Exception:
+                        pass
+            if not _matched_ctx:
+                c.profiling_context = dict(state.get("baseline_profiling_context", {}))
             _bl_wall = state.get("baseline_wall_ms", float("inf"))
             c.wall_speedup = (
                 round(_bl_wall / c.wall_ms, 4)
@@ -1686,7 +1697,10 @@ def profile_candidates(state: GraphState) -> dict:
             c.speedup = c.wall_speedup
 
             _wall_str = f"{c.wall_ms:.3f} ms wall ({c.wall_speedup:.2f}x)" if c.wall_ms < float("inf") else "N/A"
-            _mode_tag = "replay" if _use_replay else "skip-ncu"
+            if _use_replay:
+                _mode_tag = "replay" if _matched_ctx else "replay/baseline"
+            else:
+                _mode_tag = "skip-ncu"
             pipe_print(
                 f"    Plan {c.plan_letter} ({c.direction}): {_wall_str} [dim]({_mode_tag})[/]"
             )
