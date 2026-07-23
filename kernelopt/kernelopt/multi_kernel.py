@@ -286,6 +286,19 @@ def optimize_all_kernels(
         standalone_path = kernel_output_dir / "standalone.py"
         standalone_path.write_text(standalone)
 
+        # Resolve per-sub-kernel replay directory
+        _sub_replay = state.config.replay_profiles
+        if _sub_replay:
+            _sub_replay_dir = Path(_sub_replay) / f"kernel_{idx}_{kernel_name[:30]}"
+            if not _sub_replay_dir.exists():
+                # Fallback: scan replay dir for subdirs matching kernel name
+                _kr = kernel_name[:30]
+                for _sd in Path(_sub_replay).iterdir():
+                    if _sd.is_dir() and _kr in _sd.name and (_sd / "baseline_profiling_context.json").exists():
+                        _sub_replay_dir = _sd
+                        break
+            _sub_replay = str(_sub_replay_dir) if _sub_replay_dir.exists() else ""
+
         kernel_cfg = PipelineConfig(
             T=state.config.T,
             N=state.config.N,
@@ -306,7 +319,7 @@ def optimize_all_kernels(
             kernel_path=str(standalone_path),
             kernel_args=state.config.kernel_args,
             replay_mode=state.config.replay_mode,
-            replay_profiles=state.config.replay_profiles,
+            replay_profiles=_sub_replay,
             skip_ncu=state.config.skip_ncu,
             no_memory=state.config.no_memory,
             agentic_correctness=state.config.agentic_correctness,
