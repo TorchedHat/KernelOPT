@@ -176,80 +176,77 @@ def profile_baseline(state: GraphState) -> dict:
         }
 
     # Replay: load baseline profiling context from a prior run directory
-    if getattr(cfg, "replay_profiles", ""):
+    _replay_dir_str = getattr(cfg, "replay_profiles", "")
+    if _replay_dir_str:
         import json as _rp_json
-        from kernelopt.functions.benchmark import benchmark_kernel
-        replay_dir = Path(cfg.replay_profiles)
+        replay_dir = Path(_replay_dir_str)
         bl_ctx_path = replay_dir / "baseline_profiling_context.json"
-        if not bl_ctx_path.exists():
-            raise RuntimeError(
-                f"--replay-profiles: baseline_profiling_context.json not found in {replay_dir}"
-            )
-        pipe_print(f"[dim]Replaying baseline profile from {bl_ctx_path}[/]")
-        baseline_ctx = _rp_json.loads(bl_ctx_path.read_text())
+        if bl_ctx_path.exists():
+            from kernelopt.functions.benchmark import benchmark_kernel
+            pipe_print(f"[dim]Replaying baseline profile from {bl_ctx_path}[/]")
+            baseline_ctx = _rp_json.loads(bl_ctx_path.read_text())
 
-        # Load ncu_config from checkpoint if available
-        ncu_config = None
-        ckpt_path = replay_dir / "pipeline_checkpoint.json"
-        if ckpt_path.exists():
+            ncu_config = None
+            ckpt_path = replay_dir / "pipeline_checkpoint.json"
+            if ckpt_path.exists():
+                try:
+                    ckpt_data = _rp_json.loads(ckpt_path.read_text())
+                    gs = ckpt_data.get("graph_state", {})
+                    ncu_config = gs.get("ncu_config") if isinstance(gs, dict) else None
+                except Exception:
+                    pass
+
+            latency = get_latency_ns(baseline_ctx)
+
+            _baseline_wall_ms = float("inf")
             try:
-                ckpt_data = _rp_json.loads(ckpt_path.read_text())
-                gs = ckpt_data.get("graph_state", {})
-                ncu_config = gs.get("ncu_config") if isinstance(gs, dict) else None
+                _wc = benchmark_kernel(kernel_path)
+                if _wc.get("median_ms", -1) > 0:
+                    _baseline_wall_ms = _wc["median_ms"]
             except Exception:
                 pass
 
-        latency = get_latency_ns(baseline_ctx)
+            _ctx_copy = output_dir / "baseline_profiling_context.json"
+            _ctx_copy.write_text(_rp_json.dumps(baseline_ctx, indent=2))
 
-        # Wall-clock benchmark on the current machine
-        _baseline_wall_ms = float("inf")
-        try:
-            _wc = benchmark_kernel(kernel_path)
-            if _wc.get("median_ms", -1) > 0:
-                _baseline_wall_ms = _wc["median_ms"]
-        except Exception:
-            pass
+            _wall_str = f"  Wall: {_baseline_wall_ms:.3f} ms" if _baseline_wall_ms < float("inf") else ""
+            pipe_print(
+                f"  Baseline (replayed): [cyan]{latency:.0f} ns[/] (NCU){_wall_str}"
+            )
 
-        # Save a copy into the current output dir for downstream consumers
-        _ctx_copy = output_dir / "baseline_profiling_context.json"
-        _ctx_copy.write_text(_rp_json.dumps(baseline_ctx, indent=2))
+            framework = state["framework"]
+            if framework == "auto":
+                framework = baseline_ctx.get("framework_hint", "triton")
 
-        _wall_str = f"  Wall: {_baseline_wall_ms:.3f} ms" if _baseline_wall_ms < float("inf") else ""
-        pipe_print(
-            f"  Baseline (replayed): [cyan]{latency:.0f} ns[/] (NCU){_wall_str}"
-        )
-
-        framework = state["framework"]
-        if framework == "auto":
-            framework = baseline_ctx.get("framework_hint", "triton")
-
-        return {
-            "baseline_profiling_context": baseline_ctx,
-            "baseline_csv": str(replay_dir / "baseline.csv"),
-            "baseline_ncu_rep": str(replay_dir / "baseline.ncu-rep"),
-            "baseline_latency_ns": latency,
-            "baseline_wall_ms": _baseline_wall_ms,
-            "best_latency_ns": latency,
-            "best_wall_ms": _baseline_wall_ms,
-            "current_profiling_context": baseline_ctx,
-            "framework": framework,
-            "ncu_config": ncu_config,
-            "kernel_id": kernel_id,
-            "active_kernels": [{
-                "chain_id": "chain_0",
-                "kernel_source": _get_primary_kernel(state),
-                "latency_ns": latency,
-                "wall_ms": _baseline_wall_ms,
-                "speedup": 1.0,
-                "profiling_context": baseline_ctx,
-                "ncu_summary": _build_ncu_summary(baseline_ctx),
-                "history": [],
-                "depth": 0,
-                "alive": True,
-            }],
-            "global_best_kernel": state.get("best_kernel", ""),
-            "global_best_latency_ns": latency,
-        }
+            return {
+                "baseline_profiling_context": baseline_ctx,
+                "baseline_csv": str(replay_dir / "baseline.csv"),
+                "baseline_ncu_rep": str(replay_dir / "baseline.ncu-rep"),
+                "baseline_latency_ns": latency,
+                "baseline_wall_ms": _baseline_wall_ms,
+                "best_latency_ns": latency,
+                "best_wall_ms": _baseline_wall_ms,
+                "current_profiling_context": baseline_ctx,
+                "framework": framework,
+                "ncu_config": ncu_config,
+                "kernel_id": kernel_id,
+                "active_kernels": [{
+                    "chain_id": "chain_0",
+                    "kernel_source": _get_primary_kernel(state),
+                    "latency_ns": latency,
+                    "wall_ms": _baseline_wall_ms,
+                    "speedup": 1.0,
+                    "profiling_context": baseline_ctx,
+                    "ncu_summary": _build_ncu_summary(baseline_ctx),
+                    "history": [],
+                    "depth": 0,
+                    "alive": True,
+                }],
+                "global_best_kernel": state.get("best_kernel", ""),
+                "global_best_latency_ns": latency,
+            }
+        else:
+            pipe_print(f"[dim]No baseline profile in {replay_dir} — running normally[/]")
 
     ui = get_pipeline_ui()
     if ui:
