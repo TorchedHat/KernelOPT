@@ -9,9 +9,13 @@
 
 ## Demo
 
-> End-to-end optimization run on a KernelBench kernel (1.75x playback speed)
+> End-to-end optimization run on KernelBench L1 014 kernel (playback speedup)
 
-https://github.com/user-attachments/assets/6710ff29-b44e-4a66-b4b8-1d04da69b847
+
+
+https://github.com/user-attachments/assets/fe1b6a07-c6c4-4ddc-aac7-c077f676c4b3
+
+
 
 ---
 
