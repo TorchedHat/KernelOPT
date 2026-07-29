@@ -2166,8 +2166,35 @@ def select_best_candidate(state: GraphState) -> dict:
             c for c in candidates
             if c.correctness_passed and c.latency_ns < float("inf")
         ]
-        # Sort by latency (best first)
-        viable.sort(key=lambda c: c.latency_ns)
+
+        # Use SearchTree UCB scores when available to balance
+        # exploration (underexpanded chains) vs exploitation (best latency)
+        try:
+            from kernelopt.search_tree import SearchTree
+            import math as _m
+            _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+            _total_exp = sum(
+                n.n_expansions for n in _tree.nodes.values()
+            ) + 1
+            _c = 1.4
+
+            def _ucb_score(cand):
+                parent_exp = 0
+                parent_chain = cand.chain_id or "chain_0"
+                for n in _tree.nodes.values():
+                    if n.direction == cand.direction and n.iteration == iteration + 1:
+                        parent_exp = _tree.nodes[n.parent_id].n_expansions if n.parent_id and n.parent_id in _tree.nodes else 0
+                        break
+                exploit = cand.speedup if cand.speedup > 0 else 0.0
+                explore = _c * _m.sqrt(
+                    _m.log(_total_exp) / (parent_exp + 1)
+                )
+                return exploit + explore
+
+            viable.sort(key=_ucb_score, reverse=True)
+        except Exception:
+            # Fallback: sort by latency (best first)
+            viable.sort(key=lambda c: c.latency_ns)
 
         # Select top-B with diversity: avoid picking multiple candidates
         # from the same chain unless necessary
@@ -2181,7 +2208,7 @@ def select_best_candidate(state: GraphState) -> dict:
             if cid not in seen_chains:
                 selected_beam.append(c)
                 seen_chains.add(cid)
-        # Second pass: fill remaining slots with best remaining
+        # Second pass: fill remaining slots by UCB score (already sorted)
         for c in viable:
             if len(selected_beam) >= beam_width:
                 break
@@ -2216,6 +2243,21 @@ def select_best_candidate(state: GraphState) -> dict:
                     "depth": parent_depth + 1,
                     "alive": True,
                 })
+        # Update SearchTree n_expansions for selected candidates
+        if selected_beam:
+            try:
+                from kernelopt.search_tree import SearchTree
+                _tree_update = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+                for c in selected_beam:
+                    for n in _tree_update.nodes.values():
+                        if n.direction == c.direction and n.iteration == iteration + 1:
+                            if n.parent_id and n.parent_id in _tree_update.nodes:
+                                _tree_update.nodes[n.parent_id].n_expansions += 1
+                            break
+                _tree_update._save()
+            except Exception:
+                pass
+
         if new_active:
             pipe_print(
                 f"  [bold cyan]Beam: {len(new_active)} active chains "
