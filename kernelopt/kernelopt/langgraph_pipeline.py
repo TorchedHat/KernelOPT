@@ -172,84 +172,83 @@ def profile_baseline(state: GraphState) -> dict:
                 "history": [],
                 "depth": 0,
                 "alive": True,
+                "tree_node_id": "root",
             }],
         }
 
     # Replay: load baseline profiling context from a prior run directory
-    if getattr(cfg, "replay_profiles", ""):
+    _replay_dir_str = getattr(cfg, "replay_profiles", "")
+    if _replay_dir_str:
         import json as _rp_json
-        from kernelopt.functions.benchmark import benchmark_kernel
-        replay_dir = Path(cfg.replay_profiles)
+        replay_dir = Path(_replay_dir_str)
         bl_ctx_path = replay_dir / "baseline_profiling_context.json"
-        if not bl_ctx_path.exists():
-            raise RuntimeError(
-                f"--replay-profiles: baseline_profiling_context.json not found in {replay_dir}"
-            )
-        pipe_print(f"[dim]Replaying baseline profile from {bl_ctx_path}[/]")
-        baseline_ctx = _rp_json.loads(bl_ctx_path.read_text())
+        if bl_ctx_path.exists():
+            from kernelopt.functions.benchmark import benchmark_kernel
+            pipe_print(f"[dim]Replaying baseline profile from {bl_ctx_path}[/]")
+            baseline_ctx = _rp_json.loads(bl_ctx_path.read_text())
 
-        # Load ncu_config from checkpoint if available
-        ncu_config = None
-        ckpt_path = replay_dir / "pipeline_checkpoint.json"
-        if ckpt_path.exists():
+            ncu_config = None
+            ckpt_path = replay_dir / "pipeline_checkpoint.json"
+            if ckpt_path.exists():
+                try:
+                    ckpt_data = _rp_json.loads(ckpt_path.read_text())
+                    gs = ckpt_data.get("graph_state", {})
+                    ncu_config = gs.get("ncu_config") if isinstance(gs, dict) else None
+                except Exception:
+                    pass
+
+            latency = get_latency_ns(baseline_ctx)
+
+            _baseline_wall_ms = float("inf")
             try:
-                ckpt_data = _rp_json.loads(ckpt_path.read_text())
-                gs = ckpt_data.get("graph_state", {})
-                ncu_config = gs.get("ncu_config") if isinstance(gs, dict) else None
+                _wc = benchmark_kernel(kernel_path)
+                if _wc.get("median_ms", -1) > 0:
+                    _baseline_wall_ms = _wc["median_ms"]
             except Exception:
                 pass
 
-        latency = get_latency_ns(baseline_ctx)
+            _ctx_copy = output_dir / "baseline_profiling_context.json"
+            _ctx_copy.write_text(_rp_json.dumps(baseline_ctx, indent=2))
 
-        # Wall-clock benchmark on the current machine
-        _baseline_wall_ms = float("inf")
-        try:
-            _wc = benchmark_kernel(kernel_path)
-            if _wc.get("median_ms", -1) > 0:
-                _baseline_wall_ms = _wc["median_ms"]
-        except Exception:
-            pass
+            _wall_str = f"  Wall: {_baseline_wall_ms:.3f} ms" if _baseline_wall_ms < float("inf") else ""
+            pipe_print(
+                f"  Baseline (replayed): [cyan]{latency:.0f} ns[/] (NCU){_wall_str}"
+            )
 
-        # Save a copy into the current output dir for downstream consumers
-        _ctx_copy = output_dir / "baseline_profiling_context.json"
-        _ctx_copy.write_text(_rp_json.dumps(baseline_ctx, indent=2))
+            framework = state["framework"]
+            if framework == "auto":
+                framework = baseline_ctx.get("framework_hint", "triton")
 
-        _wall_str = f"  Wall: {_baseline_wall_ms:.3f} ms" if _baseline_wall_ms < float("inf") else ""
-        pipe_print(
-            f"  Baseline (replayed): [cyan]{latency:.0f} ns[/] (NCU){_wall_str}"
-        )
-
-        framework = state["framework"]
-        if framework == "auto":
-            framework = baseline_ctx.get("framework_hint", "triton")
-
-        return {
-            "baseline_profiling_context": baseline_ctx,
-            "baseline_csv": str(replay_dir / "baseline.csv"),
-            "baseline_ncu_rep": str(replay_dir / "baseline.ncu-rep"),
-            "baseline_latency_ns": latency,
-            "baseline_wall_ms": _baseline_wall_ms,
-            "best_latency_ns": latency,
-            "best_wall_ms": _baseline_wall_ms,
-            "current_profiling_context": baseline_ctx,
-            "framework": framework,
-            "ncu_config": ncu_config,
-            "kernel_id": kernel_id,
-            "active_kernels": [{
-                "chain_id": "chain_0",
-                "kernel_source": _get_primary_kernel(state),
-                "latency_ns": latency,
-                "wall_ms": _baseline_wall_ms,
-                "speedup": 1.0,
-                "profiling_context": baseline_ctx,
-                "ncu_summary": _build_ncu_summary(baseline_ctx),
-                "history": [],
-                "depth": 0,
-                "alive": True,
-            }],
-            "global_best_kernel": state.get("best_kernel", ""),
-            "global_best_latency_ns": latency,
-        }
+            return {
+                "baseline_profiling_context": baseline_ctx,
+                "baseline_csv": str(replay_dir / "baseline.csv"),
+                "baseline_ncu_rep": str(replay_dir / "baseline.ncu-rep"),
+                "baseline_latency_ns": latency,
+                "baseline_wall_ms": _baseline_wall_ms,
+                "best_latency_ns": latency,
+                "best_wall_ms": _baseline_wall_ms,
+                "current_profiling_context": baseline_ctx,
+                "framework": framework,
+                "ncu_config": ncu_config,
+                "kernel_id": kernel_id,
+                "active_kernels": [{
+                    "chain_id": "chain_0",
+                    "kernel_source": _get_primary_kernel(state),
+                    "latency_ns": latency,
+                    "wall_ms": _baseline_wall_ms,
+                    "speedup": 1.0,
+                    "profiling_context": baseline_ctx,
+                    "ncu_summary": _build_ncu_summary(baseline_ctx),
+                    "history": [],
+                    "depth": 0,
+                    "alive": True,
+                    "tree_node_id": "root",
+                }],
+                "global_best_kernel": state.get("best_kernel", ""),
+                "global_best_latency_ns": latency,
+            }
+        else:
+            pipe_print(f"[dim]No baseline profile in {replay_dir} — running normally[/]")
 
     ui = get_pipeline_ui()
     if ui:
@@ -454,6 +453,7 @@ def profile_baseline(state: GraphState) -> dict:
                 "history": [],
                 "depth": 0,
                 "alive": True,
+                "tree_node_id": "root",
             }
         ],
         "global_best_kernel": state.get("best_kernel", ""),
@@ -1720,17 +1720,24 @@ def profile_candidates(state: GraphState) -> dict:
                     change_summary=c.execution_result.get("change_summary", c.direction),
                 )
 
-            from kernelopt.search_tree import SearchTree
-            _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
-            _tree.add_candidate(
-                parent_id=_tree.get_best().id if _tree.get_best() else "root",
-                kernel_source=c.optimized_kernel,
-                latency_ns=c.latency_ns,
-                direction=c.direction,
-                iteration=iteration + 1,
-                correctness=c.correctness_passed,
-                plan_letter=c.plan_letter,
-            )
+            try:
+                from kernelopt.search_tree import SearchTree
+                _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+                _chain_ak = chain_lookup.get(c.chain_id) if c.chain_id else None
+                _parent = (_chain_ak or {}).get("tree_node_id") or (
+                    _tree.get_best().id if _tree.get_best() else "root"
+                )
+                _tree.add_candidate(
+                    parent_id=_parent,
+                    kernel_source=c.optimized_kernel,
+                    latency_ns=c.latency_ns,
+                    direction=c.direction,
+                    iteration=iteration + 1,
+                    correctness=c.correctness_passed,
+                    plan_letter=c.plan_letter,
+                )
+            except Exception:
+                pass
             continue
 
         try:
@@ -1819,17 +1826,24 @@ def profile_candidates(state: GraphState) -> dict:
                 )
 
             # Add candidate to search tree
-            from kernelopt.search_tree import SearchTree
-            _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
-            _tree.add_candidate(
-                parent_id=_tree.get_best().id if _tree.get_best() else "root",
-                kernel_source=c.optimized_kernel,
-                latency_ns=c.latency_ns,
-                direction=c.direction,
-                iteration=iteration + 1,
-                correctness=c.correctness_passed,
-                plan_letter=c.plan_letter,
-            )
+            try:
+                from kernelopt.search_tree import SearchTree
+                _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+                _chain_ak = chain_lookup.get(c.chain_id) if c.chain_id else None
+                _parent = (_chain_ak or {}).get("tree_node_id") or (
+                    _tree.get_best().id if _tree.get_best() else "root"
+                )
+                _tree.add_candidate(
+                    parent_id=_parent,
+                    kernel_source=c.optimized_kernel,
+                    latency_ns=c.latency_ns,
+                    direction=c.direction,
+                    iteration=iteration + 1,
+                    correctness=c.correctness_passed,
+                    plan_letter=c.plan_letter,
+                )
+            except Exception:
+                pass
 
         except Exception as e:
             pipe_print(
@@ -2148,35 +2162,46 @@ def select_best_candidate(state: GraphState) -> dict:
             best_latency,
         )
 
-    # Search tree: log state
+    # Load search tree once for this function call
+    _tree = None
     try:
         from kernelopt.search_tree import SearchTree
-        _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+        _tree_path = Path(state["output_dir"]) / "search_tree.json"
+        if _tree_path.exists():
+            _tree = SearchTree(_tree_path)
+    except Exception as e:
+        pipe_print(f"  [dim]SearchTree unavailable: {e}[/]")
+
+    if _tree:
         _ts = _tree.stats()
         pipe_print(
             f"  [dim]Search tree: {_ts['total_nodes']} nodes, "
             f"{_ts['correct_nodes']} correct, "
             f"best {_ts['best_speedup']:.2f}x[/]"
         )
-    except Exception:
-        pass
 
     # --- Beam selection (multi-chain forest) ---
     new_active: list[dict] = []
     if beam_width > 1 and candidates:
-        # Collect all viable candidates: correct + finite latency
         viable = [
             c for c in candidates
             if c.correctness_passed and c.latency_ns < float("inf")
         ]
-        # Sort by latency (best first)
-        viable.sort(key=lambda c: c.latency_ns)
 
-        # Select top-B with diversity: avoid picking multiple candidates
-        # from the same chain unless necessary
+        # UCB scoring via SearchTree (falls back to latency sort)
+        if _tree:
+            viable.sort(
+                key=lambda c: _tree.ucb_score_for_candidate(
+                    c.direction, iteration + 1, c.speedup,
+                ),
+                reverse=True,
+            )
+        else:
+            viable.sort(key=lambda c: c.latency_ns)
+
+        # Select top-B with diversity
         seen_chains: set[str] = set()
         selected_beam: list[PlanCandidate] = []
-        # First pass: one per chain (diversity)
         for c in viable:
             if len(selected_beam) >= beam_width:
                 break
@@ -2184,22 +2209,17 @@ def select_best_candidate(state: GraphState) -> dict:
             if cid not in seen_chains:
                 selected_beam.append(c)
                 seen_chains.add(cid)
-        # Second pass: fill remaining slots with best remaining
         for c in viable:
             if len(selected_beam) >= beam_width:
                 break
             if c not in selected_beam:
                 selected_beam.append(c)
 
-        # If no viable candidates, carry forward previous active kernels
         if not selected_beam and prev_active:
             new_active = [ak for ak in prev_active if ak.get("alive", True)]
         else:
             for idx, c in enumerate(selected_beam):
-                # Reuse chain_id if the candidate came from an existing chain,
-                # otherwise assign a new one
                 cid = c.chain_id or f"chain_{idx}"
-                # Find parent chain to inherit history
                 parent_ak = next(
                     (ak for ak in prev_active if ak["chain_id"] == cid),
                     None,
@@ -2207,6 +2227,7 @@ def select_best_candidate(state: GraphState) -> dict:
                 parent_history = parent_ak["history"] if parent_ak else []
                 parent_depth = parent_ak["depth"] if parent_ak else 0
 
+                _tnode = _tree._find_node(c.direction, iteration + 1) if _tree else None
                 new_active.append({
                     "chain_id": cid,
                     "kernel_source": c.optimized_kernel,
@@ -2218,7 +2239,15 @@ def select_best_candidate(state: GraphState) -> dict:
                     "history": parent_history + [c.direction],
                     "depth": parent_depth + 1,
                     "alive": True,
+                    "tree_node_id": _tnode.id if _tnode else None,
                 })
+
+        # Update n_expansions on selected nodes and save once
+        if selected_beam and _tree:
+            for c in selected_beam:
+                _tree.increment_expansions(c.direction, iteration + 1)
+            _tree._save()
+
         if new_active:
             pipe_print(
                 f"  [bold cyan]Beam: {len(new_active)} active chains "
@@ -2233,6 +2262,9 @@ def select_best_candidate(state: GraphState) -> dict:
         best_direction = ""
         if improved and iter_result.best_candidate:
             best_direction = iter_result.best_candidate.direction
+        _sc_tnode = None
+        if _tree and best_direction:
+            _sc_tnode = _tree._find_node(best_direction, iteration + 1)
         new_active = [{
             "chain_id": "chain_0",
             "kernel_source": best_kernel,
@@ -2244,32 +2276,31 @@ def select_best_candidate(state: GraphState) -> dict:
             "history": (parent_history + [best_direction]) if best_direction else parent_history,
             "depth": (parent_depth + 1) if improved else parent_depth,
             "alive": True,
+            "tree_node_id": _sc_tnode.id if _sc_tnode else parent_ak.get("tree_node_id", "root"),
         }]
 
         # Legacy search tree policy (only for beam_width=1)
-        try:
-            from kernelopt.search_tree import SearchTree
-            _tree = SearchTree(Path(state["output_dir"]) / "search_tree.json")
+        if _tree:
             policy = cfg.search_policy if hasattr(cfg, "search_policy") else "greedy"
             if policy != "greedy":
-                selected = _tree.select_nodes(policy, n=1)
-                if selected and selected[0].kernel_source:
-                    chosen = selected[0]
-                    if chosen.id != (_tree.get_best() or chosen).id:
-                        pipe_print(
-                            f"  [bold cyan]Search policy '{policy}': expanding "
-                            f"'{chosen.direction[:40]}' ({chosen.speedup:.2f}x) "
-                            f"instead of global best[/]"
-                        )
-                        # Override best_kernel for next iteration's exploration
-                        best_kernel = chosen.kernel_source
-                        best_latency = chosen.latency_ns
-                        # Keep active_kernels[0] consistent with best_kernel
-                        new_active[0]["kernel_source"] = chosen.kernel_source
-                        new_active[0]["latency_ns"] = chosen.latency_ns
-                        new_active[0]["ncu_summary"] = chosen.ncu_summary if hasattr(chosen, "ncu_summary") else ""
-        except Exception:
-            pass
+                try:
+                    selected = _tree.select_nodes(policy, n=1)
+                    if selected and selected[0].kernel_source:
+                        chosen = selected[0]
+                        if chosen.id != (_tree.get_best() or chosen).id:
+                            pipe_print(
+                                f"  [bold cyan]Search policy '{policy}': expanding "
+                                f"'{chosen.direction[:40]}' ({chosen.speedup:.2f}x) "
+                                f"instead of global best[/]"
+                            )
+                            best_kernel = chosen.kernel_source
+                            best_latency = chosen.latency_ns
+                            new_active[0]["kernel_source"] = chosen.kernel_source
+                            new_active[0]["latency_ns"] = chosen.latency_ns
+                            new_active[0]["ncu_summary"] = chosen.ncu_summary if hasattr(chosen, "ncu_summary") else ""
+                    _tree._save()
+                except Exception as e:
+                    pipe_print(f"  [dim]Search policy error: {e}[/]")
 
     # Build out dict with both legacy and multi-chain fields
     out = {
@@ -2747,6 +2778,7 @@ def run_langgraph_pipeline(state: PipelineState) -> PipelineState:
                     "history": [],
                     "depth": 0,
                     "alive": True,
+                    "tree_node_id": "root",
                 }],
                 "global_best_kernel": state.kernel_source,
                 "global_best_latency_ns": latency,

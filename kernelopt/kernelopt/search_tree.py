@@ -121,7 +121,9 @@ class SearchTree:
             for node in selected:
                 node.n_expansions += 1
         elif policy == "ucb":
-            total_expansions = sum(n.n_expansions for n in leaves) + 1
+            total_expansions = sum(
+                n.n_expansions for n in self.nodes.values() if n.correctness
+            ) + 1
             c = 1.4  # exploration constant
 
             def ucb_score(node: SearchNode) -> float:
@@ -142,6 +144,32 @@ class SearchTree:
         # Persist updated n_expansions so UCB state survives across iterations
         self._save()
         return selected
+
+    def _find_node(self, direction: str, iteration: int) -> SearchNode | None:
+        """Find a tree node matching direction and iteration."""
+        for n in self.nodes.values():
+            if n.direction == direction and n.iteration == iteration:
+                return n
+        return None
+
+    def ucb_score_for_candidate(
+        self, direction: str, iteration: int, speedup: float, c: float = 1.4,
+    ) -> float:
+        """Compute UCB score for an external candidate by matching to tree node."""
+        node = self._find_node(direction, iteration)
+        n_exp = node.n_expansions if node else 0
+        total = sum(
+            n.n_expansions for n in self.nodes.values() if n.correctness
+        ) + 1
+        exploit = speedup if speedup > 0 else 0.0
+        explore = c * math.sqrt(math.log(total) / (n_exp + 1))
+        return exploit + explore
+
+    def increment_expansions(self, direction: str, iteration: int) -> None:
+        """Increment n_expansions for a node matching direction+iteration."""
+        node = self._find_node(direction, iteration)
+        if node:
+            node.n_expansions += 1
 
     def get_best(self) -> SearchNode | None:
         """Return the node with lowest latency (global best)."""
