@@ -601,6 +601,33 @@ def run(
             synth_dir = Path(resolved_output) / "synthesis"
             synth_dir.mkdir(parents=True, exist_ok=True)
 
+            compiler_context_json = None
+            if cfg.use_compiler_context:
+                try:
+                    from kernelopt.compiler import extract_compiler_context
+                    compiler_ctx = extract_compiler_context(
+                        str(kernel_path),
+                        entry_point=entry_point,
+                        timeout=min(cfg.trace_timeout, 300),
+                    )
+                    if compiler_ctx.extraction_success:
+                        compiler_context_json = compiler_ctx.to_json()
+                        n_ir = len(compiler_ctx.ir_nodes)
+                        n_fuse = len(compiler_ctx.fusion_groups)
+                        n_decomp = len(compiler_ctx.aot_decomps)
+                        console.print(
+                            f"  Compiler context: [green]{n_ir} IR nodes, "
+                            f"{n_fuse} fusion groups, {n_decomp} decompositions[/]"
+                        )
+                        cc_path = Path(resolved_output) / "compiler_context.json"
+                        cc_path.write_text(compiler_context_json)
+                    else:
+                        console.print(
+                            f"  [dim]Compiler context: {compiler_ctx.extraction_warnings[:1]}[/]"
+                        )
+                except Exception as e:
+                    console.print(f"  [dim]Compiler context skipped: {e}[/]")
+
             # Phase 1b: LLM generates clean Triton kernels (with K retries)
             codegen_attempts = cfg.K
             # Include original PyTorch source so the LLM can see the exact formula
@@ -738,6 +765,7 @@ def run(
                         replay_profiles=_sub_replay,
                         skip_ncu=cfg.skip_ncu,
                         no_memory=cfg.no_memory,
+                        use_compiler_context=cfg.use_compiler_context,
                         debug=cfg.debug, verbose=cfg.verbose,
                     )
                     kernel_state = PipelineState(
@@ -748,6 +776,7 @@ def run(
                         best_kernel=gk["source"],
                         framework="triton",
                         optimization_memory=list(state.optimization_memory),
+                        compiler_context=compiler_context_json,
                     )
                     kernel_state._baseline_standalone_path = gk["path"]
 
