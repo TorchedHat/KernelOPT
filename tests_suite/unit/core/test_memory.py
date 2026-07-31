@@ -111,7 +111,7 @@ class TestSelectTopK:
             {"speedup": 0.90},
         ]
 
-        top_2 = select_top_k(items, top_k=2, spe_gate=1.05, slo_gate=1.20)
+        top_2 = select_top_k(items, keep_n=2, spe_gate=1.05, slo_gate=1.20)
 
         assert len(top_2) <= 2
 
@@ -126,7 +126,7 @@ class TestSelectTopK:
             {"speedup": 1.15},  # |0.15| = 0.15
         ]
 
-        top_items = select_top_k(items, top_k=4, spe_gate=1.05, slo_gate=1.20)
+        top_items = select_top_k(items, keep_n=4, spe_gate=1.05, slo_gate=1.20)
 
         # First should be 1.30 (largest deviation)
         if len(top_items) > 0:
@@ -142,7 +142,7 @@ class TestSelectTopK:
             {"speedup": 1.03},
         ]
 
-        top = select_top_k(items, top_k=10, spe_gate=1.05, slo_gate=1.20)
+        top = select_top_k(items, keep_n=10, spe_gate=1.05, slo_gate=1.20)
 
         # All should be filtered out
         assert len(top) == 0
@@ -158,7 +158,7 @@ class TestSelectTopK:
             {"speedup": 1.15},  # Significant positive
         ]
 
-        top = select_top_k(items, top_k=3, spe_gate=1.05, slo_gate=1.20)
+        top = select_top_k(items, keep_n=3, spe_gate=1.05, slo_gate=1.20)
 
         # Should include both significant positive and negative
         assert len(top) > 0
@@ -170,7 +170,7 @@ class TestSelectTopK:
         """Test selection with empty list."""
         from kernelopt.memory import select_top_k
 
-        top = select_top_k([], top_k=5)
+        top = select_top_k([], keep_n=5)
 
         assert len(top) == 0
 
@@ -183,7 +183,7 @@ class TestSelectTopK:
             {"speedup": 1.10},
         ]
 
-        top = select_top_k(items, top_k=10, spe_gate=1.05, slo_gate=1.20)
+        top = select_top_k(items, keep_n=10, spe_gate=1.05, slo_gate=1.20)
 
         # Should return all qualifying items
         assert len(top) <= 2
@@ -372,7 +372,7 @@ class TestMemoryIntegration:
         ]
 
         # Select top-K
-        top = select_top_k(candidates, top_k=2, spe_gate=1.05, slo_gate=1.20)
+        top = select_top_k(candidates, keep_n=2, spe_gate=1.05, slo_gate=1.20)
 
         # Append to memory
         memory = []

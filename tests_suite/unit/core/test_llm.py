@@ -143,17 +143,14 @@ class TestLLMConfiguration:
         """Test default model constant."""
         from kernelopt.llm import DEFAULT_MODEL
 
-        # Default model is Claude Sonnet 4 on Vertex AI
-        assert DEFAULT_MODEL == "claude-sonnet-4@20250514"
+        assert DEFAULT_MODEL == "claude-sonnet-4-6"
 
     def test_model_naming_convention(self):
         """Test that model names follow expected conventions."""
         from kernelopt.llm import DEFAULT_MODEL
 
-        # Model should be a valid HuggingFace or Vertex AI format
         assert len(DEFAULT_MODEL) > 0
-        # Either HF format (org/model) or Vertex AI format (model@version)
-        assert "/" in DEFAULT_MODEL or "@" in DEFAULT_MODEL
+        assert "claude" in DEFAULT_MODEL.lower() or "/" in DEFAULT_MODEL
 
 
 class TestLLMErrorHandling:
