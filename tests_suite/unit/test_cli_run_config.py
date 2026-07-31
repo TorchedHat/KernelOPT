@@ -37,7 +37,7 @@ class TestRunConfigFallback:
             patch("kernelopt.agents.profiler.get_latency_ns", return_value=float("nan")),
             patch.dict("os.environ", {"ANTHROPIC_VERTEX_PROJECT_ID": "", "VERTEX_REGION": ""}, clear=False),
         ):
-            result = runner.invoke(app, ["run", str(kernel)])
+            result = runner.invoke(app, ["run", str(kernel), "--single-kernel"])
         assert calls, f"Pipeline not called. Output:\n{result.output}"
         assert calls[0]["project_id"] == "config-project"
 
@@ -55,6 +55,6 @@ class TestRunConfigFallback:
             patch("kernelopt.agents.profiler.get_latency_ns", return_value=float("nan")),
             patch.dict("os.environ", {"ANTHROPIC_VERTEX_PROJECT_ID": "", "VERTEX_REGION": ""}, clear=False),
         ):
-            result = runner.invoke(app, ["run", str(kernel), "--project-id", "cli-project"])
+            result = runner.invoke(app, ["run", str(kernel), "--single-kernel", "--project-id", "cli-project"])
         assert calls, f"Pipeline not called. Output:\n{result.output}"
         assert calls[0]["project_id"] == "cli-project"

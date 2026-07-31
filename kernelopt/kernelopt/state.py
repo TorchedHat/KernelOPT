@@ -153,6 +153,7 @@ class PipelineConfig:
     skip_ncu: bool = False           # skip NCU profiling, planner gets no bottleneck context
     optimize_all_kernels: bool = False  # disable Inductor-aware synthesis (optimize extern too)
     replay_profiles: str = ""        # replay NCU profiles from a prior run directory
+    use_compiler_context: bool = True  # extract compiler IR/fusion/autotune context
 
     # Synthesis options (PyTorch → Triton)
     entry_point: str | None = None
@@ -204,6 +205,9 @@ class PipelineState:
 
     # Multi-kernel: benchmark source for rebuild_standalone_from_body
     benchmark_kernel_source: str | None = None
+
+    # Compiler context: JSON-serialized CompilerContext from kernelopt.compiler
+    compiler_context: str | None = None
 
 
 class GraphState(TypedDict, total=False):
@@ -263,6 +267,10 @@ class GraphState(TypedDict, total=False):
     _all_benchmark_files: Optional[list]
     _baseline_standalone_path: Optional[str]
     _target_triton_kernel_name: Optional[str]
+
+    # Compiler context: extracted IR/fusion/autotune metadata (JSON string)
+    # Populated during synthesis for PyTorch models; None for standalone Triton/Helion
+    compiler_context: Optional[str]
 
     # Internal: LangGraph entry routing (fresh | after_baseline | after_iteration)
     _entry: str

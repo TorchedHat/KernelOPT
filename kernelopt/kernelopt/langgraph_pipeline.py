@@ -219,7 +219,7 @@ def profile_baseline(state: GraphState) -> dict:
             if framework == "auto":
                 framework = baseline_ctx.get("framework_hint", "triton")
 
-            return {
+            _replay_return = {
                 "baseline_profiling_context": baseline_ctx,
                 "baseline_csv": str(replay_dir / "baseline.csv"),
                 "baseline_ncu_rep": str(replay_dir / "baseline.ncu-rep"),
@@ -247,6 +247,17 @@ def profile_baseline(state: GraphState) -> dict:
                 "global_best_kernel": state.get("best_kernel", ""),
                 "global_best_latency_ns": latency,
             }
+
+            # Load saved compiler context if available
+            _cc_path = replay_dir / "compiler_context.json"
+            if _cc_path.exists():
+                try:
+                    _replay_return["compiler_context"] = _cc_path.read_text()
+                    pipe_print("  [dim]Loaded compiler context from replay dir[/]")
+                except Exception:
+                    pass
+
+            return _replay_return
         else:
             pipe_print(f"[dim]No baseline profile in {replay_dir} — running normally[/]")
 
@@ -923,6 +934,18 @@ def generate_plans(state: GraphState) -> dict:
             ),
         }
 
+    # --- Inject compiler context into profiling_ctx ---
+    _cc_json = state.get("compiler_context")
+    if _cc_json and cfg.use_compiler_context:
+        try:
+            from kernelopt.compiler.rendering import build_compiler_context_section
+            _target_name = state.get("_target_triton_kernel_name", "")
+            _cc_section = build_compiler_context_section(_cc_json, _target_name)
+            if _cc_section:
+                profiling_ctx = {**profiling_ctx, "compiler_context": _cc_section}
+        except Exception:
+            pass
+
     # --- Multi-chain forest: generate plans per active kernel ---
     active = state.get("active_kernels", [])
     beam_width = getattr(cfg, "beam_width", 1)
@@ -1160,6 +1183,18 @@ def _build_executor_context(state: GraphState) -> str:
     techniques = select_techniques(ctx, _get_primary_kernel(state), max_techniques=2)
     if techniques:
         base += "\n\n" + format_techniques_for_executor(techniques)
+
+    # Inject compiler constraints for the executor
+    _cc_json = state.get("compiler_context")
+    if _cc_json and state["config"].use_compiler_context:
+        try:
+            from kernelopt.compiler.rendering import build_executor_compiler_section
+            _target_name = state.get("_target_triton_kernel_name", "")
+            _cc_exec = build_executor_compiler_section(_cc_json, _target_name)
+            if _cc_exec:
+                base += _cc_exec
+        except Exception:
+            pass
 
     return base
 
@@ -2543,6 +2578,36 @@ def maybe_synthesize(state: GraphState) -> dict:
         baseline_standalone_path = synth_dir / "baseline_standalone.py"
         baseline_standalone_path.write_text(standalone_kernel)
 
+        compiler_context_json = None
+        if cfg.use_compiler_context:
+            try:
+                from kernelopt.compiler import extract_compiler_context
+                compiler_ctx = extract_compiler_context(
+                    kernel_path,
+                    entry_point=cfg.entry_point,
+                    timeout=min(cfg.trace_timeout, 300),
+                )
+                if compiler_ctx.extraction_success:
+                    compiler_context_json = compiler_ctx.to_json()
+                    n_ir = len(compiler_ctx.ir_nodes)
+                    n_fuse = len(compiler_ctx.fusion_groups)
+                    n_decomp = len(compiler_ctx.aot_decomps)
+                    pipe_print(
+                        f"  Compiler context: [green]{n_ir} IR nodes, "
+                        f"{n_fuse} fusion groups, {n_decomp} decompositions[/]"
+                    )
+                else:
+                    pipe_print(
+                        f"  [dim]Compiler context: {compiler_ctx.extraction_warnings[:1]}[/]"
+                    )
+            except Exception as e:
+                pipe_print(f"  [dim]Compiler context skipped: {e}[/]")
+
+        # Save compiler context to output dir for replay
+        if compiler_context_json:
+            ctx_path = output_dir / "compiler_context.json"
+            ctx_path.write_text(compiler_context_json)
+
         return {
             "kernel_path": str(wrapped_path),
             "kernel_source": wrapped_source,
@@ -2555,6 +2620,7 @@ def maybe_synthesize(state: GraphState) -> dict:
             "_benchmark_kernel_source": benchmark_kernel_src,
             "_all_benchmark_files": benchmark_files,
             "_baseline_standalone_path": str(baseline_standalone_path),
+            "compiler_context": compiler_context_json,
         }
 
     except Exception as e:

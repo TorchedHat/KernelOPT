@@ -244,6 +244,10 @@ def run(
         None, "--replay-profiles",
         help="Replay NCU profiles from a prior run directory instead of live profiling.",
     ),
+    use_compiler_context: bool = typer.Option(
+        True, "--use-compiler-context/--no-compiler-context",
+        help="Extract compiler IR/fusion/autotune context for planner/executor prompts.",
+    ),
     multi_kernel: bool = typer.Option(
         True, "--multi-kernel/--single-kernel",
         help="Optimize ALL Triton kernels in a PyTorch model sequentially, re-stitching each back",
@@ -463,6 +467,7 @@ def run(
                 skip_ncu=skip_ncu,
                 optimize_all_kernels=optimize_all_kernels,
                 replay_profiles=replay_profiles or "",
+                use_compiler_context=use_compiler_context,
             )
     else:
         resolved_output = _run_output_dir(output_dir, run_subdir=run_subdir)
@@ -507,6 +512,7 @@ def run(
             skip_ncu=skip_ncu,
             optimize_all_kernels=optimize_all_kernels,
             replay_profiles=replay_profiles or "",
+            use_compiler_context=use_compiler_context,
         )
 
     cfg.hud = hud

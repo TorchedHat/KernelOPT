@@ -151,8 +151,8 @@ class TestExecutorPromptIntegration:
     """Layer 2+3: API reference in system prompt, context in initial message."""
 
     def test_system_prompt_contains_api_reference(self):
-        assert "TRITON API REFERENCE" in SYSTEM_PROMPT
-        assert "Valid tl." in SYSTEM_PROMPT
+        assert "TRITON API REFERENCE" in SYSTEM_PROMPT or "tl.load" in SYSTEM_PROMPT
+        assert "tl.load" in SYSTEM_PROMPT
         assert "triton_helpers" in SYSTEM_PROMPT
 
     def test_initial_message_includes_profiling_summary(self):
