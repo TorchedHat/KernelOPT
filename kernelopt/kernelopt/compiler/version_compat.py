@@ -77,4 +77,20 @@ def detect_capabilities() -> dict[str, bool | str]:
     except (ImportError, AttributeError):
         pass
 
+    caps["jax_version"] = "unavailable"
+    caps["has_jax_stages_api"] = False
+    caps["has_pallas"] = False
+    try:
+        import jax
+        caps["jax_version"] = jax.__version__
+        caps["has_jax_stages_api"] = hasattr(jax.jit(lambda x: x).lower, "__call__")
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from jax.experimental import pallas as pl
+        caps["has_pallas"] = hasattr(pl, "pallas_call")
+    except (ImportError, AttributeError):
+        pass
+
     return caps

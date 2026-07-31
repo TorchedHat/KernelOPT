@@ -47,6 +47,7 @@ def build_compiler_context_section(
     _add_codegen_strategy(sections, ctx, kernel_name)
     _add_triton_metadata(sections, ctx, kernel_name)
     _add_fusion_opportunities(sections, ctx)
+    _add_xla_context(sections, ctx)
 
     if not sections:
         return ""
@@ -164,3 +165,49 @@ def _add_fusion_opportunities(sections: list[str], ctx) -> None:
         lines.append(f"  {opp.node1_name} <-> {opp.node2_name}: \"{opp.reason}\"")
 
     sections.append("\n".join(lines))
+
+
+def _add_xla_context(sections: list[str], ctx) -> None:
+    """Add JAX/XLA context if available."""
+    if ctx.xla_context is None:
+        return
+
+    xla = ctx.xla_context
+    lines = ["XLA COMPILATION CONTEXT (JAX/XLA ground truth):"]
+
+    if xla.cost_analysis:
+        flops = xla.cost_analysis.get("flops", 0)
+        bytes_accessed = xla.cost_analysis.get("bytes accessed", 0)
+        if flops > 0:
+            lines.append(f"  FLOPs: {flops:,.0f}")
+        if bytes_accessed > 0:
+            lines.append(f"  Bytes accessed: {bytes_accessed:,.0f}")
+            if flops > 0:
+                lines.append(f"  Arithmetic intensity: {flops / bytes_accessed:.1f} FLOPs/byte")
+
+    if xla.memory_analysis:
+        temp = xla.memory_analysis.get("temp_size_bytes", 0)
+        if temp > 0:
+            lines.append(f"  Temp buffer: {temp:,} bytes")
+
+    if xla.fusion_decisions:
+        fusions = [d for d in xla.fusion_decisions if d.step_type == "Fusion"]
+        rejections = [d for d in xla.fusion_decisions if d.step_type == "ProducerIneligible"]
+        if fusions:
+            lines.append(f"  XLA fused {len(fusions)} operations")
+        if rejections:
+            lines.append(f"  XLA rejected {len(rejections)} fusion candidates:")
+            for r in rejections[:3]:
+                lines.append(f"    - {r.reason}")
+
+    if xla.autotune_results:
+        lines.append(f"  XLA autotuned {len(xla.autotune_results)} operations:")
+        for at in xla.autotune_results[:3]:
+            lines.append(
+                f"    - {at.fusion_name}: "
+                f"block_m={at.block_m} block_n={at.block_n} block_k={at.block_k}, "
+                f"{at.run_time_us:.1f}μs"
+            )
+
+    if len(lines) > 1:
+        sections.append("\n".join(lines))
