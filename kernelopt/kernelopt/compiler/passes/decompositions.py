@@ -32,7 +32,8 @@ def register_decomposition(
     """Register a custom decomposition for an ATen operation.
 
     Args:
-        op: The aten operation to decompose (e.g., torch.ops.aten.layer_norm.default).
+        op: The aten operation to decompose
+            (e.g., torch.ops.aten.native_layer_norm.default).
         decomp_fn: Replacement function with matching signature.
         name: Human-readable name for logging.
     """
@@ -68,6 +69,9 @@ def clear_decompositions() -> None:
 def register_builtin_decompositions() -> int:
     """Register KernelOPT's built-in decompositions.
 
+    These decompositions expose compound ops as elementwise primitives,
+    enabling Inductor to fuse them with adjacent operations.
+
     Returns number of decompositions registered.
     """
     count = 0
@@ -75,15 +79,49 @@ def register_builtin_decompositions() -> int:
     try:
         import torch
 
-        @torch.library.custom_op("kernelopt::fused_rms_norm", mutates_args=())
-        def fused_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-            variance = x.pow(2).mean(-1, keepdim=True)
-            x_normed = x * torch.rsqrt(variance + eps)
-            return x_normed * weight
+        def _layer_norm_decomp(input, normalized_shape, weight, bias, eps):
+            mean = input.mean(-1, keepdim=True)
+            var = input.var(-1, keepdim=True, correction=0)
+            out = (input - mean) * torch.rsqrt(var + eps)
+            if weight is not None:
+                out = out * weight
+            if bias is not None:
+                out = out + bias
+            return (out, mean, torch.rsqrt(var + eps))
 
-        logger.debug("Registered built-in decompositions")
-        count = 1
-    except (ImportError, Exception) as e:
-        logger.debug(f"Built-in decompositions not available: {e}")
+        def _group_norm_decomp(input, num_groups, weight, bias, eps):
+            N, C = input.shape[:2]
+            spatial = input.shape[2:]
+            x = input.reshape(N, num_groups, C // num_groups, *spatial)
+            mean = x.mean(dim=list(range(2, x.dim())), keepdim=True)
+            var = x.var(dim=list(range(2, x.dim())), keepdim=True, correction=0)
+            x_norm = (x - mean) * torch.rsqrt(var + eps)
+            x_norm = x_norm.reshape(N, C, *spatial)
+            if weight is not None:
+                shape = [1, C] + [1] * len(spatial)
+                x_norm = x_norm * weight.reshape(shape)
+            if bias is not None:
+                shape = [1, C] + [1] * len(spatial)
+                x_norm = x_norm + bias.reshape(shape)
+            return (x_norm, mean.squeeze(), torch.rsqrt(var + eps).squeeze())
+
+        if hasattr(torch.ops.aten, "native_layer_norm"):
+            register_decomposition(
+                torch.ops.aten.native_layer_norm.default,
+                _layer_norm_decomp,
+                name="native_layer_norm",
+            )
+            count += 1
+
+        if hasattr(torch.ops.aten, "native_group_norm"):
+            register_decomposition(
+                torch.ops.aten.native_group_norm.default,
+                _group_norm_decomp,
+                name="native_group_norm",
+            )
+            count += 1
+
+    except ImportError:
+        logger.debug("torch not available for builtin decompositions")
 
     return count

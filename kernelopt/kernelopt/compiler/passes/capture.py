@@ -35,6 +35,18 @@ class CaptureResult:
         return self.data.get("post_grad", [])
 
     @property
+    def fusion_pre(self) -> list[dict]:
+        return self.data.get("fusion_pre", [])
+
+    @property
+    def fusion_post(self) -> list[dict]:
+        return self.data.get("fusion_post", [])
+
+    @property
+    def fusion_rejections(self) -> list[dict]:
+        return self.data.get("fusion_rejections", [])
+
+    @property
     def triton_kernels(self) -> list[dict]:
         return self.data.get("triton", [])
 

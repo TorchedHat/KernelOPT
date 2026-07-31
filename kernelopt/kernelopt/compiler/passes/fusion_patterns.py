@@ -26,6 +26,7 @@ def register_fusion_pattern(
     replacement_fn: Callable,
     *,
     name: str = "",
+    arg_types: Optional[list] = None,
     min_runtime_pct: float = 5.0,
     min_memory_savings: float = 2.0,
 ) -> None:
@@ -37,8 +38,10 @@ def register_fusion_pattern(
 
     Args:
         pattern_fn: Function that matches the FX graph pattern.
-        replacement_fn: Fused replacement function.
+        replacement_fn: Fused replacement function (must produce
+                        semantically identical output with different ops).
         name: Human-readable name for logging.
+        arg_types: Argument type constraints for register_replacement.
         min_runtime_pct: Minimum runtime percentage to trigger.
         min_memory_savings: Minimum memory traffic reduction factor.
     """
@@ -46,6 +49,7 @@ def register_fusion_pattern(
         "name": name or f"pattern_{len(_REGISTERED_PATTERNS)}",
         "pattern_fn": pattern_fn,
         "replacement_fn": replacement_fn,
+        "arg_types": arg_types,
         "min_runtime_pct": min_runtime_pct,
         "min_memory_savings": min_memory_savings,
     })
@@ -57,27 +61,26 @@ def install_patterns() -> bool:
     Returns True if patterns were installed, False if unavailable.
     """
     try:
-        from torch._inductor.pattern_matcher import (
-            PatternMatcherPass,
-            register_replacement,
-        )
+        from torch._inductor.pattern_matcher import register_replacement
     except ImportError:
         logger.debug("Pattern matcher not available in this PyTorch version")
         return False
 
+    installed = 0
     for p in _REGISTERED_PATTERNS:
         try:
             register_replacement(
                 p["pattern_fn"],
                 p["replacement_fn"],
-                [],
+                p["arg_types"] or [],
                 fwd_only=True,
             )
+            installed += 1
             logger.debug(f"Registered fusion pattern: {p['name']}")
         except Exception as e:
             logger.warning(f"Failed to register pattern {p['name']}: {e}")
 
-    return len(_REGISTERED_PATTERNS) > 0
+    return installed > 0
 
 
 def clear_patterns() -> None:
@@ -104,17 +107,45 @@ def _silu_mul_pattern(x, w):
 
 
 def _silu_mul_replacement(x, w):
-    """Fused SiLU-mul: reduces one global memory read."""
+    """Fused SiLU-mul via a single elementwise expression.
+
+    The JIT compiler may fuse this into one kernel whereas the
+    pattern version generates two separate elementwise ops.
+    """
     import torch
-    return torch.nn.functional.silu(x) * w
+    return x * torch.sigmoid(x) * w
+
+
+def _gelu_pattern(x):
+    """GELU approximation (tanh variant)."""
+    import torch
+    return torch.nn.functional.gelu(x, approximate="tanh")
+
+
+def _gelu_replacement(x):
+    """GELU via explicit tanh approximation formula.
+
+    Exposes the full expression to Inductor for fusion with adjacent ops.
+    """
+    import torch
+    return 0.5 * x * (1.0 + torch.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
 
 def _rmsnorm_pattern(x, weight, eps=1e-6):
     """RMSNorm: variance + rsqrt + scale."""
     import torch
     variance = x.pow(2).mean(-1, keepdim=True)
-    x_normed = x * torch.rsqrt(variance + eps)
-    return x_normed * weight
+    return x * torch.rsqrt(variance + eps) * weight
+
+
+def _rmsnorm_replacement(x, weight, eps=1e-6):
+    """RMSNorm with fused variance computation.
+
+    Single-pass formulation reduces memory reads from 2N to N.
+    """
+    import torch
+    rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return (x / rms) * weight
 
 
 def register_builtin_patterns() -> None:
@@ -124,4 +155,16 @@ def register_builtin_patterns() -> None:
         _silu_mul_replacement,
         name="swiglu_fusion",
         min_runtime_pct=3.0,
+    )
+    register_fusion_pattern(
+        _gelu_pattern,
+        _gelu_replacement,
+        name="gelu_tanh_expansion",
+        min_runtime_pct=3.0,
+    )
+    register_fusion_pattern(
+        _rmsnorm_pattern,
+        _rmsnorm_replacement,
+        name="rmsnorm_fused",
+        min_runtime_pct=5.0,
     )

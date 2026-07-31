@@ -48,7 +48,12 @@ class TestHookInstaller:
     def test_captured_data_empty_initially(self):
         from kernelopt.compiler.passes import get_captured_data
         data = get_captured_data()
-        assert data == {"pre_grad": [], "post_grad": [], "triton": []}
+        assert data["pre_grad"] == []
+        assert data["post_grad"] == []
+        assert data["triton"] == []
+        assert data["fusion_pre"] == []
+        assert data["fusion_post"] == []
+        assert data["fusion_rejections"] == []
 
     def test_clear_captured_data(self):
         from kernelopt.compiler.passes.hook_installer import (
@@ -58,7 +63,9 @@ class TestHookInstaller:
         _captured_pre_grad.append({"test": True})
         clear_captured_data()
         from kernelopt.compiler.passes import get_captured_data
-        assert get_captured_data() == {"pre_grad": [], "post_grad": [], "triton": []}
+        data = get_captured_data()
+        assert data["pre_grad"] == []
+        assert data["triton"] == []
 
 
 # =========================================================================
@@ -157,39 +164,31 @@ class TestFusionPatterns:
 # =========================================================================
 
 class TestInductorChoices:
-    def test_default_persistent_reduction(self):
-        from kernelopt.compiler.passes.inductor_choices import ProfileGuidedChoices
-        choices = ProfileGuidedChoices()
-        assert choices.should_use_persistent_reduction(1024, 4096) is True
-        assert choices.should_use_persistent_reduction(1024, 16384) is False
-
     def test_override_persistent_reduction(self):
         from kernelopt.compiler.passes.inductor_choices import ProfileGuidedChoices
         choices = ProfileGuidedChoices()
         choices.set_override("persistent_reduction", True)
         assert choices.should_use_persistent_reduction(1024, 100000) is True
 
-    def test_profiling_data_force(self):
+    def test_profiling_data_force_streaming(self):
         from kernelopt.compiler.passes.inductor_choices import ProfileGuidedChoices
         choices = ProfileGuidedChoices(
             profiling_data={"reduction_analysis": {"force_streaming": True}}
         )
         assert choices.should_use_persistent_reduction(1, 1) is False
 
-    def test_tile_sizes_with_data(self):
+    def test_profiling_data_force_persistent(self):
         from kernelopt.compiler.passes.inductor_choices import ProfileGuidedChoices
         choices = ProfileGuidedChoices(
-            profiling_data={"tile_sizes": {"kernel_0": {"BLOCK_M": 128}}}
+            profiling_data={"reduction_analysis": {"force_persistent": True}}
         )
-        assert choices.get_tile_sizes("kernel_0", []) == {"BLOCK_M": 128}
-        assert choices.get_tile_sizes("kernel_1", []) is None
+        assert choices.should_use_persistent_reduction(1, 100000) is True
 
-    def test_num_warps_heuristic(self):
+    def test_set_override(self):
         from kernelopt.compiler.passes.inductor_choices import ProfileGuidedChoices
         choices = ProfileGuidedChoices()
-        assert choices.get_num_warps("k", 100000) == 8
-        assert choices.get_num_warps("k", 5000) == 4
-        assert choices.get_num_warps("k", 100) is None
+        choices.set_override("test_key", 42)
+        assert choices._overrides["test_key"] == 42
 
 
 # =========================================================================

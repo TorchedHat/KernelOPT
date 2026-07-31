@@ -5,8 +5,8 @@ prunes known-bad configs, and explores neighbors that Inductor's
 coordinate descent misses.
 
 References:
-    - CachingAutotunerPlugin: torch/_inductor/runtime/triton_heuristics.py:452
-    - IncrementalAutotunePlugin: FB-internal (PR #182010)
+    - CachingAutotuner: torch/_inductor/runtime/triton_heuristics.py
+    - Autotuning flow: CachingAutotuner.run() → precompile() → autotune()
 """
 
 from __future__ import annotations
@@ -41,11 +41,7 @@ class KernelOPTAutotunePlugin:
         kernel_name: str,
         configs: list[dict],
     ) -> list[dict]:
-        """Inject profile-guided configs before compilation.
-
-        Adds configs derived from NCU metrics (occupancy-optimal
-        num_warps, register-safe block sizes).
-        """
+        """Inject profile-guided configs before compilation."""
         suggested = self._profiling_data.get("suggested_configs", {})
         if kernel_name in suggested:
             for cfg in suggested[kernel_name]:
@@ -59,11 +55,7 @@ class KernelOPTAutotunePlugin:
         kernel_name: str,
         configs: list[dict],
     ) -> list[dict]:
-        """Filter configs before dispatch to GPU.
-
-        Removes configs that previously caused register spills
-        or had occupancy below 25%.
-        """
+        """Filter configs before dispatch to GPU."""
         if not self._avoid_configs:
             return configs
 
@@ -81,11 +73,7 @@ class KernelOPTAutotunePlugin:
         kernel_name: str,
         configs: list[dict],
     ) -> list[dict]:
-        """Add diagonal neighbor configs that coordinate descent misses.
-
-        Inductor's coordinate descent changes one parameter at a time.
-        This adds configs that simultaneously adjust num_warps + BLOCK_M.
-        """
+        """Add diagonal neighbor configs that coordinate descent misses."""
         neighbors = self._profiling_data.get("neighbor_configs", {})
         if kernel_name in neighbors:
             for cfg in neighbors[kernel_name]:
@@ -113,7 +101,10 @@ def install_autotune_plugin(
     profiling_data: Optional[dict] = None,
     avoid_configs: Optional[list[dict]] = None,
 ) -> Optional[KernelOPTAutotunePlugin]:
-    """Install the autotuning plugin into Inductor's config.
+    """Install the autotuning plugin.
+
+    The plugin is stored and accessed via the CachingAutotuner's
+    plugin registry rather than a config flag.
 
     Returns the plugin instance, or None if unavailable.
     """
@@ -123,12 +114,18 @@ def install_autotune_plugin(
     )
 
     try:
-        import torch._inductor.config as cfg
-        if hasattr(cfg, "triton") and hasattr(cfg.triton, "autotune_caching_plugin"):
-            cfg.triton.autotune_caching_plugin = plugin
+        from torch._inductor.runtime import triton_heuristics
+        if hasattr(triton_heuristics, "CachingAutotuner"):
+            CachingAutotuner = triton_heuristics.CachingAutotuner
+            if hasattr(CachingAutotuner, "plugin"):
+                CachingAutotuner.plugin = plugin
+                logger.debug("Installed autotuning plugin via CachingAutotuner.plugin")
+                return plugin
+            CachingAutotuner._kernelopt_plugin = plugin
+            logger.debug("Installed autotuning plugin via CachingAutotuner._kernelopt_plugin")
             return plugin
     except ImportError:
         pass
 
-    logger.debug("CachingAutotunerPlugin not available in this PyTorch version")
+    logger.debug("CachingAutotuner not available in this PyTorch version")
     return None

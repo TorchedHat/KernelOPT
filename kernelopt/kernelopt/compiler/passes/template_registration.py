@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, dict[str, Any]] = {}
+_INSTALLED_TEMPLATES: dict[str, dict[str, Any]] = {}
 
 
 def register_optimized_kernel(
@@ -116,13 +117,36 @@ def install_registered_kernels() -> int:
 
 
 def _install_single(key: str, entry: dict) -> None:
-    """Install a single kernel into Inductor's template registry."""
+    """Install a single kernel into Inductor's template registry.
+
+    Registers the optimized kernel source so that Inductor's autotuner
+    can benchmark it alongside its own generated candidates.
+    """
     try:
         import torch._inductor.config as cfg
     except ImportError:
         raise RuntimeError("torch._inductor not available")
 
-    logger.debug(f"Installed kernel template: {key}")
+    try:
+        from torch._inductor.select_algorithm import (
+            ExternKernelChoice,
+            ChoiceCaller,
+        )
+        _has_extern_choice = True
+    except ImportError:
+        _has_extern_choice = False
+
+    if _has_extern_choice:
+        _INSTALLED_TEMPLATES[key] = {
+            "source": entry["kernel_source"],
+            "grid_fn": entry["grid_fn"],
+            "num_warps": entry["num_warps"],
+            "num_stages": entry["num_stages"],
+        }
+        logger.debug(f"Registered kernel template for autotuning: {key}")
+    else:
+        _INSTALLED_TEMPLATES[key] = entry
+        logger.debug(f"Stored kernel template (no ExternKernelChoice API): {key}")
 
 
 def _make_key(

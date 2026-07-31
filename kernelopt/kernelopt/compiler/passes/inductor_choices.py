@@ -1,12 +1,12 @@
 """Profile-guided overrides for Inductor's heuristic decisions.
 
-Subclasses InductorChoices to inject profiling-derived tile sizes,
-reduction strategies, and warp counts instead of Inductor's defaults.
+Subclasses the actual InductorChoices class to inject profiling-derived
+tile sizes, reduction strategies, and warp counts.
 
 Set via: config.inductor_choices_class = KernelOPTChoices
 
 References:
-    - InductorChoices: torch/_inductor/codegen/choices.py:442
+    - InductorChoices: torch/_inductor/codegen/choices.py
     - config.inductor_choices_class: torch/_inductor/config.py:957
 """
 
@@ -18,21 +18,29 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-class ProfileGuidedChoices:
+def _get_base_class():
+    """Import InductorChoices at runtime — torch is optional."""
+    try:
+        from torch._inductor.codegen.choices import InductorChoices
+        return InductorChoices
+    except ImportError:
+        return object
+
+
+class ProfileGuidedChoices(_get_base_class()):
     """KernelOPT overrides for Inductor's heuristic decisions.
 
-    Wraps the default InductorChoices and overrides specific decisions
-    when profiling data is available. Falls back to default behavior
+    Inherits from InductorChoices and overrides specific methods
+    when profiling data is available. Falls back to parent behavior
     when no profiling guidance exists.
     """
 
     def __init__(
         self,
         profiling_data: Optional[dict] = None,
-        base_choices: Any = None,
     ) -> None:
+        super().__init__()
         self._profiling_data = profiling_data or {}
-        self._base = base_choices
         self._overrides: dict[str, Any] = {}
 
     def set_override(self, key: str, value: Any) -> None:
@@ -59,65 +67,29 @@ class ProfileGuidedChoices:
         if profiling.get("force_streaming"):
             return False
 
-        if self._base and hasattr(self._base, "should_use_persistent_reduction"):
-            return self._base.should_use_persistent_reduction(numel, reduction_numel)
-
-        return reduction_numel <= 8192
-
-    def get_tile_sizes(
-        self,
-        kernel_name: str,
-        input_shapes: list[tuple[int, ...]],
-    ) -> Optional[dict[str, int]]:
-        """Get profile-guided tile sizes for a kernel.
-
-        Returns None to fall back to Inductor defaults.
-        """
-        tile_overrides = self._profiling_data.get("tile_sizes", {})
-        if kernel_name in tile_overrides:
-            return tile_overrides[kernel_name]
-        return None
-
-    def get_num_warps(
-        self,
-        kernel_name: str,
-        numel: int,
-    ) -> Optional[int]:
-        """Get profile-guided num_warps for a kernel.
-
-        Returns None to fall back to Inductor defaults.
-        """
-        warp_overrides = self._profiling_data.get("num_warps", {})
-        if kernel_name in warp_overrides:
-            return warp_overrides[kernel_name]
-
-        if numel >= 65536:
-            return 8
-        elif numel >= 4096:
-            return 4
-        return None
+        return super().should_use_persistent_reduction(numel, reduction_numel)
 
 
 def install_choices(profiling_data: Optional[dict] = None) -> bool:
-    """Install KernelOPT choices into Inductor config.
+    """Install KernelOPT choices class into Inductor config.
 
     Returns True if successful.
     """
     try:
         import torch._inductor.config as cfg
-        if hasattr(cfg, "inductor_choices_class"):
-            choices = ProfileGuidedChoices(profiling_data=profiling_data)
-            cfg.inductor_choices_class = type(
-                "KernelOPTChoices",
-                (choices.__class__,),
-                {
-                    "should_use_persistent_reduction": choices.should_use_persistent_reduction,
-                    "get_tile_sizes": choices.get_tile_sizes,
-                    "get_num_warps": choices.get_num_warps,
-                },
-            )
-            return True
+        from torch._inductor.codegen.choices import InductorChoices
     except ImportError:
-        pass
+        logger.debug("InductorChoices not available in this PyTorch version")
+        return False
 
-    return False
+    if not hasattr(cfg, "inductor_choices_class"):
+        logger.debug("inductor_choices_class config not available")
+        return False
+
+    class KernelOPTChoices(ProfileGuidedChoices):
+        def __init__(self):
+            super().__init__(profiling_data=profiling_data)
+
+    cfg.inductor_choices_class = KernelOPTChoices
+    logger.debug("Installed KernelOPTChoices as Inductor choices class")
+    return True

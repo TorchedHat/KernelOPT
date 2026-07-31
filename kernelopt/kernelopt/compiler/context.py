@@ -113,6 +113,9 @@ class FusionRejection:
     reason: str
     near_threshold: bool = False
     fixable_by_manual_fusion: bool = False
+    score: int = 0
+    threshold: int = 0
+    shared_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -382,12 +385,35 @@ class CompilerContext:
         return avoid
 
     def get_original_op_name(self, kernel_name: str) -> str | None:
-        """Map a kernel back to its original high-level op (e.g., layer_norm)."""
-        if self.dynamo is None:
+        """Map a kernel back to its original high-level op (e.g., layer_norm).
+
+        Uses the decomposition table: if a compound Dynamo op decomposes into
+        primitives that match this kernel's IR node ops, returns the compound op.
+        """
+        if self.dynamo is None or not self.dynamo.original_ops:
             return None
+
         ir_nodes = self.get_kernel_ir(kernel_name)
         if not ir_nodes:
+            strat = self.get_codegen_strategy(kernel_name)
+            if strat and "_fused_" in kernel_name:
+                fused_part = kernel_name.split("_fused_", 1)[-1]
+                for op in self.dynamo.original_ops:
+                    if op.is_compound and op.op_name.lower() in fused_part:
+                        return op.op_name
             return None
+
+        kernel_op_names = {n.node_type.lower() for n in ir_nodes if n.node_type}
+
+        for decomp in self.aot_decomps:
+            decomp_ops = {d.lower() for d in decomp.decomposed_into}
+            if decomp_ops and decomp_ops.issubset(kernel_op_names):
+                return decomp.original_op
+
+        for op in self.dynamo.original_ops:
+            if op.is_compound and op.op_name.lower() in kernel_name.lower():
+                return op.op_name
+
         return None
 
     # ---------------------------------------------------------------
