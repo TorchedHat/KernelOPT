@@ -473,6 +473,13 @@ def profile_baseline(state: GraphState) -> dict:
     if _triton_name:
         out["_target_triton_kernel_name"] = _triton_name
 
+    _cc = state.get("compiler_context")
+    if _cc:
+        try:
+            (output_dir / "compiler_context.json").write_text(_cc)
+        except Exception:
+            pass
+
     # If the target kernel differs from the current standalone, rebuild the
     # standalone from the correct benchmark file so optimizations target the
     # right kernel and re-stitching can match by name.
