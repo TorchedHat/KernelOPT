@@ -67,7 +67,28 @@ def build_executor_compiler_section(
         if warnings:
             parts.append("HARDWARE WARNINGS:\n" + "\n".join(f"  ! {w}" for w in warnings))
 
+    _add_xla_autotune_constraints(parts, ctx)
+
     if not parts:
         return ""
 
     return "\n\n" + "\n\n".join(parts) + "\n"
+
+
+def _add_xla_autotune_constraints(parts: list[str], ctx) -> None:
+    """Add XLA autotune results as reference configs for the executor."""
+    if ctx.xla_context is None:
+        return
+
+    xla = ctx.xla_context
+    if not xla.autotune_results:
+        return
+
+    lines = ["XLA AUTOTUNE REFERENCE (XLA's best configs — use as starting points):"]
+    for at in xla.autotune_results[:5]:
+        lines.append(
+            f"  - {at.fusion_name}: "
+            f"block_m={at.block_m}, block_n={at.block_n}, block_k={at.block_k}, "
+            f"warps={at.num_warps}, stages={at.num_stages}"
+        )
+    parts.append("\n".join(lines))
