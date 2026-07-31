@@ -128,6 +128,8 @@ def serialize_for_checkpoint(state: GraphState) -> dict[str, Any]:
         "active_kernels": state.get("active_kernels", []),
         "global_best_kernel": state.get("global_best_kernel", ""),
         "global_best_latency_ns": state.get("global_best_latency_ns", float("inf")),
+        "global_best_wall_ms": state.get("global_best_wall_ms", float("inf")),
+        "compiler_context": state.get("compiler_context"),
     }
 
 
@@ -223,6 +225,7 @@ def graph_state_from_checkpoint_payload(
         "_baseline_standalone_path": gs.get("_baseline_standalone_path"),
         "baseline_wall_ms": gs.get("baseline_wall_ms", -1),
         "best_wall_ms": gs.get("best_wall_ms", -1),
+        "compiler_context": gs.get("compiler_context"),
     }
 
     # Migrate old checkpoints: create active_kernels from legacy best_kernel
