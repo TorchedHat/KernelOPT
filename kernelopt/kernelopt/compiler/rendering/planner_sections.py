@@ -15,7 +15,10 @@ Sections are ordered by actionability:
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def build_compiler_context_section(
@@ -26,15 +29,15 @@ def build_compiler_context_section(
 
     Returns empty string if no compiler context is available.
     The output is plain text (not JSON) designed for token efficiency.
+
+    Raises on malformed JSON — a valid compiler_context_json string
+    that cannot be deserialized indicates a bug in the serialization layer.
     """
     if not compiler_context_json:
         return ""
 
-    try:
-        from kernelopt.compiler.context import CompilerContext
-        ctx = CompilerContext.from_json(compiler_context_json)
-    except Exception:
-        return ""
+    from kernelopt.compiler.context import CompilerContext
+    ctx = CompilerContext.from_json(compiler_context_json)
 
     if not ctx.extraction_success:
         return ""

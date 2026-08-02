@@ -193,8 +193,8 @@ def _make_pre_grad_pass(original: Optional[Callable]) -> Callable:
                     name = str(node.target).split(".")[-1] if hasattr(node.target, "__name__") else str(node.target)
                     ops.append({"op": name, "args_count": len(node.args)})
             _captured_pre_grad.append({"ops": ops, "num_ops": len(ops)})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Pre-grad op capture failed: %s", e)
 
         if callable(original):
             return original(graph)
@@ -218,8 +218,8 @@ def _make_post_grad_pass(original: Optional[Callable]) -> Callable:
                         "name": node.name,
                     })
             _captured_post_grad.append({"ir_nodes": ir_info, "num_nodes": len(ir_info)})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Post-grad IR capture failed: %s", e)
 
         if callable(original):
             return original(graph)
@@ -245,8 +245,8 @@ def _make_fusion_pass(
                     info["sub_nodes"] = len(list(node.get_nodes()))
                 node_info.append(info)
             capture_list.append({"nodes": node_info, "count": len(node_info)})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Fusion pass capture failed: %s", e)
 
         if callable(original):
             return original(nodes)
@@ -256,10 +256,16 @@ def _make_fusion_pass(
 
 
 def _patch_why_no_fuse() -> None:
-    """Wrap WhyNoFuse.__call__ to capture fusion rejection reasons."""
+    """Wrap WhyNoFuse.__call__ to capture fusion rejection reasons.
+
+    WhyNoFuse.__call__(self, reason: str, *args: Any) -> None
+    sets self.reason and self.args, then calls fusion_log.debug(self).
+    We wrap it to additionally store the formatted rejection in our list.
+    """
     try:
         from torch._inductor.scheduler import WhyNoFuse
     except ImportError:
+        logger.warning("WhyNoFuse not found in torch._inductor.scheduler — skipping fusion rejection capture")
         return
 
     if hasattr(WhyNoFuse, "_kernelopt_original_call"):
@@ -267,18 +273,20 @@ def _patch_why_no_fuse() -> None:
 
     original_call = WhyNoFuse.__call__
 
-    def patched_call(self, node1, node2):
-        result = original_call(self, node1, node2)
+    def patched_call(self, reason: str, *args) -> None:
+        original_call(self, reason, *args)
         try:
-            if self.args:
-                _captured_fusion_rejections.append({
-                    "node1": getattr(node1, "name", str(node1)),
-                    "node2": getattr(node2, "name", str(node2)),
-                    "reason": str(self.args[-1])[:200] if self.args else "",
-                })
+            formatted = reason % args if args else reason
+        except (TypeError, ValueError):
+            formatted = reason
+        try:
+            _captured_fusion_rejections.append({
+                "node1": getattr(self, "name1", ""),
+                "node2": getattr(self, "name2", ""),
+                "reason": formatted[:200],
+            })
         except Exception:
             pass
-        return result
 
     WhyNoFuse._kernelopt_original_call = original_call
     WhyNoFuse.__call__ = patched_call

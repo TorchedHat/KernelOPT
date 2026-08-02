@@ -21,6 +21,7 @@ def trace_model(
     pytorch_path: str,
     *,
     timeout: int = 1800,
+    extract_compiler_context: bool = False,
 ) -> list[dict]:
     """Trace a PyTorch model and return kernel group descriptions.
 
@@ -38,7 +39,7 @@ def trace_model(
             - inductor_source: the raw Inductor kernel source (for reference)
     """
     pytorch_path = str(Path(pytorch_path).resolve())
-    script = _build_tracer_script(pytorch_path)
+    script = _build_tracer_script(pytorch_path, extract_compiler_context=extract_compiler_context)
 
     import os as _os
     env = {k: v for k, v in _os.environ.items()}
@@ -75,9 +76,21 @@ def trace_model(
     )
 
 
-def _build_tracer_script(pytorch_path: str) -> str:
+def _build_tracer_script(
+    pytorch_path: str,
+    *,
+    extract_compiler_context: bool = False,
+) -> str:
     """Build the subprocess script that traces the model."""
-    return textwrap.dedent(f"""\
+    from kernelopt.synthesis.compile_extract import (
+        _extraction_hooks_code,
+        _extraction_collect_code,
+    )
+
+    cc_hooks = _extraction_hooks_code() if extract_compiler_context else ""
+    cc_collect = _extraction_collect_code() if extract_compiler_context else ""
+
+    script = textwrap.dedent(f"""\
         import json, sys, re, os, torch
         import importlib.util
 
@@ -253,3 +266,28 @@ def _build_tracer_script(pytorch_path: str) -> str:
 
         print(json.dumps(kernel_groups))
     """)
+
+    if extract_compiler_context:
+        _marker1 = "# Step 2: Compile to get Inductor fusion decisions"
+        _marker2 = "print(json.dumps(kernel_groups))"
+        if _marker1 not in script or _marker2 not in script:
+            logger.warning(
+                "graph_tracer template markers not found — "
+                "compiler context hooks not injected"
+            )
+        else:
+            script = script.replace(
+                _marker1,
+                cc_hooks + _marker1,
+            )
+            cc_insert = (
+                "sources = [code] if code else []\n"
+                + cc_collect
+                + 'for kg in kernel_groups:\n    kg["_compiler_context"] = _compiler_context\n'
+            )
+            script = script.replace(
+                _marker2,
+                cc_insert + _marker2,
+            )
+
+    return script

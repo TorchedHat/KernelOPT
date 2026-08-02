@@ -7,7 +7,6 @@ profiling data indicates a performance benefit.
 References:
     - register_replacement: torch/_inductor/pattern_matcher.py:1828
     - PatternMatcherPass: torch/_inductor/pattern_matcher.py:2583
-    - vLLM uses same API: vllm/compilation/fusion.py
 """
 
 from __future__ import annotations

@@ -56,6 +56,25 @@ def detect_capabilities() -> dict[str, bool | str]:
     except ImportError:
         pass
 
+    caps["has_extern_kernel_choice"] = False
+    caps["has_external_triton_template_kernel"] = False
+    caps["has_register_custom_op_autotuning"] = False
+    try:
+        from torch._inductor.select_algorithm import ExternKernelChoice  # noqa: F401
+        caps["has_extern_kernel_choice"] = True
+    except ImportError:
+        pass
+    try:
+        from torch._inductor.select_algorithm import ExternalTritonTemplateKernel  # noqa: F401
+        caps["has_external_triton_template_kernel"] = True
+    except ImportError:
+        pass
+    try:
+        from torch._inductor.kernel.custom_op import register_custom_op_autotuning  # noqa: F401
+        caps["has_register_custom_op_autotuning"] = True
+    except ImportError:
+        pass
+
     try:
         from torch._inductor.scheduler import WhyNoFuse
         caps["has_why_no_fuse"] = hasattr(WhyNoFuse, "__call__")
@@ -80,6 +99,7 @@ def detect_capabilities() -> dict[str, bool | str]:
     caps["jax_version"] = "unavailable"
     caps["has_jax_stages_api"] = False
     caps["has_pallas"] = False
+    caps["has_pallas_triton"] = False
     try:
         import jax
         caps["jax_version"] = jax.__version__
@@ -90,6 +110,12 @@ def detect_capabilities() -> dict[str, bool | str]:
     try:
         from jax.experimental import pallas as pl
         caps["has_pallas"] = hasattr(pl, "pallas_call")
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from jax.experimental.pallas.triton import CompilerParams  # noqa: F401
+        caps["has_pallas_triton"] = True
     except (ImportError, AttributeError):
         pass
 

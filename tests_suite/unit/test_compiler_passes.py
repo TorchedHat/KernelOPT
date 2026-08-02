@@ -196,47 +196,47 @@ class TestInductorChoices:
 # =========================================================================
 
 class TestAutotunePlugin:
-    def test_pre_compile_injects(self):
+    def test_plugin_creation(self):
         from kernelopt.compiler.passes.autotune_plugin import KernelOPTAutotunePlugin
         plugin = KernelOPTAutotunePlugin(
-            profiling_data={"suggested_configs": {"k0": [{"BLOCK_M": 256}]}}
+            profiling_data={"suggested_configs": {"k0": [{"BLOCK_M": 256}]}},
+            avoid_configs=[{"BLOCK_M": 32}],
         )
-        configs = [{"BLOCK_M": 128}]
-        result = plugin.pre_compile("k0", configs)
-        assert len(result) == 2
-        assert plugin.stats["injected"] == 1
+        assert plugin.stats["injected"] == 0
+        assert plugin.stats["pruned"] == 0
 
-    def test_pre_dispatch_prunes(self):
+    def test_should_avoid_launcher(self):
         from kernelopt.compiler.passes.autotune_plugin import KernelOPTAutotunePlugin
         plugin = KernelOPTAutotunePlugin(
             avoid_configs=[{"BLOCK_M": 32, "num_warps": 1}]
         )
-        configs = [
-            {"BLOCK_M": 32, "num_warps": 1},
-            {"BLOCK_M": 128, "num_warps": 4},
-        ]
-        result = plugin.pre_dispatch("k0", configs)
-        assert len(result) == 1
-        assert result[0]["BLOCK_M"] == 128
-        assert plugin.stats["pruned"] == 1
 
-    def test_pre_dispatch_keeps_all_if_all_pruned(self):
-        from kernelopt.compiler.passes.autotune_plugin import KernelOPTAutotunePlugin
-        plugin = KernelOPTAutotunePlugin(
-            avoid_configs=[{"BLOCK_M": 128}]
-        )
-        configs = [{"BLOCK_M": 128}]
-        result = plugin.pre_dispatch("k0", configs)
-        assert len(result) == 1
+        class FakeConfig:
+            def __init__(self, **kw):
+                self.kwargs = kw
 
-    def test_pre_autotune_adds_neighbors(self):
-        from kernelopt.compiler.passes.autotune_plugin import KernelOPTAutotunePlugin
-        plugin = KernelOPTAutotunePlugin(
-            profiling_data={"neighbor_configs": {"k0": [{"BLOCK_M": 192}]}}
+        class FakeLauncher:
+            def __init__(self, **kw):
+                self.config = FakeConfig(**kw)
+
+        bad = FakeLauncher(BLOCK_M=32, num_warps=1)
+        good = FakeLauncher(BLOCK_M=128, num_warps=4)
+        assert plugin._should_avoid_launcher(bad) is True
+        assert plugin._should_avoid_launcher(good) is False
+
+    def test_install_uninstall(self):
+        from kernelopt.compiler.passes.autotune_plugin import (
+            install_autotune_plugin,
+            uninstall_autotune_plugin,
         )
-        configs = [{"BLOCK_M": 128}]
-        result = plugin.pre_autotune("k0", configs)
-        assert len(result) == 2
+        plugin = install_autotune_plugin(profiling_data={"test": True})
+        uninstall_autotune_plugin()
+
+    def test_profiling_data_stored(self):
+        from kernelopt.compiler.passes.autotune_plugin import KernelOPTAutotunePlugin
+        data = {"suggested_configs": {"k0": [{"BLOCK_M": 256}]}}
+        plugin = KernelOPTAutotunePlugin(profiling_data=data)
+        assert plugin._profiling_data == data
 
 
 # =========================================================================

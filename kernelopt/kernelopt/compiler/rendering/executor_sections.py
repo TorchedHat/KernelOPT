@@ -7,7 +7,10 @@ All output is plain text — no JSON reaches the LLM.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def build_executor_compiler_section(
@@ -17,15 +20,15 @@ def build_executor_compiler_section(
     """Build compiler constraints section for the executor prompt.
 
     Returns empty string if no compiler context is available.
+
+    Raises on malformed JSON — a valid compiler_context_json string
+    that cannot be deserialized indicates a bug in the serialization layer.
     """
     if not compiler_context_json:
         return ""
 
-    try:
-        from kernelopt.compiler.context import CompilerContext
-        ctx = CompilerContext.from_json(compiler_context_json)
-    except Exception:
-        return ""
+    from kernelopt.compiler.context import CompilerContext
+    ctx = CompilerContext.from_json(compiler_context_json)
 
     if not ctx.extraction_success:
         return ""

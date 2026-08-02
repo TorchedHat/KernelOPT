@@ -152,6 +152,12 @@ class AutotuneEntry:
     runner_up_type: str = ""
     runner_up_timing_ms: float = 0.0
     all_timings: tuple[dict, ...] = ()
+    m: int = 0
+    n: int = 0
+    k: int = 0
+    winner_config: dict = field(default_factory=dict)
+    coordinate_descent_trajectory: tuple[dict, ...] = ()
+    unexplored_neighbors: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,6 +185,10 @@ class TileSizeAnalysis:
     original_shape: tuple[int, ...] = ()
     flattened_numel: int = 0
     contiguous_dim_size: int = 0
+    contiguous_dim_index: int = -1
+    strides: tuple[tuple[int, ...], ...] = ()
+    divisibility: dict = field(default_factory=dict)
+    inductor_configs_tried: tuple[dict, ...] = ()
     vectorization_max_width: int = 4
     vectorization_aligned: bool = False
     inductor_winner: dict = field(default_factory=dict)
@@ -191,6 +201,7 @@ class MemoryPressureInfo:
     peak_memory_bytes: int = 0
     peak_kernel: str = ""
     long_lived_buffers: tuple[IntermediateBuffer, ...] = ()
+    memory_timeline: tuple[dict, ...] = ()
 
 
 # =========================================================================

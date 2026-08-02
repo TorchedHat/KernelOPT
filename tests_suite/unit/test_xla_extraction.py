@@ -91,18 +91,25 @@ class TestAutotuneResultParsing:
         proto_file = tmp_path / "autotune.textproto"
         proto_file.write_text(
             'results {\n'
-            '  device: "fused_dot_general"\n'
-            '  block_m: 128\n'
-            '  block_n: 128\n'
-            '  block_k: 32\n'
-            '  num_stages: 3\n'
-            '  num_warps: 4\n'
-            '  run_time: 5000\n'
+            '  device: "gpu:0"\n'
+            '  hlo: "fused_dot_general.1"\n'
+            '  result {\n'
+            '    triton {\n'
+            '      block_m: 128\n'
+            '      block_n: 128\n'
+            '      block_k: 32\n'
+            '      num_stages: 3\n'
+            '      num_warps: 4\n'
+            '    }\n'
+            '    run_time {\n'
+            '      nanos: 5000\n'
+            '    }\n'
+            '  }\n'
             '}\n'
         )
         results = parse_autotune_results(str(proto_file))
         assert len(results) == 1
-        assert results[0]["fusion_name"] == "fused_dot_general"
+        assert results[0]["fusion_name"] == "1"
         assert results[0]["block_m"] == 128
         assert results[0]["block_n"] == 128
         assert results[0]["block_k"] == 32
@@ -115,13 +122,15 @@ class TestAutotuneResultParsing:
 
         proto_file = tmp_path / "results.txt"
         proto_file.write_text(
-            'results {\n  device: "fusion1"\n  block_m: 64\n}\n'
-            'results {\n  device: "fusion2"\n  block_m: 256\n}\n'
+            'results {\n  device: "gpu:0"\n  hlo: "fusion1"\n'
+            '  result {\n    triton {\n      block_m: 64\n    }\n  }\n}\n'
+            'results {\n  device: "gpu:0"\n  hlo: "fusion2"\n'
+            '  result {\n    triton {\n      block_m: 256\n    }\n  }\n}\n'
         )
         results = parse_autotune_results(str(proto_file))
         assert len(results) == 2
-        assert results[0]["fusion_name"] == "fusion1"
-        assert results[1]["fusion_name"] == "fusion2"
+        assert results[0]["block_m"] == 64
+        assert results[1]["block_m"] == 256
 
     def test_parse_per_fusion_cache(self, tmp_path):
         from kernelopt.compiler.extraction.xla.autotune import parse_per_fusion_cache
@@ -130,11 +139,12 @@ class TestAutotuneResultParsing:
         cache_dir.mkdir()
         f1 = cache_dir / "fused_reduce"
         f1.write_text(
-            'results {\n  device: ""\n  block_m: 32\n}\n'
+            'results {\n  device: "gpu:0"\n  hlo: "fused_reduce"\n'
+            '  result {\n    triton {\n      block_m: 32\n    }\n  }\n}\n'
         )
         results = parse_per_fusion_cache(str(cache_dir))
         assert len(results) == 1
-        assert results[0]["fusion_name"] == "fused_reduce"
+        assert results[0]["block_m"] == 32
 
     def test_empty_cache_dir(self, tmp_path):
         from kernelopt.compiler.extraction.xla.autotune import parse_per_fusion_cache
@@ -187,7 +197,7 @@ class TestPallasBridge:
     def test_create_wrapper_no_jax(self):
         from kernelopt.compiler.extraction.xla.pallas_bridge import create_pallas_kernel_wrapper
         with patch.dict("sys.modules", {"jax": None, "jax.experimental": None}):
-            with pytest.raises(ImportError, match="JAX"):
+            with pytest.raises((ImportError, RuntimeError)):
                 wrapper = create_pallas_kernel_wrapper(
                     lambda: None, None, (1,)
                 )

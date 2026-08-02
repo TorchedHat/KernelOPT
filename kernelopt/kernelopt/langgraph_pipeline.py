@@ -475,10 +475,7 @@ def profile_baseline(state: GraphState) -> dict:
 
     _cc = state.get("compiler_context")
     if _cc:
-        try:
-            (output_dir / "compiler_context.json").write_text(_cc)
-        except Exception:
-            pass
+        (output_dir / "compiler_context.json").write_text(_cc)
 
     # If the target kernel differs from the current standalone, rebuild the
     # standalone from the correct benchmark file so optimizations target the
@@ -950,8 +947,8 @@ def generate_plans(state: GraphState) -> dict:
             _cc_section = build_compiler_context_section(_cc_json, _target_name)
             if _cc_section:
                 profiling_ctx = {**profiling_ctx, "compiler_context": _cc_section}
-        except Exception:
-            pass
+        except Exception as e:
+            pipe_print(f"  [dim]Compiler context rendering failed: {e}[/]")
 
     # --- Multi-chain forest: generate plans per active kernel ---
     active = state.get("active_kernels", [])
@@ -2488,6 +2485,7 @@ def maybe_synthesize(state: GraphState) -> dict:
             kernel_path,
             entry_point=cfg.entry_point,
             input_shapes=cfg.input_shapes,
+            extract_compiler_context=getattr(cfg, "use_compiler_context", False),
         )
 
         if not results:
@@ -2587,10 +2585,31 @@ def maybe_synthesize(state: GraphState) -> dict:
 
         compiler_context_json = None
         if cfg.use_compiler_context:
-            try:
+            _cc_raw = primary.get("compiler_context")
+            if _cc_raw:
+                try:
+                    from kernelopt.compiler.extraction import _build_context
+                    compiler_ctx = _build_context(_cc_raw)
+                    if compiler_ctx.extraction_success:
+                        compiler_context_json = compiler_ctx.to_json()
+                        n_ir = len(compiler_ctx.ir_nodes)
+                        n_fuse = len(compiler_ctx.fusion_groups)
+                        n_decomp = len(compiler_ctx.aot_decomps)
+                        pipe_print(
+                            f"  Compiler context: [green]{n_ir} IR nodes, "
+                            f"{n_fuse} fusion groups, {n_decomp} decompositions[/]"
+                        )
+                    else:
+                        pipe_print(
+                            f"  [dim]Compiler context: {compiler_ctx.extraction_warnings[:1]}[/]"
+                        )
+                except Exception as e:
+                    pipe_print(f"  [dim]Compiler context (merged) failed: {e}[/]")
+            if compiler_context_json is None:
                 from kernelopt.compiler import extract_compiler_context
                 compiler_ctx = extract_compiler_context(
                     kernel_path,
+                    framework="pytorch",
                     entry_point=cfg.entry_point,
                     timeout=min(cfg.trace_timeout, 300),
                 )
@@ -2600,15 +2619,14 @@ def maybe_synthesize(state: GraphState) -> dict:
                     n_fuse = len(compiler_ctx.fusion_groups)
                     n_decomp = len(compiler_ctx.aot_decomps)
                     pipe_print(
-                        f"  Compiler context: [green]{n_ir} IR nodes, "
+                        f"  Compiler context (fallback): [green]{n_ir} IR nodes, "
                         f"{n_fuse} fusion groups, {n_decomp} decompositions[/]"
                     )
                 else:
                     pipe_print(
-                        f"  [dim]Compiler context: {compiler_ctx.extraction_warnings[:1]}[/]"
+                        f"  [dim]Compiler context: "
+                        f"{compiler_ctx.extraction_warnings[:1]}[/]"
                     )
-            except Exception as e:
-                pipe_print(f"  [dim]Compiler context skipped: {e}[/]")
 
         # Save compiler context to output dir for replay
         if compiler_context_json:

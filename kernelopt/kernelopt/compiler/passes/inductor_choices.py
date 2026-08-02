@@ -12,6 +12,8 @@ References:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from typing import Any, Optional
 
@@ -42,6 +44,11 @@ class ProfileGuidedChoices(_get_base_class()):
         super().__init__()
         self._profiling_data = profiling_data or {}
         self._overrides: dict[str, Any] = {}
+
+    def uuid(self) -> str:
+        """Cache key for Inductor's config serialization."""
+        data = json.dumps(self._profiling_data, sort_keys=True, default=str)
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     def set_override(self, key: str, value: Any) -> None:
         """Set a specific override for a heuristic decision."""

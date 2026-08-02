@@ -119,34 +119,119 @@ def install_registered_kernels() -> int:
 def _install_single(key: str, entry: dict) -> None:
     """Install a single kernel into Inductor's template registry.
 
-    Registers the optimized kernel source so that Inductor's autotuner
+    Attempts to register the optimized kernel so that Inductor's autotuner
     can benchmark it alongside its own generated candidates.
+
+    Full autotuning integration requires one of:
+    - ``ExternKernelChoice`` + ``ChoiceCaller`` (for callable kernels)
+    - ``register_custom_op_autotuning`` (requires wrapping as a CustomOpDef)
+    - ``ExternalTritonTemplateKernel`` (for template-based backends like Helion)
+
+    When these APIs are available, we compile the kernel source, create a
+    callable wrapper, and register it via ``ExternKernelChoice``.  When not
+    available (older PyTorch versions), the kernel is stored for later use
+    but cannot participate in Inductor's autotuning.
     """
-    try:
-        import torch._inductor.config as cfg
-    except ImportError:
-        raise RuntimeError("torch._inductor not available")
+    from kernelopt.compiler.version_compat import detect_capabilities
 
-    try:
-        from torch._inductor.select_algorithm import (
-            ExternKernelChoice,
-            ChoiceCaller,
-        )
-        _has_extern_choice = True
-    except ImportError:
-        _has_extern_choice = False
+    kernel_source = entry["kernel_source"]
+    caps = detect_capabilities()
 
-    if _has_extern_choice:
+    namespace: dict[str, Any] = {}
+    kernel_fn = None
+    try:
+        code = compile(kernel_source, f"<kernelopt:{key}>", "exec")
+        exec(code, namespace)  # noqa: S102
+        for obj in namespace.values():
+            if callable(obj) and (
+                hasattr(obj, "__triton_kernel__")
+                or getattr(obj, "fn", None) is not None
+                or getattr(obj, "run", None) is not None
+            ):
+                kernel_fn = obj
+                break
+    except Exception as e:
+        logger.warning("Cannot compile kernel source for %s: %s", key, e)
         _INSTALLED_TEMPLATES[key] = {
-            "source": entry["kernel_source"],
-            "grid_fn": entry["grid_fn"],
-            "num_warps": entry["num_warps"],
-            "num_stages": entry["num_stages"],
+            "source": kernel_source,
+            "status": "compile_failed",
+            "error": str(e),
         }
-        logger.debug(f"Registered kernel template for autotuning: {key}")
-    else:
-        _INSTALLED_TEMPLATES[key] = entry
-        logger.debug(f"Stored kernel template (no ExternKernelChoice API): {key}")
+        return
+
+    if kernel_fn is None:
+        logger.info(
+            "No Triton kernel function found in source for %s; "
+            "storing source for manual injection",
+            key,
+        )
+        _INSTALLED_TEMPLATES[key] = {
+            "source": kernel_source,
+            "status": "no_kernel_found",
+        }
+        return
+
+    grid_fn = entry["grid_fn"]
+    num_warps = entry["num_warps"]
+    num_stages = entry["num_stages"]
+
+    def _make_launcher(kfn, gfn, nw, ns):
+        """Create a tensor-level wrapper for the Triton kernel."""
+        def launcher(*args, **kwargs):
+            import torch
+            grid = gfn(*[a.numel() if isinstance(a, torch.Tensor) else a for a in args])
+            kfn[grid](*args, num_warps=nw, num_stages=ns, **kwargs)
+        launcher.__name__ = f"kernelopt_{key}"
+        launcher.__qualname__ = launcher.__name__
+        return launcher
+
+    launcher = _make_launcher(kernel_fn, grid_fn, num_warps, num_stages)
+
+    try:
+        from torch._inductor.select_algorithm import ExternKernelChoice
+
+        safe_name = key.replace(".", "_").replace("[", "_").replace("]", "_").replace(",", "_")
+        choice_name = f"kernelopt_{safe_name}"
+        choice = ExternKernelChoice(launcher, name=choice_name)
+        _INSTALLED_TEMPLATES[key] = {
+            "source": kernel_source,
+            "kernel_fn": kernel_fn,
+            "launcher": launcher,
+            "extern_choice": choice,
+            "grid_fn": grid_fn,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "status": "registered_extern_choice",
+        }
+        logger.info("Registered kernel as ExternKernelChoice: %s", choice_name)
+        return
+    except ImportError:
+        logger.debug("ExternKernelChoice not available")
+    except Exception as e:
+        logger.debug("ExternKernelChoice registration failed for %s: %s", key, e)
+
+    if caps.get("has_register_custom_op_autotuning"):
+        logger.info(
+            "Kernel %s: register_custom_op_autotuning available but requires "
+            "wrapping as a CustomOpDef — storing compiled callable for manual "
+            "injection via torch._inductor.kernel.custom_op.CustomOpConfig",
+            key,
+        )
+
+    _INSTALLED_TEMPLATES[key] = {
+        "source": kernel_source,
+        "kernel_fn": kernel_fn,
+        "launcher": launcher,
+        "grid_fn": grid_fn,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "status": "stored_compiled",
+    }
+    logger.info(
+        "Stored compiled kernel for %s (ExternKernelChoice unavailable, "
+        "kernel ready for manual injection)",
+        key,
+    )
 
 
 def _make_key(

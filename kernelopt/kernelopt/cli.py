@@ -607,6 +607,7 @@ def run(
                     from kernelopt.compiler import extract_compiler_context
                     compiler_ctx = extract_compiler_context(
                         str(kernel_path),
+                        framework="pytorch",
                         entry_point=entry_point,
                         timeout=min(cfg.trace_timeout, 300),
                     )

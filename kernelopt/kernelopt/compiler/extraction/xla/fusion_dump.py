@@ -15,10 +15,13 @@ References:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def parse_fusion_dump_text(dump_dir: str) -> list[dict]:
@@ -42,7 +45,8 @@ def parse_fusion_dump_text(dump_dir: str) -> list[dict]:
         try:
             content = f.read_text(errors="replace")
             decisions.extend(_parse_fusion_text(content))
-        except Exception:
+        except (OSError, IOError, ValueError) as e:
+            logger.debug("Failed to read fusion dump %s: %s", f, e)
             continue
 
     if not decisions:
@@ -50,7 +54,8 @@ def parse_fusion_dump_text(dump_dir: str) -> list[dict]:
             try:
                 content = f.read_text(errors="replace")
                 decisions.extend(_extract_fusions_from_hlo(content))
-            except Exception:
+            except (OSError, IOError, ValueError) as e:
+                logger.debug("Failed to read HLO file %s: %s", f, e)
                 continue
 
     return decisions
@@ -112,6 +117,7 @@ def setup_xla_dump_flags(dump_dir: str) -> None:
     flags = [
         f"--xla_dump_to={dump_dir}",
         "--xla_dump_hlo_as_text",
+        "--xla_dump_hlo_as_proto",
     ]
     existing = os.environ.get("XLA_FLAGS", "")
     os.environ["XLA_FLAGS"] = " ".join(filter(None, [existing] + flags))
