@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 import re
+import sysconfig
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,10 @@ from click.core import ParameterSource
 from rich.console import Console
 
 import warnings
+
+# Pre-initialize sysconfig to avoid thread-safety race in Triton's JIT
+# compiler. See: cpython#92452, triton-lang/triton#5933
+sysconfig.get_config_vars()
 
 from kernelopt.functions.gpu_monitoring import (
     select_gpu,
