@@ -16,7 +16,9 @@ from rich.console import Console
 import warnings
 
 # Pre-initialize sysconfig to avoid thread-safety race in Triton's JIT
-# compiler. See: cpython#92452, triton-lang/triton#5933
+# compiler. See: cpython#92452, triton-lang/triton#5933,
+# triton-lang/triton#5436 (parallel autotune compilation),
+# triton-lang/triton#9612 (TRITON_AUTOTUNING_COMPILE_WORKERS)
 sysconfig.get_config_vars()
 
 from kernelopt.functions.gpu_monitoring import (
