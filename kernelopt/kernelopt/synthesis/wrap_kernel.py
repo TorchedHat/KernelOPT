@@ -729,26 +729,51 @@ def rebuild_standalone_from_body(
 
 
 def _extract_get_inputs(inductor_source: str) -> str:
-    """Build get_inputs() from Inductor's benchmark_compiled_module().
+    """Build get_inputs() from Inductor's module-level get_args() or benchmark.
 
     Parses rand_strided(...) calls and produces torch.randn/randint equivalents,
     handling non-float dtypes correctly.
     """
     # With TORCHINDUCTOR_BENCHMARK_KERNEL=1, the inductor source has
     # rand_strided calls inside async_compile.triton('''...''') blocks
-    # (per-kernel benchmark harnesses). We only want the ones from the
-    # LAST top-level get_args() function (the real module-level one).
-    # Find it by looking for the last "def get_args" at column 0.
-    last_get_args = ""
+    # (per-kernel benchmark harnesses).  Each per-kernel get_args() returns
+    # that KERNEL's buffers (e.g. 2 tensors for a reduction), NOT the full
+    # model inputs (e.g. 3 tensors: weight, bias, x).  We must use only
+    # the MODULE-LEVEL get_args() — the one NOT inside a triple-quoted
+    # string.  ^def with re.MULTILINE matches line-starts inside '''...'''
+    # blocks too, so we filter by checking whether the match offset falls
+    # inside an open triple-quote pair.
+    last_module_get_args = ""
     for m in re.finditer(r'^def get_args\b.*', inductor_source, re.MULTILINE):
+        # Count unmatched ''' before this position.  An odd count means
+        # we are inside a triple-quoted string (per-kernel benchmark).
+        preceding = inductor_source[:m.start()]
+        if preceding.count("'''") % 2 == 1:
+            continue  # skip — inside async_compile.triton('''...''')
         func_lines = []
         for line in inductor_source[m.start():].split("\n"):
             if func_lines and line and not line[0].isspace() and not line.startswith("#"):
                 break
             func_lines.append(line)
-        last_get_args = "\n".join(func_lines)
+        last_module_get_args = "\n".join(func_lines)
 
-    search_source = last_get_args if last_get_args else inductor_source
+    # Fallback: if no module-level get_args() exists, search only the
+    # module-level portion of the source (after async_compile.wait).
+    # This avoids accidentally extracting per-kernel buffers from inside
+    # the triple-quoted benchmark harnesses.
+    if not last_module_get_args:
+        # Everything after async_compile.wait(globals()) is module-level.
+        wait_pos = inductor_source.find("async_compile.wait(globals())")
+        if wait_pos != -1:
+            last_module_get_args = inductor_source[wait_pos:]
+        else:
+            # No async_compile.wait found — strip all '''...''' blocks
+            # so only module-level rand_strided calls remain.
+            last_module_get_args = re.sub(
+                r"'''.*?'''", "", inductor_source, flags=re.DOTALL
+            )
+
+    search_source = last_module_get_args if last_module_get_args else inductor_source
 
     pattern = re.compile(
         r"(\w+)\s*=\s*rand_strided\(\s*"
