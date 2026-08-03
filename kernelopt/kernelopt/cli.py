@@ -252,8 +252,8 @@ def run(
         help="Replay NCU profiles from a prior run directory instead of live profiling.",
     ),
     use_compiler_context: bool = typer.Option(
-        True, "--use-compiler-context/--no-compiler-context",
-        help="Extract compiler IR/fusion/autotune context for planner/executor prompts.",
+        False, "--use-compiler-context/--no-compiler-context",
+        help="Extract compiler IR/fusion/autotune context for planner/executor prompts (experimental).",
     ),
     multi_kernel: bool = typer.Option(
         True, "--multi-kernel/--single-kernel",

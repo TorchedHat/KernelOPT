@@ -153,7 +153,7 @@ class PipelineConfig:
     skip_ncu: bool = False           # skip NCU profiling, planner gets no bottleneck context
     optimize_all_kernels: bool = False  # disable Inductor-aware synthesis (optimize extern too)
     replay_profiles: str = ""        # replay NCU profiles from a prior run directory
-    use_compiler_context: bool = True  # extract compiler IR/fusion/autotune context
+    use_compiler_context: bool = False  # opt-in: extract compiler IR/fusion/autotune context
 
     # Synthesis options (PyTorch → Triton)
     entry_point: str | None = None
