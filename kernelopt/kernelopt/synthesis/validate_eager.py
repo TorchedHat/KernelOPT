@@ -120,6 +120,11 @@ for seed in seeds:
         ref_out = model(*ref_inputs)
         gen_out = kernel_fn(*gen_inputs)
 
+    # Reject None output (kernel_function with pass returns None)
+    if gen_out is None:
+        failures.append(f"seed={{seed}}: kernel_function returned None")
+        continue
+
     # Normalize outputs to lists for multi-output comparison
     if not isinstance(ref_out, (tuple, list)):
         ref_out = [ref_out]
@@ -131,7 +136,10 @@ for seed in seeds:
         continue
 
     for _oi, (_r, _g) in enumerate(zip(ref_out, gen_out)):
-        if not isinstance(_r, torch.Tensor) or not isinstance(_g, torch.Tensor):
+        if not isinstance(_g, torch.Tensor):
+            failures.append(f"seed={{seed}} output[{{_oi}}]: generated output is {{type(_g).__name__}}, not Tensor")
+            continue
+        if not isinstance(_r, torch.Tensor):
             continue
         ref_f = _r.float().cpu()
         gen_f = _g.float().cpu()

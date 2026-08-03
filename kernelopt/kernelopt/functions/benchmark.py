@@ -322,6 +322,11 @@ try:
 
         torch.cuda.synchronize()
 
+        if opt_out is None:
+            print(json.dumps({{"correct": False, "max_diff": -1,
+                              "error": "kernel_function returned None"}}))
+            sys.exit(0)
+
         # Normalize outputs to lists for uniform handling of single/multi-output
         ref_outs = ref_out if isinstance(ref_out, (tuple, list)) else [ref_out]
         opt_outs = opt_out if isinstance(opt_out, (tuple, list)) else [opt_out]
@@ -334,7 +339,11 @@ try:
         seed_worst_diff = 0.0
 
         for out_idx, (r, o) in enumerate(zip(ref_outs, opt_outs)):
-            if not isinstance(r, torch.Tensor) or not isinstance(o, torch.Tensor):
+            if not isinstance(o, torch.Tensor):
+                print(json.dumps({{"correct": False,
+                                  "error": f"output[{{out_idx}}] is {{type(o).__name__}}, not Tensor"}}))
+                sys.exit(0)
+            if not isinstance(r, torch.Tensor):
                 continue
 
             # Structural checks — required for BOTH paths
