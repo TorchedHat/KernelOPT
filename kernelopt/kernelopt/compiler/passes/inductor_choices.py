@@ -23,10 +23,14 @@ logger = logging.getLogger(__name__)
 def _get_base_class():
     """Import InductorChoices at runtime — torch is optional."""
     try:
-        from torch._inductor.codegen.choices import InductorChoices
+        from torch._inductor.choices import InductorChoices
         return InductorChoices
     except ImportError:
-        return object
+        try:
+            from torch._inductor.codegen.choices import InductorChoices
+            return InductorChoices
+        except ImportError:
+            return object
 
 
 class ProfileGuidedChoices(_get_base_class()):
@@ -84,7 +88,10 @@ def install_choices(profiling_data: Optional[dict] = None) -> bool:
     """
     try:
         import torch._inductor.config as cfg
-        from torch._inductor.codegen.choices import InductorChoices
+        try:
+            from torch._inductor.choices import InductorChoices
+        except ImportError:
+            from torch._inductor.codegen.choices import InductorChoices
     except ImportError:
         logger.debug("InductorChoices not available in this PyTorch version")
         return False

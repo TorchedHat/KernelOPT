@@ -875,15 +875,12 @@ def run(
                             f"  [bold green]vs compile: {vs_compile:.2f}x[/]"
                         )
                     elif vs_compile >= _NOISE_THRESHOLD:
-                        # Within measurement noise — report as baseline
                         console.print(
                             f"  [dim]vs compile: ~1.00x (within measurement noise, raw={vs_compile:.4f}x)[/]"
                         )
                     elif vs_compile > 0 and vs_compile < _NOISE_THRESHOLD:
                         console.print(
-                            f"  [yellow]No improvement: KernelOPT output is {vs_compile:.2f}x vs torch.compile "
-                            f"(compile={compile_:.3f}ms, optimized={opt:.3f}ms). "
-                            f"Falling back to torch.compile baseline.[/]"
+                            f"  [yellow]vs compile: {vs_compile:.2f}x (REGRESSION, falling back to torch.compile baseline)[/]"
                         )
                         _write_compile_fallback(final_path, kernel_path)
                     if vs_eager > 0:
