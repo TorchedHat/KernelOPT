@@ -32,7 +32,7 @@ Five specialized agents (profiler, planner, executor, correctness verifier, summ
 - **Profiling-grounded** --- optimization plans are derived from NCU metrics (memory throughput, compute utilization, occupancy), not blind code generation
 - **Dispatch-aware** --- detects when Inductor dispatches to cuBLAS/cuDNN and preserves those calls instead of replacing them with slower Triton
 - **Zero regressions** --- four-gate verification (static analysis, element-wise correctness, float64 reference, E2E performance gate) ensures no shipped result is slower than the baseline
-- **Multi-framework** --- accepts PyTorch models, Triton kernels, CUDA kernels, and Helion kernels as input
+- **Multi-framework** --- accepts PyTorch models, Triton kernels, and Helion kernels as input
 - **Pluggable LLM backend** --- works with Vertex AI (default), Anthropic API, OpenAI, or any OpenAI-compatible local endpoint
 
 ### Inputs
@@ -40,9 +40,8 @@ Five specialized agents (profiler, planner, executor, correctness verifier, summ
 | Input | How it works |
 |-------|-------------|
 | **PyTorch model** (`.py` with `nn.Module`) | Traces through `torch.compile` / TorchInductor, extracts generated Triton kernels, optimizes each, re-stitches into the model with E2E verification |
-| **Triton kernel** (`.py` with `@triton.jit`) | Profiles and optimizes directly |
-| **CUDA kernel** (`.cu`) | Compiles with nvcc, profiles with NCU, optimizes |
-| **Helion kernel** (`.hl` / `@helion.kernel`) | Profiles and optimizes directly |
+| **Triton kernel** (`.py` with `@triton.jit`) | Profiles with NCU and optimizes the Triton source directly |
+| **Helion kernel** (`.py` with `@helion.kernel`) | Profiles and optimizes directly |
 
 ---
 
@@ -115,10 +114,7 @@ kernelopt doctor
 CUDA_VISIBLE_DEVICES=0 kernelopt run model.py
 
 # Standalone Triton kernel
-CUDA_VISIBLE_DEVICES=0 kernelopt run softmax_triton.py -T 3 -N 4
-
-# CUDA kernel
-CUDA_VISIBLE_DEVICES=0 kernelopt run matmul.cu -T 3 -N 4
+CUDA_VISIBLE_DEVICES=0 kernelopt run softmax_triton.py --framework triton -T 3 -N 4
 
 # Full configuration with beam search
 CUDA_VISIBLE_DEVICES=0 kernelopt run model.py \
@@ -154,7 +150,7 @@ kernelopt doctor                    # Verify environment health
 | `-K` | 1 | Executor attempts per plan |
 | `--beam-width` | 1 | Concurrent optimization chains |
 | `--search-policy` | `greedy` | `greedy`, `beam`, `top_k`, or `ucb` (UCB1 with c=1.4) |
-| `--framework` | `auto` | `auto`, `triton`, `helion`, `cuda`, or `pytorch` |
+| `--framework` | `auto` | `auto`, `triton`, `helion`, or `pytorch` |
 | `--backend` | `vertex` | LLM backend: `vertex`, `anthropic`, `openai` |
 | `--multi-kernel` / `--single-kernel` | on | Multi-kernel mode for PyTorch models |
 | `--e2e-perf-gate` | on | Reject optimizations that slow down the full model |
@@ -182,7 +178,7 @@ kernelopt run model.py --checkpoint output/run_20260625_120000/
 ### Pipeline
 
 ```
-Input (PyTorch / Triton / CUDA / Helion)
+Input (PyTorch / Triton / Helion)
   --> torch.compile (Inductor) --> Triton kernel extraction [PyTorch only]
   --> NCU baseline profiling
   --> Strategy analysis (memory-bound / compute-bound / launch-bound)
