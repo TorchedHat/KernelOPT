@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_clone_permute_view_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_1_triton_poi_fused_clone_permute/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_1_triton_poi_fused_clone_permute/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (23520,1,1), Waves/SM: 11.14
 - **Registers/thread**: 16

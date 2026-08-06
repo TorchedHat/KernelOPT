@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused__native_batch_norm_legit_no_training_cat_relu_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_014/kernel_2_triton_poi_fused__native_batch/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_014/kernel_2_triton_poi_fused__native_batch/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (8,1,1), Waves/SM: 0.00
 - **Registers/thread**: 32

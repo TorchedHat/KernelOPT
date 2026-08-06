@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/rw/crw5i634rrnmyzcofjubzr3yogt5l6fpsawoe5r2asp2ry45uhuh.py
+# kernel path: /workspace/tmp/torchinductor_user/rw/crw5i634rrnmyzcofjubzr3yogt5l6fpsawoe5r2asp2ry45uhuh.py
 # Topologically Sorted Source Nodes: [input_1], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_1 => convolution
@@ -123,7 +123,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/yg/cyggg4ke2deuarwqt76km52xh63wigodq5qcjvs7frv4x4cwuitz.py
+# kernel path: /workspace/tmp/torchinductor_user/yg/cyggg4ke2deuarwqt76km52xh63wigodq5qcjvs7frv4x4cwuitz.py
 # Topologically Sorted Source Nodes: [input_1], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_1 => convolution
@@ -199,7 +199,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ux/cuxiru5c3bkyg62ldildy5s5uqlc2dnfk5bj7ynpqzx4gmnx62l5.py
+# kernel path: /workspace/tmp/torchinductor_user/ux/cuxiru5c3bkyg62ldildy5s5uqlc2dnfk5bj7ynpqzx4gmnx62l5.py
 # Topologically Sorted Source Nodes: [input_1, input_2, input_3], Original ATen: [aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online, aten.sub, aten.exp, aten._softmax]
 # Source node to ATen node mapping:
 #   input_1 => convolution
@@ -362,7 +362,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/my/cmysrr3kwr2jttyn6mni3cxp5xo5ceqhlcruml5x4rlbrzlhuhk5.py
+# kernel path: /workspace/tmp/torchinductor_user/my/cmysrr3kwr2jttyn6mni3cxp5xo5ceqhlcruml5x4rlbrzlhuhk5.py
 # Topologically Sorted Source Nodes: [input_3, input_4], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   input_3 => div
@@ -442,7 +442,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/tx/ctxnvg7mdz6mdoribt6uzl7nfzqxtsdcknv4vwdfjuognglcdyof.py
+# kernel path: /workspace/tmp/torchinductor_user/tx/ctxnvg7mdz6mdoribt6uzl7nfzqxtsdcknv4vwdfjuognglcdyof.py
 # Topologically Sorted Source Nodes: [input_3, input_4, input_5, input_6], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_3 => div
@@ -608,7 +608,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/2o/c2opoldplclzugwldhpp34vzl5y6q5ae77vcljusuarva24vvhum.py
+# kernel path: /workspace/tmp/torchinductor_user/2o/c2opoldplclzugwldhpp34vzl5y6q5ae77vcljusuarva24vvhum.py
 # Topologically Sorted Source Nodes: [input_6, max_pool2d], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   input_6 => div_1
@@ -695,7 +695,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/zv/czvqsad57lb2h3cctdoe4kyspwkxpjxifbkvrafddl4gxjgmmalg.py
+# kernel path: /workspace/tmp/torchinductor_user/zv/czvqsad57lb2h3cctdoe4kyspwkxpjxifbkvrafddl4gxjgmmalg.py
 # Topologically Sorted Source Nodes: [input_6, max_pool2d, input_7], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution]
 # Source node to ATen node mapping:
 #   input_6 => div_1
@@ -777,7 +777,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/c7/cc77icbv6ofn4de7li7u2dz3tmh2yvmylbblhcu5ubg3v5t5hd6g.py
+# kernel path: /workspace/tmp/torchinductor_user/c7/cc77icbv6ofn4de7li7u2dz3tmh2yvmylbblhcu5ubg3v5t5hd6g.py
 # Topologically Sorted Source Nodes: [input_6, max_pool2d, input_7, input_8, input_9], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_6 => div_1
@@ -944,7 +944,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/qz/cqzi2siopousukdgjov5mw3fbj2lskuyvvqwr5pbd25alckee2xr.py
+# kernel path: /workspace/tmp/torchinductor_user/qz/cqzi2siopousukdgjov5mw3fbj2lskuyvvqwr5pbd25alckee2xr.py
 # Topologically Sorted Source Nodes: [input_9, input_10], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   input_10 => convolution_3
@@ -1024,7 +1024,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/cu/ccugwmyky6mucfo7xrks5mf3rr255x4rxitjg66slrutaeuqj6kz.py
+# kernel path: /workspace/tmp/torchinductor_user/cu/ccugwmyky6mucfo7xrks5mf3rr255x4rxitjg66slrutaeuqj6kz.py
 # Topologically Sorted Source Nodes: [input_9, input_10, input_11, input_12], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_10 => convolution_3
@@ -1190,7 +1190,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/x7/cx76cckgsd74wnvxqkxtiwvm5sojn26k6anlk5a5zqfprr3br5f2.py
+# kernel path: /workspace/tmp/torchinductor_user/x7/cx76cckgsd74wnvxqkxtiwvm5sojn26k6anlk5a5zqfprr3br5f2.py
 # Topologically Sorted Source Nodes: [input_12, max_pool2d_1], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   input_12 => div_3
@@ -1277,7 +1277,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/65/c65hkltmlfuurla7ocuenikw4nbp4p67vgglrulwsgfjoo67vy4b.py
+# kernel path: /workspace/tmp/torchinductor_user/65/c65hkltmlfuurla7ocuenikw4nbp4p67vgglrulwsgfjoo67vy4b.py
 # Topologically Sorted Source Nodes: [input_12, max_pool2d_1, input_13], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution]
 # Source node to ATen node mapping:
 #   input_12 => div_3
@@ -1359,7 +1359,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/rb/crbvrsrfp3obkyxtb5cxxrp4jgtohtju3uhyn354aeyxhbh2alod.py
+# kernel path: /workspace/tmp/torchinductor_user/rb/crbvrsrfp3obkyxtb5cxxrp4jgtohtju3uhyn354aeyxhbh2alod.py
 # Topologically Sorted Source Nodes: [input_12, max_pool2d_1, input_13, input_14, input_15], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_12 => div_3
@@ -1524,7 +1524,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/rn/crndqkyib4mfqud464hjylpqd3r6xxm6q5lzooh4m4p4zrik6ubc.py
+# kernel path: /workspace/tmp/torchinductor_user/rn/crndqkyib4mfqud464hjylpqd3r6xxm6q5lzooh4m4p4zrik6ubc.py
 # Topologically Sorted Source Nodes: [input_15, input_16], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   input_15 => div_4
@@ -1604,7 +1604,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bx/cbx2avxgvcf7u2hcjhm4uqyqsmu52hvgse2vj4yv3sonhhnnorkv.py
+# kernel path: /workspace/tmp/torchinductor_user/bx/cbx2avxgvcf7u2hcjhm4uqyqsmu52hvgse2vj4yv3sonhhnnorkv.py
 # Topologically Sorted Source Nodes: [input_15, input_16, input_17, input_18], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_15 => div_4
@@ -1770,7 +1770,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/hl/chlz2bobs2fnw5jamxcofoe5qx7ktq353z25rqma5rqsmtteh3yd.py
+# kernel path: /workspace/tmp/torchinductor_user/hl/chlz2bobs2fnw5jamxcofoe5qx7ktq353z25rqma5rqsmtteh3yd.py
 # Topologically Sorted Source Nodes: [input_18, max_pool2d_2], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   input_18 => div_5
@@ -1857,7 +1857,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/gc/cgcjgffw7zdvk6h75leklw5viwl374jn7mmn2mb4b6hgwterxefl.py
+# kernel path: /workspace/tmp/torchinductor_user/gc/cgcjgffw7zdvk6h75leklw5viwl374jn7mmn2mb4b6hgwterxefl.py
 # Topologically Sorted Source Nodes: [input_18, max_pool2d_2, input_19], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution]
 # Source node to ATen node mapping:
 #   input_18 => div_5
@@ -1939,7 +1939,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ca/ccaatuxblczybglj37a2q76kxn2yhjfltjxzxhhkobgldo3z4py2.py
+# kernel path: /workspace/tmp/torchinductor_user/ca/ccaatuxblczybglj37a2q76kxn2yhjfltjxzxhhkobgldo3z4py2.py
 # Topologically Sorted Source Nodes: [input_18, max_pool2d_2, input_19, input_20, input_21], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_18 => div_5
@@ -2087,7 +2087,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/k4/ck4ni5csu2nj2cbxt5jh3vmbejeqhsb7mny27oksq2r4o5ty55vo.py
+# kernel path: /workspace/tmp/torchinductor_user/k4/ck4ni5csu2nj2cbxt5jh3vmbejeqhsb7mny27oksq2r4o5ty55vo.py
 # Topologically Sorted Source Nodes: [input_21, input_22], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   input_21 => div_6
@@ -2167,7 +2167,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/q4/cq4dz5wzgygo7tdbwei2tlue5g6wpmvzvmcoi7mj6gmdcjv2deli.py
+# kernel path: /workspace/tmp/torchinductor_user/q4/cq4dz5wzgygo7tdbwei2tlue5g6wpmvzvmcoi7mj6gmdcjv2deli.py
 # Topologically Sorted Source Nodes: [input_21, input_22, input_23, input_24], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_21 => div_6
@@ -2316,7 +2316,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/p3/cp3q4zd7hxubeu5tchjts2e6oh3xotl2u34rua2gdkqr52ys5nkg.py
+# kernel path: /workspace/tmp/torchinductor_user/p3/cp3q4zd7hxubeu5tchjts2e6oh3xotl2u34rua2gdkqr52ys5nkg.py
 # Topologically Sorted Source Nodes: [input_24, max_pool2d_3], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   input_24 => div_7
@@ -2403,7 +2403,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ck/cckvjulgnymiivpy42n6jnjfzcf4sj4n3tqoh2tzdgzw7h3tp65i.py
+# kernel path: /workspace/tmp/torchinductor_user/ck/cckvjulgnymiivpy42n6jnjfzcf4sj4n3tqoh2tzdgzw7h3tp65i.py
 # Topologically Sorted Source Nodes: [input_24, max_pool2d_3, input_25], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution]
 # Source node to ATen node mapping:
 #   input_24 => div_7
@@ -2485,7 +2485,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/fx/cfxygflqdozxgn5q4h25kd2seorl5vwqnfn3engkgpbrexn65uu3.py
+# kernel path: /workspace/tmp/torchinductor_user/fx/cfxygflqdozxgn5q4h25kd2seorl5vwqnfn3engkgpbrexn65uu3.py
 # Topologically Sorted Source Nodes: [input_24, max_pool2d_3, input_25, input_26, input_27], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.max_pool2d_with_indices, aten.convolution, aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online]
 # Source node to ATen node mapping:
 #   input_24 => div_7
@@ -2628,7 +2628,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/q5/cq5a4bxuvoh2tux43kmzdlsxpiivdltgjiewthhbhwelyo636jzw.py
+# kernel path: /workspace/tmp/torchinductor_user/q5/cq5a4bxuvoh2tux43kmzdlsxpiivdltgjiewthhbhwelyo636jzw.py
 # Topologically Sorted Source Nodes: [input_27, input_28], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   input_27 => div_8
@@ -2708,7 +2708,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6f/c6f5ypjegspaqjbvn2fajbe24rx3losdfvb4t4dm6q74orfrlb6b.py
+# kernel path: /workspace/tmp/torchinductor_user/6f/c6f5ypjegspaqjbvn2fajbe24rx3losdfvb4t4dm6q74orfrlb6b.py
 # Topologically Sorted Source Nodes: [input_30, dec4], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec4 => convolution_10
@@ -2788,7 +2788,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/jt/cjtkbek7vmy3rdeopb6k2d433xapqizvjc5d2cosajfkpxrhplfd.py
+# kernel path: /workspace/tmp/torchinductor_user/jt/cjtkbek7vmy3rdeopb6k2d433xapqizvjc5d2cosajfkpxrhplfd.py
 # Topologically Sorted Source Nodes: [input_30, dec4], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec4 => convolution_10
@@ -2871,7 +2871,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ci/ccirekqswshv6f5ukbfy3lz4vyazwdd5qpd7ceihdxc2vtu26vpa.py
+# kernel path: /workspace/tmp/torchinductor_user/ci/ccirekqswshv6f5ukbfy3lz4vyazwdd5qpd7ceihdxc2vtu26vpa.py
 # Topologically Sorted Source Nodes: [input_31], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_31 => convolution_11
@@ -2948,7 +2948,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ni/cnix4ood734uxtfdd7y5koohf7hgbwstwcvvprvp6iyglf72sw4o.py
+# kernel path: /workspace/tmp/torchinductor_user/ni/cnix4ood734uxtfdd7y5koohf7hgbwstwcvvprvp6iyglf72sw4o.py
 # Topologically Sorted Source Nodes: [input_31], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_31 => convolution_11
@@ -3024,7 +3024,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/gy/cgytr66o5eawjgpe7ud6bhepmdcs4v34ji3jc22z4qu3wpkuw2er.py
+# kernel path: /workspace/tmp/torchinductor_user/gy/cgytr66o5eawjgpe7ud6bhepmdcs4v34ji3jc22z4qu3wpkuw2er.py
 # Topologically Sorted Source Nodes: [input_36, dec3], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec3 => convolution_13
@@ -3104,7 +3104,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/43/c43kxkntd5s5zpo4n3h5n5o3gg2v74rsfmcznjgo7g7qb3xggape.py
+# kernel path: /workspace/tmp/torchinductor_user/43/c43kxkntd5s5zpo4n3h5n5o3gg2v74rsfmcznjgo7g7qb3xggape.py
 # Topologically Sorted Source Nodes: [input_36, dec3], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec3 => convolution_13
@@ -3187,7 +3187,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ke/ckeyqqo4brrmxtcfzcqjbw5rl2mxlgc2o7e6tu4x7vnp3mzp3cak.py
+# kernel path: /workspace/tmp/torchinductor_user/ke/ckeyqqo4brrmxtcfzcqjbw5rl2mxlgc2o7e6tu4x7vnp3mzp3cak.py
 # Topologically Sorted Source Nodes: [input_37], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_37 => convolution_14
@@ -3263,7 +3263,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/wx/cwx3owdbcbv2ed5dhj44eahh4hxn3vws3rfnojiuepof5bpv5dh2.py
+# kernel path: /workspace/tmp/torchinductor_user/wx/cwx3owdbcbv2ed5dhj44eahh4hxn3vws3rfnojiuepof5bpv5dh2.py
 # Topologically Sorted Source Nodes: [input_37], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_37 => convolution_14
@@ -3339,7 +3339,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/m5/cm5nr5sclipbfnaz4arbwo6xrpagnvvilyba6cobl4cp5mxsysvp.py
+# kernel path: /workspace/tmp/torchinductor_user/m5/cm5nr5sclipbfnaz4arbwo6xrpagnvvilyba6cobl4cp5mxsysvp.py
 # Topologically Sorted Source Nodes: [input_42, dec2], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec2 => convolution_16
@@ -3419,7 +3419,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/dw/cdwuiz7rhrmumgljlkr4zcspbm3vhftbsrqtokihro2jt64nmz5i.py
+# kernel path: /workspace/tmp/torchinductor_user/dw/cdwuiz7rhrmumgljlkr4zcspbm3vhftbsrqtokihro2jt64nmz5i.py
 # Topologically Sorted Source Nodes: [input_42, dec2], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec2 => convolution_16
@@ -3502,7 +3502,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/3t/c3twut7hjmm76coqrqjzstu2mpsfwnb3matz3q3xg6h7pvi3sz3d.py
+# kernel path: /workspace/tmp/torchinductor_user/3t/c3twut7hjmm76coqrqjzstu2mpsfwnb3matz3q3xg6h7pvi3sz3d.py
 # Topologically Sorted Source Nodes: [input_43], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_43 => convolution_17
@@ -3578,7 +3578,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/iu/ciuckikk5h7uikwmzcqou44wfopu5xojcjfrzug7aiepyxlb74y3.py
+# kernel path: /workspace/tmp/torchinductor_user/iu/ciuckikk5h7uikwmzcqou44wfopu5xojcjfrzug7aiepyxlb74y3.py
 # Topologically Sorted Source Nodes: [input_43], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_43 => convolution_17
@@ -3654,7 +3654,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/pm/cpmryoow6w3yshzohl54tyt7w6t3oxqdrxfnltnr4v6lb2e6leyy.py
+# kernel path: /workspace/tmp/torchinductor_user/pm/cpmryoow6w3yshzohl54tyt7w6t3oxqdrxfnltnr4v6lb2e6leyy.py
 # Topologically Sorted Source Nodes: [input_48, dec1], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec1 => convolution_19
@@ -3734,7 +3734,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/xd/cxdt5z2tr434vqgxns3lh3taxho57qtjwamz37wfr6xfzyy26ixs.py
+# kernel path: /workspace/tmp/torchinductor_user/xd/cxdt5z2tr434vqgxns3lh3taxho57qtjwamz37wfr6xfzyy26ixs.py
 # Topologically Sorted Source Nodes: [input_48, dec1], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   dec1 => convolution_19
@@ -3817,7 +3817,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/e5/ce5dqz4ac7664fk5zjfwhdozrevg5fihsboiaetsbb5ur7moy6xg.py
+# kernel path: /workspace/tmp/torchinductor_user/e5/ce5dqz4ac7664fk5zjfwhdozrevg5fihsboiaetsbb5ur7moy6xg.py
 # Topologically Sorted Source Nodes: [input_49], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_49 => convolution_20
@@ -3893,7 +3893,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/nb/cnbnpkmp65hmle5fijlwlnpi4dgdq26o4ax4e6fzjpkvlyd7ravw.py
+# kernel path: /workspace/tmp/torchinductor_user/nb/cnbnpkmp65hmle5fijlwlnpi4dgdq26o4ax4e6fzjpkvlyd7ravw.py
 # Topologically Sorted Source Nodes: [input_49], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_49 => convolution_20
@@ -3969,7 +3969,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/uc/cuc6j2ymwyewxbereg2f2mbxkmw3ealk2tuo4h6lojvhgf43ynou.py
+# kernel path: /workspace/tmp/torchinductor_user/uc/cuc6j2ymwyewxbereg2f2mbxkmw3ealk2tuo4h6lojvhgf43ynou.py
 # Topologically Sorted Source Nodes: [input_54, conv2d_18], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   conv2d_18 => convolution_22
@@ -4119,7 +4119,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/qu/cqurygc3rimsrbsio5fqjzfubpvh3nslq5tioo5r4yziwmam2sq6.py
+# kernel path: /workspace/tmp/torchinductor_user/qu/cqurygc3rimsrbsio5fqjzfubpvh3nslq5tioo5r4yziwmam2sq6.py
 # Topologically Sorted Source Nodes: [input_54, conv2d_18], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.convolution]
 # Source node to ATen node mapping:
 #   conv2d_18 => convolution_22

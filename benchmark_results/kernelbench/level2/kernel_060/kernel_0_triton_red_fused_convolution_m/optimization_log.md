@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused_convolution_mul_native_group_norm_sigmoid_0`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_060/kernel_0_triton_red_fused_convolution_m/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_060/kernel_0_triton_red_fused_convolution_m/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (512,1,1), Waves/SM: 0.97
 - **Registers/thread**: 128

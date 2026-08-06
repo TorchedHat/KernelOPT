@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_addmm_relu_view_8`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_8_triton_poi_fused_addmm_relu_vi/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_8_triton_poi_fused_addmm_relu_vi/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (676,1,1), Waves/SM: 0.32
 - **Registers/thread**: 16

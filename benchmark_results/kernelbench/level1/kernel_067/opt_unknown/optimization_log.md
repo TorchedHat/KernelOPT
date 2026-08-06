@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv1d_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_067/synthesis/kernel_0_unknown.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_067/synthesis/kernel_0_unknown.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (131070,1,1), Waves/SM: 330.98
 - **Registers/thread**: 143

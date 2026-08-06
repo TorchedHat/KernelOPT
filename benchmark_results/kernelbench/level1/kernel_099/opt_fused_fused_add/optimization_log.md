@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triplet_margin_loss_row_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_099/synthesis/kernel_0_fused_fused_add.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_099/synthesis/kernel_0_fused_fused_add.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (32768,1,1), Waves/SM: 15.52
 - **Registers/thread**: 28

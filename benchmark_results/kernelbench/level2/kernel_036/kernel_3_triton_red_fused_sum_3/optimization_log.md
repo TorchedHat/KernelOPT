@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused_sum_3`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_036/kernel_3_triton_red_fused_sum_3/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_036/kernel_3_triton_red_fused_sum_3/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (64,1,1), Waves/SM: 0.03
 - **Registers/thread**: 32

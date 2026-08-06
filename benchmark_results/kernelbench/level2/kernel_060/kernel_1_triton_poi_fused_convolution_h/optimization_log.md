@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_convolution_hardswish_mul_native_group_norm_sigmoid_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_060/kernel_1_triton_poi_fused_convolution_h/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_060/kernel_1_triton_poi_fused_convolution_h/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1968624,1,1), Waves/SM: 932.11
 - **Registers/thread**: 22

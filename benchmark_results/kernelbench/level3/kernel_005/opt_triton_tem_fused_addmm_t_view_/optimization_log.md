@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv2d_relu_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_005/synthesis/kernel_11_triton_tem_fused_addmm_t_view_18.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_005/synthesis/kernel_11_triton_tem_fused_addmm_t_view_18.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (24200,1,1), Waves/SM: 183.33
 - **Registers/thread**: 230

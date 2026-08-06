@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/pr/cprmbblaca2y2endrbpbkyvle6v5jgvellr5r2usjimw3giy3qeg.py
+# kernel path: /workspace/tmp/torchinductor_user/pr/cprmbblaca2y2endrbpbkyvle6v5jgvellr5r2usjimw3giy3qeg.py
 # Topologically Sorted Source Nodes: [input_1, input_2], Original ATen: [aten.t, aten.addmm, aten.relu]
 # Source node to ATen node mapping:
 #   input_1 => add_tensor_15, mm_default_15, permute
@@ -201,7 +201,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/2l/c2ldvlxlh26nil4hpfkxpmj7jncrocw2wyy6u4mw53ngv5pjvzi4.py
+# kernel path: /workspace/tmp/torchinductor_user/2l/c2ldvlxlh26nil4hpfkxpmj7jncrocw2wyy6u4mw53ngv5pjvzi4.py
 # Topologically Sorted Source Nodes: [input_1, input_2, input_3, input_4], Original ATen: [aten.addmm, aten.relu, aten.t]
 # Source node to ATen node mapping:
 #   input_1 => add_tensor_15
@@ -360,7 +360,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6x/c6xumgompsbxvkbthidkc3l7qpfbnlrm6t5qfaseyhnjsj7vf3fi.py
+# kernel path: /workspace/tmp/torchinductor_user/6x/c6xumgompsbxvkbthidkc3l7qpfbnlrm6t5qfaseyhnjsj7vf3fi.py
 # Topologically Sorted Source Nodes: [input_21, input_22, input_23], Original ATen: [aten.addmm, aten.relu, aten.t]
 # Source node to ATen node mapping:
 #   input_21 => add_tensor_5
@@ -509,7 +509,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/kw/ckwvd2wxudy3qyh2ysxvuetdrunrtcfpuctxsa6slifrr5uquhmh.py
+# kernel path: /workspace/tmp/torchinductor_user/kw/ckwvd2wxudy3qyh2ysxvuetdrunrtcfpuctxsa6slifrr5uquhmh.py
 # Topologically Sorted Source Nodes: [input_23, input_24], Original ATen: [aten.addmm, aten.relu]
 # Source node to ATen node mapping:
 #   input_23 => add_tensor_4
@@ -586,7 +586,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/f7/cf7b3dapyf73ccqxafgaxroy4hlszrtandolnxuqtvigdn2sjhnq.py
+# kernel path: /workspace/tmp/torchinductor_user/f7/cf7b3dapyf73ccqxafgaxroy4hlszrtandolnxuqtvigdn2sjhnq.py
 # Topologically Sorted Source Nodes: [input_31, input_32, input_33], Original ATen: [aten.addmm, aten.relu, aten.t]
 # Source node to ATen node mapping:
 #   input_31 => add_tensor

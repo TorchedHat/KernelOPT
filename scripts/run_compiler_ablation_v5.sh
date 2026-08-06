@@ -9,22 +9,22 @@ GPU=$1
 MODE=$2
 LEVEL=$3
 
-BASE="/mnt/podman_storage/ahpoddar/kernelopt_ablation"
+BASE="/workspace/user/kernelopt_ablation"
 KPT="$BASE/kernel-profiling-tool"
 KB="$BASE/KernelBench/KernelBench"
 RESULTS="$BASE/compiler_ablation_v5/${MODE}_gpu${GPU}"
 
 export CUDA_VISIBLE_DEVICES=$GPU
 export PYTHONUNBUFFERED=1
-export PATH="/mnt/podman_storage/ahpoddar/conda_envs/kopt/bin:/usr/local/cuda-12.8/bin:$PATH"
+export PATH="/workspace/user/conda_envs/kopt/bin:/usr/local/cuda-12.8/bin:$PATH"
 
 # Triton cache: isolated per GPU, on /mnt (7TB), not /home (250GB)
 # See: triton-lang/triton#5933, python/cpython#92452
-export TRITON_CACHE_DIR="/mnt/podman_storage/ahpoddar/triton_cache_v5_gpu${GPU}"
+export TRITON_CACHE_DIR="/workspace/user/triton_cache_v5_gpu${GPU}"
 mkdir -p "$TRITON_CACHE_DIR"
 
-eval "$(/home/ahpoddar/.conda/bin/conda shell.bash hook 2>/dev/null)"
-conda activate /mnt/podman_storage/ahpoddar/conda_envs/kopt
+eval "$(/home/user/.conda/bin/conda shell.bash hook 2>/dev/null)"
+conda activate /workspace/user/conda_envs/kopt
 cd "$KPT"
 
 # Matching original benchmark config (T=5, N=4, K=4, beam_width=4)

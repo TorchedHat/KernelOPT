@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `distribution_elementwise_grid_stride_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_049/synthesis/kernel_0_fused_fused_cumsum.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_049/synthesis/kernel_0_fused_fused_cumsum.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (1056,1,1), Waves/SM: 1.60
 - **Registers/thread**: 44

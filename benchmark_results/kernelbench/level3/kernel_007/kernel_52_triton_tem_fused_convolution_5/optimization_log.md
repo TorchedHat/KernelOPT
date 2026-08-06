@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused_convolution_52`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_007/kernel_52_triton_tem_fused_convolution_5/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_007/kernel_52_triton_tem_fused_convolution_5/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (124,1,1), Waves/SM: 0.16
 - **Registers/thread**: 80

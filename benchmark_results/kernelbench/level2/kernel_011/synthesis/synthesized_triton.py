@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ve/cveobhbgctxnpnub3q4ldnvelhasoluyhcrxnlrv6u65ydqbqpqp.py
+# kernel path: /workspace/tmp/torchinductor_user/ve/cveobhbgctxnpnub3q4ldnvelhasoluyhcrxnlrv6u65ydqbqpqp.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -122,7 +122,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/4g/c4gphst5wkxcyzeq3p4wyqz67t6ejj747vfz6g47poj5dysgduda.py
+# kernel path: /workspace/tmp/torchinductor_user/4g/c4gphst5wkxcyzeq3p4wyqz67t6ejj747vfz6g47poj5dysgduda.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -198,7 +198,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/om/comnt3uw556yu4edar3pbtoidqufxpwebfm7unplhmfiitsrjobe.py
+# kernel path: /workspace/tmp/torchinductor_user/om/comnt3uw556yu4edar3pbtoidqufxpwebfm7unplhmfiitsrjobe.py
 # Topologically Sorted Source Nodes: [x, x_1, x_2], Original ATen: [aten.convolution, aten._native_batch_norm_legit_no_training, aten.tanh]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -314,7 +314,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ig/ciger3jvjp3227syv2bdb6zybym5akkyffzvxhn5t7k5ucj4wjj7.py
+# kernel path: /workspace/tmp/torchinductor_user/ig/ciger3jvjp3227syv2bdb6zybym5akkyffzvxhn5t7k5ucj4wjj7.py
 # Topologically Sorted Source Nodes: [x, x_1, x_2, x_3, x_4], Original ATen: [aten.convolution, aten._native_batch_norm_legit_no_training, aten.tanh, aten.max_pool2d_with_indices, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -443,7 +443,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ak/cakrl4yrhfkp36gylqm3klzwo7hkazpbupwo566wvhsrsp5y2w24.py
+# kernel path: /workspace/tmp/torchinductor_user/ak/cakrl4yrhfkp36gylqm3klzwo7hkazpbupwo566wvhsrsp5y2w24.py
 # Topologically Sorted Source Nodes: [x, x_1, x_2, x_3, x_4], Original ATen: [aten.convolution, aten._native_batch_norm_legit_no_training, aten.tanh, aten.max_pool2d_with_indices, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   x => convolution

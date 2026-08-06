@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6p/c6p6kwmig6px3dsaeljqdjt25elvgh2lcjdzyxwbhw6l2hbz2voh.py
+# kernel path: /workspace/tmp/torchinductor_user/6p/c6p6kwmig6px3dsaeljqdjt25elvgh2lcjdzyxwbhw6l2hbz2voh.py
 # Topologically Sorted Source Nodes: [x_1, x_2], Original ATen: [aten.relu, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   x_1 => relu
@@ -158,7 +158,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/3h/c3h6yjru6q5xp6jioh3zf377p7z7x33nm6ineibplltmvhith46d.py
+# kernel path: /workspace/tmp/torchinductor_user/3h/c3h6yjru6q5xp6jioh3zf377p7z7x33nm6ineibplltmvhith46d.py
 # Topologically Sorted Source Nodes: [x_1, x_2], Original ATen: [aten.relu, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   x_1 => relu
@@ -258,7 +258,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6c/c6chdljdp4gbo7bgc2xxx4v26nmxdxtiadb5mpd3ptfnpvhfk5aa.py
+# kernel path: /workspace/tmp/torchinductor_user/6c/c6chdljdp4gbo7bgc2xxx4v26nmxdxtiadb5mpd3ptfnpvhfk5aa.py
 # Topologically Sorted Source Nodes: [x_1, x_2], Original ATen: [aten.relu, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   x_1 => relu

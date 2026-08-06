@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused__native_batch_norm_legit_no_training_addmm_avg_pool2d_convolution_relu_t_view_22`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_019/kernel_22_triton_tem_fused__native_batch/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_019/kernel_22_triton_tem_fused__native_batch/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (32,1,1), Waves/SM: 0.06
 - **Registers/thread**: 66

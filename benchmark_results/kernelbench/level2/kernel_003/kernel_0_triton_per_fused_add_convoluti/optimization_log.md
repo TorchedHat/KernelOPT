@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_add_convolution_native_layer_norm_0`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_003/kernel_0_triton_per_fused_add_convoluti/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_003/kernel_0_triton_per_fused_add_convoluti/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (32768,1,1), Waves/SM: 62.06
 - **Registers/thread**: 121

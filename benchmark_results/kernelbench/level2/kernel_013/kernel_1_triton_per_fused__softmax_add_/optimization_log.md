@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused__softmax_add_convolution_exp_mean_mul_prepare_softmax_online_sub_tanh_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_013/kernel_1_triton_per_fused__softmax_add_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_013/kernel_1_triton_per_fused__softmax_add_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (2048,1,1), Waves/SM: 3.88
 - **Registers/thread**: 128

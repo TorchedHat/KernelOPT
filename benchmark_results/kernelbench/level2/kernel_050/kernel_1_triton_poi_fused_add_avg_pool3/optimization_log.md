@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_add_avg_pool3d_convolution_mul_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_050/kernel_1_triton_poi_fused_add_avg_pool3/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_050/kernel_1_triton_poi_fused_add_avg_pool3/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (230640,1,1), Waves/SM: 109.20
 - **Registers/thread**: 24

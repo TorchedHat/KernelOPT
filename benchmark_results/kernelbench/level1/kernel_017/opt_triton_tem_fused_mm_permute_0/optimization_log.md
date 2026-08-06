@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `matmul_nt_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_017/synthesis/kernel_0_triton_tem_fused_mm_permute_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_017/synthesis/kernel_0_triton_tem_fused_mm_permute_0.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (256,1,1), Waves/SM: 1.94
 - **Registers/thread**: 255

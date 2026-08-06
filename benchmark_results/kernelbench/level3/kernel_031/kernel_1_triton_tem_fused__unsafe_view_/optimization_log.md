@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused__unsafe_view_clone_mm_permute_t_view_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_031/kernel_1_triton_tem_fused__unsafe_view_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_031/kernel_1_triton_tem_fused__unsafe_view_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (768,1,1), Waves/SM: 2.91
 - **Registers/thread**: 255

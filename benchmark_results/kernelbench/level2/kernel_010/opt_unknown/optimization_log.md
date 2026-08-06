@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv_transpose2d_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_010/synthesis/kernel_0_unknown.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_010/synthesis/kernel_0_unknown.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (131072,1,1), Waves/SM: 165.49
 - **Registers/thread**: 80

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused__native_batch_norm_legit_no_training__softmax_convolution_exp_prepare_softmax_online_sub_14`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_045/kernel_14_triton_red_fused__native_batch/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_045/kernel_14_triton_red_fused__native_batch/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (256,1,1), Waves/SM: 0.65
 - **Registers/thread**: 32

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused__unsafe_view_add_bmm_clone_mul_select_squeeze_transpose_unsqueeze_view_4`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_031/kernel_4_triton_poi_fused__unsafe_view_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_031/kernel_4_triton_poi_fused__unsafe_view_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (4096,1,1), Waves/SM: 1.94
 - **Registers/thread**: 25

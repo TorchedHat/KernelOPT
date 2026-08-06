@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused_addmm_clone_permute_t_view_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_2_triton_tem_fused_addmm_clone_p/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_2_triton_tem_fused_addmm_clone_p/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1225,1,1), Waves/SM: 3.09
 - **Registers/thread**: 168

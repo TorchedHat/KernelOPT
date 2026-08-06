@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused__unsafe_view_clone_convolution_native_layer_norm_permute_transpose_view_17`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_029/kernel_17_triton_poi_fused__unsafe_view_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_029/kernel_17_triton_poi_fused__unsafe_view_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (11760,1,1), Waves/SM: 5.57
 - **Registers/thread**: 20

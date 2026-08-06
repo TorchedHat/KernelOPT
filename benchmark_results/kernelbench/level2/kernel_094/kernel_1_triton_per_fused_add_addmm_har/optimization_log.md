@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_add_addmm_hardtanh_mish_native_group_norm_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_094/kernel_1_triton_per_fused_add_addmm_har/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_094/kernel_1_triton_per_fused_add_addmm_har/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (2048,1,1), Waves/SM: 3.88
 - **Registers/thread**: 106

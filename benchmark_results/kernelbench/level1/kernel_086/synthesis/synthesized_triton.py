@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/er/cergp2xvis75vcueb3cxhvbccmkfdjlgn46ao5bxrortoteiuynj.py
+# kernel path: /workspace/tmp/torchinductor_user/er/cergp2xvis75vcueb3cxhvbccmkfdjlgn46ao5bxrortoteiuynj.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -122,7 +122,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/3s/c3sdhkpsxqtk46cf5mqqd5hcpfmsuq7qngno6xwzupn5txsaooc5.py
+# kernel path: /workspace/tmp/torchinductor_user/3s/c3sdhkpsxqtk46cf5mqqd5hcpfmsuq7qngno6xwzupn5txsaooc5.py
 # Topologically Sorted Source Nodes: [x_1], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x_1 => convolution_1
@@ -266,7 +266,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6p/c6pbpn4fsiqoj5zfqvc25o7lrsrhwzaom6pzaf3sn4dwc37sb6ok.py
+# kernel path: /workspace/tmp/torchinductor_user/6p/c6pbpn4fsiqoj5zfqvc25o7lrsrhwzaom6pzaf3sn4dwc37sb6ok.py
 # Topologically Sorted Source Nodes: [x_1], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x_1 => convolution_1

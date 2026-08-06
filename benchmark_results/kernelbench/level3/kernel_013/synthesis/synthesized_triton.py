@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/v4/cv4ip2xrajfb52auqctlugfgmmq4ntxad5edo736w43ijdkf3xp6.py
+# kernel path: /workspace/tmp/torchinductor_user/v4/cv4ip2xrajfb52auqctlugfgmmq4ntxad5edo736w43ijdkf3xp6.py
 # Topologically Sorted Source Nodes: [input_1, input_2, input_3], Original ATen: [aten._native_batch_norm_legit_no_training, aten.relu, aten.convolution]
 # Source node to ATen node mapping:
 #   input_1 => add, add_1, mul, mul_1, mul_2, reciprocal, sqrt, sub, unsqueeze, unsqueeze_1, unsqueeze_2, unsqueeze_3, unsqueeze_4, unsqueeze_5, unsqueeze_6, unsqueeze_7
@@ -166,7 +166,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/p4/cp4qlvvqqqph7vkp7rm6sqov2uhadn2modsrm6dtgbamjxhk7faw.py
+# kernel path: /workspace/tmp/torchinductor_user/p4/cp4qlvvqqqph7vkp7rm6sqov2uhadn2modsrm6dtgbamjxhk7faw.py
 # Topologically Sorted Source Nodes: [input_1, input_2, input_3], Original ATen: [aten._native_batch_norm_legit_no_training, aten.relu, aten.convolution]
 # Source node to ATen node mapping:
 #   input_1 => add, add_1, mul, mul_1, mul_2, reciprocal, sqrt, sub, unsqueeze, unsqueeze_1, unsqueeze_2, unsqueeze_3, unsqueeze_4, unsqueeze_5, unsqueeze_6, unsqueeze_7
@@ -329,7 +329,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6a/c6at5beuw4maajfk5lfoytybsh2iffdxpoq5fneqmzh4cs6pmmtj.py
+# kernel path: /workspace/tmp/torchinductor_user/6a/c6at5beuw4maajfk5lfoytybsh2iffdxpoq5fneqmzh4cs6pmmtj.py
 # Topologically Sorted Source Nodes: [input_1, input_2, input_3, input_4], Original ATen: [aten._native_batch_norm_legit_no_training, aten.relu, aten.convolution, aten.avg_pool2d]
 # Source node to ATen node mapping:
 #   input_1 => add, add_1, mul, mul_1, mul_2, reciprocal, sqrt, sub, unsqueeze, unsqueeze_1, unsqueeze_2, unsqueeze_3, unsqueeze_4, unsqueeze_5, unsqueeze_6, unsqueeze_7

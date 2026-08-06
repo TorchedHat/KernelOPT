@@ -48,7 +48,7 @@ from torch._C import _cuda_getCurrentRawStream as get_raw_stream
 
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/sy/csy7mfk24hi5ki74wo3f2zk6on32z33zbnrn7wv3dmr5eh3jr6mh.py
+# kernel path: /workspace/tmp/torchinductor_user/sy/csy7mfk24hi5ki74wo3f2zk6on32z33zbnrn7wv3dmr5eh3jr6mh.py
 # Unsorted Source Nodes: [matmul], Original ATen: [aten.mm]
 # Source node to ATen node mapping:
 #   matmul => mm

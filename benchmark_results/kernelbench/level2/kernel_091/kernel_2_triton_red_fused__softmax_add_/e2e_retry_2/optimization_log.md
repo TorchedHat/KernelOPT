@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused__softmax_add_convolution_exp_mul_prepare_softmax_online_sigmoid_sub_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_091/kernel_2_triton_red_fused__softmax_add_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_091/kernel_2_triton_red_fused__softmax_add_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (16641,1,1), Waves/SM: 42.02
 - **Registers/thread**: 32

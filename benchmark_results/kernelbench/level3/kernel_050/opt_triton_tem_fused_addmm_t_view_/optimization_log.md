@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `gemm_qkv_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_050/synthesis/kernel_0_triton_tem_fused_addmm_t_view_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_050/synthesis/kernel_0_triton_tem_fused_addmm_t_view_0.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (2304,1,1), Waves/SM: 17.45
 - **Registers/thread**: 248

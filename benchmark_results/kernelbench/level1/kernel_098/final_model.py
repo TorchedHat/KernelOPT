@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/it/citp2eyvfjyusy3dcebyd6ibm5ybcjdohwflyjznybslvwdfhypm.py
+# kernel path: /workspace/tmp/torchinductor_user/it/citp2eyvfjyusy3dcebyd6ibm5ybcjdohwflyjznybslvwdfhypm.py
 # Topologically Sorted Source Nodes: [kl_div, log], Original ATen: [aten.xlogy, aten.log, aten.mul, aten.sub, aten.sum]
 # Source node to ATen node mapping:
 #   kl_div => eq, full_default, full_default_1, isnan, log_1, mul, mul_1, sub, sum_1, where, where_1
@@ -157,7 +157,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/me/cmefdauljwxjt7prmdqrjdwmtst665hf6h72qk7g376cbzhfikgw.py
+# kernel path: /workspace/tmp/torchinductor_user/me/cmefdauljwxjt7prmdqrjdwmtst665hf6h72qk7g376cbzhfikgw.py
 # Topologically Sorted Source Nodes: [kl_div, log], Original ATen: [aten.xlogy, aten.log, aten.mul, aten.sub, aten.sum, aten.div]
 # Source node to ATen node mapping:
 #   kl_div => div, eq, full_default, full_default_1, isnan, log_1, mul, mul_1, sub, sum_1, where, where_1

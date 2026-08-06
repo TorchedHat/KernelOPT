@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/gc/cgcjt6z47dcsp4qoxnyrlew5uuj2snjys53cckism5yhl6cbpxow.py
+# kernel path: /workspace/tmp/torchinductor_user/gc/cgcjt6z47dcsp4qoxnyrlew5uuj2snjys53cckism5yhl6cbpxow.py
 # Topologically Sorted Source Nodes: [x, x_1, hardswish, x_2], Original ATen: [aten.convolution, aten.add, aten.hardswish, aten.mul]
 # Source node to ATen node mapping:
 #   hardswish => add_1, clamp_max, clamp_min, div, mul

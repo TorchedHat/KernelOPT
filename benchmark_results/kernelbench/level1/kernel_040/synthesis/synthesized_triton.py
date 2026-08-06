@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ah/cah5reduzairwcutfgjnj3s7dvh2jtzwxuhuvqzv4oraut3doht6.py
+# kernel path: /workspace/tmp/torchinductor_user/ah/cah5reduzairwcutfgjnj3s7dvh2jtzwxuhuvqzv4oraut3doht6.py
 # Topologically Sorted Source Nodes: [layer_norm], Original ATen: [aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   layer_norm => var_mean
@@ -144,7 +144,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/so/csou5vszjobcr2iphzjffmk2gbcsxrajiq76bxb2z2dpomn6caht.py
+# kernel path: /workspace/tmp/torchinductor_user/so/csou5vszjobcr2iphzjffmk2gbcsxrajiq76bxb2z2dpomn6caht.py
 # Topologically Sorted Source Nodes: [layer_norm], Original ATen: [aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   layer_norm => var_mean
@@ -241,7 +241,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ls/clscxzstepr5eh6cfnu7bfyuvekb7nydcfe4xo2gumgmmmpolm5z.py
+# kernel path: /workspace/tmp/torchinductor_user/ls/clscxzstepr5eh6cfnu7bfyuvekb7nydcfe4xo2gumgmmmpolm5z.py
 # Topologically Sorted Source Nodes: [layer_norm], Original ATen: [aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   layer_norm => add, add_1, mul, mul_1, rsqrt, sub, var_mean

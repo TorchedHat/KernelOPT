@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_clone_unfold_0`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_028/kernel_0_triton_poi_fused_clone_unfold_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_028/kernel_0_triton_poi_fused_clone_unfold_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (2352,1,1), Waves/SM: 1.11
 - **Registers/thread**: 16

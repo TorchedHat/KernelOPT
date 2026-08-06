@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `matvec_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_004/synthesis/kernel_0_fused_fused_mm.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_004/synthesis/kernel_0_fused_fused_mm.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (2048,1,1), Waves/SM: 1.29
 - **Registers/thread**: 36

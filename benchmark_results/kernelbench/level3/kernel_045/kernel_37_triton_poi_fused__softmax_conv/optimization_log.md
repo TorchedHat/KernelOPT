@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused__softmax_convolution_exp_sub_37`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_045/kernel_37_triton_poi_fused__softmax_conv/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_045/kernel_37_triton_poi_fused__softmax_conv/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (16384,1,1), Waves/SM: 7.76
 - **Registers/thread**: 30

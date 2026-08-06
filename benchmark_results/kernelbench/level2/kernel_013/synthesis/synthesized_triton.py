@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/7m/c7mgwlxxjrqj6jxplgo42vgybthzqrznojkxuenjlnpz4s3ggha3.py
+# kernel path: /workspace/tmp/torchinductor_user/7m/c7mgwlxxjrqj6jxplgo42vgybthzqrznojkxuenjlnpz4s3ggha3.py
 # Topologically Sorted Source Nodes: [x, x_1], Original ATen: [aten.convolution, aten.mean]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -136,7 +136,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/sl/cslrf52t2ra3y5iewhwtu6ttjoqqu7jasmpi5psq7xu7duemt7vz.py
+# kernel path: /workspace/tmp/torchinductor_user/sl/cslrf52t2ra3y5iewhwtu6ttjoqqu7jasmpi5psq7xu7duemt7vz.py
 # Topologically Sorted Source Nodes: [x, x_1, x_2, x_3, x_4, x_5], Original ATen: [aten.convolution, aten.mean, aten.add, prims.prepare_softmax_online, aten.sub, aten.exp, aten._softmax, aten.tanh, aten.mul]
 # Source node to ATen node mapping:
 #   x => convolution

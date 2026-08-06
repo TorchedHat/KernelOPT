@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused__scaled_dot_product_efficient_attention_addmm_clone_select_squeeze_transpose_unsqueeze_view_4`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_028/kernel_4_triton_poi_fused__scaled_dot_p/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_028/kernel_4_triton_poi_fused__scaled_dot_p/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1576,1,1), Waves/SM: 0.75
 - **Registers/thread**: 16

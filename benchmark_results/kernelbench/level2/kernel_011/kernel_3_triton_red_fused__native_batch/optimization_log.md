@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused__native_batch_norm_legit_no_training_convolution_max_pool2d_with_indices_native_group_norm_tanh_3`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_011/kernel_3_triton_red_fused__native_batch/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_011/kernel_3_triton_red_fused__native_batch/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (32,1,1), Waves/SM: 0.02
 - **Registers/thread**: 32

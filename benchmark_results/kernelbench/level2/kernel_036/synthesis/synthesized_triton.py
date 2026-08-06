@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ex/cexlukauo6w5yxly7jfhlch3xttx2izygno5sdn6rl7d4dyb6u5b.py
+# kernel path: /workspace/tmp/torchinductor_user/ex/cexlukauo6w5yxly7jfhlch3xttx2izygno5sdn6rl7d4dyb6u5b.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -122,7 +122,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/m2/cm2365xyut73lutrwdlm6kyupeuv4paagspcw3asrdzzec2onpgx.py
+# kernel path: /workspace/tmp/torchinductor_user/m2/cm2365xyut73lutrwdlm6kyupeuv4paagspcw3asrdzzec2onpgx.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   x => convolution
@@ -198,7 +198,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/u2/cu2gle26bczlrn2c6m65lq2y4gq7oqmkfdie6nn47bfsria5hknw.py
+# kernel path: /workspace/tmp/torchinductor_user/u2/cu2gle26bczlrn2c6m65lq2y4gq7oqmkfdie6nn47bfsria5hknw.py
 # Topologically Sorted Source Nodes: [x, min_1], Original ATen: [aten.convolution, aten.min]
 # Source node to ATen node mapping:
 #   min_1 => min_1
@@ -285,7 +285,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/hl/chl3lhtzdivjfduv5wlopjofvr2ln5kfyt7auqkhfcjievx43j6p.py
+# kernel path: /workspace/tmp/torchinductor_user/hl/chl3lhtzdivjfduv5wlopjofvr2ln5kfyt7auqkhfcjievx43j6p.py
 # Topologically Sorted Source Nodes: [x_2], Original ATen: [aten.sum]
 # Source node to ATen node mapping:
 #   x_2 => sum_1
@@ -372,7 +372,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/da/cdaswutvod3xhbtwmstvgsdxdz5tpb5pzirmeyuu4zg53xrawb52.py
+# kernel path: /workspace/tmp/torchinductor_user/da/cdaswutvod3xhbtwmstvgsdxdz5tpb5pzirmeyuu4zg53xrawb52.py
 # Topologically Sorted Source Nodes: [x_2, x_3, x_4], Original ATen: [aten.sum, aten.gelu, aten.add]
 # Source node to ATen node mapping:
 #   x_2 => sum_1

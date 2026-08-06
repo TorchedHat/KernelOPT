@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bi/cbiqlj6ywnwe6teh3ckgnm7yih4qfchfyc5eord5upavh2fnz35b.py
+# kernel path: /workspace/tmp/torchinductor_user/bi/cbiqlj6ywnwe6teh3ckgnm7yih4qfchfyc5eord5upavh2fnz35b.py
 # Topologically Sorted Source Nodes: [input_1], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_1 => convolution
@@ -122,7 +122,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/b5/cb56k4pyfixak3zemqc4kkrmsb6irnjjp6f5wanwslu4t3iaw2cp.py
+# kernel path: /workspace/tmp/torchinductor_user/b5/cb56k4pyfixak3zemqc4kkrmsb6irnjjp6f5wanwslu4t3iaw2cp.py
 # Topologically Sorted Source Nodes: [input_1], Original ATen: [aten.convolution]
 # Source node to ATen node mapping:
 #   input_1 => convolution
@@ -269,7 +269,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/lc/clcnxidohc5ppg2ely7zofzpl2s2qsnhd5hobnmjbfrltwwvcyo4.py
+# kernel path: /workspace/tmp/torchinductor_user/lc/clcnxidohc5ppg2ely7zofzpl2s2qsnhd5hobnmjbfrltwwvcyo4.py
 # Topologically Sorted Source Nodes: [input_1, input_2, input_3], Original ATen: [aten.convolution, aten._native_batch_norm_legit_no_training, aten.hardtanh]
 # Source node to ATen node mapping:
 #   input_1 => convolution
@@ -385,7 +385,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/nb/cnbnlahw4466o372fhqiubzppkaqbsddqlkdloskwtnrnzbguwxg.py
+# kernel path: /workspace/tmp/torchinductor_user/nb/cnbnlahw4466o372fhqiubzppkaqbsddqlkdloskwtnrnzbguwxg.py
 # Topologically Sorted Source Nodes: [input_5, input_6, input_7], Original ATen: [aten._native_batch_norm_legit_no_training, aten.hardtanh, aten.convolution]
 # Source node to ATen node mapping:
 #   input_5 => add_2, add_3, mul_3, mul_4, mul_5, reciprocal_1, sqrt_1, sub_1, unsqueeze_10, unsqueeze_11, unsqueeze_12, unsqueeze_13, unsqueeze_14, unsqueeze_15, unsqueeze_8, unsqueeze_9
@@ -501,7 +501,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/su/csud5fxudwudluip3wblv3ubsfpuz2rirmg6cbyl3d7gwrkukoc3.py
+# kernel path: /workspace/tmp/torchinductor_user/su/csud5fxudwudluip3wblv3ubsfpuz2rirmg6cbyl3d7gwrkukoc3.py
 # Topologically Sorted Source Nodes: [input_5, input_6, input_7], Original ATen: [aten._native_batch_norm_legit_no_training, aten.hardtanh, aten.convolution]
 # Source node to ATen node mapping:
 #   input_5 => add_2, add_3, mul_3, mul_4, mul_5, reciprocal_1, sqrt_1, sub_1, unsqueeze_10, unsqueeze_11, unsqueeze_12, unsqueeze_13, unsqueeze_14, unsqueeze_15, unsqueeze_8, unsqueeze_9
@@ -665,7 +665,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/rz/crzal5t34cppl3sfyezaenmib2ypkd3w5z5bm766ln7zehy26azu.py
+# kernel path: /workspace/tmp/torchinductor_user/rz/crzal5t34cppl3sfyezaenmib2ypkd3w5z5bm766ln7zehy26azu.py
 # Topologically Sorted Source Nodes: [input_5, input_6, input_7, input_8], Original ATen: [aten._native_batch_norm_legit_no_training, aten.hardtanh, aten.convolution]
 # Source node to ATen node mapping:
 #   input_5 => add_2, add_3, mul_3, mul_4, mul_5, reciprocal_1, sqrt_1, sub_1, unsqueeze_10, unsqueeze_11, unsqueeze_12, unsqueeze_13, unsqueeze_14, unsqueeze_15, unsqueeze_8, unsqueeze_9

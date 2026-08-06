@@ -11,7 +11,7 @@ from pathlib import Path
 from datasets import load_dataset
 
 BENCHMARKS_DIR = Path(__file__).parent
-REPOS_DIR = Path("/mnt/podman_storage/ahpoddar/home/kernelopt")
+REPOS_DIR = Path("/workspace/user/home/kernelopt")
 
 
 def download_kernelbench():

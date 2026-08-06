@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/7b/c7bkhdjbc3vaprvwcru7nhzliuyj3obkjdv65ztlj527ijv2x7gv.py
+# kernel path: /workspace/tmp/torchinductor_user/7b/c7bkhdjbc3vaprvwcru7nhzliuyj3obkjdv65ztlj527ijv2x7gv.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   x => mm_default, permute
@@ -191,7 +191,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/p5/cp543h4p5wvykruq2v3uhtmumll2p6iuo54do5fy6mhhsdugcdwd.py
+# kernel path: /workspace/tmp/torchinductor_user/p5/cp543h4p5wvykruq2v3uhtmumll2p6iuo54do5fy6mhhsdugcdwd.py
 # Topologically Sorted Source Nodes: [x, sigmoid, x_1, x_2, x_3], Original ATen: [aten.addmm, aten.sigmoid, aten.mul, aten.add, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   sigmoid => sigmoid
@@ -302,7 +302,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/e4/ce4slekvx7cdnhk2kn3iohzae7k4jowjegwhoxdsukiwhfjt674i.py
+# kernel path: /workspace/tmp/torchinductor_user/e4/ce4slekvx7cdnhk2kn3iohzae7k4jowjegwhoxdsukiwhfjt674i.py
 # Topologically Sorted Source Nodes: [x, sigmoid, x_1, x_2, x_3], Original ATen: [aten.addmm, aten.sigmoid, aten.mul, aten.add, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   sigmoid => sigmoid

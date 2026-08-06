@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_addmm_clone_split_transpose_view_3`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_044/kernel_3_triton_poi_fused_addmm_clone_s/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_044/kernel_3_triton_poi_fused_addmm_clone_s/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (64,1,1), Waves/SM: 0.03
 - **Registers/thread**: 28

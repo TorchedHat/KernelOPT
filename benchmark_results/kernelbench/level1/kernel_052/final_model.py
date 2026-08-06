@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/oh/cohgmdssjqmzl5w2ttovmfftk4cmpxzk5hnvl3fejrgmejfwje3f.py
+# kernel path: /workspace/tmp/torchinductor_user/oh/cohgmdssjqmzl5w2ttovmfftk4cmpxzk5hnvl3fejrgmejfwje3f.py
 # Topologically Sorted Source Nodes: [argmin], Original ATen: [aten.argmin]
 # Source node to ATen node mapping:
 #   argmin => argmin

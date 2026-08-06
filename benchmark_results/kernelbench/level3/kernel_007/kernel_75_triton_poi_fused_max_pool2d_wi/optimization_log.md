@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_max_pool2d_with_indices_75`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_007/kernel_75_triton_poi_fused_max_pool2d_wi/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_007/kernel_75_triton_poi_fused_max_pool2d_wi/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (3185,1,1), Waves/SM: 1.51
 - **Registers/thread**: 24

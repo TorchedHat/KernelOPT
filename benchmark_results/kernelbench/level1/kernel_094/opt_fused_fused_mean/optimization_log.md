@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `mse_partial_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_094/synthesis/kernel_0_fused_fused_mean.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_094/synthesis/kernel_0_fused_fused_mean.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (32768,1,1), Waves/SM: 41.37
 - **Registers/thread**: 33

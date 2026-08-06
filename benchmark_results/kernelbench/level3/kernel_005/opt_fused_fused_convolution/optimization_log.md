@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv2d_implicit_gemm_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_005/synthesis/kernel_10_fused_fused_convolution.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_005/synthesis/kernel_10_fused_fused_convolution.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (96800,1,1), Waves/SM: 244.44
 - **Registers/thread**: 139

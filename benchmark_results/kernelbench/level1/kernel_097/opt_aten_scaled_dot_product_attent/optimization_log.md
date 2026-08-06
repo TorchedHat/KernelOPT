@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `flash_attn_fwd_kernel_split_d`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_097/synthesis/kernel_0_aten_scaled_dot_product_attention_defaul.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_097/synthesis/kernel_0_aten_scaled_dot_product_attention_defaul.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (32768,1,1), Waves/SM: 248.24
 - **Registers/thread**: 157

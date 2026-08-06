@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ex/cexxboemywcf76jmjggpmcplutusw2rufwireqdch672fpgy6h5q.py
+# kernel path: /workspace/tmp/torchinductor_user/ex/cexxboemywcf76jmjggpmcplutusw2rufwireqdch672fpgy6h5q.py
 # Topologically Sorted Source Nodes: [x, assignment], Original ATen: [aten.view, aten.mm]
 # Source node to ATen node mapping:
 #   assignment => mm
@@ -192,7 +192,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/dk/cdkzavitj2xhei2qr5r3zreixc5xcdzioirgzzi52vdvflpxjnex.py
+# kernel path: /workspace/tmp/torchinductor_user/dk/cdkzavitj2xhei2qr5r3zreixc5xcdzioirgzzi52vdvflpxjnex.py
 # Topologically Sorted Source Nodes: [assignment_1, assignment_2], Original ATen: [aten._native_batch_norm_legit_no_training, prims.prepare_softmax_online, aten.sub, aten.exp, aten._softmax]
 # Source node to ATen node mapping:
 #   assignment_1 => add, add_1, mul, mul_1, mul_2, reciprocal, sqrt, sub
@@ -318,7 +318,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/on/conjgmwln3cc7ja5y76orj6744fo3lsmlf6jvpz35zqrqoqlemry.py
+# kernel path: /workspace/tmp/torchinductor_user/on/conjgmwln3cc7ja5y76orj6744fo3lsmlf6jvpz35zqrqoqlemry.py
 # Topologically Sorted Source Nodes: [x, assignment_2, assignment_4, assignment_5, x_1, vlad], Original ATen: [aten.view, aten.sub, aten.exp, aten._softmax, aten.transpose, aten.bmm]
 # Source node to ATen node mapping:
 #   assignment_2 => div
@@ -473,7 +473,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/vh/cvhray66gzpwxn6xsd572tz3g3o5qhtjq7cy725jc57ehbzfcvaf.py
+# kernel path: /workspace/tmp/torchinductor_user/vh/cvhray66gzpwxn6xsd572tz3g3o5qhtjq7cy725jc57ehbzfcvaf.py
 # Topologically Sorted Source Nodes: [assignment_2, assignment_4, a_sum], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.view, aten.sum]
 # Source node to ATen node mapping:
 #   a_sum => sum_2
@@ -566,7 +566,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/je/cjecj3avi46iojik37nmbrgxuhe34at3igkn2opmxtyn5kwocdwi.py
+# kernel path: /workspace/tmp/torchinductor_user/je/cjecj3avi46iojik37nmbrgxuhe34at3igkn2opmxtyn5kwocdwi.py
 # Topologically Sorted Source Nodes: [vlad_1, a, vlad_2, vlad_3], Original ATen: [aten.transpose, aten.mul, aten.sub, aten.linalg_vector_norm]
 # Source node to ATen node mapping:
 #   a => mul_3
@@ -668,7 +668,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/lu/clutawz6suv4gpu2nrxl33w6dzzuy76akdcdzw5jtdcx5pn27ar4.py
+# kernel path: /workspace/tmp/torchinductor_user/lu/clutawz6suv4gpu2nrxl33w6dzzuy76akdcdzw5jtdcx5pn27ar4.py
 # Topologically Sorted Source Nodes: [vlad_1, a, vlad_2, vlad_3, vlad_4, vlad_5], Original ATen: [aten.transpose, aten.mul, aten.sub, aten.linalg_vector_norm, aten.clamp_min, aten.expand, aten.div, aten.clone, aten._unsafe_view]
 # Source node to ATen node mapping:
 #   a => mul_3

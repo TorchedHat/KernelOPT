@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/lx/clxtnufojh4swagnochsdj3pxyzgcsfbaqaik6yaahiijdz4itg5.py
+# kernel path: /workspace/tmp/torchinductor_user/lx/clxtnufojh4swagnochsdj3pxyzgcsfbaqaik6yaahiijdz4itg5.py
 # Topologically Sorted Source Nodes: [smooth_l1_loss], Original ATen: [aten.smooth_l1_loss]
 # Source node to ATen node mapping:
 #   smooth_l1_loss => abs_1, div, lt, mean, mul, pow_1, sub, sub_1, where
@@ -152,7 +152,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/og/cog4dhy7pmd6fnw4diw4offtlm3zws2rvxvkphocuipazgtkpx6d.py
+# kernel path: /workspace/tmp/torchinductor_user/og/cog4dhy7pmd6fnw4diw4offtlm3zws2rvxvkphocuipazgtkpx6d.py
 # Topologically Sorted Source Nodes: [smooth_l1_loss], Original ATen: [aten.smooth_l1_loss]
 # Source node to ATen node mapping:
 #   smooth_l1_loss => abs_1, div, lt, mean, mul, pow_1, sub, sub_1, where

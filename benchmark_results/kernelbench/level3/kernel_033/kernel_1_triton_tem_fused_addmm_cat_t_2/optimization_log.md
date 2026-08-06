@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused_addmm_cat_t_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_033/kernel_1_triton_tem_fused_addmm_cat_t_2/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_033/kernel_1_triton_tem_fused_addmm_cat_t_2/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (256,1,1), Waves/SM: 0.97
 - **Registers/thread**: 255

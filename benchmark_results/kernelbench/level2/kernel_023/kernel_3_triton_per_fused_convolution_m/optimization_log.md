@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_convolution_mean_native_group_norm_3`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_023/kernel_3_triton_per_fused_convolution_m/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_023/kernel_3_triton_per_fused_convolution_m/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1,1,1), Waves/SM: 0.00
 - **Registers/thread**: 22

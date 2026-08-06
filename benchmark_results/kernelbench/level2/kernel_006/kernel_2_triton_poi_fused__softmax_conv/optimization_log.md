@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused__softmax_convolution_exp_max_pool3d_with_indices_sub_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_006/kernel_2_triton_poi_fused__softmax_conv/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_006/kernel_2_triton_poi_fused__softmax_conv/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (2352,1,1), Waves/SM: 1.11
 - **Registers/thread**: 22

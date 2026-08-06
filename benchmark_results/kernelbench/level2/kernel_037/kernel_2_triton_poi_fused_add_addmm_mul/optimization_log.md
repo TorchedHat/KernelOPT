@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_add_addmm_mul_native_group_norm_sigmoid_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_037/kernel_2_triton_poi_fused_add_addmm_mul/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_037/kernel_2_triton_poi_fused_add_addmm_mul/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1048576,1,1), Waves/SM: 496.48
 - **Registers/thread**: 24

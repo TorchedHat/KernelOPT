@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv_epilogue_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_046/synthesis/kernel_0_fused_fused_convolution.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_046/synthesis/kernel_0_fused_fused_convolution.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (15876,1,1), Waves/SM: 60.14
 - **Registers/thread**: 254

@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/nk/cnkiyngu2bhcipeierr5sxfwsmwnmndczmxq7hgmtl6mts6cllwr.py
+# kernel path: /workspace/tmp/torchinductor_user/nk/cnkiyngu2bhcipeierr5sxfwsmwnmndczmxq7hgmtl6mts6cllwr.py
 # Topologically Sorted Source Nodes: [conv2d, flatten, x, x_1, x_3], Original ATen: [aten.convolution, aten.view, aten.transpose, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -205,7 +205,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ut/cutqacpo44fnae7zyg4rte4w3clu64edfmt722wgwcfe2i4jtc6q.py
+# kernel path: /workspace/tmp/torchinductor_user/ut/cutqacpo44fnae7zyg4rte4w3clu64edfmt722wgwcfe2i4jtc6q.py
 # Topologically Sorted Source Nodes: [x_3, x_4, x_5, permute, contiguous, windows, x_windows, x_windows_heads, x_windows_heads_1, x_windows_heads_2, spatial_mlp_windows], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous => clone_2
@@ -329,7 +329,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/hm/chmyzxai6b72sst55363zju6vhcovrxpehhidmbgr2yqzeuft64k.py
+# kernel path: /workspace/tmp/torchinductor_user/hm/chmyzxai6b72sst55363zju6vhcovrxpehhidmbgr2yqzeuft64k.py
 # Topologically Sorted Source Nodes: [x_3, x_4, x_5, permute, contiguous, windows, x_windows, x_windows_heads, x_windows_heads_1, x_windows_heads_2, spatial_mlp_windows, view_5, spatial_mlp_windows_1, spatial_mlp_windows_2, spatial_mlp_windows_3, x_6, permute_1, contiguous_1, x_7, x_8, x_9, layer_norm_2], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.add]
 # Source node to ATen node mapping:
 #   contiguous => clone_2
@@ -517,7 +517,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/iu/ciu3tudttkddfufdeetlp6wknimdefnfdt4ar277amnp2dvdog2v.py
+# kernel path: /workspace/tmp/torchinductor_user/iu/ciu3tudttkddfufdeetlp6wknimdefnfdt4ar277amnp2dvdog2v.py
 # Topologically Sorted Source Nodes: [x_3, x_4, x_5, permute, contiguous, windows, x_windows, x_windows_heads, x_windows_heads_1, x_windows_heads_2, spatial_mlp_windows, view_5, spatial_mlp_windows_1, spatial_mlp_windows_2, spatial_mlp_windows_3, x_6, permute_1, contiguous_1, x_7, x_8, x_9, layer_norm_2, x_10], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.add, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous => clone_2
@@ -721,7 +721,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/tu/ctupoit5mzfba5bwv4i2lgqojeh3khocv727vpjqoejbaieqwwtz.py
+# kernel path: /workspace/tmp/torchinductor_user/tu/ctupoit5mzfba5bwv4i2lgqojeh3khocv727vpjqoejbaieqwwtz.py
 # Topologically Sorted Source Nodes: [x_10, x_11], Original ATen: [aten.addmm, aten.view, aten.gelu]
 # Source node to ATen node mapping:
 #   x_10 => add_tensor_23, view_14
@@ -809,7 +809,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/pb/cpb2qmklkz3gs6enf7vtjjfv6slvclzwm7iel65iw7tuutfj7by7.py
+# kernel path: /workspace/tmp/torchinductor_user/pb/cpb2qmklkz3gs6enf7vtjjfv6slvclzwm7iel65iw7tuutfj7by7.py
 # Topologically Sorted Source Nodes: [x_10, x_11, x_13], Original ATen: [aten.addmm, aten.view, aten.gelu, aten.t]
 # Source node to ATen node mapping:
 #   x_10 => add_tensor_23, view_14
@@ -964,7 +964,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ys/cyss67fgrpi4zc5me7e4mirf5zirsvw6vtjcul4ai3yboy64tr3x.py
+# kernel path: /workspace/tmp/torchinductor_user/ys/cyss67fgrpi4zc5me7e4mirf5zirsvw6vtjcul4ai3yboy64tr3x.py
 # Topologically Sorted Source Nodes: [x_3, x_4, x_5, permute, contiguous, windows, x_windows, x_windows_heads, x_windows_heads_1, x_windows_heads_2, spatial_mlp_windows, view_5, spatial_mlp_windows_1, spatial_mlp_windows_2, spatial_mlp_windows_3, x_6, permute_1, contiguous_1, x_7, x_8, x_9, x_13, x_15, x_16], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous => clone_2
@@ -1135,7 +1135,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/td/ctdx7xoeiwxuw2vfszojbezclei7bzj2bukhm6fcfzdo6ndvky4o.py
+# kernel path: /workspace/tmp/torchinductor_user/td/ctdx7xoeiwxuw2vfszojbezclei7bzj2bukhm6fcfzdo6ndvky4o.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -1270,7 +1270,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/br/cbrk6mng26eogrzsjat4jcvbdcn6ht2kkwozfyylsuve76mo6anc.py
+# kernel path: /workspace/tmp/torchinductor_user/br/cbrk6mng26eogrzsjat4jcvbdcn6ht2kkwozfyylsuve76mo6anc.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4, view_14, spatial_mlp_windows_5, spatial_mlp_windows_6, spatial_mlp_windows_7, x_19, permute_3, contiguous_3, x_20, getitem, x_21, x_22, x_23, layer_norm_4], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -1465,7 +1465,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bs/cbsgnh4hz6ldkg4c4bneruuzqh3qcwpcimdhw2swvk2jqvtt7vnh.py
+# kernel path: /workspace/tmp/torchinductor_user/bs/cbsgnh4hz6ldkg4c4bneruuzqh3qcwpcimdhw2swvk2jqvtt7vnh.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4, view_14, spatial_mlp_windows_5, spatial_mlp_windows_6, spatial_mlp_windows_7, x_19, permute_3, contiguous_3, x_20, getitem, x_21, x_22, x_23, x_27, x_29], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -1612,7 +1612,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bg/cbg4i27lcf2ad76udqrz37cg6tkpsyjdx7bohlvasgztn2m7zrsb.py
+# kernel path: /workspace/tmp/torchinductor_user/bg/cbg4i27lcf2ad76udqrz37cg6tkpsyjdx7bohlvasgztn2m7zrsb.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4, view_14, spatial_mlp_windows_5, spatial_mlp_windows_6, spatial_mlp_windows_7, x_19, permute_3, contiguous_3, x_20, getitem, x_21, x_22, x_23, x_27, x_29, x_30, x0, x1, x2, x3, x_31], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -1760,7 +1760,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/va/cva67moea2whldil3ejc4udkec24462sl2s3hwmnispingt4kf45.py
+# kernel path: /workspace/tmp/torchinductor_user/va/cva67moea2whldil3ejc4udkec24462sl2s3hwmnispingt4kf45.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4, view_14, spatial_mlp_windows_5, spatial_mlp_windows_6, spatial_mlp_windows_7, x_19, permute_3, contiguous_3, x_20, getitem, x_21, x_22, x_23, x_27, x_29, x_30, x0, x1, x2, x3, x_31], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -1908,7 +1908,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/f7/cf7tv363rnx3c3o2ncgtzdzpumv6nktnqgypcgedn34rdqsaij7y.py
+# kernel path: /workspace/tmp/torchinductor_user/f7/cf7tv363rnx3c3o2ncgtzdzpumv6nktnqgypcgedn34rdqsaij7y.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4, view_14, spatial_mlp_windows_5, spatial_mlp_windows_6, spatial_mlp_windows_7, x_19, permute_3, contiguous_3, x_20, getitem, x_21, x_22, x_23, x_27, x_29, x_30, x0, x1, x2, x3, x_31], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -2056,7 +2056,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6a/c6a2gux3j7ocloatdrly3okmoskbaieofxz5qqfw6ezssqrvyeyb.py
+# kernel path: /workspace/tmp/torchinductor_user/6a/c6a2gux3j7ocloatdrly3okmoskbaieofxz5qqfw6ezssqrvyeyb.py
 # Topologically Sorted Source Nodes: [x_16, x_17, shifted_x, x_18, permute_2, contiguous_2, windows_1, x_windows_1, x_windows_heads_3, x_windows_heads_4, x_windows_heads_5, spatial_mlp_windows_4, view_14, spatial_mlp_windows_5, spatial_mlp_windows_6, spatial_mlp_windows_7, x_19, permute_3, contiguous_3, x_20, getitem, x_21, x_22, x_23, x_27, x_29, x_30, x0, x1, x2, x3, x_31], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_2 => clone_8
@@ -2204,7 +2204,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/o4/co4zaccbjnobxh4rwgpw3wcjycjyov3cqmukqkywgbnydepe3h4h.py
+# kernel path: /workspace/tmp/torchinductor_user/o4/co4zaccbjnobxh4rwgpw3wcjycjyov3cqmukqkywgbnydepe3h4h.py
 # Topologically Sorted Source Nodes: [x_32, x_33], Original ATen: [aten.view, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   x_32 => view_34
@@ -2321,7 +2321,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/zb/czbfi5wub3ntwboilo6astd54xjtmi37wnbzpjtihimkpze4mfz4.py
+# kernel path: /workspace/tmp/torchinductor_user/zb/czbfi5wub3ntwboilo6astd54xjtmi37wnbzpjtihimkpze4mfz4.py
 # Topologically Sorted Source Nodes: [x_32, x_33, x_34], Original ATen: [aten.view, aten.native_layer_norm, aten.t, aten.mm]
 # Source node to ATen node mapping:
 #   x_32 => view_34
@@ -2477,7 +2477,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/du/cduwpmzwtef3oepdfty7p3bg2ahkdsl4p5jv46bkozzoatouqpgi.py
+# kernel path: /workspace/tmp/torchinductor_user/du/cduwpmzwtef3oepdfty7p3bg2ahkdsl4p5jv46bkozzoatouqpgi.py
 # Topologically Sorted Source Nodes: [x_34, x_35], Original ATen: [aten._unsafe_view, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   x_34 => view_36
@@ -2573,7 +2573,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bb/cbbg3rirqm22woijzyt5ivn7qrhhgnr52t5zymbcxam6ofva4k6j.py
+# kernel path: /workspace/tmp/torchinductor_user/bb/cbbg3rirqm22woijzyt5ivn7qrhhgnr52t5zymbcxam6ofva4k6j.py
 # Topologically Sorted Source Nodes: [x_34, x_35, x_36, x_37, permute_4, contiguous_5, windows_2, x_windows_2, x_windows_heads_6, x_windows_heads_7, x_windows_heads_8, spatial_mlp_windows_8], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous_5 => clone_15
@@ -2695,7 +2695,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ry/cryimemqygaovmyntzrgcnf3wc6gapjtk3iejc7onnsbfwtr6dbu.py
+# kernel path: /workspace/tmp/torchinductor_user/ry/cryimemqygaovmyntzrgcnf3wc6gapjtk3iejc7onnsbfwtr6dbu.py
 # Topologically Sorted Source Nodes: [x_34, x_35, x_36, x_37, permute_4, contiguous_5, windows_2, x_windows_2, x_windows_heads_6, x_windows_heads_7, x_windows_heads_8, spatial_mlp_windows_8, view_25, spatial_mlp_windows_9, spatial_mlp_windows_10, spatial_mlp_windows_11, x_38, permute_5, contiguous_6, x_39, x_40, x_41, layer_norm_7], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution, aten.add]
 # Source node to ATen node mapping:
 #   contiguous_5 => clone_15
@@ -2872,7 +2872,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/5a/c5ayhguswwysv6mbhwvsnefclmnyhh7vasvxu6lor5wyrs7baent.py
+# kernel path: /workspace/tmp/torchinductor_user/5a/c5ayhguswwysv6mbhwvsnefclmnyhh7vasvxu6lor5wyrs7baent.py
 # Topologically Sorted Source Nodes: [x_34, x_35, x_36, x_37, permute_4, contiguous_5, windows_2, x_windows_2, x_windows_heads_6, x_windows_heads_7, x_windows_heads_8, spatial_mlp_windows_8, view_25, spatial_mlp_windows_9, spatial_mlp_windows_10, spatial_mlp_windows_11, x_38, permute_5, contiguous_6, x_39, x_40, x_41, layer_norm_7, x_42], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution, aten.add, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_5 => clone_15
@@ -3078,7 +3078,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/4d/c4dyjpmlycstkbckvgdgbml4dhh5vxhlpvjrgbwenboizsq3gwl5.py
+# kernel path: /workspace/tmp/torchinductor_user/4d/c4dyjpmlycstkbckvgdgbml4dhh5vxhlpvjrgbwenboizsq3gwl5.py
 # Topologically Sorted Source Nodes: [x_42, x_43], Original ATen: [aten.addmm, aten.view, aten.gelu]
 # Source node to ATen node mapping:
 #   x_42 => add_tensor_19, view_50
@@ -3166,7 +3166,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/j5/cj5t52mgiwvkbnflm2ozjp66qygydtazk5cohwy64uxcmmgqx67w.py
+# kernel path: /workspace/tmp/torchinductor_user/j5/cj5t52mgiwvkbnflm2ozjp66qygydtazk5cohwy64uxcmmgqx67w.py
 # Topologically Sorted Source Nodes: [x_42, x_43, x_45], Original ATen: [aten.addmm, aten.view, aten.gelu, aten.t]
 # Source node to ATen node mapping:
 #   x_42 => add_tensor_19, view_50
@@ -3321,7 +3321,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/pw/cpwydxj7pbsajy6gwlqnmzgiqftdua5chcolg6lyodnbubrcvppx.py
+# kernel path: /workspace/tmp/torchinductor_user/pw/cpwydxj7pbsajy6gwlqnmzgiqftdua5chcolg6lyodnbubrcvppx.py
 # Topologically Sorted Source Nodes: [x_34, x_35, x_36, x_37, permute_4, contiguous_5, windows_2, x_windows_2, x_windows_heads_6, x_windows_heads_7, x_windows_heads_8, spatial_mlp_windows_8, view_25, spatial_mlp_windows_9, spatial_mlp_windows_10, spatial_mlp_windows_11, x_38, permute_5, contiguous_6, x_39, x_40, x_41, x_45, x_47, x_48], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_5 => clone_15
@@ -3492,7 +3492,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/26/c26664pxtmmqwepgeludv2aqstr7fyovr65uicjg3lvgsfznnkz6.py
+# kernel path: /workspace/tmp/torchinductor_user/26/c26664pxtmmqwepgeludv2aqstr7fyovr65uicjg3lvgsfznnkz6.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -3627,7 +3627,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/r7/cr7kqefzzes4wtks7kxzb267qq23a3zcyo5nydlhoknnmakvarle.py
+# kernel path: /workspace/tmp/torchinductor_user/r7/cr7kqefzzes4wtks7kxzb267qq23a3zcyo5nydlhoknnmakvarle.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12, view_34, spatial_mlp_windows_13, spatial_mlp_windows_14, spatial_mlp_windows_15, x_51, permute_7, contiguous_8, x_52, getitem_5, x_53, x_54, x_55, layer_norm_9], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -3809,7 +3809,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/4t/c4tqzpyny7z2ld5ztescdsj62qmcpobuwzotl6duvnbqykipnyni.py
+# kernel path: /workspace/tmp/torchinductor_user/4t/c4tqzpyny7z2ld5ztescdsj62qmcpobuwzotl6duvnbqykipnyni.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12, view_34, spatial_mlp_windows_13, spatial_mlp_windows_14, spatial_mlp_windows_15, x_51, permute_7, contiguous_8, x_52, getitem_5, x_53, x_54, x_55, x_59, x_61], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -3956,7 +3956,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/sz/cszx6qriya5yl5wlqwwghd7jwr5o4g6libpdzuv3ts4ktfejbsup.py
+# kernel path: /workspace/tmp/torchinductor_user/sz/cszx6qriya5yl5wlqwwghd7jwr5o4g6libpdzuv3ts4ktfejbsup.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12, view_34, spatial_mlp_windows_13, spatial_mlp_windows_14, spatial_mlp_windows_15, x_51, permute_7, contiguous_8, x_52, getitem_5, x_53, x_54, x_55, x_59, x_61, x_62, x0_1, x1_1, x2_1, x3_1, x_63], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -4104,7 +4104,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/sv/csvyw5sgiuaeyh5ahbjb7zwlk6vtwpij7nre636flemxmx3qum3n.py
+# kernel path: /workspace/tmp/torchinductor_user/sv/csvyw5sgiuaeyh5ahbjb7zwlk6vtwpij7nre636flemxmx3qum3n.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12, view_34, spatial_mlp_windows_13, spatial_mlp_windows_14, spatial_mlp_windows_15, x_51, permute_7, contiguous_8, x_52, getitem_5, x_53, x_54, x_55, x_59, x_61, x_62, x0_1, x1_1, x2_1, x3_1, x_63], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -4252,7 +4252,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ja/cjasyhf4knjy4mrlevpqwc27dzp22f3jqr32mip2ot2jxsbrrkie.py
+# kernel path: /workspace/tmp/torchinductor_user/ja/cjasyhf4knjy4mrlevpqwc27dzp22f3jqr32mip2ot2jxsbrrkie.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12, view_34, spatial_mlp_windows_13, spatial_mlp_windows_14, spatial_mlp_windows_15, x_51, permute_7, contiguous_8, x_52, getitem_5, x_53, x_54, x_55, x_59, x_61, x_62, x0_1, x1_1, x2_1, x3_1, x_63], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -4400,7 +4400,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/e7/ce75azyojlnk5otdti4vofjhb7kgh4loolkg4rjvtyacrsfgnoqf.py
+# kernel path: /workspace/tmp/torchinductor_user/e7/ce75azyojlnk5otdti4vofjhb7kgh4loolkg4rjvtyacrsfgnoqf.py
 # Topologically Sorted Source Nodes: [x_48, x_49, shifted_x_1, x_50, permute_6, contiguous_7, windows_3, x_windows_3, x_windows_heads_9, x_windows_heads_10, x_windows_heads_11, spatial_mlp_windows_12, view_34, spatial_mlp_windows_13, spatial_mlp_windows_14, spatial_mlp_windows_15, x_51, permute_7, contiguous_8, x_52, getitem_5, x_53, x_54, x_55, x_59, x_61, x_62, x0_1, x1_1, x2_1, x3_1, x_63], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_7 => clone_21
@@ -4548,7 +4548,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6c/c6clgoq6dnca2la3cly46cucqhgy2tav5amfhjdhywvkew2d2rid.py
+# kernel path: /workspace/tmp/torchinductor_user/6c/c6clgoq6dnca2la3cly46cucqhgy2tav5amfhjdhywvkew2d2rid.py
 # Topologically Sorted Source Nodes: [x_64, x_65], Original ATen: [aten.view, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   x_64 => view_70
@@ -4665,7 +4665,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/u4/cu4idhfhevnhywp5uvtpjx27zk574vww7xmj6uybyabktw3vtarn.py
+# kernel path: /workspace/tmp/torchinductor_user/u4/cu4idhfhevnhywp5uvtpjx27zk574vww7xmj6uybyabktw3vtarn.py
 # Topologically Sorted Source Nodes: [x_64, x_65, x_66], Original ATen: [aten.view, aten.native_layer_norm, aten.t, aten.mm]
 # Source node to ATen node mapping:
 #   x_64 => view_70
@@ -4821,7 +4821,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/f2/cf2go67tebruvibhjuewl3nxzompcdf57e64h2gaph2s4miq4ljz.py
+# kernel path: /workspace/tmp/torchinductor_user/f2/cf2go67tebruvibhjuewl3nxzompcdf57e64h2gaph2s4miq4ljz.py
 # Topologically Sorted Source Nodes: [x_66, x_67], Original ATen: [aten._unsafe_view, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   x_66 => view_72
@@ -4917,7 +4917,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bt/cbt3pppzgxzepswqm24nwn2j6vs2t3pjuykk5lvtsu2ybsjffxzi.py
+# kernel path: /workspace/tmp/torchinductor_user/bt/cbt3pppzgxzepswqm24nwn2j6vs2t3pjuykk5lvtsu2ybsjffxzi.py
 # Topologically Sorted Source Nodes: [x_66, x_67, x_68, x_69, permute_8, contiguous_10, windows_4, x_windows_4, x_windows_heads_12, x_windows_heads_13, x_windows_heads_14, spatial_mlp_windows_16], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous_10 => clone_28
@@ -5039,7 +5039,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/2s/c2s32hc3w5oy2winyl44yvhom3vhajd4h5h56bggqcjn6g3df5f6.py
+# kernel path: /workspace/tmp/torchinductor_user/2s/c2s32hc3w5oy2winyl44yvhom3vhajd4h5h56bggqcjn6g3df5f6.py
 # Topologically Sorted Source Nodes: [x_66, x_67, x_68, x_69, permute_8, contiguous_10, windows_4, x_windows_4, x_windows_heads_12, x_windows_heads_13, x_windows_heads_14, spatial_mlp_windows_16, view_45, spatial_mlp_windows_17, spatial_mlp_windows_18, spatial_mlp_windows_19, x_70, permute_9, contiguous_11, x_71, x_72, x_73, layer_norm_12], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution, aten.add]
 # Source node to ATen node mapping:
 #   contiguous_10 => clone_28
@@ -5216,7 +5216,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/pk/cpkwq2ldjy2t3ac3isztzfie4wyxzs5o4d5h7tfow4ayc6khtura.py
+# kernel path: /workspace/tmp/torchinductor_user/pk/cpkwq2ldjy2t3ac3isztzfie4wyxzs5o4d5h7tfow4ayc6khtura.py
 # Topologically Sorted Source Nodes: [x_66, x_67, x_68, x_69, permute_8, contiguous_10, windows_4, x_windows_4, x_windows_heads_12, x_windows_heads_13, x_windows_heads_14, spatial_mlp_windows_16, view_45, spatial_mlp_windows_17, spatial_mlp_windows_18, spatial_mlp_windows_19, x_70, permute_9, contiguous_11, x_71, x_72, x_73, layer_norm_12, x_74], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution, aten.add, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_10 => clone_28
@@ -5422,7 +5422,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/vm/cvmebx7gtu6vywgj4w6uggcw6klmxflm2qfxmsukzws2gvyjgtgv.py
+# kernel path: /workspace/tmp/torchinductor_user/vm/cvmebx7gtu6vywgj4w6uggcw6klmxflm2qfxmsukzws2gvyjgtgv.py
 # Topologically Sorted Source Nodes: [x_74, x_75], Original ATen: [aten.addmm, aten.view, aten.gelu]
 # Source node to ATen node mapping:
 #   x_74 => add_tensor_15, view_86
@@ -5510,7 +5510,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/5b/c5bjgw4hl5edtq6vdub4bml5jx7muhlz3itswspn3x7v2dkfbjlx.py
+# kernel path: /workspace/tmp/torchinductor_user/5b/c5bjgw4hl5edtq6vdub4bml5jx7muhlz3itswspn3x7v2dkfbjlx.py
 # Topologically Sorted Source Nodes: [x_74, x_75, x_77], Original ATen: [aten.addmm, aten.view, aten.gelu, aten.t]
 # Source node to ATen node mapping:
 #   x_74 => add_tensor_15, view_86
@@ -5665,7 +5665,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/o7/co764xjeiw7jqiasthg5ys3yzhggohtffdpmmxbrpmzvzowgicog.py
+# kernel path: /workspace/tmp/torchinductor_user/o7/co764xjeiw7jqiasthg5ys3yzhggohtffdpmmxbrpmzvzowgicog.py
 # Topologically Sorted Source Nodes: [x_66, x_67, x_68, x_69, permute_8, contiguous_10, windows_4, x_windows_4, x_windows_heads_12, x_windows_heads_13, x_windows_heads_14, spatial_mlp_windows_16, view_45, spatial_mlp_windows_17, spatial_mlp_windows_18, spatial_mlp_windows_19, x_70, permute_9, contiguous_11, x_71, x_72, x_73, x_77, x_79, x_80], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten.convolution, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_10 => clone_28
@@ -5836,7 +5836,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ow/cowafd4hqbva3qxdvbgnslkrwxgwlmk7bj6nqtwn2zk6jossz3xp.py
+# kernel path: /workspace/tmp/torchinductor_user/ow/cowafd4hqbva3qxdvbgnslkrwxgwlmk7bj6nqtwn2zk6jossz3xp.py
 # Topologically Sorted Source Nodes: [x_80, x_81, shifted_x_2, x_82, permute_10, contiguous_12, windows_5, x_windows_5, x_windows_heads_15, x_windows_heads_16, x_windows_heads_17, spatial_mlp_windows_20], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous_12 => clone_34
@@ -5971,7 +5971,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/xx/cxxqqtmg5rhetmh6ttv72qccgei67zkco4do7inbiiydpkg4zkft.py
+# kernel path: /workspace/tmp/torchinductor_user/xx/cxxqqtmg5rhetmh6ttv72qccgei67zkco4do7inbiiydpkg4zkft.py
 # Topologically Sorted Source Nodes: [x_80, x_81, shifted_x_2, x_82, permute_10, contiguous_12, windows_5, x_windows_5, x_windows_heads_15, x_windows_heads_16, x_windows_heads_17, spatial_mlp_windows_20, view_54, spatial_mlp_windows_21, spatial_mlp_windows_22, spatial_mlp_windows_23, x_83, permute_11, contiguous_13, x_84, getitem_10, x_85, x_86, x_87, layer_norm_14], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add]
 # Source node to ATen node mapping:
 #   contiguous_12 => clone_34
@@ -6153,7 +6153,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ys/cyswjkzrqwbonndmlwcpxhi5bxo5e3jekvz3cq35muqv7pvojihs.py
+# kernel path: /workspace/tmp/torchinductor_user/ys/cyswjkzrqwbonndmlwcpxhi5bxo5e3jekvz3cq35muqv7pvojihs.py
 # Topologically Sorted Source Nodes: [x_80, x_81, shifted_x_2, x_82, permute_10, contiguous_12, windows_5, x_windows_5, x_windows_heads_15, x_windows_heads_16, x_windows_heads_17, spatial_mlp_windows_20, view_54, spatial_mlp_windows_21, spatial_mlp_windows_22, spatial_mlp_windows_23, x_83, permute_11, contiguous_13, x_84, getitem_10, x_85, x_86, x_87, x_91, x_93, x_94], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_12 => clone_34
@@ -6329,7 +6329,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ol/col6fkdzp6pdsirfdv42eyu6mqhhaixe7362y5cdjo6ludyka6mu.py
+# kernel path: /workspace/tmp/torchinductor_user/ol/col6fkdzp6pdsirfdv42eyu6mqhhaixe7362y5cdjo6ludyka6mu.py
 # Topologically Sorted Source Nodes: [x_94, x_95, x_96, permute_12, contiguous_15, windows_6, x_windows_6, x_windows_heads_18, x_windows_heads_19, x_windows_heads_20, spatial_mlp_windows_24], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution]
 # Source node to ATen node mapping:
 #   contiguous_15 => clone_41
@@ -6449,7 +6449,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/2c/c2c72nh5nop42vlwcxmuueaagsnxjoc5wybvoxvtm4enumww6ehe.py
+# kernel path: /workspace/tmp/torchinductor_user/2c/c2c72nh5nop42vlwcxmuueaagsnxjoc5wybvoxvtm4enumww6ehe.py
 # Topologically Sorted Source Nodes: [x_94, x_95, x_96, permute_12, contiguous_15, windows_6, x_windows_6, x_windows_heads_18, x_windows_heads_19, x_windows_heads_20, spatial_mlp_windows_24, view_63, spatial_mlp_windows_25, spatial_mlp_windows_26, spatial_mlp_windows_27, x_97, permute_13, contiguous_16, x_98, x_99, x_100, layer_norm_16], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.add]
 # Source node to ATen node mapping:
 #   contiguous_15 => clone_41
@@ -6624,7 +6624,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/q2/cq2eiw2vbzs6ojpgsxmrjzndjlqayxn22g3bddcoqtm6rij2mvqg.py
+# kernel path: /workspace/tmp/torchinductor_user/q2/cq2eiw2vbzs6ojpgsxmrjzndjlqayxn22g3bddcoqtm6rij2mvqg.py
 # Topologically Sorted Source Nodes: [x_134, x_135, shifted_x_4, x_136, permute_18, contiguous_22, windows_9, x_windows_9, x_windows_heads_27, x_windows_heads_28, x_windows_heads_29, spatial_mlp_windows_36, view_90, spatial_mlp_windows_37, spatial_mlp_windows_38, spatial_mlp_windows_39, x_137, permute_19, contiguous_23, x_138, getitem_12, x_139, x_140, x_141, x_145, x_147], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   contiguous_22 => clone_60
@@ -6771,7 +6771,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bt/cbtk4jd4ub6g6uytwh5ar4a2xwigezp7rgv2c7z77vxxrmbhhjbo.py
+# kernel path: /workspace/tmp/torchinductor_user/bt/cbtk4jd4ub6g6uytwh5ar4a2xwigezp7rgv2c7z77vxxrmbhhjbo.py
 # Topologically Sorted Source Nodes: [x_134, x_135, shifted_x_4, x_136, permute_18, contiguous_22, windows_9, x_windows_9, x_windows_heads_27, x_windows_heads_28, x_windows_heads_29, spatial_mlp_windows_36, view_90, spatial_mlp_windows_37, spatial_mlp_windows_38, spatial_mlp_windows_39, x_137, permute_19, contiguous_23, x_138, getitem_12, x_139, x_140, x_141, x_145, x_147, x_148, x0_2, x1_2, x2_2, x3_2, x_149], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_22 => clone_60
@@ -6919,7 +6919,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/lx/clxubvwhr2n6iffvdum2djk4m2ubt42vcqaemw6glbwcmcpddrhr.py
+# kernel path: /workspace/tmp/torchinductor_user/lx/clxubvwhr2n6iffvdum2djk4m2ubt42vcqaemw6glbwcmcpddrhr.py
 # Topologically Sorted Source Nodes: [x_134, x_135, shifted_x_4, x_136, permute_18, contiguous_22, windows_9, x_windows_9, x_windows_heads_27, x_windows_heads_28, x_windows_heads_29, spatial_mlp_windows_36, view_90, spatial_mlp_windows_37, spatial_mlp_windows_38, spatial_mlp_windows_39, x_137, permute_19, contiguous_23, x_138, getitem_12, x_139, x_140, x_141, x_145, x_147, x_148, x0_2, x1_2, x2_2, x3_2, x_149], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_22 => clone_60
@@ -7067,7 +7067,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/wc/cwc6jfnqoqcamy4ktj6jrawf3ulmtv7ru4lz6ytyytil7wvfrsiq.py
+# kernel path: /workspace/tmp/torchinductor_user/wc/cwc6jfnqoqcamy4ktj6jrawf3ulmtv7ru4lz6ytyytil7wvfrsiq.py
 # Topologically Sorted Source Nodes: [x_134, x_135, shifted_x_4, x_136, permute_18, contiguous_22, windows_9, x_windows_9, x_windows_heads_27, x_windows_heads_28, x_windows_heads_29, spatial_mlp_windows_36, view_90, spatial_mlp_windows_37, spatial_mlp_windows_38, spatial_mlp_windows_39, x_137, permute_19, contiguous_23, x_138, getitem_12, x_139, x_140, x_141, x_145, x_147, x_148, x0_2, x1_2, x2_2, x3_2, x_149], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_22 => clone_60
@@ -7215,7 +7215,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/qy/cqy5otos337itedz57gkidaxpsurl6zif4noy4y54sskdiw5tktj.py
+# kernel path: /workspace/tmp/torchinductor_user/qy/cqy5otos337itedz57gkidaxpsurl6zif4noy4y54sskdiw5tktj.py
 # Topologically Sorted Source Nodes: [x_134, x_135, shifted_x_4, x_136, permute_18, contiguous_22, windows_9, x_windows_9, x_windows_heads_27, x_windows_heads_28, x_windows_heads_29, spatial_mlp_windows_36, view_90, spatial_mlp_windows_37, spatial_mlp_windows_38, spatial_mlp_windows_39, x_137, permute_19, contiguous_23, x_138, getitem_12, x_139, x_140, x_141, x_145, x_147, x_148, x0_2, x1_2, x2_2, x3_2, x_149], Original ATen: [aten.native_layer_norm, aten.view, aten.constant_pad_nd, aten.permute, aten.clone, aten.transpose, aten._unsafe_view, aten.convolution, aten.slice, aten.add, aten.addmm, aten.cat]
 # Source node to ATen node mapping:
 #   contiguous_22 => clone_60
@@ -7363,7 +7363,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/2e/c2efjwgjrjdiv2zdq7o24af6ozb5mzkbv3ckxoalbqkb3l3gpkuz.py
+# kernel path: /workspace/tmp/torchinductor_user/2e/c2efjwgjrjdiv2zdq7o24af6ozb5mzkbv3ckxoalbqkb3l3gpkuz.py
 # Topologically Sorted Source Nodes: [x_150, x_151], Original ATen: [aten.view, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   x_150 => view_170
@@ -7489,7 +7489,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/zo/czolw7znerezjmkofy5xz74mn435pzfgupli37kwpx5s4atz4mce.py
+# kernel path: /workspace/tmp/torchinductor_user/zo/czolw7znerezjmkofy5xz74mn435pzfgupli37kwpx5s4atz4mce.py
 # Topologically Sorted Source Nodes: [x_150, x_151, x_152], Original ATen: [aten.view, aten.native_layer_norm, aten.t, aten.mm]
 # Source node to ATen node mapping:
 #   x_150 => view_170
@@ -7645,7 +7645,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/zk/czkt2hhqvuiz3mfxo5i3mr4kf34orb25zncytehiyoi6ek3titep.py
+# kernel path: /workspace/tmp/torchinductor_user/zk/czkt2hhqvuiz3mfxo5i3mr4kf34orb25zncytehiyoi6ek3titep.py
 # Topologically Sorted Source Nodes: [x_152, x_153], Original ATen: [aten._unsafe_view, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   x_152 => view_172
@@ -7741,7 +7741,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/74/c7466lo7zclmjunua4qc7rzfq53e3n4h6y4dbjukkjb3oj4hv6lo.py
+# kernel path: /workspace/tmp/torchinductor_user/74/c7466lo7zclmjunua4qc7rzfq53e3n4h6y4dbjukkjb3oj4hv6lo.py
 # Topologically Sorted Source Nodes: [x_152, x_153, x_154, x_155, permute_20, windows_10, x_windows_10, x_windows_heads_30, x_windows_heads_31, x_windows_heads_32, spatial_mlp_windows_40], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.transpose, aten.clone, aten.convolution]
 # Source node to ATen node mapping:
 #   permute_20 => permute_64
@@ -7861,7 +7861,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/kj/ckj3kzlaqjgfk2v5uhr4qvr6glhi2wdskgnp5mlcp4mlzx6hy737.py
+# kernel path: /workspace/tmp/torchinductor_user/kj/ckj3kzlaqjgfk2v5uhr4qvr6glhi2wdskgnp5mlcp4mlzx6hy737.py
 # Topologically Sorted Source Nodes: [x_152, x_153, x_154, x_155, permute_20, windows_10, x_windows_10, x_windows_heads_30, x_windows_heads_31, x_windows_heads_32, spatial_mlp_windows_40, view_101, spatial_mlp_windows_41, spatial_mlp_windows_42, spatial_mlp_windows_43, x_156, permute_21, x_157, x_158, x_159, layer_norm_25], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.transpose, aten.clone, aten.convolution, aten.add]
 # Source node to ATen node mapping:
 #   layer_norm_25 => add_81, add_82, mul_80, mul_81, rsqrt_25, sub_25, var_mean_25
@@ -8034,7 +8034,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/nk/cnkktxrpp2jxopcbjozpiz5544hpa3tzi66t6uxzr4dnalqbyhsx.py
+# kernel path: /workspace/tmp/torchinductor_user/nk/cnkktxrpp2jxopcbjozpiz5544hpa3tzi66t6uxzr4dnalqbyhsx.py
 # Topologically Sorted Source Nodes: [x_152, x_153, x_154, x_155, permute_20, windows_10, x_windows_10, x_windows_heads_30, x_windows_heads_31, x_windows_heads_32, spatial_mlp_windows_40, view_101, spatial_mlp_windows_41, spatial_mlp_windows_42, spatial_mlp_windows_43, x_156, permute_21, x_157, x_158, x_159, layer_norm_25, x_160], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.transpose, aten.clone, aten.convolution, aten.add, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   layer_norm_25 => add_81, add_82, mul_80, mul_81, rsqrt_25, sub_25, var_mean_25
@@ -8236,7 +8236,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/fl/cflph4dxornnn7xgvjrwkt65os6bpkkkvoq5yx4imd3rbmicnhia.py
+# kernel path: /workspace/tmp/torchinductor_user/fl/cflph4dxornnn7xgvjrwkt65os6bpkkkvoq5yx4imd3rbmicnhia.py
 # Topologically Sorted Source Nodes: [x_160, x_161], Original ATen: [aten.addmm, aten.view, aten.gelu]
 # Source node to ATen node mapping:
 #   x_160 => add_tensor_3, view_186
@@ -8324,7 +8324,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/3s/c3swkh3vkpfrxopvyohxnifg2i7zbe4fm7audn2hlzqjzvjofxqf.py
+# kernel path: /workspace/tmp/torchinductor_user/3s/c3swkh3vkpfrxopvyohxnifg2i7zbe4fm7audn2hlzqjzvjofxqf.py
 # Topologically Sorted Source Nodes: [x_160, x_161, x_163], Original ATen: [aten.addmm, aten.view, aten.gelu, aten.t]
 # Source node to ATen node mapping:
 #   x_160 => add_tensor_3, view_186
@@ -8479,7 +8479,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/6q/c6qr7qjq26ofavcwybubajaaurjclcq7uyq6a4flklhxx3sr4a4l.py
+# kernel path: /workspace/tmp/torchinductor_user/6q/c6qr7qjq26ofavcwybubajaaurjclcq7uyq6a4flklhxx3sr4a4l.py
 # Topologically Sorted Source Nodes: [x_152, x_153, x_154, x_155, permute_20, windows_10, x_windows_10, x_windows_heads_30, x_windows_heads_31, x_windows_heads_32, spatial_mlp_windows_40, view_101, spatial_mlp_windows_41, spatial_mlp_windows_42, spatial_mlp_windows_43, x_156, permute_21, x_157, x_158, x_159, x_163, x_165, x_166], Original ATen: [aten._unsafe_view, aten.native_layer_norm, aten.view, aten.permute, aten.transpose, aten.clone, aten.convolution, aten.add, aten.addmm]
 # Source node to ATen node mapping:
 #   permute_20 => permute_64
@@ -8646,7 +8646,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/nj/cnjcz2nu7j2yp2qgydkql4uvi3acwd7gopweieiueins7cr7u4na.py
+# kernel path: /workspace/tmp/torchinductor_user/nj/cnjcz2nu7j2yp2qgydkql4uvi3acwd7gopweieiueins7cr7u4na.py
 # Topologically Sorted Source Nodes: [x_166, x_167, x_168, permute_22, windows_11, x_windows_11, x_windows_heads_33, x_windows_heads_34, x_windows_heads_35, spatial_mlp_windows_44], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.transpose, aten.clone, aten._unsafe_view, aten.convolution]
 # Source node to ATen node mapping:
 #   permute_22 => permute_70
@@ -8764,7 +8764,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/z3/cz35fcojs7duuj7cj7insuigk32z7hzcgloei4by5lkaumv3f2n7.py
+# kernel path: /workspace/tmp/torchinductor_user/z3/cz35fcojs7duuj7cj7insuigk32z7hzcgloei4by5lkaumv3f2n7.py
 # Topologically Sorted Source Nodes: [x_166, x_167, x_168, permute_22, windows_11, x_windows_11, x_windows_heads_33, x_windows_heads_34, x_windows_heads_35, spatial_mlp_windows_44, view_110, spatial_mlp_windows_45, spatial_mlp_windows_46, spatial_mlp_windows_47, x_169, permute_23, x_170, x_171, x_172, layer_norm_27], Original ATen: [aten.native_layer_norm, aten.view, aten.permute, aten.transpose, aten.clone, aten._unsafe_view, aten.convolution, aten.add]
 # Source node to ATen node mapping:
 #   layer_norm_27 => add_88, add_89, mul_87, mul_88, rsqrt_27, sub_27, var_mean_27
@@ -8935,7 +8935,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/aa/caalca23ky3ideitjgfezcok34b624gqb7mpn2ada63h6sawr7vu.py
+# kernel path: /workspace/tmp/torchinductor_user/aa/caalca23ky3ideitjgfezcok34b624gqb7mpn2ada63h6sawr7vu.py
 # Topologically Sorted Source Nodes: [x_179, transpose_25, x_180], Original ATen: [aten.native_layer_norm, aten.transpose, aten.unsqueeze, aten.mean]
 # Source node to ATen node mapping:
 #   transpose_25 => permute_76
@@ -9055,7 +9055,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ih/cihvm4ppuvmkbxyy6ifbccq565lhogp2c4g7xdaw5vhk7batntd4.py
+# kernel path: /workspace/tmp/torchinductor_user/ih/cihvm4ppuvmkbxyy6ifbccq565lhogp2c4g7xdaw5vhk7batntd4.py
 # Topologically Sorted Source Nodes: [x_180, x_181, x_182], Original ATen: [aten.as_strided, aten.squeeze, aten.view, aten.addmm, aten.t]
 # Source node to ATen node mapping:
 #   x_180 => as_strided, squeeze

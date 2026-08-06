@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/wd/cwda4zzffdxiuvlpvjsqkjzgcy7uuyymseef7n2ioe7ageehuqhr.py
+# kernel path: /workspace/tmp/torchinductor_user/wd/cwda4zzffdxiuvlpvjsqkjzgcy7uuyymseef7n2ioe7ageehuqhr.py
 # Topologically Sorted Source Nodes: [x, sigmoid, x_1, x_2], Original ATen: [aten.convolution, aten.sigmoid, aten.mul, aten.native_group_norm]
 # Source node to ATen node mapping:
 #   sigmoid => sigmoid
@@ -157,7 +157,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/gi/cgi7nf7o3vlwslsiwb5op6ge66ipz2wpe5dyfqb6bcl2m2wkigya.py
+# kernel path: /workspace/tmp/torchinductor_user/gi/cgi7nf7o3vlwslsiwb5op6ge66ipz2wpe5dyfqb6bcl2m2wkigya.py
 # Topologically Sorted Source Nodes: [x, sigmoid, x_1, x_2, x_3], Original ATen: [aten.convolution, aten.sigmoid, aten.mul, aten.native_group_norm, aten.hardswish]
 # Source node to ATen node mapping:
 #   sigmoid => sigmoid

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `avg_pool1d_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/synthesis/kernel_0_triton_poi_fused_avg_pool2d_unsqueeze_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_044/synthesis/kernel_0_triton_poi_fused_avg_pool2d_unsqueeze_0.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (524296,1,1), Waves/SM: 441.33
 - **Registers/thread**: 56

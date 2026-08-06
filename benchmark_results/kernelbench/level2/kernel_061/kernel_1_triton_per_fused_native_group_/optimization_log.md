@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_native_group_norm_relu_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_061/kernel_1_triton_per_fused_native_group_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_061/kernel_1_triton_per_fused_native_group_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1,1,1), Waves/SM: 0.00
 - **Registers/thread**: 40

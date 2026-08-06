@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_bitwise_not_exp_masked_fill_ones_sub_tril_unsqueeze_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_048/kernel_2_triton_poi_fused_bitwise_not_e/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_048/kernel_2_triton_poi_fused_bitwise_not_e/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1152,1,1), Waves/SM: 0.55
 - **Registers/thread**: 16

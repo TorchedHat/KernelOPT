@@ -74,7 +74,7 @@ extern "C"  void  kernel(const float* in_ptr0,
 ''')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/xp/cxp2golj2fovd74ozmlmelol3qlvftrt7urqei7zxhlvzjqiowks.py
+# kernel path: /workspace/tmp/torchinductor_user/xp/cxp2golj2fovd74ozmlmelol3qlvftrt7urqei7zxhlvzjqiowks.py
 # Topologically Sorted Source Nodes: [combined], Original ATen: [aten.cat]
 # Source node to ATen node mapping:
 #   combined => cat
@@ -157,7 +157,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/gd/cgdbtttu7oqkfzioww5pmjs2l535whw7dxk5hnykf225qlixldeo.py
+# kernel path: /workspace/tmp/torchinductor_user/gd/cgdbtttu7oqkfzioww5pmjs2l535whw7dxk5hnykf225qlixldeo.py
 # Topologically Sorted Source Nodes: [combined, linear], Original ATen: [aten.cat, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   combined => cat
@@ -304,7 +304,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ma/cmafuwotbley25kpbmdmqvj5746caj6qefburobup2xq7enmtrqd.py
+# kernel path: /workspace/tmp/torchinductor_user/ma/cmafuwotbley25kpbmdmqvj5746caj6qefburobup2xq7enmtrqd.py
 # Topologically Sorted Source Nodes: [linear, tanh], Original ATen: [aten.addmm, aten.tanh]
 # Source node to ATen node mapping:
 #   linear => add_tensor
@@ -380,7 +380,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/hz/chzm24dfxwh5fcjh2qh7tzusjyjqhdtsshztzzgkw46fn3ttf7an.py
+# kernel path: /workspace/tmp/torchinductor_user/hz/chzm24dfxwh5fcjh2qh7tzusjyjqhdtsshztzzgkw46fn3ttf7an.py
 # Topologically Sorted Source Nodes: [output], Original ATen: [aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   output => addmm_1, permute_1

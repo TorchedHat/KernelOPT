@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `cumsum_kernel_v2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_089/synthesis/kernel_0_triton_red_fused_cumsum_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_089/synthesis/kernel_0_triton_red_fused_cumsum_0.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (4,1,1), Waves/SM: 0.00
 - **Registers/thread**: 40

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_add_convolution_gelu_leaky_relu_relu_sigmoid_0`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_007/kernel_0_triton_poi_fused_add_convoluti/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_007/kernel_0_triton_poi_fused_add_convoluti/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1845120,1,1), Waves/SM: 873.64
 - **Registers/thread**: 16

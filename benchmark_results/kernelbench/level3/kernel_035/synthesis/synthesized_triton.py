@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/mm/cmmctueykt3l5ybmaatr3jashgoyjv3ffpayljjykmyb6bur74ue.py
+# kernel path: /workspace/tmp/torchinductor_user/mm/cmmctueykt3l5ybmaatr3jashgoyjv3ffpayljjykmyb6bur74ue.py
 # Topologically Sorted Source Nodes: [h0], Original ATen: [aten.randn]
 # Source node to ATen node mapping:
 #   h0 => inductor_lookup_seed_default, inductor_random_default_1
@@ -119,7 +119,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/b2/cb2ool5x4h3efvyq4jewispbv3tmbxvppi4ba6nsippe5kmpkjqe.py
+# kernel path: /workspace/tmp/torchinductor_user/b2/cb2ool5x4h3efvyq4jewispbv3tmbxvppi4ba6nsippe5kmpkjqe.py
 # Topologically Sorted Source Nodes: [c0], Original ATen: [aten.randn]
 # Source node to ATen node mapping:
 #   c0 => inductor_lookup_seed_default_1, inductor_random_default

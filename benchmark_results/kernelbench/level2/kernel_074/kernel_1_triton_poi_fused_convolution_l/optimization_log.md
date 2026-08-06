@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_convolution_leaky_relu_max_pool3d_with_indices_mul_1`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_074/kernel_1_triton_poi_fused_convolution_l/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_074/kernel_1_triton_poi_fused_convolution_l/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (65536,1,1), Waves/SM: 31.03
 - **Registers/thread**: 20

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused_convolution_4`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_006/kernel_4_triton_tem_fused_convolution_4/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_006/kernel_4_triton_tem_fused_convolution_4/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (3920,1,1), Waves/SM: 9.90
 - **Registers/thread**: 168
@@ -113,7 +113,7 @@ Plan 'tma_loads' produced a kernel that crashed on execution after 4 attempt(s).
 stderr:
 loads.py", line 90, in kernel_function
     triton_tem_fused_convolution_4[grid](arg_0, arg_1, arg_2, arg_3)
-  File "/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit.py", line 370, in <lambda>
+  File "/home/user/.local/lib/python3.11/site-packages/triton/runtime/jit.py", line 370, in <lambda>
     return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *ar
 
 > **Applicable when**: The kernel is a GEMM (M=501760, N=64, K=480) fused with bias add. The B matrix has stride_bn=480 (non-power-of-2, not a multiple of 32), so when Triton stages the (BLOCK_N=64, BLOCK_K=32) B tile through shared memory, the 480-element row stride creates systematic bank aliasing — 8-way conflicts on 69.79% of all shared load wavefronts. Prior attempts to fix this by changing BLOCK_K, BLOCK_M, or num_stages all introduced correctness bugs in the executor's rewrites. The diversity instruction mandates TMA loads. On Hopper (H100), replacing tl.make_block_ptr + tl.load with tl.make_tensor_descriptor + descriptor.load() uses the TMA hardware unit, which performs asynchronous bulk copies from global memory directly into shared memory via a dedicated DMA path — bypassing the warp-level load pipeline entirely. This eliminates the bank-conflict-prone scalar staging path and offloads address generation to the TMA unit, freeing SM cycles. The existing code already uses tl.make_block_ptr (a prerequisite pattern), making the migration to tl.make_tensor_descriptor straightforward.
@@ -122,7 +122,7 @@ loads.py", line 90, in kernel_function
 stderr:
 loads.py", line 90, in kernel_function
     triton_tem_fused_convolution_4[grid](arg_0, arg_1, arg_2, arg_3)
-  File "/home/ahpoddar/.local/lib/python3.11/site-packages/triton/runtime/jit
+  File "/home/user/.local/lib/python3.11/site-packages/triton/runtime/jit
 
 ---
 

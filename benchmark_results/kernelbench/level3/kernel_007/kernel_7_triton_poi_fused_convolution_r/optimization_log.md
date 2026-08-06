@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_convolution_relu_7`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_007/kernel_7_triton_poi_fused_convolution_r/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_007/kernel_7_triton_poi_fused_convolution_r/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (47040,1,1), Waves/SM: 22.27
 - **Registers/thread**: 16

@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/7e/c7e2ewnqpfokc7vqywzfgwmzyvsriw4jbt2qjypasl5qwfn27nq5.py
+# kernel path: /workspace/tmp/torchinductor_user/7e/c7e2ewnqpfokc7vqywzfgwmzyvsriw4jbt2qjypasl5qwfn27nq5.py
 # Topologically Sorted Source Nodes: [conv2d, x], Original ATen: [aten.convolution, aten.relu]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -123,7 +123,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/k2/ck24gza76etwjz6yarq4ufudezltfvjbyez6kxcg5bc4e7rasbnh.py
+# kernel path: /workspace/tmp/torchinductor_user/k2/ck24gza76etwjz6yarq4ufudezltfvjbyez6kxcg5bc4e7rasbnh.py
 # Topologically Sorted Source Nodes: [conv2d, x, x_1], Original ATen: [aten.convolution, aten.relu, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -211,7 +211,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/4a/c4arvkfu67wwbhcbls6cqjep5yu7d3rsivozqbbcle4zv4evjn4k.py
+# kernel path: /workspace/tmp/torchinductor_user/4a/c4arvkfu67wwbhcbls6cqjep5yu7d3rsivozqbbcle4zv4evjn4k.py
 # Topologically Sorted Source Nodes: [conv2d, x, x_1, conv2d_1], Original ATen: [aten.convolution, aten.relu, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -293,7 +293,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ey/cey4hdrhpvxdhay7gsxdr6w74y3zngbwvkebkxuprsfh5bkfyw42.py
+# kernel path: /workspace/tmp/torchinductor_user/ey/cey4hdrhpvxdhay7gsxdr6w74y3zngbwvkebkxuprsfh5bkfyw42.py
 # Topologically Sorted Source Nodes: [conv2d, x, x_1, conv2d_1, x_2], Original ATen: [aten.convolution, aten.relu, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -376,7 +376,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/7w/c7wf6c5ttfjzmd2jipmuaavzbv4f2gc67gbft2dzihzqudn4vgbj.py
+# kernel path: /workspace/tmp/torchinductor_user/7w/c7wf6c5ttfjzmd2jipmuaavzbv4f2gc67gbft2dzihzqudn4vgbj.py
 # Topologically Sorted Source Nodes: [conv2d, x, x_1, conv2d_1, x_2, x_3], Original ATen: [aten.convolution, aten.relu, aten.max_pool2d_with_indices]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -469,7 +469,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/4r/c4rf4eu3g3pi63qqds27af75kvzi6hzfxyuw3x44ms4oy6gtp5gu.py
+# kernel path: /workspace/tmp/torchinductor_user/4r/c4rf4eu3g3pi63qqds27af75kvzi6hzfxyuw3x44ms4oy6gtp5gu.py
 # Topologically Sorted Source Nodes: [conv2d, x, x_1, conv2d_1, x_2, x_3, x_4, linear, x_5], Original ATen: [aten.convolution, aten.relu, aten.max_pool2d_with_indices, aten.view, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   conv2d => convolution
@@ -641,7 +641,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/rn/crnhrjugvxkdghjww2aftoaffelqppygqwxen3665mz3idsr43mb.py
+# kernel path: /workspace/tmp/torchinductor_user/rn/crnhrjugvxkdghjww2aftoaffelqppygqwxen3665mz3idsr43mb.py
 # Topologically Sorted Source Nodes: [linear, x_5, linear_1], Original ATen: [aten.addmm, aten.relu, aten.t]
 # Source node to ATen node mapping:
 #   linear => add_tensor_1
@@ -793,7 +793,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/j7/cj7bgcvroufhou3uzu6bzpbzfxc7iavuap5gy4ertgj23vnhpl7j.py
+# kernel path: /workspace/tmp/torchinductor_user/j7/cj7bgcvroufhou3uzu6bzpbzfxc7iavuap5gy4ertgj23vnhpl7j.py
 # Topologically Sorted Source Nodes: [linear_1, x_6], Original ATen: [aten.addmm, aten.relu]
 # Source node to ATen node mapping:
 #   linear_1 => add_tensor
@@ -870,7 +870,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/37/c37ifkph57ntwv2ferlwzbgclasjexstjszhur5uskxxwxopdmys.py
+# kernel path: /workspace/tmp/torchinductor_user/37/c37ifkph57ntwv2ferlwzbgclasjexstjszhur5uskxxwxopdmys.py
 # Topologically Sorted Source Nodes: [linear_1, x_6, x_7], Original ATen: [aten.addmm, aten.relu, aten.t]
 # Source node to ATen node mapping:
 #   linear_1 => add_tensor

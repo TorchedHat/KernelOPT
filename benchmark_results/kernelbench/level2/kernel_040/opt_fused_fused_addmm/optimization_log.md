@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `fused_linear_scale_residual_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu3/kernel_040/synthesis/kernel_0_fused_fused_addmm.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu3/kernel_040/synthesis/kernel_0_fused_fused_addmm.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (4096,1,1), Waves/SM: 15.52
 - **Registers/thread**: 255

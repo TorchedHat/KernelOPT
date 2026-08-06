@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `rnn_i2h_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_034/synthesis/kernel_2_triton_poi_fused_addmm_tanh_2.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_034/synthesis/kernel_2_triton_poi_fused_addmm_tanh_2.py`
 - **Framework**: triton
 - **Launch**: Block (64,1,1), Grid (4,1,1), Waves/SM: 0.01
 - **Registers/thread**: 114

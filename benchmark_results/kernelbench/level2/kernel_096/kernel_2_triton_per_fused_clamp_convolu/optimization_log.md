@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_clamp_convolution_max_pool3d_with_indices_mean_mul_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_096/kernel_2_triton_per_fused_clamp_convolu/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_096/kernel_2_triton_per_fused_clamp_convolu/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (16,1,1), Waves/SM: 0.03
 - **Registers/thread**: 128

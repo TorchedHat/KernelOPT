@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_clone_exp_mul_permute_slice_sub_unsqueeze_view_5`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_048/kernel_5_triton_poi_fused_clone_exp_mul/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_048/kernel_5_triton_poi_fused_clone_exp_mul/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (2,1,1), Waves/SM: 0.00
 - **Registers/thread**: 32

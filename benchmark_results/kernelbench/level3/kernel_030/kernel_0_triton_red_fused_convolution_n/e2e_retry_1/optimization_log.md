@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused_convolution_native_layer_norm_transpose_view_0`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_0_triton_red_fused_convolution_n/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_0_triton_red_fused_convolution_n/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (245,1,1), Waves/SM: 0.62
 - **Registers/thread**: 32

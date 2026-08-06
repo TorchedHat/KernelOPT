@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused_sigmoid_sum_4`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_065/kernel_4_triton_red_fused_sigmoid_sum_4/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_065/kernel_4_triton_red_fused_sigmoid_sum_4/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (640,1,1), Waves/SM: 0.40
 - **Registers/thread**: 40

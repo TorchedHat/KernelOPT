@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `gemm_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_080/synthesis/kernel_0_fused_fused_addmm.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_080/synthesis/kernel_0_fused_fused_addmm.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (512,1,1), Waves/SM: 1.94
 - **Registers/thread**: 202

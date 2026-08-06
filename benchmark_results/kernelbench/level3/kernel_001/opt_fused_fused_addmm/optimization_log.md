@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `gemm_bias_relu_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_001/synthesis/kernel_0_fused_fused_addmm.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_001/synthesis/kernel_0_fused_fused_addmm.py`
 - **Framework**: triton
 - **Launch**: Block (256,1,1), Grid (128,1,1), Waves/SM: 0.97
 - **Registers/thread**: 246

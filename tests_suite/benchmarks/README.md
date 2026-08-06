@@ -38,7 +38,7 @@ Real-world CUDA kernel specifications evaluated against theoretical hardware lim
 ### 3. BackendBench (Meta/PyTorch)
 **Location:** `backendbench/`
 **Repo:** https://github.com/meta-pytorch/BackendBench
-**Cloned to:** `/mnt/podman_storage/ahpoddar/home/kernelopt/backendbench`
+**Cloned to:** `/workspace/user/home/kernelopt/backendbench`
 
 | Property | Value |
 |----------|-------|
@@ -82,7 +82,7 @@ Groups: cuda-kernels (114), cudnn (113), mathlibs (101), cublas (81), cccl (80),
 Covers AI, scientific computing, data analytics, signal processing, graphics, and simulation domains.
 
 ### 6. TritonBench (Meta/PyTorch)
-**Location:** (external) `/mnt/podman_storage/ahpoddar/home/kernelopt/tritonbench`
+**Location:** (external) `/workspace/user/home/kernelopt/tritonbench`
 **Repo:** https://github.com/pytorch/tritonbench
 
 | Property | Value |

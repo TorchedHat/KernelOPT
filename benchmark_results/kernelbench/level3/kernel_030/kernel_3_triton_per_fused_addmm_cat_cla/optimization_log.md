@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_addmm_cat_clamp_min_clone_div_expand_linalg_vector_norm_permute_select_view_zeros_like_3`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_3_triton_per_fused_addmm_cat_cla/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_3_triton_per_fused_addmm_cat_cla/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (735,1,1), Waves/SM: 0.93
 - **Registers/thread**: 76

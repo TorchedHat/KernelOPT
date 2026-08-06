@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_native_layer_norm_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_040/kernel_2_triton_poi_fused_native_layer_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_040/kernel_2_triton_poi_fused_native_layer_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (524288,1,1), Waves/SM: 248.24
 - **Registers/thread**: 18

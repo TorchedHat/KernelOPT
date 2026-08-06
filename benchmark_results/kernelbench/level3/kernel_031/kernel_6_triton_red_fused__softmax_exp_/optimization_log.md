@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_red_fused__softmax_exp_prepare_softmax_online_sub_6`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_priority/kernel_031/kernel_6_triton_red_fused__softmax_exp_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_priority/kernel_031/kernel_6_triton_red_fused__softmax_exp_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (131072,1,1), Waves/SM: 82.75
 - **Registers/thread**: 40

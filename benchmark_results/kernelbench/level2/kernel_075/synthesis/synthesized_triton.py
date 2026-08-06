@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/n3/cn3gl2rws4qmkmw35sfdt6sl46nmytt6oopdy64bmuuera7acbhc.py
+# kernel path: /workspace/tmp/torchinductor_user/n3/cn3gl2rws4qmkmw35sfdt6sl46nmytt6oopdy64bmuuera7acbhc.py
 # Topologically Sorted Source Nodes: [x], Original ATen: [aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   x => addmm, permute
@@ -195,7 +195,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/5s/c5szbe3wkejyszzbhdh6vbyx6vgglvbalwtba3e22ufdwrikgh5u.py
+# kernel path: /workspace/tmp/torchinductor_user/5s/c5szbe3wkejyszzbhdh6vbyx6vgglvbalwtba3e22ufdwrikgh5u.py
 # Topologically Sorted Source Nodes: [x_1], Original ATen: [aten.native_group_norm]
 # Source node to ATen node mapping:
 #   x_1 => var_mean, view
@@ -287,7 +287,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/65/c656uvaubh36vehtdweqadxdjavorbrzawq7nnd7tpz6yx3ofexy.py
+# kernel path: /workspace/tmp/torchinductor_user/65/c656uvaubh36vehtdweqadxdjavorbrzawq7nnd7tpz6yx3ofexy.py
 # Topologically Sorted Source Nodes: [x_1, min_1], Original ATen: [aten.native_group_norm, aten.min]
 # Source node to ATen node mapping:
 #   min_1 => min_1
@@ -406,7 +406,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ps/cpsq2rvhuurdqtrmklvssmbgmmajsq5hclzan3rbg4q2p6s6olqe.py
+# kernel path: /workspace/tmp/torchinductor_user/ps/cpsq2rvhuurdqtrmklvssmbgmmajsq5hclzan3rbg4q2p6s6olqe.py
 # Topologically Sorted Source Nodes: [x_1, min_1], Original ATen: [aten.native_group_norm, aten.min]
 # Source node to ATen node mapping:
 #   min_1 => min_1
@@ -500,7 +500,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/x2/cx25ofcr3uiibx3vurjmolg4bd4t3ap2atayv7vnvhr2xzsnyuss.py
+# kernel path: /workspace/tmp/torchinductor_user/x2/cx25ofcr3uiibx3vurjmolg4bd4t3ap2atayv7vnvhr2xzsnyuss.py
 # Topologically Sorted Source Nodes: [x_3], Original ATen: [aten.add]
 # Source node to ATen node mapping:
 #   x_3 => add_2

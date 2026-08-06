@@ -9,7 +9,7 @@ GPU=$1
 MODE=$2
 LEVEL=$3
 
-BASE="/mnt/podman_storage/ahpoddar/kernelopt_ablation"
+BASE="/workspace/user/kernelopt_ablation"
 KPT="$BASE/kernel-profiling-tool"
 KB="$BASE/KernelBench/KernelBench"
 RESULTS="$BASE/compiler_ablation_v4/${MODE}_gpu${GPU}"
@@ -21,12 +21,12 @@ export PATH=/usr/local/cuda-12.8/bin:$PATH
 # CRITICAL: Triton JIT cache on 7TB /mnt partition, NOT /home (250GB)
 # Each GPU gets its own cache dir to prevent cross-process corruption
 # See: triton-lang/triton#5933, python/cpython#92452
-export TRITON_CACHE_DIR="/mnt/podman_storage/ahpoddar/triton_cache_gpu${GPU}"
+export TRITON_CACHE_DIR="/workspace/user/triton_cache_gpu${GPU}"
 mkdir -p "$TRITON_CACHE_DIR"
 
-eval "$(/home/ahpoddar/.conda/bin/conda shell.bash hook 2>/dev/null)"
-conda activate /mnt/podman_storage/ahpoddar/conda_envs/kopt
-export PATH="/mnt/podman_storage/ahpoddar/conda_envs/kopt/bin:$PATH"
+eval "$(/home/user/.conda/bin/conda shell.bash hook 2>/dev/null)"
+conda activate /workspace/user/conda_envs/kopt
+export PATH="/workspace/user/conda_envs/kopt/bin:$PATH"
 cd "$KPT"
 
 T=5

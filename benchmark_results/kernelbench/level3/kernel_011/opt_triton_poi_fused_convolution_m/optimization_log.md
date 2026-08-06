@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `bias_relu_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_011/synthesis/kernel_16_triton_poi_fused_convolution_max_pool2d_.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_011/synthesis/kernel_16_triton_poi_fused_convolution_max_pool2d_.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (31360,1,1), Waves/SM: 14.85
 - **Registers/thread**: 26

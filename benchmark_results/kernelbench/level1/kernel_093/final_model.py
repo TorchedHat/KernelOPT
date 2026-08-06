@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/mn/cmndxcf4c74bmkhcqxxvrp37ijjy4vi24wkvbm4cr6xpsigcqfbp.py
+# kernel path: /workspace/tmp/torchinductor_user/mn/cmndxcf4c74bmkhcqxxvrp37ijjy4vi24wkvbm4cr6xpsigcqfbp.py
 # Topologically Sorted Source Nodes: [mul, cumsum], Original ATen: [aten.mul, aten.cumsum]
 # Source node to ATen node mapping:
 #   cumsum => cumsum

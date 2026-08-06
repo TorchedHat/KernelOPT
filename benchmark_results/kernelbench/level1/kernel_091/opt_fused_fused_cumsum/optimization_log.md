@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `reverse_cumsum_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_091/synthesis/kernel_0_fused_fused_cumsum.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_091/synthesis/kernel_0_fused_fused_cumsum.py`
 - **Framework**: triton
 - **Launch**: Block (1024,1,1), Grid (4,1,1), Waves/SM: 0.03
 - **Registers/thread**: 64

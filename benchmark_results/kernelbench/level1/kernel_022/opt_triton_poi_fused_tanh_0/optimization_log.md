@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `tanh_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_022/synthesis/kernel_0_triton_poi_fused_tanh_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_022/synthesis/kernel_0_triton_poi_fused_tanh_0.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1572864,1,1), Waves/SM: 744.73
 - **Registers/thread**: 17

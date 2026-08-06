@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused_add_addmm_native_layer_norm_view_9`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_028/kernel_9_triton_per_fused_add_addmm_nat/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_028/kernel_9_triton_per_fused_add_addmm_nat/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (4,1,1), Waves/SM: 0.00
 - **Registers/thread**: 32

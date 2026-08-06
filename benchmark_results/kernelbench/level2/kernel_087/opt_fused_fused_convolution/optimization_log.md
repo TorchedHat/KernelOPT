@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv2d_mish_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_087/synthesis/kernel_0_fused_fused_convolution.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_087/synthesis/kernel_0_fused_fused_convolution.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (64516,1,1), Waves/SM: 244.38
 - **Registers/thread**: 214

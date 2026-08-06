@@ -47,7 +47,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/h7/ch7szoh6c2bqhz4mnjr5t7uh2hqvhvsnfr6qlw44oawha4odsrky.py
+# kernel path: /workspace/tmp/torchinductor_user/h7/ch7szoh6c2bqhz4mnjr5t7uh2hqvhvsnfr6qlw44oawha4odsrky.py
 # Topologically Sorted Source Nodes: [x, x_1, x_2], Original ATen: [aten.t, aten.addmm, aten.minimum, aten.sub]
 # Source node to ATen node mapping:
 #   x => add_tensor, mm_default, permute

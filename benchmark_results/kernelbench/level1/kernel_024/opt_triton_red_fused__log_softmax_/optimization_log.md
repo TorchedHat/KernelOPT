@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `log_softmax_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_024/synthesis/kernel_0_triton_red_fused__log_softmax_prepare_so.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_024/synthesis/kernel_0_triton_red_fused__log_softmax_prepare_so.py`
 - **Framework**: triton
 - **Launch**: Block (1024,1,1), Grid (4096,1,1), Waves/SM: 15.52
 - **Registers/thread**: 32

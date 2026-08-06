@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_poi_fused_cat_55`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_015/kernel_55_triton_poi_fused_cat_55/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_015/kernel_55_triton_poi_fused_cat_55/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (490,1,1), Waves/SM: 0.23
 - **Registers/thread**: 16

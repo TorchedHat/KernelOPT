@@ -46,7 +46,7 @@ except (AttributeError, ImportError):
     pass
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ob/cobkayukt3722cbmdseaevfk7rgb6f7sumirdyfgr3wgsoxhofge.py
+# kernel path: /workspace/tmp/torchinductor_user/ob/cobkayukt3722cbmdseaevfk7rgb6f7sumirdyfgr3wgsoxhofge.py
 # Topologically Sorted Source Nodes: [view, x, multi_head_attention_forward], Original ATen: [aten.view, aten.permute, aten.clone]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => clone
@@ -126,7 +126,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ac/cacyl4vhfje6nmddf6lwwyrycoxrv2uw4jb4hkehvjmcvulv4ep6.py
+# kernel path: /workspace/tmp/torchinductor_user/ac/cacyl4vhfje6nmddf6lwwyrycoxrv2uw4jb4hkehvjmcvulv4ep6.py
 # Topologically Sorted Source Nodes: [view, x, multi_head_attention_forward], Original ATen: [aten.view, aten.permute, aten.clone, aten._unsafe_view, aten.t, aten.mm]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => clone, mm, permute_1, view_1
@@ -277,7 +277,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/5w/c5wrrfdqshn73cgp4jvtv6ojjppu2aqktyi4jc5xfyc4zhrjkfeq.py
+# kernel path: /workspace/tmp/torchinductor_user/5w/c5wrrfdqshn73cgp4jvtv6ojjppu2aqktyi4jc5xfyc4zhrjkfeq.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten._unsafe_view, aten.add, aten.view, aten.unsqueeze, aten.transpose, aten.squeeze, aten.clone, aten.select, aten.mul]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => add, clone_1, mul, permute_2, permute_3, select, squeeze, unsqueeze, view_2, view_3, view_4
@@ -365,7 +365,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/ub/cubgogr2zy3ylciq4bgrhvmy5euouz2lndai5yzn2hhqcd7njl4k.py
+# kernel path: /workspace/tmp/torchinductor_user/ub/cubgogr2zy3ylciq4bgrhvmy5euouz2lndai5yzn2hhqcd7njl4k.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten._unsafe_view, aten.add, aten.view, aten.unsqueeze, aten.transpose, aten.squeeze, aten.clone]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => add, clone_1, permute_2, squeeze, unsqueeze, view_2, view_3
@@ -446,7 +446,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/2p/c2ppk5p75k23p5a7dvzqxamyzhi5tuuy5rzpd66edmdvehiiptly.py
+# kernel path: /workspace/tmp/torchinductor_user/2p/c2ppk5p75k23p5a7dvzqxamyzhi5tuuy5rzpd66edmdvehiiptly.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten._unsafe_view, aten.add, aten.view, aten.unsqueeze, aten.transpose, aten.squeeze, aten.clone, aten.select, aten.mul, aten.bmm]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => add, bmm, clone_1, mul, permute_2, permute_3, permute_4, permute_6, select, select_1, squeeze, unsqueeze, view_2, view_3, view_4, view_5
@@ -536,7 +536,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/lb/clbbsnrwghdlcvbaph7bvzjiyksq4lt4zrerensqgm6kmlamekvj.py
+# kernel path: /workspace/tmp/torchinductor_user/lb/clbbsnrwghdlcvbaph7bvzjiyksq4lt4zrerensqgm6kmlamekvj.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten._unsafe_view, aten.add, aten.view, aten.unsqueeze, aten.transpose, aten.squeeze, aten.clone, aten.select, aten.mul, aten.bmm]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => add, bmm, clone_1, mul, permute_2, permute_3, permute_4, permute_6, select, select_1, squeeze, unsqueeze, view_2, view_3, view_4, view_5
@@ -694,7 +694,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/jo/cjo3iqupad5x2h4fi6ynnpl5mvicu7x5w6odi3nibjfmivdb3p5q.py
+# kernel path: /workspace/tmp/torchinductor_user/jo/cjo3iqupad5x2h4fi6ynnpl5mvicu7x5w6odi3nibjfmivdb3p5q.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [prims.prepare_softmax_online, aten.sub, aten.exp, aten._softmax]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => div
@@ -803,7 +803,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/c6/cc6ihn5gjubwu5tl7xe5jkexzfz3gmbybuun7iv5hnxctgg4pv6a.py
+# kernel path: /workspace/tmp/torchinductor_user/c6/cc6ihn5gjubwu5tl7xe5jkexzfz3gmbybuun7iv5hnxctgg4pv6a.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten.sub, aten.exp, aten._softmax, aten.select, aten.view, aten.transpose, aten.bmm]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => bmm_1, div, permute_5, select_2, view_6
@@ -956,7 +956,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/bw/cbwp6njrydfucn3sl6o7tyqirgbbs7xxkqqpyboyzsil5tvcooar.py
+# kernel path: /workspace/tmp/torchinductor_user/bw/cbwp6njrydfucn3sl6o7tyqirgbbs7xxkqqpyboyzsil5tvcooar.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten.transpose, aten.clone]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => clone_2, permute_7
@@ -1029,7 +1029,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/nl/cnlcxoabrxcvjelctb3okpx4odqfrfgy6ur4xme7kkhg2vl27gng.py
+# kernel path: /workspace/tmp/torchinductor_user/nl/cnlcxoabrxcvjelctb3okpx4odqfrfgy6ur4xme7kkhg2vl27gng.py
 # Topologically Sorted Source Nodes: [multi_head_attention_forward], Original ATen: [aten.transpose, aten.clone, aten.view, aten.t, aten.addmm]
 # Source node to ATen node mapping:
 #   multi_head_attention_forward => clone_2, mm_default, permute_7, permute_8, view_7
@@ -1174,7 +1174,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/lx/clxotdvsqbuw2sa3uuqmyqe77ezmv5hgaf5rcuykk5tcix43npn6.py
+# kernel path: /workspace/tmp/torchinductor_user/lx/clxotdvsqbuw2sa3uuqmyqe77ezmv5hgaf5rcuykk5tcix43npn6.py
 # Topologically Sorted Source Nodes: [view, x, multi_head_attention_forward, add, x_1], Original ATen: [aten.view, aten.permute, aten.addmm, aten.add, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   add => add_1
@@ -1292,7 +1292,7 @@ if __name__ == '__main__':
 ''', device_str='cuda')
 
 
-# kernel path: /mnt/podman_storage/ahpoddar/tmp/torchinductor_ahpoddar/fm/cfm4srbitozq5qrlh2jbz72beve2w4huhq3eug3d2axjgtmzzc6y.py
+# kernel path: /workspace/tmp/torchinductor_user/fm/cfm4srbitozq5qrlh2jbz72beve2w4huhq3eug3d2axjgtmzzc6y.py
 # Topologically Sorted Source Nodes: [view, x, multi_head_attention_forward, add, x_1], Original ATen: [aten.view, aten.permute, aten.addmm, aten.add, aten.native_layer_norm]
 # Source node to ATen node mapping:
 #   add => add_1

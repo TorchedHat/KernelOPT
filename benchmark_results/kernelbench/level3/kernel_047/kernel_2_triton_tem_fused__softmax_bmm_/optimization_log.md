@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_tem_fused__softmax_bmm_exp_sub_transpose_view_2`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_047/kernel_2_triton_tem_fused__softmax_bmm_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_047/kernel_2_triton_tem_fused__softmax_bmm_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (4,1,1), Waves/SM: 0.01
 - **Registers/thread**: 96

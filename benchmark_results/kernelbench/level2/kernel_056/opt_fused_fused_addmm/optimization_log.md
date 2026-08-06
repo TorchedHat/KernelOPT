@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `linear_sigmoid_sum_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_056/synthesis/kernel_0_fused_fused_addmm.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_056/synthesis/kernel_0_fused_fused_addmm.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (128,1,1), Waves/SM: 0.24
 - **Registers/thread**: 128

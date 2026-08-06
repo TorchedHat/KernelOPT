@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `batch_norm_inference_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_033/synthesis/kernel_0_triton_poi_fused__native_batch_norm_legi.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_033/synthesis/kernel_0_triton_poi_fused__native_batch_norm_legi.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (1048576,1,1), Waves/SM: 496.48
 - **Registers/thread**: 32

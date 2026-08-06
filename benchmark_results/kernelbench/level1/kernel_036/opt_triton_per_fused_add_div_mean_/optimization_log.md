@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `rms_norm_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_036/synthesis/kernel_0_triton_per_fused_add_div_mean_pow_sqrt_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_036/synthesis/kernel_0_triton_per_fused_add_div_mean_pow_sqrt_0.py`
 - **Framework**: triton
 - **Launch**: Block (64,1,1), Grid (29360128,1,1), Waves/SM: 6950.79
 - **Registers/thread**: 16

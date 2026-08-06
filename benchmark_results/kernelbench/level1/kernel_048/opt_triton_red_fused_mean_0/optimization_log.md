@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `mean_dim1_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L1_gpu0_v2/kernel_048/synthesis/kernel_0_triton_red_fused_mean_0.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L1_gpu0_v2/kernel_048/synthesis/kernel_0_triton_red_fused_mean_0.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (524160,1,1), Waves/SM: 248.18
 - **Registers/thread**: 25

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `conv2d_div_leaky_relu_kernel`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L2_gpu4/kernel_071/synthesis/kernel_0_fused_fused_convolution.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L2_gpu4/kernel_071/synthesis/kernel_0_fused_fused_convolution.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (7938,1,1), Waves/SM: 30.07
 - **Registers/thread**: 255

@@ -17,7 +17,7 @@
 ## Baseline Kernel
 
 - **Name**: `triton_per_fused__softmax_add_clamp_clone_exp_index_log_mul_permute_prepare_softmax_online_sigmoid_sub_unsqueeze_view_10`
-- **File**: `/mnt/podman_storage/ahpoddar/home/kernelopt/kernel-profiling-tool/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_10_triton_per_fused__softmax_add_/standalone.py`
+- **File**: `/opt/kernelopt/kb_benchmark_results/beam_L3_rerun/kernel_030/kernel_10_triton_per_fused__softmax_add_/standalone.py`
 - **Framework**: triton
 - **Launch**: Block (128,1,1), Grid (735,1,1), Waves/SM: 2.78
 - **Registers/thread**: 255
