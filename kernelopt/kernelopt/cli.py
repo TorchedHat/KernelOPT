@@ -1310,6 +1310,25 @@ def doctor():
     ok, msg = check_python_version()
     _row("Python", ok, msg)
 
+    # PyTorch
+    try:
+        import torch
+        cuda_ok = torch.cuda.is_available()
+        if cuda_ok:
+            dev = torch.cuda.get_device_name(0)
+            _row("PyTorch", True, f"{torch.__version__} (CUDA: {dev})")
+        else:
+            _row("PyTorch", False, f"{torch.__version__} (CUDA not available)")
+    except ImportError:
+        _row("PyTorch", False, "not installed — pip install torch")
+
+    # Triton
+    try:
+        import triton
+        _row("Triton", True, triton.__version__)
+    except ImportError:
+        _row("Triton", False, "not installed — pip install triton")
+
     ok, msg = check_gpu()
     _row("GPU", ok, msg)
 
@@ -1326,6 +1345,15 @@ def doctor():
             _row("Vertex AI", ok, msg)
         else:
             _row("Vertex AI", False, "skipped — project_id or region not set")
+    elif chosen_provider == "anthropic_api":
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        _row("Anthropic API key", bool(api_key), "set" if api_key else "not set — export ANTHROPIC_API_KEY=...")
+    elif chosen_provider == "openai":
+        api_key = provider_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
+        base_url = provider_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")
+        _row("OpenAI API key", bool(api_key), "set" if api_key else "not set")
+        if base_url:
+            _row("OpenAI base URL", True, base_url)
     elif chosen_provider == "local":
         base_url = provider_cfg.get("base_url") or os.environ.get("LOCAL_LLM_BASE_URL", "")
         if base_url:
@@ -1333,6 +1361,8 @@ def doctor():
             _row("Local server", ok, msg)
         else:
             _row("Local server", False, "base_url not configured — run: kernelopt setup")
+    elif chosen_provider in ("google_genai", "huggingface"):
+        _row("Provider", True, f"{chosen_provider} (configure via kernelopt setup)")
 
     console.print(t)
     raise typer.Exit(0 if all_ok else 1)

@@ -185,6 +185,7 @@ try:
 
     def _pre_pass(nodes):
         _pre_nodes.clear()
+        _pre_errors = 0
         for n in nodes:
             try:
                 _pre_nodes.append({{
@@ -193,12 +194,15 @@ try:
                     "is_reduction": n.is_reduction(),
                 }})
             except Exception:
-                pass
+                _pre_errors += 1
+        if _pre_errors:
+            extraction_warnings.append(f"Skipped {{_pre_errors}} nodes in pre-fusion capture")
         return nodes
 
     def _post_pass(nodes):
         from torch._inductor.scheduler import FusedSchedulerNode
         _post_nodes.clear()
+        _post_errors = 0
         for n in nodes:
             try:
                 entry = {{
@@ -210,7 +214,9 @@ try:
                     entry["snodes"] = [sn.get_name() for sn in n.snodes]
                 _post_nodes.append(entry)
             except Exception:
-                pass
+                _post_errors += 1
+        if _post_errors:
+            extraction_warnings.append(f"Skipped {{_post_errors}} nodes in post-fusion capture")
         return nodes
 
     if hasattr(_ind_config, "_pre_fusion_custom_pass"):
@@ -222,13 +228,13 @@ try:
     def _patched_wnf(self, reason, *args):
         try:
             formatted = reason % args if args else reason
-            _why_no_fuse.append({{
-                "node1": self.name1,
-                "node2": self.name2,
-                "reason": formatted,
-            }})
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            formatted = reason
+        _why_no_fuse.append({{
+            "node1": self.name1,
+            "node2": self.name2,
+            "reason": formatted,
+        }})
         return _orig_wnf(self, reason, *args)
     WhyNoFuse.__call__ = _patched_wnf
 except Exception as e:
@@ -296,8 +302,8 @@ try:
     import triton.runtime.cache as _tri_cache
     if hasattr(_tri_cache, "default_cache_manager"):
         pass  # cache manager reset not needed — listener fires even on cache hit
-except Exception:
-    pass
+except Exception as _e:
+    extraction_warnings.append(f"Triton cache check failed: {{_e}}")
 
 from torch._inductor.utils import run_and_get_code
 _compiled = torch.compile(_model)

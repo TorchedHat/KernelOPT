@@ -442,7 +442,7 @@ def _check_python_kernel(
         # Check for crash
         if result.returncode != 0:
             if debug:
-                print(f"[DEBUG] Kernel crashed with exit code {result.returncode}")
+                _logger.debug("Kernel crashed with exit code %d", result.returncode)
             return False, (
                 f"Optimized kernel crashed (exit {result.returncode}):\n"
                 f"{combined[:500]}"
@@ -458,15 +458,15 @@ def _check_python_kernel(
                 context_start = max(0, combined.find(indicator) - 100)
                 context_end = combined.find(indicator) + 200
                 if debug:
-                    print(f"[DEBUG] Triggered by indicator: '{indicator}'")
-                    print(f"[DEBUG] Context: {combined[context_start:context_end]}")
+                    _logger.debug("Triggered by indicator: '%s'", indicator)
+                    _logger.debug("Context: %s", combined[context_start:context_end])
                 return False, (
                     f"Failure indicator '{indicator}' found in output:\n"
                     f"{combined[:500]}"
                 )
 
         if debug:
-            print("[DEBUG] Correctness check PASSED")
+            _logger.debug("Correctness check PASSED")
         return True, f"Kernel ran successfully (exit 0).\n{result.stdout[:200]}"
 
     except subprocess.TimeoutExpired:

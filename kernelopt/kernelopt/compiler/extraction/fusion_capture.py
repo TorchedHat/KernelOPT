@@ -17,8 +17,11 @@ References:
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 _capture_store = threading.local()
@@ -47,6 +50,7 @@ def install_fusion_hooks() -> bool:
 
     def _pre_fusion_pass(nodes):
         store.pre_fusion_nodes = []
+        _errors = 0
         for node in nodes:
             try:
                 store.pre_fusion_nodes.append({
@@ -55,7 +59,9 @@ def install_fusion_hooks() -> bool:
                     "is_reduction": node.is_reduction(),
                 })
             except Exception:
-                pass
+                _errors += 1
+        if _errors:
+            logger.warning("Skipped %d nodes during pre-fusion capture", _errors)
         return nodes
 
     def _post_fusion_pass(nodes):
@@ -65,6 +71,7 @@ def install_fusion_hooks() -> bool:
             return nodes
 
         store.post_fusion_nodes = []
+        _errors = 0
         for node in nodes:
             try:
                 entry = {
@@ -77,7 +84,9 @@ def install_fusion_hooks() -> bool:
                     entry["snodes"] = [sn.get_name() for sn in node.snodes]
                 store.post_fusion_nodes.append(entry)
             except Exception:
-                pass
+                _errors += 1
+        if _errors:
+            logger.warning("Skipped %d nodes during post-fusion capture", _errors)
         return nodes
 
     if not hasattr(_config, "_pre_fusion_custom_pass"):
@@ -105,13 +114,13 @@ def _patch_why_no_fuse(store) -> None:
     def _patched_call(self, reason: str, *args: Any) -> None:
         try:
             formatted = reason % args if args else reason
-            store.why_no_fuse_rejections.append({
-                "node1": self.name1,
-                "node2": self.name2,
-                "reason": formatted,
-            })
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            formatted = reason
+        store.why_no_fuse_rejections.append({
+            "node1": self.name1,
+            "node2": self.name2,
+            "reason": formatted,
+        })
         return _original_call(self, reason, *args)
 
     WhyNoFuse.__call__ = _patched_call
@@ -178,6 +187,7 @@ def _find_intermediate_buffers(graph_lowering, post_fusion_nodes: list) -> list[
     buf_producers: dict[str, str] = {}
     buf_consumers: dict[str, list[str]] = {}
 
+    _dep_errors = 0
     for node in post_fusion_nodes:
         node_name = node["name"]
         for op_name in node.get("names", []):
@@ -192,9 +202,12 @@ def _find_intermediate_buffers(graph_lowering, post_fusion_nodes: list) -> list[
                         if hasattr(dep, "name"):
                             buf_consumers.setdefault(dep.name, []).append(node_name)
             except Exception:
-                pass
+                _dep_errors += 1
+    if _dep_errors:
+        logger.warning("Skipped %d buffers due to dependency extraction errors", _dep_errors)
 
     results = []
+    _size_errors = 0
     for buf_name, producer in buf_producers.items():
         consumers = buf_consumers.get(buf_name, [])
         external = [c for c in consumers if c != producer]
@@ -216,7 +229,7 @@ def _find_intermediate_buffers(graph_lowering, post_fusion_nodes: list) -> list[
             size_bytes = numel * layout.dtype.itemsize
             dtype_str = str(layout.dtype)
         except Exception:
-            pass
+            _size_errors += 1
 
         results.append({
             "name": buf_name,
@@ -227,5 +240,8 @@ def _find_intermediate_buffers(graph_lowering, post_fusion_nodes: list) -> list[
             "lifetime_span": 0,
             "eliminable_by_fusion": len(set(external)) == 1,
         })
+
+    if _size_errors:
+        logger.warning("Failed to compute size for %d intermediate buffers", _size_errors)
 
     return results

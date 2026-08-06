@@ -15,6 +15,10 @@ References:
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def extract_ir_nodes(graph_lowering) -> list[dict]:
     """Walk GraphLowering.name_to_buffer and extract metadata.
@@ -32,6 +36,7 @@ def extract_ir_nodes(graph_lowering) -> list[dict]:
         return []
 
     results = []
+    _rw_errors = 0
     name_to_buffer = getattr(graph_lowering, "name_to_buffer", {})
 
     for buf_name, buf in name_to_buffer.items():
@@ -72,7 +77,7 @@ def extract_ir_nodes(graph_lowering) -> list[dict]:
                     dep.name for dep in rw.reads if hasattr(dep, "name")
                 )
         except Exception:
-            pass
+            _rw_errors += 1
 
         reduction_info = None
         if isinstance(data, _ir.Reduction):
@@ -92,6 +97,9 @@ def extract_ir_nodes(graph_lowering) -> list[dict]:
             "write_buffer_names": write_names,
             "reduction": reduction_info,
         })
+
+    if _rw_errors:
+        logger.warning("Skipped read/write extraction for %d buffers", _rw_errors)
 
     return results
 
