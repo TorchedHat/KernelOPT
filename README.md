@@ -307,6 +307,10 @@ pip install -e ".[dev]"
 pytest tests_suite/unit/
 ```
 
+## Acknowledgments
+
+KernelOPT was developed at Red Hat, PyTorch Engineering.
+
 ## License
 
 KernelOPT is released under the [Apache 2.0 License](LICENSE).
