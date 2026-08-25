@@ -309,7 +309,7 @@ pytest tests_suite/unit/
 
 ## Acknowledgments
 
-KernelOPT was developed at Red Hat, PyTorch Engineering.
+KernelOPT was developed during internship at Red Hat, PyTorch Engineering.
 
 ## License
 
