@@ -4,7 +4,9 @@
 <p align="center">
   <a href="https://github.com/TorchedHat/KernelOPT/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg" alt="Python"></a>
-  <a href="https://developer.nvidia.com/cuda-gpus"><img src="https://img.shields.io/badge/GPU-NVIDIA%20CC%20%E2%89%A5%206.0-76B900.svg" alt="GPU"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C.svg?logo=pytorch&logoColor=white" alt="PyTorch"></a>
+  <a href="https://triton-lang.org/"><img src="https://img.shields.io/badge/Triton-3.0%2B-7B68EE.svg" alt="Triton"></a>
+  <a href="https://developer.nvidia.com/cuda-gpus"><img src="https://img.shields.io/badge/GPU-NVIDIA%20CC%20%E2%89%A5%206.0-76B900.svg?logo=nvidia&logoColor=white" alt="GPU"></a>
 </p>
 
 ---
@@ -309,7 +311,8 @@ pytest tests_suite/unit/
 
 ## Acknowledgments
 
-KernelOPT was developed during internship at Red Hat, PyTorch Engineering.
+> [!NOTE]
+> KernelOPT was developed during internship at Red Hat, PyTorch Engineering.
 
 ## License
 
