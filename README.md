@@ -314,7 +314,23 @@ pytest tests_suite/unit/
 ## Acknowledgments
 
 > [!NOTE]
-> KernelOPT was developed during internship at Red Hat, PyTorch Engineering.
+> KernelOPT was developed during an internship with the PyTorch team at Red Hat.
+
+## Citation
+
+If you use KernelOPT in your research, please cite our paper:
+
+```bibtex
+@misc{poddar2026kerneloptdispatchawareagenticsearch,
+      title={KernelOPT: Dispatch-Aware Agentic Search for GPU Kernel Optimization}, 
+      author={Aheli Poddar and Sanskar Prasad and Arindam Samanta and Subha Chakraborty and Vishal Goyal and Rohit Singh Rathaur},
+      year={2026},
+      eprint={2609.30059},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={[https://arxiv.org/abs/2609.30059](https://arxiv.org/abs/2609.30059)}, 
+}
+```
 
 ## License
 
