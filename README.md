@@ -7,6 +7,8 @@
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C.svg?logo=pytorch&logoColor=white" alt="PyTorch"></a>
   <a href="https://triton-lang.org/"><img src="https://img.shields.io/badge/Triton-3.0%2B-7B68EE.svg" alt="Triton"></a>
   <a href="https://developer.nvidia.com/cuda-gpus"><img src="https://img.shields.io/badge/GPU-NVIDIA%20CC%20%E2%89%A5%206.0-76B900.svg?logo=nvidia&logoColor=white" alt="GPU"></a>
+  <a href="https://arxiv.org/abs/2609.30059"><img src="https://img.shields.io/badge/arXiv-2609.30059-b31b1b.svg" alt="arXiv"></a>
+
 </p>
 
 ---
