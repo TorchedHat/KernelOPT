@@ -1,4 +1,6 @@
-<h1 align="center">KernelOPT</h1>
+<h1 align="center">
+  <img src="assets/kernelopt-mark.png" width="40" height="40" align="absmiddle" alt="">&nbsp; KernelOPT
+</h1>
 <p align="center">Dispatch-Aware Agentic Search for GPU Kernel Optimization</p>
 
 <p align="center">
